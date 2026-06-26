@@ -1,0 +1,5 @@
+{
+  "_comment": "docker.update — run a compose lifecycle action. action ∈ up|down|restart|start|stop|build|pull|logs.",
+  "path": "/home/operator/code/myapp",
+  "action": "up"
+}

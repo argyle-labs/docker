@@ -1,0 +1,4 @@
+{
+  "_comment": "docker.list — engine status + registered runtimes always; pass `path` for one project's services, or `root` to scan a directory of projects.",
+  "root": "/home/operator/code"
+}

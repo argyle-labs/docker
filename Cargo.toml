@@ -1,0 +1,49 @@
+[package]
+name = "docker"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "docker"
+path = "src/lib.rs"
+# `cdylib` is the orca plugin artifact orca's `plugin-loader` `dlopen`s;
+# `rlib` retains the in-crate `#[cfg(test)]` harness + lets the workspace use it
+# as a normal Rust lib.
+crate-type = ["cdylib", "rlib"]
+
+# Docker engine + compose adapter plugin for orca. CLI-based: the `docker`
+# binary is the API. Three layers — engine (colima/desktop probe + lifecycle),
+# compose (project wrapper), containers (ps/stats/inspect) — plus a flat
+# `docker.{list,detail,create,update,delete}` tool surface and the
+# `docker.{install,engine_update,backup}` lifecycle tools.
+
+[dependencies]
+# The SOLE orca dependency. Every external crate the plugin needs — serde,
+# serde_json, schemars, clap, chrono, tokio, anyhow — and every orca domain
+# (containers / db / contract) is reached through `plugin_toolkit::*` / its
+# prelude, or injected by `#[plugin_struct]`/`#[orca_tool]`. The plugin source
+# names no external crate except `abi_stable` below.
+#
+# Pinned to the orca rc tag that carries the plugin-toolkit surface. Until the
+# tag is published, the committed `[patch]` in `.cargo/config.toml` resolves
+# this to the local in-tree toolkit at ../orca.
+plugin-toolkit = { git = "https://github.com/scottdkey/orca", tag = "v0.0.8-rc.8" }
+
+# The ONE genuine non-orca dep: `#[export_root_module]` expands to bare
+# `::abi_stable` paths in this crate's root (the cdylib FFI boundary the loader
+# dlopens), so it can't route through the toolkit. Pinned to the orca workspace
+# version (0.11) so the layout hash baked into the cdylib matches what orca's
+# plugin-loader checks at load time.
+abi_stable = "0.11"
+
+[dev-dependencies]
+# Dev-only: in-crate tests reach the toolkit's re-exported tokio/serde the same
+# way the lib does. Not a runtime dep.
+plugin-toolkit = { git = "https://github.com/scottdkey/orca", tag = "v0.0.8-rc.8" }
+tempfile = "3"
+
+# Match orca's workspace lint floor: discarding a Result/Option via
+# `let _ = ...` stays a hard error so the plugin remains portable back into the
+# orca workspace.
+[lints.clippy]
+let_underscore_must_use = "deny"

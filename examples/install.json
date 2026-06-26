@@ -1,0 +1,4 @@
+{
+  "_comment": "docker.install — provision + start the engine on this host.",
+  "flavor": "colima"
+}
