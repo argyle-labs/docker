@@ -6,12 +6,12 @@ name: Lint scripts
 
 on:
   push:
-    branches: [main]
+    branches: [dev, stage, main]
     paths:
       - scripts/**
       - .github/workflows/build.yml
   pull_request:
-    branches: [main]
+    branches: [dev, main]
     paths:
       - scripts/**
 
