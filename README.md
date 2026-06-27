@@ -61,7 +61,7 @@ deriving `thiserror`, so the crate carries no path dependency on the derive's
 emitted `::thiserror` root.
 
 If you ever feel you need a third dependency, that is a signal the toolkit is
-missing a primitive — [file a toolkit gap](https://github.com/scottdkey/orca/issues)
+missing a primitive — [file a toolkit gap](https://github.com/argyle-labs/orca/issues)
 rather than adding the crate here.
 
 ## Why `abi_stable` is the unavoidable exception
