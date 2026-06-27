@@ -4,7 +4,7 @@
 //! or are addressed through `update` args without a sub-resource flag.
 //!
 //! Pod awareness: every tool inherits the universal `--peer <host>` flag —
-//! `docker.list --peer baldur` lists containers on baldur via mesh dispatch.
+//! `docker.list --peer host-b` lists containers on that peer via mesh dispatch.
 
 use std::path::{Path, PathBuf};
 
