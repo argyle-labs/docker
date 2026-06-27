@@ -18,6 +18,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Resolve git deps via the git CLI so the tokenized `insteadOf` rewrite below
+  # is honored when fetching the private orca dependency.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
   ci:
@@ -30,6 +33,13 @@ jobs:
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Drop local-dev cargo patch
+        # .cargo/config.toml carries a developer-only `[patch]` redirecting
+        # plugin-toolkit to a local ../orca checkout, which doesn't exist in CI.
+        # Remove it so the pinned git dependency (private argyle-labs/orca,
+        # fetched via the token below) is used instead.
+        run: rm -f .cargo/config.toml
 
       - name: Authenticate private orca git dependency
         run: |
