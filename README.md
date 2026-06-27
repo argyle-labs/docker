@@ -1,6 +1,6 @@
 # docker — orca plugin
 
-A standalone [orca](https://github.com/scottdkey/orca) plugin that adapts the
+A standalone [orca](https://github.com/argyle-labs/orca) plugin that adapts the
 **docker engine** and **docker compose** into orca's containers domain. It is
 CLI-based: the `docker` binary is the API. The plugin probes the local engine
 (colima vs Docker Desktop vs distro Engine), wraps compose projects, reads
@@ -36,7 +36,7 @@ This plugin has **exactly two** entries under `[dependencies]`:
 
 ```toml
 [dependencies]
-plugin-toolkit = { git = "https://github.com/scottdkey/orca", tag = "v0.0.8-rc.8" }
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", tag = "v0.0.8-rc.8" }
 abi_stable = "0.11"
 ```
 
