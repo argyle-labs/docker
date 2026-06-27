@@ -535,6 +535,7 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 [[package]]
 name = "containers"
 version = "0.0.8-rc.8"
+source = "git+https://github.com/argyle-labs/orca?tag=v0.0.8-rc.8#16cf0c77bc4c6572b77cf18f6e4448a67bf3d591"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -558,6 +559,7 @@ dependencies = [
 [[package]]
 name = "contract"
 version = "0.0.8-rc.8"
+source = "git+https://github.com/argyle-labs/orca?tag=v0.0.8-rc.8#16cf0c77bc4c6572b77cf18f6e4448a67bf3d591"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -747,6 +749,7 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 [[package]]
 name = "db"
 version = "0.0.8-rc.8"
+source = "git+https://github.com/argyle-labs/orca?tag=v0.0.8-rc.8#16cf0c77bc4c6572b77cf18f6e4448a67bf3d591"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -808,6 +811,7 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 [[package]]
 name = "derive"
 version = "0.0.8-rc.8"
+source = "git+https://github.com/argyle-labs/orca?tag=v0.0.8-rc.8#16cf0c77bc4c6572b77cf18f6e4448a67bf3d591"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -882,6 +886,7 @@ dependencies = [
 [[package]]
 name = "dispatch"
 version = "0.0.8-rc.8"
+source = "git+https://github.com/argyle-labs/orca?tag=v0.0.8-rc.8#16cf0c77bc4c6572b77cf18f6e4448a67bf3d591"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1186,6 +1191,7 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 [[package]]
 name = "graphql"
 version = "0.0.8-rc.8"
+source = "git+https://github.com/argyle-labs/orca?tag=v0.0.8-rc.8#16cf0c77bc4c6572b77cf18f6e4448a67bf3d591"
 dependencies = [
  "anyhow",
  "graphql-parser",
@@ -1760,6 +1766,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 [[package]]
 name = "macro-runtime"
 version = "0.0.8-rc.8"
+source = "git+https://github.com/argyle-labs/orca?tag=v0.0.8-rc.8#16cf0c77bc4c6572b77cf18f6e4448a67bf3d591"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1859,6 +1866,7 @@ dependencies = [
 [[package]]
 name = "notifications"
 version = "0.0.8-rc.8"
+source = "git+https://github.com/argyle-labs/orca?tag=v0.0.8-rc.8#16cf0c77bc4c6572b77cf18f6e4448a67bf3d591"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1872,7 +1880,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
- "tokio",
  "toml",
 ]
 
@@ -1961,6 +1968,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "openapi"
 version = "0.0.8-rc.8"
+source = "git+https://github.com/argyle-labs/orca?tag=v0.0.8-rc.8#16cf0c77bc4c6572b77cf18f6e4448a67bf3d591"
 dependencies = [
  "anyhow",
  "indexmap",
@@ -2138,6 +2146,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "plugin-toolkit"
 version = "0.0.8-rc.8"
+source = "git+https://github.com/argyle-labs/orca?tag=v0.0.8-rc.8#16cf0c77bc4c6572b77cf18f6e4448a67bf3d591"
 dependencies = [
  "abi_stable",
  "anyhow",
@@ -2151,7 +2160,6 @@ dependencies = [
  "derive",
  "dispatch",
  "futures-core",
- "futures-util",
  "graphql",
  "graphql_client",
  "inventory",
@@ -2167,12 +2175,10 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
- "storage",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",
- "urlencoding",
  "utils",
  "uuid",
 ]
@@ -3005,19 +3011,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
-name = "storage"
-version = "0.0.8-rc.8"
-dependencies = [
- "anyhow",
- "async-trait",
- "schemars",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
 name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3508,12 +3501,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "urlencoding"
-version = "2.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
-
-[[package]]
 name = "utf8_iter"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3528,6 +3515,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 [[package]]
 name = "utils"
 version = "0.0.8-rc.8"
+source = "git+https://github.com/argyle-labs/orca?tag=v0.0.8-rc.8#16cf0c77bc4c6572b77cf18f6e4448a67bf3d591"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4074,3 +4062,7 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
+
+[[patch.unused]]
+name = "plugin-toolkit"
+version = "0.0.8-rc.8"
