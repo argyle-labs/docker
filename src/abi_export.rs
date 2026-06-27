@@ -1,4 +1,4 @@
-// The tool surface crosses this FFI boundary as opaque JSON — the designated
+// The tool surface crosses this FFI boundary as opaque JSON â the designated
 // JSON dispatch seam, identical to orca's `plugin-loader`. The payload type is
 // aliased (`sj`) at this one seam and the workspace disallowed-types lint is
 // suppressed for this file only.
@@ -38,7 +38,7 @@ extern "C" fn orca_compat() -> RString {
 }
 
 /// Tool-name prefix this plugin owns. The cdylib statically links the toolkit's
-/// domain crates (containers / …), whose `#[orca_tool]` inventory entries the
+/// domain crates (containers / â¦), whose `#[orca_tool]` inventory entries the
 /// raw `tool_manifest_json()` walk also returns; this plugin exposes only its
 /// own `docker.*` namespace across the ABI.
 const TOOL_PREFIX: &str = "docker.";
@@ -104,6 +104,14 @@ extern "C" fn invoke(name: RStr<'_>, args_json: RStr<'_>) -> RResult<RString, RS
     }
 }
 
+/// Domain backends this plugin contributes. Pure tool-surface plugin (no
+/// storage/etc. backend), so it contributes none — an empty array, identical to
+/// what the toolkit per-field default would synthesize for a plugin that predates
+/// the `backends` ABI field.
+extern "C" fn backends() -> RString {
+    RString::from("[]")
+}
+
 #[export_root_module]
 fn export() -> PluginModRef {
     PluginMod {
@@ -113,6 +121,7 @@ fn export() -> PluginModRef {
         orca_compat,
         manifest,
         invoke,
+        backends,
     }
     .leak_into_prefix()
 }
