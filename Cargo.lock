@@ -538,13 +538,11 @@ version = "0.0.8-rc.9"
 dependencies = [
  "anyhow",
  "async-trait",
- "bollard",
  "chrono",
  "clap",
  "contract",
  "derive",
  "dispatch",
- "futures-util",
  "inventory",
  "macro-runtime",
  "notifications",
@@ -933,6 +931,8 @@ name = "docker"
 version = "0.1.0"
 dependencies = [
  "abi_stable",
+ "bollard",
+ "futures-util",
  "plugin-toolkit",
  "tempfile",
 ]
@@ -2193,6 +2193,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "service",
  "sha2 0.11.0",
  "storage",
  "thiserror 2.0.18",
@@ -2890,6 +2891,19 @@ dependencies = [
  "ryu",
  "serde",
  "unsafe-libyaml",
+]
+
+[[package]]
+name = "service"
+version = "0.0.8-rc.9"
+dependencies = [
+ "anyhow",
+ "deploy-target",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

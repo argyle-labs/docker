@@ -10,4 +10,4 @@
 git-fetch-with-cli = true
 
 [patch."https://github.com/argyle-labs/orca"]
-plugin-toolkit = { path = "../orca/projects/plugin-toolkit" }
+plugin-toolkit = { path = "../orca-refactor/projects/plugin-toolkit" }

@@ -12,6 +12,8 @@ pub mod compose;
 pub mod containers;
 pub mod engine;
 pub mod lifecycle;
+pub mod registration;
+pub mod runtime_adapter;
 pub mod tools;
 pub mod topology;
 
