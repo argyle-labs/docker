@@ -2,6 +2,10 @@
 name = "docker"
 version = "0.1.0"
 edition = "2021"
+description = "Adapts Docker Engine + Compose into orca's containers domain"
+
+[package.metadata.orca]
+category = "infra"
 
 [lib]
 name = "docker"
