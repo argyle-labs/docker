@@ -13,9 +13,11 @@ use plugin_toolkit::containers::{
 };
 use plugin_toolkit::contract::unit::{
     ActionDecl, ActionOutcome, CreateArgs, DeleteArgs, DetailArgs, ItemOutcome, ItemsOutcome,
-    KindDeclaration, ListArgs, UnitDescriptor, UnitId, UpdateArgs, VerbArgs, VerbDecl,
-    VerbOutcome, Verb, UnitProvider,
+    KindDeclaration, ListArgs, UnitDescriptor, UnitId, UnitProvider, UpdateArgs, VerbArgs,
+    VerbDecl, VerbOutcome, Verb,
 };
+use plugin_toolkit::schemars::{schema_for, JsonSchema};
+use plugin_toolkit::serde::{Deserialize, Serialize};
 use plugin_toolkit::contract::BoxFuture;
 use plugin_toolkit::serde_json;
 
@@ -47,7 +49,7 @@ impl DockerUnitProvider {
         serde_json::to_string(c).unwrap_or_default()
     }
 
-    async fn do_list(&self, args: ListArgs) -> Result<VerbOutcome> {
+    async fn do_list(&self, _args: ListArgs) -> Result<VerbOutcome> {
         // ListFilter has no name field; search is applied client-side by orca.
         let filter = ListFilter { all: true, labels: vec![] };
         let containers = self
@@ -121,8 +123,9 @@ impl DockerUnitProvider {
     async fn do_create(&self, args: CreateArgs) -> Result<VerbOutcome> {
         match args.action.as_str() {
             "exec" => {
-                let payload = args.payload.unwrap_or_default();
-                let exec = ExecPayload::from_json(&payload)?;
+                let raw = args.payload.unwrap_or_default();
+                let exec: ExecPayload = serde_json::from_str(&raw)
+                    .map_err(|e| anyhow::anyhow!("exec payload: {e}"))?;
                 let result = self
                     .adapter
                     .exec(&exec.id, &exec.cmd, exec.stdin)
@@ -149,35 +152,105 @@ impl DockerUnitProvider {
     }
 }
 
-/// Payload for `Create { action: "exec" }`.
-struct ExecPayload {
-    id: String,
-    cmd: Vec<String>,
-    stdin: Option<String>,
+/// Typed payload for `Create { action: "exec" }`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(crate = "plugin_toolkit::serde")]
+#[schemars(crate = "plugin_toolkit::schemars")]
+pub struct ExecPayload {
+    /// Container name or ID.
+    pub id: String,
+    /// Command and arguments to run inside the container.
+    pub cmd: Vec<String>,
+    /// Optional stdin to pipe into the process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdin: Option<String>,
 }
 
-impl ExecPayload {
-    fn from_json(s: &str) -> Result<Self, anyhow::Error> {
-        let v: serde_json::Value =
-            serde_json::from_str(s).map_err(|e| anyhow::anyhow!("exec payload: {e}"))?;
-        Ok(Self {
-            id: v["id"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("exec payload missing 'id'"))?
-                .to_string(),
-            cmd: v["cmd"]
-                .as_array()
-                .ok_or_else(|| anyhow::anyhow!("exec payload missing 'cmd'"))?
-                .iter()
-                .filter_map(|s| s.as_str().map(str::to_string))
-                .collect(),
-            stdin: v["stdin"].as_str().map(str::to_string),
-        })
-    }
+/// Typed response for `Create { action: "exec" }`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(crate = "plugin_toolkit::serde")]
+#[schemars(crate = "plugin_toolkit::schemars")]
+pub struct ExecResponse {
+    pub exit_code: i64,
+    pub stdout: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<String>,
 }
 
 fn adapter_err(e: AdapterError) -> anyhow::Error {
     anyhow::anyhow!("{e}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(json: &str) -> Result<ExecPayload, anyhow::Error> {
+        serde_json::from_str(json).map_err(|e| anyhow::anyhow!("exec payload: {e}"))
+    }
+
+    #[test]
+    fn exec_payload_happy_path() {
+        let p = parse(r#"{"id":"web","cmd":["ls","-la"],"stdin":"hello"}"#).unwrap();
+        assert_eq!(p.id, "web");
+        assert_eq!(p.cmd, vec!["ls", "-la"]);
+        assert_eq!(p.stdin.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn exec_payload_stdin_optional() {
+        let p = parse(r#"{"id":"db","cmd":["psql","-c","\\l"]}"#).unwrap();
+        assert_eq!(p.id, "db");
+        assert_eq!(p.cmd, vec!["psql", "-c", "\\l"]);
+        assert!(p.stdin.is_none());
+    }
+
+    #[test]
+    fn exec_payload_missing_id() {
+        let err = parse(r#"{"cmd":["ls"]}"#).unwrap_err();
+        assert!(err.to_string().contains("id"), "expected id error, got: {err}");
+    }
+
+    #[test]
+    fn exec_payload_missing_cmd() {
+        let err = parse(r#"{"id":"web"}"#).unwrap_err();
+        assert!(err.to_string().contains("cmd"), "expected cmd error, got: {err}");
+    }
+
+    #[test]
+    fn exec_payload_bad_json() {
+        let err = parse("not json at all").unwrap_err();
+        assert!(err.to_string().contains("exec payload"), "got: {err}");
+    }
+
+    #[test]
+    fn exec_payload_cmd_wrong_type() {
+        let err = parse(r#"{"id":"web","cmd":"ls"}"#).unwrap_err();
+        assert!(
+            err.to_string().contains("sequence") || err.to_string().contains("cmd"),
+            "expected sequence/cmd type error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn declarations_exec_action_has_typed_schemas() {
+        let provider = DockerUnitProvider {
+            adapter: {
+                static A: std::sync::OnceLock<DockerAdapter> = std::sync::OnceLock::new();
+                A.get_or_init(DockerAdapter::new)
+            },
+            hostname: "test".into(),
+        };
+        let decls = provider.declarations();
+        let container = decls.iter().find(|d| d.kind == "container").unwrap();
+        let create_decl = container.verbs.iter().find(|v| v.verb == Verb::Create).unwrap();
+        let exec = create_decl.actions.iter().find(|a| a.action == "exec").unwrap();
+        assert!(exec.payload_schema.is_some(), "exec must declare payload schema");
+        assert!(exec.response_schema.is_some(), "exec must declare response schema");
+        let schema_json = serde_json::to_string(exec.payload_schema.as_ref().unwrap()).unwrap();
+        assert!(schema_json.contains("cmd"), "schema must reference cmd field");
+        assert!(schema_json.contains("id"), "schema must reference id field");
+    }
 }
 
 impl UnitProvider for DockerUnitProvider {
@@ -217,8 +290,8 @@ impl UnitProvider for DockerUnitProvider {
                     query_schema: None,
                     actions: vec![ActionDecl {
                         action: "exec".into(),
-                        payload_schema: None,
-                        response_schema: None,
+                        payload_schema: Some(schema_for!(ExecPayload)),
+                        response_schema: Some(schema_for!(ExecResponse)),
                     }],
                 },
             ],
