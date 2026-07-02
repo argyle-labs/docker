@@ -16,6 +16,7 @@ pub mod registration;
 pub mod runtime_adapter;
 pub mod tools;
 pub mod topology;
+pub mod unit_provider;
 
 pub use compose::{Compose, ComposeError, ServiceStatus, ServiceSummary};
 pub use containers::ContainerSummary;

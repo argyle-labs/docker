@@ -17,19 +17,25 @@ use std::sync::OnceLock;
 
 use plugin_toolkit::abi::BackendDef;
 use plugin_toolkit::containers::{self, RuntimeAdapter};
+use plugin_toolkit::contract::unit::{self as unit_domain, UnitProvider};
 use plugin_toolkit::export::runtime;
 use plugin_toolkit::serde_json;
 
 use crate::runtime_adapter::DockerAdapter;
+use crate::unit_provider::DockerUnitProvider;
 
 const TOPO_PREFIX: &str = "docker.__topo";
 const RUNTIME_PREFIX: &str = "docker.__runtime";
+const UNIT_PREFIX: &str = "docker.__unit";
 
-/// The process-wide docker runtime adapter. Its bollard client is built lazily
-/// on first use, so constructing it here does no I/O.
 fn adapter() -> &'static DockerAdapter {
     static ADAPTER: OnceLock<DockerAdapter> = OnceLock::new();
     ADAPTER.get_or_init(DockerAdapter::new)
+}
+
+fn unit_provider() -> &'static DockerUnitProvider {
+    static PROVIDER: OnceLock<DockerUnitProvider> = OnceLock::new();
+    PROVIDER.get_or_init(|| DockerUnitProvider::new(adapter()))
 }
 
 /// Backend descriptors this plugin advertises: a topology collector and a
@@ -49,6 +55,12 @@ pub fn backends_json() -> String {
             name: "docker".to_string(),
             kind: "docker".to_string(),
             invoke_prefix: RUNTIME_PREFIX.to_string(),
+            ..Default::default()
+        },
+        BackendDef {
+            domain: "unit".to_string(),
+            name: "docker".to_string(),
+            invoke_prefix: UNIT_PREFIX.to_string(),
             ..Default::default()
         },
     ];
@@ -72,6 +84,11 @@ pub fn backend_dispatch(name: &str, args_json: &str) -> Option<Result<String, St
             op,
             args_json,
         ));
+        return Some(out);
+    }
+    if let Some(op) = name.strip_prefix(UNIT_PREFIX).and_then(|s| s.strip_prefix('.')) {
+        let out = runtime()
+            .block_on(unit_domain::dispatch_op(unit_provider() as &dyn UnitProvider, op, args_json));
         return Some(out);
     }
     None
