@@ -181,6 +181,82 @@ fn adapter_err(e: AdapterError) -> anyhow::Error {
     anyhow::anyhow!("{e}")
 }
 
+impl UnitProvider for DockerUnitProvider {
+    fn name(&self) -> &str {
+        "docker"
+    }
+
+    fn declarations(&self) -> Vec<KindDeclaration> {
+        vec![KindDeclaration {
+            kind: KIND.into(),
+            verbs: vec![
+                VerbDecl::list(),
+                VerbDecl::detail(),
+                VerbDecl {
+                    verb: Verb::Update,
+                    query_schema: None,
+                    actions: vec![
+                        ActionDecl {
+                            action: "start".into(),
+                            payload_schema: None,
+                            response_schema: None,
+                        },
+                        ActionDecl {
+                            action: "stop".into(),
+                            payload_schema: None,
+                            response_schema: None,
+                        },
+                        ActionDecl {
+                            action: "restart".into(),
+                            payload_schema: None,
+                            response_schema: None,
+                        },
+                    ],
+                },
+                VerbDecl {
+                    verb: Verb::Create,
+                    query_schema: None,
+                    actions: vec![ActionDecl {
+                        action: "exec".into(),
+                        payload_schema: Some(schema_for!(ExecPayload)),
+                        response_schema: Some(schema_for!(ExecResponse)),
+                    }],
+                },
+            ],
+        }]
+    }
+
+    fn units(&self) -> BoxFuture<'_, Result<Vec<UnitDescriptor>>> {
+        Box::pin(async move {
+            let containers = self
+                .adapter
+                .list(&ListFilter::default())
+                .await
+                .map_err(adapter_err)?;
+            Ok(containers
+                .into_iter()
+                .map(|c| UnitDescriptor {
+                    id: self.unit_id(&c),
+                    verbs: vec![Verb::List, Verb::Detail, Verb::Update, Verb::Create],
+                    parent: None,
+                })
+                .collect())
+        })
+    }
+
+    fn invoke(&self, args: VerbArgs) -> BoxFuture<'_, Result<VerbOutcome>> {
+        Box::pin(async move {
+            match args {
+                VerbArgs::List(a) => self.do_list(a).await,
+                VerbArgs::Detail(a) => self.do_detail(a).await,
+                VerbArgs::Update(a) => self.do_update(a).await,
+                VerbArgs::Create(a) => self.do_create(a).await,
+                VerbArgs::Delete(a) => self.do_delete(a),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,81 +349,5 @@ mod tests {
             "schema must reference cmd field"
         );
         assert!(schema_json.contains("id"), "schema must reference id field");
-    }
-}
-
-impl UnitProvider for DockerUnitProvider {
-    fn name(&self) -> &str {
-        "docker"
-    }
-
-    fn declarations(&self) -> Vec<KindDeclaration> {
-        vec![KindDeclaration {
-            kind: KIND.into(),
-            verbs: vec![
-                VerbDecl::list(),
-                VerbDecl::detail(),
-                VerbDecl {
-                    verb: Verb::Update,
-                    query_schema: None,
-                    actions: vec![
-                        ActionDecl {
-                            action: "start".into(),
-                            payload_schema: None,
-                            response_schema: None,
-                        },
-                        ActionDecl {
-                            action: "stop".into(),
-                            payload_schema: None,
-                            response_schema: None,
-                        },
-                        ActionDecl {
-                            action: "restart".into(),
-                            payload_schema: None,
-                            response_schema: None,
-                        },
-                    ],
-                },
-                VerbDecl {
-                    verb: Verb::Create,
-                    query_schema: None,
-                    actions: vec![ActionDecl {
-                        action: "exec".into(),
-                        payload_schema: Some(schema_for!(ExecPayload)),
-                        response_schema: Some(schema_for!(ExecResponse)),
-                    }],
-                },
-            ],
-        }]
-    }
-
-    fn units(&self) -> BoxFuture<'_, Result<Vec<UnitDescriptor>>> {
-        Box::pin(async move {
-            let containers = self
-                .adapter
-                .list(&ListFilter::default())
-                .await
-                .map_err(adapter_err)?;
-            Ok(containers
-                .into_iter()
-                .map(|c| UnitDescriptor {
-                    id: self.unit_id(&c),
-                    verbs: vec![Verb::List, Verb::Detail, Verb::Update, Verb::Create],
-                    parent: None,
-                })
-                .collect())
-        })
-    }
-
-    fn invoke(&self, args: VerbArgs) -> BoxFuture<'_, Result<VerbOutcome>> {
-        Box::pin(async move {
-            match args {
-                VerbArgs::List(a) => self.do_list(a).await,
-                VerbArgs::Detail(a) => self.do_detail(a).await,
-                VerbArgs::Update(a) => self.do_update(a).await,
-                VerbArgs::Create(a) => self.do_create(a).await,
-                VerbArgs::Delete(a) => self.do_delete(a),
-            }
-        })
     }
 }
