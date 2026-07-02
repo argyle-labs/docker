@@ -26,7 +26,7 @@ if [ "$RUNTIME" = auto ]; then
   if [ "$OS" = Darwin ]; then RUNTIME=colima; else RUNTIME=docker; fi
 fi
 
-upgrade_brew_pkg() { have brew && brew upgrade "$@" || true; }
+upgrade_brew_pkg() { if have brew; then brew upgrade "$@" || true; fi; }
 
 update_docker() {
   case "$OS" in
