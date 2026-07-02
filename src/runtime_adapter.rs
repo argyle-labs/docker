@@ -11,6 +11,7 @@
 //! to connect are deferred until the first call, where they surface as
 //! [`AdapterError::Unavailable`].
 
+use bollard::Docker;
 use bollard::container::LogOutput;
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::models::{
@@ -20,15 +21,14 @@ use bollard::models::{
 use bollard::query_parameters::{
     InspectContainerOptionsBuilder, ListContainersOptionsBuilder, LogsOptionsBuilder,
 };
-use bollard::Docker;
 use futures_util::StreamExt;
 use plugin_toolkit::async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use plugin_toolkit::containers::{
-    local_hostname, AdapterError, Container, ContainerMount, ContainerState, ExecOutput,
-    ListFilter, LogTail, RestartPolicy, RuntimeAdapter, RuntimeKind,
+    AdapterError, Container, ContainerMount, ContainerState, ExecOutput, ListFilter, LogTail,
+    RestartPolicy, RuntimeAdapter, RuntimeKind, local_hostname,
 };
 
 /// Local docker adapter. Holds a lazily-initialised `bollard::Docker` client
