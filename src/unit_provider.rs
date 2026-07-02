@@ -8,17 +8,15 @@
 //! - [`Verb::Delete`] → not supported (containers are managed by Compose / CLI)
 
 use plugin_toolkit::anyhow::{self, Result};
-use plugin_toolkit::containers::{
-    AdapterError, Container, ListFilter, LogTail, RuntimeAdapter,
-};
+use plugin_toolkit::containers::{AdapterError, Container, ListFilter, LogTail, RuntimeAdapter};
 use plugin_toolkit::contract::unit::{
     ActionDecl, ActionOutcome, CreateArgs, DeleteArgs, DetailArgs, ItemOutcome, ItemsOutcome,
-    KindDeclaration, ListArgs, UnitDescriptor, UnitId, UnitProvider, UpdateArgs, VerbArgs,
-    VerbDecl, VerbOutcome, Verb,
+    KindDeclaration, ListArgs, UnitDescriptor, UnitId, UnitProvider, UpdateArgs, Verb, VerbArgs,
+    VerbDecl, VerbOutcome,
 };
+use plugin_toolkit::contract::BoxFuture;
 use plugin_toolkit::schemars::{schema_for, JsonSchema};
 use plugin_toolkit::serde::{Deserialize, Serialize};
-use plugin_toolkit::contract::BoxFuture;
 use plugin_toolkit::serde_json;
 
 use crate::runtime_adapter::DockerAdapter;
@@ -33,7 +31,10 @@ pub struct DockerUnitProvider {
 impl DockerUnitProvider {
     pub fn new(adapter: &'static DockerAdapter) -> Self {
         let hostname = plugin_toolkit::containers::local_hostname();
-        Self { adapter, hostname: hostname.to_string() }
+        Self {
+            adapter,
+            hostname: hostname.to_string(),
+        }
     }
 
     fn unit_id(&self, c: &Container) -> UnitId {
@@ -51,12 +52,11 @@ impl DockerUnitProvider {
 
     async fn do_list(&self, _args: ListArgs) -> Result<VerbOutcome> {
         // ListFilter has no name field; search is applied client-side by orca.
-        let filter = ListFilter { all: true, labels: vec![] };
-        let containers = self
-            .adapter
-            .list(&filter)
-            .await
-            .map_err(adapter_err)?;
+        let filter = ListFilter {
+            all: true,
+            labels: vec![],
+        };
+        let containers = self.adapter.list(&filter).await.map_err(adapter_err)?;
         let items = containers
             .into_iter()
             .map(|c| ItemOutcome {
@@ -124,8 +124,8 @@ impl DockerUnitProvider {
         match args.action.as_str() {
             "exec" => {
                 let raw = args.payload.unwrap_or_default();
-                let exec: ExecPayload = serde_json::from_str(&raw)
-                    .map_err(|e| anyhow::anyhow!("exec payload: {e}"))?;
+                let exec: ExecPayload =
+                    serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("exec payload: {e}"))?;
                 let result = self
                     .adapter
                     .exec(&exec.id, &exec.cmd, exec.stdin)
@@ -208,13 +208,19 @@ mod tests {
     #[test]
     fn exec_payload_missing_id() {
         let err = parse(r#"{"cmd":["ls"]}"#).unwrap_err();
-        assert!(err.to_string().contains("id"), "expected id error, got: {err}");
+        assert!(
+            err.to_string().contains("id"),
+            "expected id error, got: {err}"
+        );
     }
 
     #[test]
     fn exec_payload_missing_cmd() {
         let err = parse(r#"{"id":"web"}"#).unwrap_err();
-        assert!(err.to_string().contains("cmd"), "expected cmd error, got: {err}");
+        assert!(
+            err.to_string().contains("cmd"),
+            "expected cmd error, got: {err}"
+        );
     }
 
     #[test]
@@ -243,12 +249,29 @@ mod tests {
         };
         let decls = provider.declarations();
         let container = decls.iter().find(|d| d.kind == "container").unwrap();
-        let create_decl = container.verbs.iter().find(|v| v.verb == Verb::Create).unwrap();
-        let exec = create_decl.actions.iter().find(|a| a.action == "exec").unwrap();
-        assert!(exec.payload_schema.is_some(), "exec must declare payload schema");
-        assert!(exec.response_schema.is_some(), "exec must declare response schema");
+        let create_decl = container
+            .verbs
+            .iter()
+            .find(|v| v.verb == Verb::Create)
+            .unwrap();
+        let exec = create_decl
+            .actions
+            .iter()
+            .find(|a| a.action == "exec")
+            .unwrap();
+        assert!(
+            exec.payload_schema.is_some(),
+            "exec must declare payload schema"
+        );
+        assert!(
+            exec.response_schema.is_some(),
+            "exec must declare response schema"
+        );
         let schema_json = serde_json::to_string(exec.payload_schema.as_ref().unwrap()).unwrap();
-        assert!(schema_json.contains("cmd"), "schema must reference cmd field");
+        assert!(
+            schema_json.contains("cmd"),
+            "schema must reference cmd field"
+        );
         assert!(schema_json.contains("id"), "schema must reference id field");
     }
 }

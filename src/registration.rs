@@ -72,7 +72,10 @@ pub fn backends_json() -> String {
 /// `docker.` tool surface. Async work runs on the toolkit's shared runtime
 /// behind the synchronous FFI boundary.
 pub fn backend_dispatch(name: &str, args_json: &str) -> Option<Result<String, String>> {
-    if let Some(op) = name.strip_prefix(TOPO_PREFIX).and_then(|s| s.strip_prefix('.')) {
+    if let Some(op) = name
+        .strip_prefix(TOPO_PREFIX)
+        .and_then(|s| s.strip_prefix('.'))
+    {
         return Some(dispatch_topology(op));
     }
     if let Some(op) = name
@@ -86,9 +89,15 @@ pub fn backend_dispatch(name: &str, args_json: &str) -> Option<Result<String, St
         ));
         return Some(out);
     }
-    if let Some(op) = name.strip_prefix(UNIT_PREFIX).and_then(|s| s.strip_prefix('.')) {
-        let out = runtime()
-            .block_on(unit_domain::dispatch_op(unit_provider() as &dyn UnitProvider, op, args_json));
+    if let Some(op) = name
+        .strip_prefix(UNIT_PREFIX)
+        .and_then(|s| s.strip_prefix('.'))
+    {
+        let out = runtime().block_on(unit_domain::dispatch_op(
+            unit_provider() as &dyn UnitProvider,
+            op,
+            args_json,
+        ));
         return Some(out);
     }
     None
