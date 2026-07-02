@@ -31,8 +31,10 @@ Once orca is on the host you never touch the scripts — drive the tools. Payloa
 | `docker.install` | provision + start a runtime (`scripts/install.sh`) | `runtime`: `docker`\|`colima`\|`podman` |
 | `docker.engine_update` | upgrade the runtime (`scripts/update.sh`) | `runtime` |
 | `docker.update` | run a Compose lifecycle action against a stack | `path`, `action`, optional `service` |
-| `docker.list` / `docker.detail` | inventory / inspect containers | — |
-| `docker.create` / `docker.delete` | create / remove a container | — |
+| `docker.list` | list containers | — |
+| `docker.detail` | inspect a container | — |
+| `docker.create` | create a container | — |
+| `docker.delete` | remove a container | — |
 | `docker.backup` | archive engine state to a `.tar.gz` | `destination`, optional `state_path` |
 | `docker.restore` | restore engine state from an archive | `archive`, optional `state_path` |
 
