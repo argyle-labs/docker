@@ -17,7 +17,9 @@ use std::process::Output;
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::tokio::process::Command;
 
-/// Which engine flavor the lifecycle tools target on this host.
+/// Which container runtime the lifecycle tools install/upgrade on this host.
+/// The scripts map each variant onto the right per-target install method
+/// (macOS/brew, apt/apk/pacman/dnf, or rpm-ostree layering on atomic hosts).
 #[derive(
     Debug,
     Clone,
@@ -31,12 +33,26 @@ use plugin_toolkit::tokio::process::Command;
 #[serde(crate = "plugin_toolkit::serde")]
 #[schemars(crate = "plugin_toolkit::schemars")]
 #[serde(rename_all = "lowercase")]
-pub enum EngineFlavor {
-    /// colima (lima-backed) — the default for headless Linux/macOS hosts.
+pub enum ContainerRuntime {
+    /// colima (lima-backed) — provides dockerd on macOS and headless hosts.
     #[default]
     Colima,
-    /// Docker Engine via the distro package (`docker-ce`).
-    Engine,
+    /// Docker Engine proper (`docker-ce` / distro `docker`); on macOS this is
+    /// backed by colima since there is no native daemon.
+    Docker,
+    /// Podman — daemonless, rootless; preinstalled on atomic distros.
+    Podman,
+}
+
+impl ContainerRuntime {
+    /// The argument passed to `scripts/install.sh` / `scripts/update.sh`.
+    fn as_arg(self) -> &'static str {
+        match self {
+            ContainerRuntime::Colima => "colima",
+            ContainerRuntime::Docker => "docker",
+            ContainerRuntime::Podman => "podman",
+        }
+    }
 }
 
 async fn run(cmd: &mut Command) -> Result<Output> {
@@ -57,10 +73,10 @@ async fn run(cmd: &mut Command) -> Result<Output> {
 
 #[plugin_struct(args)]
 pub struct DockerInstallArgs {
-    /// Engine flavor to provision.
-    #[arg(long, value_enum, default_value_t = EngineFlavor::Colima)]
+    /// Container runtime to provision.
+    #[arg(long, value_enum, default_value_t = ContainerRuntime::Colima)]
     #[serde(default)]
-    pub flavor: EngineFlavor,
+    pub runtime: ContainerRuntime,
     /// Path to the bootstrap script. Defaults to the repo-relative
     /// `scripts/install.sh`; override for a non-standard layout.
     #[arg(long)]
@@ -76,20 +92,18 @@ pub struct DockerInstallOutput {
     pub log: String,
 }
 
-/// **Provision the docker engine on this host.** Runs `scripts/install.sh`,
-/// which installs colima (or Docker Engine) via the host package manager and
-/// starts it. Idempotent: a present, running engine is left untouched.
+/// **Provision a container runtime on this host.** Runs `scripts/install.sh`,
+/// which installs the requested runtime (docker engine, colima, or podman) via
+/// the right method for this target — brew on macOS; apt/apk/pacman/dnf on
+/// Linux; rpm-ostree layering on atomic hosts (Bazzite/Silverblue) — and starts
+/// it. Idempotent: a present, running runtime is left untouched.
 #[orca_tool(domain = "docker", verb = "install", local_only = true)]
 async fn docker_install(args: DockerInstallArgs, _ctx: &ToolCtx) -> Result<DockerInstallOutput> {
     let script = args
         .bootstrap_path
         .clone()
         .unwrap_or_else(|| "scripts/install.sh".to_string());
-    let flavor = match args.flavor {
-        EngineFlavor::Colima => "colima",
-        EngineFlavor::Engine => "engine",
-    };
-    let output = run(Command::new("bash").arg(&script).arg(flavor)).await?;
+    let output = run(Command::new("bash").arg(&script).arg(args.runtime.as_arg())).await?;
     Ok(DockerInstallOutput {
         provisioned: true,
         log: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -102,10 +116,10 @@ async fn docker_install(args: DockerInstallArgs, _ctx: &ToolCtx) -> Result<Docke
 
 #[plugin_struct(args)]
 pub struct DockerEngineUpdateArgs {
-    /// Engine flavor to upgrade.
-    #[arg(long, value_enum, default_value_t = EngineFlavor::Colima)]
+    /// Container runtime to upgrade.
+    #[arg(long, value_enum, default_value_t = ContainerRuntime::Colima)]
     #[serde(default)]
-    pub flavor: EngineFlavor,
+    pub runtime: ContainerRuntime,
     /// Path to the update script. Defaults to `scripts/update.sh`.
     #[arg(long)]
     #[serde(default)]
@@ -120,10 +134,10 @@ pub struct DockerEngineUpdateOutput {
     pub log: String,
 }
 
-/// **Upgrade the docker engine** on this host. Runs `scripts/update.sh`, which
-/// bumps the engine package (or colima/lima) to the latest available release
-/// and restarts the daemon. Distinct from `docker.update`, which runs compose
-/// lifecycle actions against deployed stacks.
+/// **Upgrade a container runtime** on this host. Runs `scripts/update.sh`, which
+/// bumps the runtime (docker engine, colima/lima, or podman) to the latest
+/// available release and restarts the daemon. Distinct from `docker.update`,
+/// which runs compose lifecycle actions against deployed stacks.
 #[orca_tool(domain = "docker", verb = "engine_update", local_only = true)]
 async fn docker_engine_update(
     args: DockerEngineUpdateArgs,
@@ -133,11 +147,7 @@ async fn docker_engine_update(
         .bootstrap_path
         .clone()
         .unwrap_or_else(|| "scripts/update.sh".to_string());
-    let flavor = match args.flavor {
-        EngineFlavor::Colima => "colima",
-        EngineFlavor::Engine => "engine",
-    };
-    let output = run(Command::new("bash").arg(&script).arg(flavor)).await?;
+    let output = run(Command::new("bash").arg(&script).arg(args.runtime.as_arg())).await?;
     Ok(DockerEngineUpdateOutput {
         updated: true,
         log: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -200,6 +210,63 @@ async fn docker_backup(args: DockerBackupArgs, _ctx: &ToolCtx) -> Result<DockerB
     Ok(DockerBackupOutput { archive })
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// docker.restore — restore engine state from a backup archive
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[plugin_struct(args)]
+pub struct DockerRestoreArgs {
+    /// Path to a `.tar.gz` produced by `docker.backup`.
+    #[arg(long)]
+    pub archive: String,
+    /// Host path of the docker/colima state dir to restore into
+    /// (default `$HOME/.colima`).
+    #[arg(long)]
+    #[serde(default)]
+    pub state_path: Option<String>,
+    /// Path to the restore script. Defaults to `scripts/restore.sh`.
+    #[arg(long)]
+    #[serde(default)]
+    pub bootstrap_path: Option<String>,
+}
+
+#[plugin_struct]
+#[serde(rename_all = "camelCase")]
+#[derive(Debug)]
+pub struct DockerRestoreOutput {
+    pub restored: bool,
+    /// Host path the state was restored into.
+    pub state_path: String,
+}
+
+/// **Restore the engine's persistent state** from a `.tar.gz` produced by
+/// `docker.backup`, unpacking it into the colima/lima profile dir (or a supplied
+/// state path). Pair with `docker.install` to rebuild a host from a backup.
+#[orca_tool(domain = "docker", verb = "restore", local_only = true)]
+async fn docker_restore(args: DockerRestoreArgs, _ctx: &ToolCtx) -> Result<DockerRestoreOutput> {
+    if !std::path::Path::new(&args.archive).is_file() {
+        bail!("archive '{}' is not a file", args.archive);
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let state = args
+        .state_path
+        .clone()
+        .unwrap_or_else(|| format!("{home}/.colima"));
+    let script = args
+        .bootstrap_path
+        .clone()
+        .unwrap_or_else(|| "scripts/restore.sh".to_string());
+    run(Command::new("bash")
+        .arg(&script)
+        .arg(&args.archive)
+        .arg(&state))
+    .await?;
+    Ok(DockerRestoreOutput {
+        restored: true,
+        state_path: state,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +280,17 @@ mod tests {
         };
         let err = docker_backup(args, &test_ctx()).await.unwrap_err();
         assert!(err.to_string().contains("not a directory"), "{err}");
+    }
+
+    #[plugin_toolkit::tokio::test]
+    async fn restore_rejects_missing_archive() {
+        let args = DockerRestoreArgs {
+            archive: "/nonexistent/docker-state.tar.gz".to_string(),
+            state_path: Some("/tmp/docker-restore-dest".to_string()),
+            bootstrap_path: None,
+        };
+        let err = docker_restore(args, &test_ctx()).await.unwrap_err();
+        assert!(err.to_string().contains("is not a file"), "{err}");
     }
 
     fn test_ctx() -> ToolCtx {

@@ -1,4 +1,4 @@
 {
-  "_comment": "docker.install — provision + start the engine on this host.",
-  "flavor": "colima"
+  "_comment": "docker.install — provision + start a runtime on this host. runtime ∈ docker|colima|podman.",
+  "runtime": "colima"
 }
