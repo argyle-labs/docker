@@ -31,12 +31,14 @@ Once orca is on the host you never touch the scripts — drive the tools. Payloa
 | `docker.install` | provision + start a runtime (`scripts/install.sh`) | `runtime`: `docker`\|`colima`\|`podman` |
 | `docker.engine_update` | upgrade the runtime (`scripts/update.sh`) | `runtime` |
 | `docker.update` | run a Compose lifecycle action against a stack | `path`, `action`, optional `service` |
-| `docker.list` | list containers | — |
-| `docker.detail` | inspect a container | — |
-| `docker.create` | create a container | — |
-| `docker.delete` | remove a container | — |
+| `docker.list` | host docker resources: engine status + registered runtimes; plus compose services (`path`) or a project scan (`root`) | optional `path` \| `root` |
+| `docker.detail` | inspect one Compose project: services, logs, stats | `path`, optional `service`, `tail` |
+| `docker.create` | register a docker runtime | `runtime_name`, one of `socket_path`\|`host`\|`url` |
+| `docker.delete` | remove a registered docker runtime | `runtime` |
 | `docker.backup` | archive engine state to a `.tar.gz` | `destination`, optional `state_path` |
 | `docker.restore` | restore engine state from an archive | `archive`, optional `state_path` |
+
+> Individual **containers** are not managed by these tools — they are surfaced on orca's generic five-verb **unit** surface (`docker.__unit.*`: list / inspect / start / stop / restart / exec). The `docker.*` tools above manage the runtime, its registered engines, and Compose projects.
 
 ```jsonc
 // docker.install — provision colima (default), Docker Engine, or podman
@@ -44,6 +46,12 @@ Once orca is on the host you never touch the scripts — drive the tools. Payloa
 
 // docker.update — bring a Compose stack up
 { "path": "/srv/stacks/myapp", "action": "up" }
+
+// docker.detail — inspect a Compose project (services + logs + stats)
+{ "path": "/srv/stacks/myapp", "tail": 200 }
+
+// docker.create — register a docker runtime (needs socketPath | host | url)
+{ "runtimeName": "remote-host", "host": "tcp://10.0.0.5:2375" }
 
 // docker.backup / docker.restore
 { "destination": "/srv/backups" }

@@ -1,0 +1,4 @@
+{
+  "_comment": "docker.backup — archive engine state to a .tar.gz in destination (optionally override state_path).",
+  "destination": "/srv/backups"
+}
