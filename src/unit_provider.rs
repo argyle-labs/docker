@@ -59,10 +59,7 @@ impl DockerUnitProvider {
         let containers = self.adapter.list(&filter).await.map_err(adapter_err)?;
         let items = containers
             .into_iter()
-            .map(|c| ItemOutcome {
-                id: self.unit_id(&c),
-                payload: Self::container_payload(&c),
-            })
+            .map(|c| ItemOutcome::new(self.unit_id(&c), Self::container_payload(&c)))
             .collect::<Vec<_>>();
         let total = items.len() as u64;
         Ok(VerbOutcome::Items(ItemsOutcome {
@@ -80,16 +77,16 @@ impl DockerUnitProvider {
                 .logs(id, LogTail(tail))
                 .await
                 .map_err(adapter_err)?;
-            return Ok(VerbOutcome::Item(ItemOutcome {
-                id: args.id,
-                payload: serde_json::to_string(&logs).unwrap_or_default(),
-            }));
+            return Ok(VerbOutcome::Item(ItemOutcome::new(
+                args.id,
+                serde_json::to_string(&logs).unwrap_or_default(),
+            )));
         }
         let c = self.adapter.inspect(id).await.map_err(adapter_err)?;
-        Ok(VerbOutcome::Item(ItemOutcome {
-            id: self.unit_id(&c),
-            payload: Self::container_payload(&c),
-        }))
+        Ok(VerbOutcome::Item(ItemOutcome::new(
+            self.unit_id(&c),
+            Self::container_payload(&c),
+        )))
     }
 
     async fn do_update(&self, args: UpdateArgs) -> Result<VerbOutcome> {
@@ -131,15 +128,15 @@ impl DockerUnitProvider {
                     .exec(&exec.id, &exec.cmd, exec.stdin)
                     .await
                     .map_err(adapter_err)?;
-                Ok(VerbOutcome::Item(ItemOutcome {
-                    id: UnitId {
+                Ok(VerbOutcome::Item(ItemOutcome::new(
+                    UnitId {
                         manager: format!("docker@{}", self.hostname),
                         kind: "exec".into(),
                         id: exec.id.clone(),
                         name: format!("exec:{}", exec.id),
                     },
-                    payload: serde_json::to_string(&result).unwrap_or_default(),
-                }))
+                    serde_json::to_string(&result).unwrap_or_default(),
+                )))
             }
             other => Err(anyhow::anyhow!("unknown container create action: {other}")),
         }
