@@ -12,8 +12,8 @@ use plugin_toolkit::containers::{AdapterError, Container, ListFilter, LogTail, R
 use plugin_toolkit::contract::BoxFuture;
 use plugin_toolkit::contract::unit::{
     ActionDecl, ActionOutcome, CreateArgs, DeleteArgs, DetailArgs, ItemOutcome, ItemsOutcome,
-    KindDeclaration, ListArgs, UnitDescriptor, UnitId, UnitProvider, UpdateArgs, Verb, VerbArgs,
-    VerbDecl, VerbOutcome,
+    KindDeclaration, ListArgs, UnitDescriptor, UnitId, UnitProvider, UpdateArgs, UpsertArgs, Verb,
+    VerbArgs, VerbDecl, VerbOutcome,
 };
 use plugin_toolkit::schemars::{JsonSchema, schema_for};
 use plugin_toolkit::serde::{Deserialize, Serialize};
@@ -147,6 +147,12 @@ impl DockerUnitProvider {
             "container delete is managed by Compose/CLI; use the docker.delete tool"
         ))
     }
+
+    fn do_upsert(&self, _args: UpsertArgs) -> Result<VerbOutcome> {
+        Err(anyhow::anyhow!(
+            "containers are not provisioned by the docker plugin (Compose/dockge owns creation); upsert is unsupported"
+        ))
+    }
 }
 
 /// Typed payload for `Create { action: "exec" }`.
@@ -249,6 +255,7 @@ impl UnitProvider for DockerUnitProvider {
                 VerbArgs::Update(a) => self.do_update(a).await,
                 VerbArgs::Create(a) => self.do_create(a).await,
                 VerbArgs::Delete(a) => self.do_delete(a),
+                VerbArgs::Upsert(a) => self.do_upsert(a),
             }
         })
     }
