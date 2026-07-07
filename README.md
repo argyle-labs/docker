@@ -11,7 +11,7 @@ A first-party orca plugin (containers backend). This is a **backend/adapter**: i
 ## What it manages
 
 - **Provision / upgrade** a container runtime — **Docker Engine**, **Colima**, or **Podman** — on any target (macOS, Alpine, Debian/Ubuntu, CachyOS/Arch, Fedora, and atomic/immutable hosts like Bazzite).
-- **Run Compose stacks** — `up` / `down` / `restart` / `start` / `stop` / `build` / `pull` / `logs`.
+- **Manage Compose stacks as config** — register a stack, then **view / edit / deploy** its compose file over cli / api / mcp (orca is the config manager), plus the full `up` / `down` / `restart` / `start` / `stop` / `build` / `pull` / `logs` lifecycle.
 - **Inventory** — list / inspect containers through orca's five-verb surface.
 - **Back up / restore** the engine's persistent state.
 
@@ -38,7 +38,7 @@ Once orca is on the host you never touch the scripts — drive the tools. Payloa
 | `docker.backup` | archive engine state to a `.tar.gz` | `destination`, optional `state_path` |
 | `docker.restore` | restore engine state from an archive | `archive`, optional `state_path` |
 
-> Individual **containers** are not managed by these tools — they are surfaced on orca's generic five-verb **unit** surface (`docker.__unit.*`: list / inspect / start / stop / restart / exec). The `docker.*` tools above manage the runtime, its registered engines, and Compose projects.
+> Individual **containers** and managed **Compose stacks** are not `docker.*` tools — they are surfaced on orca's generic five-verb **unit** surface (`docker.__unit.*`). The `docker.*` tools above manage the runtime, its registered engines, and one-off Compose projects by path. See **[Managing Compose stacks](#managing-compose-stacks-orca-as-config-manager)** below.
 
 ```jsonc
 // docker.install — provision colima (default), Docker Engine, or podman
@@ -59,6 +59,59 @@ Once orca is on the host you never touch the scripts — drive the tools. Payloa
 ```
 
 The lifecycle tools are `local_only` — they act on the host orca is running on.
+
+### Managing Compose stacks (orca as config manager)
+
+orca is your **config manager** for `docker compose`: register a stack once and
+then **view / edit / deploy** its compose file entirely over the cli / api / mcp —
+no need to SSH in and hand-edit YAML. A *stack* is a name bound to a project
+directory on the host; orca owns the registry of managed stacks (persisted in its
+per-plugin store) while the compose file stays canonical on disk.
+
+Stacks ride orca's generic **unit** surface as the `stack` kind (the same surface
+the [dockge](https://github.com/argyle-labs/dockge) plugin uses, so one stack
+vocabulary spans both). Every operation is available through `unit` list / detail
+/ update / create / upsert / delete with `kind = "stack"`:
+
+| operation | verb | payload |
+| --- | --- | --- |
+| **list** stacks + service status | `list` | `query.kind = "stack"` |
+| **view** compose YAML + `.env` + status | `detail` | `id.kind = "stack"`, `id.id = <name>` |
+| **tail** stack logs | `detail` | `id.kind = "stack"`, `query.kind = "logs"` |
+| **edit** (rewrite YAML/env, no deploy) | `update` | `action = "edit"`, `{ compose_yaml?, compose_env? }` |
+| **deploy / lifecycle** | `update` | `action = up`\|`down`\|`start`\|`stop`\|`restart`\|`build`\|`pull` |
+| **register + deploy** (add-only) | `create` | `action = "deploy"`, deploy payload |
+| **register-or-replace + deploy** | `upsert` | `action = "set"`, deploy payload |
+| **deregister** (leaves containers running) | `delete` | `id.kind = "stack"`, `id.id = <name>` |
+
+```jsonc
+// create (action=deploy) — write a brand-new stack's compose file and bring it up.
+// Omit compose_yaml to register an existing on-disk compose file as-is.
+{
+  "action": "deploy",
+  "payload": {
+    "name": "myapp",
+    "dir": "/srv/stacks/myapp",
+    "compose_yaml": "services:\n  web:\n    image: nginx\n    ports: [\"8080:80\"]\n",
+    "compose_env": "TZ=UTC\n",
+    "deploy": true
+  }
+}
+
+// detail (view) — returns { name, dir, file, compose_yaml, compose_env, services[] }
+{ "id": { "manager": "docker@host", "kind": "stack", "id": "myapp", "name": "myapp" } }
+
+// update (edit) — change the YAML without redeploying
+{ "id": { "kind": "stack", "id": "myapp", ... }, "action": "edit",
+  "payload": { "compose_yaml": "services:\n  web:\n    image: nginx:1.27\n" } }
+
+// update (deploy the edit) — bring the changed stack up
+{ "id": { "kind": "stack", "id": "myapp", ... }, "action": "up" }
+```
+
+To **tear down** a stack, run `update action=down` first, then `delete` to
+deregister — `delete` alone only stops orca managing it; it never stops your
+running containers out from under you.
 
 ---
 
