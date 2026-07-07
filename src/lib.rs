@@ -14,6 +14,7 @@ pub mod engine;
 pub mod lifecycle;
 pub mod registration;
 pub mod runtime_adapter;
+pub mod stacks;
 pub mod tools;
 pub mod topology;
 pub mod unit_provider;

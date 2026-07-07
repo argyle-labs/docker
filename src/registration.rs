@@ -17,8 +17,8 @@ use std::sync::OnceLock;
 
 use plugin_toolkit::abi::BackendDef;
 use plugin_toolkit::containers::{self, RuntimeAdapter};
-use plugin_toolkit::contract::unit::{self as unit_domain, UnitProvider};
-use plugin_toolkit::export::runtime;
+use plugin_toolkit::contract::unit::UnitProvider;
+use plugin_toolkit::export::{dispatch_unit_op, runtime, topology_backend_def, unit_backend_def};
 use plugin_toolkit::serde_json;
 
 use crate::runtime_adapter::DockerAdapter;
@@ -44,12 +44,10 @@ fn unit_provider() -> &'static DockerUnitProvider {
 /// `wedge_recover` capability — the reconciler escalates instead.
 pub fn backends_json() -> String {
     let defs = vec![
-        BackendDef {
-            domain: "topology".to_string(),
-            name: "docker".to_string(),
-            invoke_prefix: TOPO_PREFIX.to_string(),
-            ..Default::default()
-        },
+        // Topology + unit descriptors are derived from the live surface via the
+        // toolkit's export helpers (the descriptor orca registers is exactly the
+        // backend's own — advertised kinds/verbs stay in sync automatically).
+        topology_backend_def("docker", TOPO_PREFIX),
         BackendDef {
             domain: "container_runtime".to_string(),
             name: "docker".to_string(),
@@ -57,12 +55,7 @@ pub fn backends_json() -> String {
             invoke_prefix: RUNTIME_PREFIX.to_string(),
             ..Default::default()
         },
-        BackendDef {
-            domain: "unit".to_string(),
-            name: "docker".to_string(),
-            invoke_prefix: UNIT_PREFIX.to_string(),
-            ..Default::default()
-        },
+        unit_backend_def(unit_provider() as &dyn UnitProvider, UNIT_PREFIX),
     ];
     serde_json::to_string(&defs).unwrap_or_else(|_| "[]".to_string())
 }
@@ -93,12 +86,11 @@ pub fn backend_dispatch(name: &str, args_json: &str) -> Option<Result<String, St
         .strip_prefix(UNIT_PREFIX)
         .and_then(|s| s.strip_prefix('.'))
     {
-        let out = runtime().block_on(unit_domain::dispatch_op(
+        return Some(dispatch_unit_op(
             unit_provider() as &dyn UnitProvider,
             op,
             args_json,
         ));
-        return Some(out);
     }
     None
 }
