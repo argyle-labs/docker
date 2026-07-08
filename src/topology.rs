@@ -49,6 +49,8 @@ pub async fn collect_claims() -> anyhow::Result<Vec<TopologyClaim>> {
             macs,
             provider: "docker".to_string(),
             provider_instance: "local".to_string(),
+            // Single-host provider: the reporting peer is the host.
+            runs_on: None,
         });
     }
     Ok(claims)
