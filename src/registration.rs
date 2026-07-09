@@ -27,6 +27,7 @@ use crate::unit_provider::DockerUnitProvider;
 const TOPO_PREFIX: &str = "docker.__topo";
 const RUNTIME_PREFIX: &str = "docker.__runtime";
 const UNIT_PREFIX: &str = "docker.__unit";
+const ENV_PREFIX: &str = "docker.__env";
 
 fn adapter() -> &'static DockerAdapter {
     static ADAPTER: OnceLock<DockerAdapter> = OnceLock::new();
@@ -56,6 +57,16 @@ pub fn backends_json() -> String {
             ..Default::default()
         },
         unit_backend_def(unit_provider() as &dyn UnitProvider, UNIT_PREFIX),
+        // subprocess_env: expose DOCKER_HOST for the active runtime to every
+        // subprocess orca spawns (MCP servers), via the generic seam — orca core
+        // no longer knows about docker.
+        BackendDef {
+            domain: "subprocess_env".to_string(),
+            name: "docker".to_string(),
+            kind: "docker".to_string(),
+            invoke_prefix: ENV_PREFIX.to_string(),
+            ..Default::default()
+        },
     ];
     serde_json::to_string(&defs).unwrap_or_else(|_| "[]".to_string())
 }
@@ -92,7 +103,32 @@ pub fn backend_dispatch(name: &str, args_json: &str) -> Option<Result<String, St
             args_json,
         ));
     }
+    if let Some(op) = name
+        .strip_prefix(ENV_PREFIX)
+        .and_then(|s| s.strip_prefix('.'))
+    {
+        return Some(dispatch_env(op));
+    }
     None
+}
+
+/// Answer the `subprocess_env` seam's `env` op: expose `DOCKER_HOST` for the
+/// active registered runtime (first enabled socket/tcp). Returns an empty set
+/// when no socket/tcp runtime is registered (web-only or none) — orca then
+/// injects nothing, and a docker-based MCP server falls back to its own default.
+fn dispatch_env(op: &str) -> Result<String, String> {
+    use plugin_toolkit::contract::subprocess_env::{ENV_OP, EnvVar};
+    if op != ENV_OP {
+        return Err(format!("unknown subprocess_env op '{op}'"));
+    }
+    let vars: Vec<EnvVar> = match crate::tools::active_host() {
+        Some(host) => vec![EnvVar {
+            key: "DOCKER_HOST".to_string(),
+            value: host,
+        }],
+        None => Vec::new(),
+    };
+    serde_json::to_string(&vars).map_err(|e| e.to_string())
 }
 
 fn dispatch_topology(op: &str) -> Result<String, String> {

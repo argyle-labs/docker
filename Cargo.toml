@@ -30,7 +30,11 @@ crate-type = ["cdylib", "rlib"]
 # Pinned to the orca git source; the committed `[patch]` in `.cargo/config.toml`
 # resolves this to the local in-tree toolkit alongside a checked-out orca repo.
 [dependencies]
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
+# Thin profile: docker talks to the engine via bollard (its own dep), not
+# HTTP-over-toolkit, so no `http`/`delegated-http`. It needs `tools`
+# (#[orca_tool]), `db` (endpoint_resource! + db_op routed through core's one
+# connection), and `containers` (the RuntimeAdapter seam) — nothing else.
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", default-features = false, features = ["tools", "db", "containers"] }
 
 # The ONE genuine non-orca dep for the FFI boundary: `#[export_root_module]`
 # expands to bare `::abi_stable` paths in this crate's root, so it can't route
@@ -47,7 +51,7 @@ futures-util = "0.3"
 [dev-dependencies]
 # Dev-only: in-crate tests reach the toolkit's re-exported tokio/serde the same
 # way the lib does. Not a runtime dep.
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", default-features = false, features = ["tools", "db", "containers"] }
 tempfile = "3"
 
 # Match orca's workspace lint floor: discarding a Result/Option via

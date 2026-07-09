@@ -2,9 +2,11 @@
 //!
 //! A *stack* pairs a unique `name` with a project directory on the host that
 //! holds a compose file. orca persists this registry (name → dir/file) in the
-//! generic per-plugin KV store, so orca — not the filesystem alone — owns the
-//! *set* of managed stacks and can `view` / `edit` / `deploy` each one's compose
-//! file over the cli / api / mcp surfaces.
+//! docker-owned `docker_stacks` table — reached through the thin `db_op`
+//! capability so the plugin links no rusqlite and opens no second connection —
+//! so orca, not the filesystem alone, owns the *set* of managed stacks and can
+//! `view` / `edit` / `deploy` each one's compose file over the cli / api / mcp
+//! surfaces.
 //!
 //! The compose file itself stays on disk (it is the user's own file and the
 //! canonical input to the `docker compose` CLI); orca reads it for `view`,
@@ -14,18 +16,29 @@
 
 use std::path::{Path, PathBuf};
 
+use plugin_toolkit::abi::{DbOp, DbRow, DbValue};
 use plugin_toolkit::anyhow::{self, Context, Result};
-use plugin_toolkit::db;
+use plugin_toolkit::runtime::{db_op, field_from_row};
 use plugin_toolkit::serde::{Deserialize, Serialize};
-use plugin_toolkit::serde_json;
 
 use crate::Compose;
 
-/// plugin_data owner id — matches the docker runtime registry's plugin id.
-const PLUGIN_ID: &str = "docker";
-/// Stack rows are namespaced under this key prefix so they never collide with
-/// any other docker plugin_data entry.
-const KEY_PREFIX: &str = "stack:";
+/// The docker-owned stacks table. Created by the [`SchemaFragment`] inventory
+/// below and applied by the daemon against its single connection; every op
+/// runs through [`db_op`] (the `db.op` capability / host FFI channel), so this
+/// plugin never opens its own SQLite connection.
+const TABLE: &str = "docker_stacks";
+
+// A docker-owned table registered the same way `endpoint_resource!` registers
+// its endpoint table — through the `SchemaFragment` inventory the daemon
+// applies at startup. Columns mirror [`StackRow`]; `name` is the natural key.
+plugin_toolkit::inventory::submit! {
+    plugin_toolkit::SchemaFragment {
+        name: TABLE,
+        sql: "CREATE TABLE IF NOT EXISTS docker_stacks (\n    name TEXT PRIMARY KEY,\n    dir TEXT NOT NULL,\n    file TEXT NOT NULL,\n    enabled INTEGER NOT NULL DEFAULT 1\n);",
+    }
+}
+
 /// Compose filename written when the caller doesn't name one.
 pub const DEFAULT_COMPOSE_FILE: &str = "docker-compose.yml";
 const ENV_FILE: &str = ".env";
@@ -102,34 +115,43 @@ impl StackRow {
     }
 }
 
-fn key(name: &str) -> String {
-    format!("{KEY_PREFIX}{name}")
+fn to_dbrow(row: &StackRow) -> DbRow {
+    let mut m = DbRow::new();
+    m.insert("name".to_string(), DbValue::Text(row.name.clone()));
+    m.insert("dir".to_string(), DbValue::Text(row.dir.clone()));
+    m.insert("file".to_string(), DbValue::Text(row.file.clone()));
+    m.insert("enabled".to_string(), DbValue::Bool(row.enabled));
+    m
+}
+
+fn from_dbrow(m: &DbRow) -> Result<StackRow> {
+    Ok(StackRow {
+        name: field_from_row(m, "name")?,
+        dir: field_from_row(m, "dir")?,
+        file: field_from_row(m, "file")?,
+        enabled: field_from_row::<bool>(m, "enabled")?,
+    })
 }
 
 /// All registered stacks, ordered by name.
 pub fn list() -> Result<Vec<StackRow>> {
-    let conn = db::open_default()?;
-    let mut out = Vec::new();
-    for row in db::plugin_data::list(&conn, PLUGIN_ID)? {
-        if !row.key.starts_with(KEY_PREFIX) {
-            continue;
-        }
-        match serde_json::from_str::<StackRow>(&row.value) {
-            Ok(s) => out.push(s),
-            Err(e) => {
-                // A malformed row shouldn't take down the whole listing; skip it.
-                plugin_toolkit::tracing::warn!(key = %row.key, error = %e, "skipping unreadable stack row");
-            }
-        }
-    }
-    Ok(out)
+    let reply = db_op(&DbOp::List {
+        namespace: String::new(),
+        table: TABLE.to_string(),
+    })?;
+    reply.rows.iter().map(from_dbrow).collect()
 }
 
 /// Look up a single stack by name.
 pub fn get(name: &str) -> Result<Option<StackRow>> {
-    let conn = db::open_default()?;
-    match db::plugin_data::get(&conn, PLUGIN_ID, &key(name))? {
-        Some(r) => Ok(Some(serde_json::from_str(&r.value)?)),
+    let reply = db_op(&DbOp::Get {
+        namespace: String::new(),
+        table: TABLE.to_string(),
+        key_col: "name".to_string(),
+        key: name.to_string(),
+    })?;
+    match reply.rows.first() {
+        Some(r) => Ok(Some(from_dbrow(r)?)),
         None => Ok(None),
     }
 }
@@ -146,16 +168,24 @@ pub fn exists(name: &str) -> Result<bool> {
 
 /// Insert or replace a stack row (the registry write for create/upsert).
 pub fn put(row: &StackRow) -> Result<()> {
-    let conn = db::open_default()?;
-    let value = serde_json::to_string(row)?;
-    db::plugin_data::set(&conn, PLUGIN_ID, &key(&row.name), &value)
+    db_op(&DbOp::Upsert {
+        namespace: String::new(),
+        table: TABLE.to_string(),
+        row: to_dbrow(row),
+    })?;
+    Ok(())
 }
 
 /// Deregister a stack. Returns whether a row was removed. Does NOT tear down
 /// running containers — callers run `down` first when that's intended.
 pub fn remove(name: &str) -> Result<bool> {
-    let conn = db::open_default()?;
-    db::plugin_data::delete(&conn, PLUGIN_ID, &key(name))
+    let reply = db_op(&DbOp::Delete {
+        namespace: String::new(),
+        table: TABLE.to_string(),
+        key_col: "name".to_string(),
+        key: name.to_string(),
+    })?;
+    Ok(reply.affected > 0)
 }
 
 #[cfg(test)]
@@ -226,7 +256,8 @@ mod tests {
 
     #[test]
     fn stackrow_deserializes_with_defaults() {
-        let r: StackRow = serde_json::from_str(r#"{"name":"a","dir":"/srv/a"}"#).unwrap();
+        let r: StackRow =
+            plugin_toolkit::serde_json::from_str(r#"{"name":"a","dir":"/srv/a"}"#).unwrap();
         assert_eq!(r.file, DEFAULT_COMPOSE_FILE);
         assert!(r.enabled);
     }

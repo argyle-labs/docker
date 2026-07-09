@@ -44,9 +44,13 @@ pub fn resolve_docker_bin() -> &'static str {
 }
 
 /// Returns the DOCKER_HOST value to inject when the engine isn't on the
-/// default unix socket. Currently detects colima's socket; returns None
-/// when the default socket should be used.
+/// default unix socket. Prefers the first enabled socket/tcp entry in the
+/// docker runtime registry; falls back to auto-detecting colima's socket.
+/// Returns None when the default socket should be used.
 pub async fn docker_host() -> Option<String> {
+    if let Some(host) = tools::active_host() {
+        return Some(host);
+    }
     let home = std::env::var("HOME").ok()?;
     let colima = format!("{home}/.colima/default/docker.sock");
     if std::path::Path::new(&colima).exists() {
