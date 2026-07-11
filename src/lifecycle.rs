@@ -9,13 +9,11 @@
 //! `colima` rather than `docker run` against an image of itself.
 //!
 //! Imports flow through `plugin_toolkit::prelude::*` only. Process exec uses
-//! the toolkit's re-exported `tokio`.
+//! the orca `process` seam (the `reactor` feature); the plugin names no runtime.
 #![allow(clippy::disallowed_types)]
 
-use std::process::Output;
-
 use plugin_toolkit::prelude::*;
-use plugin_toolkit::tokio::process::Command;
+use plugin_toolkit::process::{Command, Output};
 
 /// Which container runtime the lifecycle tools install/upgrade on this host.
 /// The scripts map each variant onto the right per-target install method
@@ -55,14 +53,14 @@ impl ContainerRuntime {
     }
 }
 
-async fn run(cmd: &mut Command) -> Result<Output> {
+async fn run(cmd: Command) -> Result<Output> {
     let output = cmd
         .output()
         .await
         .with_context(|| "failed to spawn command".to_string())?;
-    if !output.status.success() {
+    if !output.status.success {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("command failed ({}): {}", output.status, stderr.trim());
+        bail!("command failed ({:?}): {}", output.status.code, stderr.trim());
     }
     Ok(output)
 }
@@ -192,9 +190,7 @@ async fn docker_backup(args: DockerBackupArgs, _ctx: &ToolCtx) -> Result<DockerB
         bail!("state path '{state}' is not a directory");
     }
     run(Command::new("mkdir").arg("-p").arg(&args.destination)).await?;
-    let stamp = plugin_toolkit::chrono::Utc::now()
-        .format("%Y%m%d-%H%M%S")
-        .to_string();
+    let stamp = plugin_toolkit::time::now().compact();
     let archive = format!(
         "{}/docker-engine-state-{}.tar.gz",
         args.destination.trim_end_matches('/'),
@@ -270,27 +266,30 @@ async fn docker_restore(args: DockerRestoreArgs, _ctx: &ToolCtx) -> Result<Docke
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plugin_toolkit::tokio;
 
-    #[plugin_toolkit::tokio::test]
-    async fn backup_rejects_missing_state_dir() {
-        let args = DockerBackupArgs {
-            destination: "/tmp/docker-bk-dest".to_string(),
-            state_path: Some("/nonexistent/docker/state".to_string()),
-        };
-        let err = docker_backup(args, &test_ctx()).await.unwrap_err();
-        assert!(err.to_string().contains("not a directory"), "{err}");
+    #[test]
+    fn backup_rejects_missing_state_dir() {
+        plugin_toolkit::reactor::block_on(async {
+            let args = DockerBackupArgs {
+                destination: "/tmp/docker-bk-dest".to_string(),
+                state_path: Some("/nonexistent/docker/state".to_string()),
+            };
+            let err = docker_backup(args, &test_ctx()).await.unwrap_err();
+            assert!(err.to_string().contains("not a directory"), "{err}");
+        });
     }
 
-    #[plugin_toolkit::tokio::test]
-    async fn restore_rejects_missing_archive() {
-        let args = DockerRestoreArgs {
-            archive: "/nonexistent/docker-state.tar.gz".to_string(),
-            state_path: Some("/tmp/docker-restore-dest".to_string()),
-            bootstrap_path: None,
-        };
-        let err = docker_restore(args, &test_ctx()).await.unwrap_err();
-        assert!(err.to_string().contains("is not a file"), "{err}");
+    #[test]
+    fn restore_rejects_missing_archive() {
+        plugin_toolkit::reactor::block_on(async {
+            let args = DockerRestoreArgs {
+                archive: "/nonexistent/docker-state.tar.gz".to_string(),
+                state_path: Some("/tmp/docker-restore-dest".to_string()),
+                bootstrap_path: None,
+            };
+            let err = docker_restore(args, &test_ctx()).await.unwrap_err();
+            assert!(err.to_string().contains("is not a file"), "{err}");
+        });
     }
 
     fn test_ctx() -> ToolCtx {

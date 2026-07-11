@@ -7,7 +7,6 @@
 //! No bollard yet. When a real Engine API call site lands (exec streaming,
 //! event subscription) we'll add a third layer rather than retro-fitting.
 
-pub mod abi_export;
 pub mod compose;
 pub mod containers;
 pub mod engine;
@@ -62,21 +61,18 @@ pub async fn docker_host() -> Option<String> {
 /// Run the docker CLI with `args`, optionally in `cwd`, returning stdout.
 /// Auto-injects DOCKER_HOST when needed.
 pub async fn run(args: &[&str], cwd: Option<&str>) -> plugin_toolkit::anyhow::Result<String> {
-    use plugin_toolkit::tokio::process::Command;
-    let mut cmd = Command::new(resolve_docker_bin());
-    cmd.args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+    use plugin_toolkit::process::Command;
+    let mut cmd = Command::new(resolve_docker_bin()).args(args);
     if let Some(dir) = cwd {
-        cmd.current_dir(dir);
+        cmd = cmd.current_dir(dir);
     }
     if let Some(host) = docker_host().await {
-        cmd.env("DOCKER_HOST", host);
+        cmd = cmd.env("DOCKER_HOST", host);
     }
     let out = cmd.output().await?;
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-    if !out.status.success() && stdout.trim().is_empty() {
+    if !out.status.success && stdout.trim().is_empty() {
         plugin_toolkit::anyhow::bail!("{}", stderr.trim());
     }
     Ok(if stdout.is_empty() { stderr } else { stdout })

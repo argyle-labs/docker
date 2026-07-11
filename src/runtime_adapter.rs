@@ -216,15 +216,9 @@ impl RuntimeAdapter for DockerAdapter {
         } = started
         {
             if let Some(data) = stdin {
-                use plugin_toolkit::tokio::io::AsyncWriteExt;
-                input
-                    .write_all(data.as_bytes())
+                plugin_toolkit::io::write_all_and_shutdown(&mut input, data.as_bytes())
                     .await
-                    .map_err(|e| AdapterError::Transport(format!("exec stdin write: {e}")))?;
-                input
-                    .shutdown()
-                    .await
-                    .map_err(|e| AdapterError::Transport(format!("exec stdin close: {e}")))?;
+                    .map_err(|e| AdapterError::Transport(format!("exec stdin: {e}")))?;
             }
             drop(input);
             while let Some(chunk) = output.next().await {
