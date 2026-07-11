@@ -1,8 +1,8 @@
 //! Engine status and lifecycle.
 
 use plugin_toolkit::anyhow;
-use plugin_toolkit::serde::{Deserialize, Serialize};
 use plugin_toolkit::process::Command;
+use plugin_toolkit::serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(crate = "plugin_toolkit::serde")]

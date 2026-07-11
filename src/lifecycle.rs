@@ -60,7 +60,11 @@ async fn run(cmd: Command) -> Result<Output> {
         .with_context(|| "failed to spawn command".to_string())?;
     if !output.status.success {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("command failed ({:?}): {}", output.status.code, stderr.trim());
+        bail!(
+            "command failed ({:?}): {}",
+            output.status.code,
+            stderr.trim()
+        );
     }
     Ok(output)
 }

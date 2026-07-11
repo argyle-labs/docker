@@ -740,7 +740,6 @@ name = "docker"
 version = "0.1.0"
 dependencies = [
  "bollard",
- "futures-util",
  "plugin-toolkit",
  "tempfile",
 ]
@@ -1772,6 +1771,7 @@ dependencies = [
  "deploy-target",
  "derive",
  "dispatch",
+ "futures-core",
  "inventory",
  "macro-runtime",
  "plugin-abi",

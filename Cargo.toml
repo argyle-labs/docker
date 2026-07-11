@@ -43,14 +43,15 @@ path = "src/main.rs"
 # connection), and `containers` (the RuntimeAdapter seam) — nothing else.
 plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", default-features = false, features = ["tools", "db", "containers"] }
 
-# Domain-specific deps owned by this plugin (the Docker Engine client + its
-# async stream helper). These are what "the docker plugin owns bollard" means:
-# the concrete engine client rides with the plugin, keeping orca core generic.
+# The ONE domain dep this plugin owns: the Docker Engine client. Everything else
+# — reactor, process, io, stream, time — comes from orca's generic seams, so
+# docker names no tokio/futures/chrono. This is what "the docker plugin owns
+# bollard" means: the concrete engine client rides with the plugin, orca stays
+# generic.
 bollard = { version = "0.21", default-features = false, features = ["pipe"] }
-futures-util = "0.3"
 
 [dev-dependencies]
-# Dev-only: in-crate tests reach the toolkit's seams (serde, `time::block_on`)
+# Dev-only: in-crate tests reach the toolkit's seams (serde, `reactor::block_on`)
 # the same way the lib does. Not a runtime dep.
 plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", default-features = false, features = ["tools", "db", "containers"] }
 tempfile = "3"

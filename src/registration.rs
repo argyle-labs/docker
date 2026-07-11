@@ -16,8 +16,8 @@
 use std::sync::OnceLock;
 
 use plugin_toolkit::abi::BackendDef;
-use plugin_toolkit::containers::{self, RuntimeAdapter};
 use plugin_toolkit::backend_def::{topology_backend_def, unit_backend_def};
+use plugin_toolkit::containers::{self, RuntimeAdapter};
 use plugin_toolkit::contract::unit::{self, UnitProvider};
 use plugin_toolkit::reactor;
 use plugin_toolkit::serde_json;
@@ -142,8 +142,8 @@ fn dispatch_env(op: &str) -> Result<String, String> {
 fn dispatch_topology(op: &str) -> Result<String, String> {
     match op {
         "collect_claims" => {
-            let claims = reactor::block_on(crate::topology::collect_claims())
-                .map_err(|e| e.to_string())?;
+            let claims =
+                reactor::block_on(crate::topology::collect_claims()).map_err(|e| e.to_string())?;
             serde_json::to_string(&claims).map_err(|e| e.to_string())
         }
         other => Err(format!("unknown topology op: {other}")),
