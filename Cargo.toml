@@ -10,10 +10,15 @@ category = "infra"
 [lib]
 name = "docker"
 path = "src/lib.rs"
-# `cdylib` is the orca plugin artifact orca's `plugin-loader` `dlopen`s;
 # `rlib` retains the in-crate `#[cfg(test)]` harness + lets the workspace use it
 # as a normal Rust lib.
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
+
+# A subprocess plugin is an executable, not a cdylib: orca's boot-time scan
+# spawns it and speaks the UDS wire protocol to it.
+[[bin]]
+name = "docker"
+path = "src/main.rs"
 
 # Docker engine + compose adapter plugin for orca. CLI-based: the `docker`
 # binary is the API. Three layers — engine (colima/desktop probe + lifecycle),
@@ -21,11 +26,13 @@ crate-type = ["cdylib", "rlib"]
 # `docker.{list,detail,create,update,delete}` tool surface and the
 # `docker.{install,engine_update,backup,restore}` lifecycle tools.
 
-# The orca surface (serde, serde_json, schemars, clap, chrono, tokio, anyhow +
-# the containers/db/contract domains) is reached through `plugin_toolkit::*` /
-# its prelude. The plugin owns its DOMAIN-SPECIFIC deps directly — bollard is
-# the Docker Engine client, which per the plugin model lives HERE, not in orca
-# core (orca's `containers` crate is now a bollard-free generic seam).
+# The orca surface (serde, serde_json, schemars, clap, anyhow + the reactor
+# seams `process`/`io`/`time` + the containers/db/contract domains) is reached
+# through `plugin_toolkit::*` / its prelude — the plugin names no async runtime
+# or time crate itself. The plugin owns its DOMAIN-SPECIFIC deps directly —
+# bollard is the Docker Engine client, which per the plugin model lives HERE,
+# not in orca core (orca's `containers` crate is now a bollard-free generic
+# seam).
 #
 # Pinned to the orca git source; the committed `[patch]` in `.cargo/config.toml`
 # resolves this to the local in-tree toolkit alongside a checked-out orca repo.
@@ -36,21 +43,16 @@ crate-type = ["cdylib", "rlib"]
 # connection), and `containers` (the RuntimeAdapter seam) — nothing else.
 plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", default-features = false, features = ["tools", "db", "containers"] }
 
-# The ONE genuine non-orca dep for the FFI boundary: `#[export_root_module]`
-# expands to bare `::abi_stable` paths in this crate's root, so it can't route
-# through the toolkit. Pinned to the orca workspace version (0.11) so the layout
-# hash baked into the cdylib matches what orca's plugin-loader checks at load.
-abi_stable = "0.11"
-
-# Domain-specific deps owned by this plugin (the Docker Engine client + its
-# async stream helper). These are what "the docker plugin owns bollard" means:
-# the concrete engine client rides with the plugin, keeping orca core generic.
+# The ONE domain dep this plugin owns: the Docker Engine client. Everything else
+# — reactor, process, io, stream, time — comes from orca's generic seams, so
+# docker names no tokio/futures/chrono. This is what "the docker plugin owns
+# bollard" means: the concrete engine client rides with the plugin, orca stays
+# generic.
 bollard = { version = "0.21", default-features = false, features = ["pipe"] }
-futures-util = "0.3"
 
 [dev-dependencies]
-# Dev-only: in-crate tests reach the toolkit's re-exported tokio/serde the same
-# way the lib does. Not a runtime dep.
+# Dev-only: in-crate tests reach the toolkit's seams (serde, `reactor::block_on`)
+# the same way the lib does. Not a runtime dep.
 plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", default-features = false, features = ["tools", "db", "containers"] }
 tempfile = "3"
 

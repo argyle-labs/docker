@@ -16,9 +16,10 @@
 use std::sync::OnceLock;
 
 use plugin_toolkit::abi::BackendDef;
+use plugin_toolkit::backend_def::{topology_backend_def, unit_backend_def};
 use plugin_toolkit::containers::{self, RuntimeAdapter};
-use plugin_toolkit::contract::unit::UnitProvider;
-use plugin_toolkit::export::{dispatch_unit_op, runtime, topology_backend_def, unit_backend_def};
+use plugin_toolkit::contract::unit::{self, UnitProvider};
+use plugin_toolkit::reactor;
 use plugin_toolkit::serde_json;
 
 use crate::runtime_adapter::DockerAdapter;
@@ -71,10 +72,17 @@ pub fn backends_json() -> String {
     serde_json::to_string(&defs).unwrap_or_else(|_| "[]".to_string())
 }
 
+/// The plugin-scoped SQL schema orca declares in the Hello handshake: the
+/// `docker.stacks` table (physical `plug__docker__stacks`). Mirrors the
+/// [`crate::stacks::StackRow`] columns; `name` is the natural key.
+pub fn schema_json() -> String {
+    r#"{"namespace":"docker","tables":[{"table":"stacks","columns":[{"name":"name","sql_type":"TEXT","not_null":true,"primary_key":true},{"name":"dir","sql_type":"TEXT","not_null":true},{"name":"file","sql_type":"TEXT","not_null":true},{"name":"enabled","sql_type":"INTEGER","not_null":true,"default":"1"}]}]}"#.to_string()
+}
+
 /// Handle the loader's `docker.__topo.*` / `docker.__runtime.*` backend calls.
 /// Returns `None` for anything else so the toolkit falls through to the
-/// `docker.` tool surface. Async work runs on the toolkit's shared runtime
-/// behind the synchronous FFI boundary.
+/// `docker.` tool surface. Async work runs on the toolkit's shared reactor via
+/// `reactor::block_on` — the sync bridge the subprocess `serve` loop calls.
 pub fn backend_dispatch(name: &str, args_json: &str) -> Option<Result<String, String>> {
     if let Some(op) = name
         .strip_prefix(TOPO_PREFIX)
@@ -86,7 +94,7 @@ pub fn backend_dispatch(name: &str, args_json: &str) -> Option<Result<String, St
         .strip_prefix(RUNTIME_PREFIX)
         .and_then(|s| s.strip_prefix('.'))
     {
-        let out = runtime().block_on(containers::dispatch_op(
+        let out = reactor::block_on(containers::dispatch_op(
             adapter() as &dyn RuntimeAdapter,
             op,
             args_json,
@@ -97,11 +105,11 @@ pub fn backend_dispatch(name: &str, args_json: &str) -> Option<Result<String, St
         .strip_prefix(UNIT_PREFIX)
         .and_then(|s| s.strip_prefix('.'))
     {
-        return Some(dispatch_unit_op(
+        return Some(reactor::block_on(unit::dispatch_op(
             unit_provider() as &dyn UnitProvider,
             op,
             args_json,
-        ));
+        )));
     }
     if let Some(op) = name
         .strip_prefix(ENV_PREFIX)
@@ -134,9 +142,8 @@ fn dispatch_env(op: &str) -> Result<String, String> {
 fn dispatch_topology(op: &str) -> Result<String, String> {
     match op {
         "collect_claims" => {
-            let claims = runtime()
-                .block_on(crate::topology::collect_claims())
-                .map_err(|e| e.to_string())?;
+            let claims =
+                reactor::block_on(crate::topology::collect_claims()).map_err(|e| e.to_string())?;
             serde_json::to_string(&claims).map_err(|e| e.to_string())
         }
         other => Err(format!("unknown topology op: {other}")),

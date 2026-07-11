@@ -340,17 +340,29 @@ impl DockerUnitProvider {
         }
     }
 
-    fn do_delete(&self, args: DeleteArgs) -> Result<VerbOutcome> {
+    async fn do_delete(&self, args: DeleteArgs) -> Result<VerbOutcome> {
         if args.id.kind == STACK_KIND {
-            if !stacks::remove(&args.id.id)? {
-                return Err(anyhow::anyhow!("no managed stack named '{}'", args.id.id));
-            }
+            // Delete is one command: tear the stack down (`compose down`), then
+            // deregister it. No separate `action=down` step first.
+            let row = stacks::require(&args.id.id)?;
+            let teardown = match row.compose() {
+                Ok(c) => match c.run_action("down", None, None).await {
+                    Ok(out) => {
+                        let out = out.trim();
+                        if out.is_empty() {
+                            "torn down".to_string()
+                        } else {
+                            format!("torn down ({out})")
+                        }
+                    }
+                    Err(e) => format!("teardown warning: {e}"),
+                },
+                Err(e) => format!("teardown skipped: {e}"),
+            };
+            stacks::remove(&args.id.id)?;
             return Ok(VerbOutcome::Action(ActionOutcome {
                 changed: true,
-                message: format!(
-                    "deregistered stack '{}' (containers left running; run action=down first to tear down)",
-                    args.id.id
-                ),
+                message: format!("stack '{}' {teardown}; deregistered", args.id.id),
             }));
         }
         Err(anyhow::anyhow!(
@@ -657,7 +669,7 @@ impl UnitProvider for DockerUnitProvider {
                 VerbArgs::Detail(a) => self.do_detail(a).await,
                 VerbArgs::Update(a) => self.do_update(a).await,
                 VerbArgs::Create(a) => self.do_create(a).await,
-                VerbArgs::Delete(a) => self.do_delete(a),
+                VerbArgs::Delete(a) => self.do_delete(a).await,
                 VerbArgs::Upsert(a) => self.do_upsert(a).await,
             }
         })

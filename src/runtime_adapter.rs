@@ -21,7 +21,6 @@ use bollard::models::{
 use bollard::query_parameters::{
     InspectContainerOptionsBuilder, ListContainersOptionsBuilder, LogsOptionsBuilder,
 };
-use futures_util::StreamExt;
 use plugin_toolkit::async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -173,7 +172,7 @@ impl RuntimeAdapter for DockerAdapter {
             .build();
         let mut stream = client.logs(id, Some(opts));
         let mut out = String::new();
-        while let Some(chunk) = stream.next().await {
+        while let Some(chunk) = plugin_toolkit::stream::next(&mut stream).await {
             let line = chunk.map_err(map_bollard_err)?;
             // `LogOutput`'s `Display`/`to_string` would re-frame; we want the
             // raw bytes (stdout+stderr interleaved as docker delivers them).
@@ -216,18 +215,12 @@ impl RuntimeAdapter for DockerAdapter {
         } = started
         {
             if let Some(data) = stdin {
-                use plugin_toolkit::tokio::io::AsyncWriteExt;
-                input
-                    .write_all(data.as_bytes())
+                plugin_toolkit::io::write_all_and_shutdown(&mut input, data.as_bytes())
                     .await
-                    .map_err(|e| AdapterError::Transport(format!("exec stdin write: {e}")))?;
-                input
-                    .shutdown()
-                    .await
-                    .map_err(|e| AdapterError::Transport(format!("exec stdin close: {e}")))?;
+                    .map_err(|e| AdapterError::Transport(format!("exec stdin: {e}")))?;
             }
             drop(input);
-            while let Some(chunk) = output.next().await {
+            while let Some(chunk) = plugin_toolkit::stream::next(&mut output).await {
                 match chunk.map_err(map_bollard_err)? {
                     LogOutput::StdOut { message } => {
                         stdout.push_str(&String::from_utf8_lossy(message.as_ref()))

@@ -1,8 +1,8 @@
 //! Engine status and lifecycle.
 
 use plugin_toolkit::anyhow;
+use plugin_toolkit::process::Command;
 use plugin_toolkit::serde::{Deserialize, Serialize};
-use plugin_toolkit::tokio::process::Command;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(crate = "plugin_toolkit::serde")]
@@ -53,7 +53,7 @@ pub async fn status() -> EngineStatus {
         .args(["info", "--format", "{{.ServerVersion}}"])
         .output()
         .await;
-    let running = ping.map(|o| o.status.success()).unwrap_or(false);
+    let running = ping.map(|o| o.status.success).unwrap_or(false);
     EngineStatus {
         engine: if running {
             Engine::Desktop
