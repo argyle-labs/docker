@@ -21,7 +21,7 @@ use bollard::models::{
 use bollard::query_parameters::{
     InspectContainerOptionsBuilder, ListContainersOptionsBuilder, LogsOptionsBuilder,
 };
-use plugin_toolkit::async_trait::async_trait;
+use plugin_toolkit::orca_async;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -82,7 +82,7 @@ impl Default for DockerAdapter {
     }
 }
 
-#[async_trait]
+#[orca_async]
 impl RuntimeAdapter for DockerAdapter {
     fn kind(&self) -> RuntimeKind {
         RuntimeKind::Docker
