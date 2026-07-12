@@ -24,10 +24,11 @@
 use plugin_toolkit::anyhow::{self, Result};
 use plugin_toolkit::containers::{AdapterError, Container, ListFilter, LogTail, RuntimeAdapter};
 use plugin_toolkit::contract::BoxFuture;
+use plugin_toolkit::contract::backup::{BackupRef, BackupSpec, BackupStrategy, RestorePayload};
 use plugin_toolkit::contract::unit::{
-    ActionDecl, ActionOutcome, CreateArgs, DeleteArgs, DetailArgs, ItemOutcome, ItemsOutcome,
-    KindDeclaration, ListArgs, UnitDescriptor, UnitId, UnitProvider, UpdateArgs, UpsertArgs, Verb,
-    VerbArgs, VerbDecl, VerbOutcome,
+    ACTION_BACKUP, ACTION_RESTORE, ActionDecl, ActionOutcome, CreateArgs, DeleteArgs, DetailArgs,
+    ItemOutcome, ItemsOutcome, KindDeclaration, ListArgs, UnitDescriptor, UnitId, UnitProvider,
+    UpdateArgs, UpsertArgs, Verb, VerbArgs, VerbDecl, VerbOutcome,
 };
 use plugin_toolkit::schemars::{JsonSchema, schema_for};
 use plugin_toolkit::serde::{Deserialize, Serialize};
@@ -196,6 +197,8 @@ impl DockerUnitProvider {
                     message: format!("edited stack '{}'", row.name),
                 }))
             }
+            ACTION_BACKUP => self.do_stack_backup(&args.id, &row, args.payload).await,
+            ACTION_RESTORE => self.do_stack_restore(&args.id, &row, args.payload).await,
             action if STACK_LIFECYCLE.contains(&action) => {
                 let out = row
                     .compose()
@@ -210,6 +213,100 @@ impl DockerUnitProvider {
             }
             other => Err(anyhow::anyhow!("unknown stack update action: {other}")),
         }
+    }
+
+    /// Minimal backup of a stack: tar its project directory (compose file, `.env`,
+    /// and any bind-mounted config under it) into a `.tar.gz`. That directory is
+    /// the stack's restore-sufficient state; bulk data on named volumes / external
+    /// mounts is out of scope (reproducible or on network storage). Returns a
+    /// [`BackupRef`] whose locator is the archive path — a later `restore`
+    /// consumes it directly. Routed to the stack's host over the mesh.
+    async fn do_stack_backup(
+        &self,
+        id: &UnitId,
+        row: &StackRow,
+        payload: Option<String>,
+    ) -> Result<VerbOutcome> {
+        let p: StackBackupPayload = match payload {
+            Some(raw) => {
+                serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("backup payload: {e}"))?
+            }
+            None => StackBackupPayload::default(),
+        };
+        let dir = std::path::Path::new(&row.dir);
+        if !dir.is_dir() {
+            return Err(anyhow::anyhow!(
+                "stack '{}' dir {} does not exist",
+                row.name,
+                row.dir
+            ));
+        }
+        // Default destination is a `.orca-backups` sibling of the stack dir, so
+        // the archive is never written inside the directory being archived.
+        let dest = match &p.dest {
+            Some(d) => std::path::PathBuf::from(d),
+            None => dir.parent().unwrap_or(dir).join(".orca-backups"),
+        };
+        std::fs::create_dir_all(&dest)
+            .map_err(|e| anyhow::anyhow!("create backup dir {}: {e}", dest.display()))?;
+        let ts = plugin_toolkit::time::now().unix_seconds();
+        let archive = dest.join(format!("{}-{ts}.tar.gz", row.name));
+        run_tar(&["czf", &archive.to_string_lossy(), "-C", &row.dir, "."]).await?;
+
+        let backup = BackupRef {
+            locator: archive.to_string_lossy().into_owned(),
+            manager: format!("docker@{}", self.hostname),
+            timestamp: ts,
+            checksum: None,
+        };
+        Ok(VerbOutcome::Item(ItemOutcome::new(
+            id.clone(),
+            serde_json::to_string(&backup).unwrap_or_default(),
+        )))
+    }
+
+    /// Restore a stack in place from a prior [`BackupRef`]: extract the archive
+    /// back over the project directory, then `docker compose up -d` so the running
+    /// stack reconciles to the restored compose and returns to service. The
+    /// inverse of [`Self::do_stack_backup`], which the RFC pairs it with.
+    async fn do_stack_restore(
+        &self,
+        _id: &UnitId,
+        row: &StackRow,
+        payload: Option<String>,
+    ) -> Result<VerbOutcome> {
+        let raw = payload.ok_or_else(|| anyhow::anyhow!("restore requires a payload"))?;
+        let p: RestorePayload =
+            serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("restore payload: {e}"))?;
+        if let Some(component) = &p.component {
+            return Err(anyhow::anyhow!(
+                "docker stack restore has no component scope (got '{component}')"
+            ));
+        }
+        let archive = p.from.locator;
+        if archive.is_empty() {
+            return Err(anyhow::anyhow!("restore backup ref has an empty locator"));
+        }
+        if !std::path::Path::new(&archive).is_file() {
+            return Err(anyhow::anyhow!("restore archive {archive} not found"));
+        }
+        std::fs::create_dir_all(&row.dir)
+            .map_err(|e| anyhow::anyhow!("create stack dir {}: {e}", row.dir))?;
+        run_tar(&["xzf", &archive, "-C", &row.dir]).await?;
+        let out = row
+            .compose()
+            .map_err(anyhow::Error::from)?
+            .run_action("up", None, None)
+            .await
+            .map_err(anyhow::Error::from)?;
+        Ok(VerbOutcome::Action(ActionOutcome {
+            changed: true,
+            message: format!(
+                "restored stack '{}' from {archive}; up: {}",
+                row.name,
+                out.trim()
+            ),
+        }))
     }
 
     /// Shared create/upsert path: register the stack, (optionally) write its
@@ -485,6 +582,20 @@ pub struct StackEditPayload {
     pub compose_env: Option<String>,
 }
 
+/// Optional payload for `Update{action:"backup"}`. Every field defaults, so the
+/// core pre-mutation guard (which dispatches `backup` with no payload) drives a
+/// minimal backup of the stack's project directory.
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(crate = "plugin_toolkit::serde")]
+#[schemars(crate = "plugin_toolkit::schemars")]
+pub struct StackBackupPayload {
+    /// Directory the archive is written to. `None` → a `.orca-backups` sibling of
+    /// the stack's project directory (a system-owned WHERE, until the backup
+    /// target/storage layer resolves it centrally).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dest: Option<String>,
+}
+
 /// Payload for `Create{action:"deploy"}` and `Upsert{action:"set"}` — register
 /// a stack, optionally (re)write its files, then deploy.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -539,9 +650,31 @@ fn stack_declaration() -> KindDeclaration {
         payload_schema: None,
         response_schema: None,
     }));
+    // Minimal backup/restore as managed-unit actions (the pre-mutation guard and
+    // scheduler reach these), routed to the stack's host over the mesh.
+    update_actions.push(ActionDecl {
+        action: ACTION_BACKUP.into(),
+        payload_schema: Some(schema_for!(StackBackupPayload)),
+        response_schema: Some(schema_for!(BackupRef)),
+    });
+    update_actions.push(ActionDecl {
+        action: ACTION_RESTORE.into(),
+        payload_schema: Some(schema_for!(RestorePayload)),
+        response_schema: None,
+    });
+
+    // A stack's minimal, restore-sufficient state is filesystem paths (its compose
+    // project directory). The concrete path is per-instance; the kind declares the
+    // strategy. Common caches are excluded.
+    let spec = BackupSpec {
+        include: Vec::new(),
+        exclude: vec![".orca-backups".into()],
+        strategies: vec![BackupStrategy::Paths],
+    };
 
     KindDeclaration {
         kind: STACK_KIND.into(),
+        backup_spec: Some(spec),
         verbs: vec![
             VerbDecl::list(),
             VerbDecl::detail(),
@@ -577,6 +710,21 @@ fn stack_declaration() -> KindDeclaration {
     }
 }
 
+/// Run `tar` through the orca process seam (no runtime named). Used for stack
+/// backup/restore; errors carry tar's stderr.
+async fn run_tar(args: &[&str]) -> Result<String> {
+    use plugin_toolkit::process::Command;
+    let out = Command::new("tar").args(args).output().await?;
+    if !out.status.success {
+        return Err(anyhow::anyhow!(
+            "tar {}: {}",
+            args.first().copied().unwrap_or(""),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 fn adapter_err(e: AdapterError) -> anyhow::Error {
     anyhow::anyhow!("{e}")
 }
@@ -590,6 +738,8 @@ impl UnitProvider for DockerUnitProvider {
         vec![
             KindDeclaration {
                 kind: KIND.into(),
+                // A container is ephemeral; the stack is the unit of state.
+                backup_spec: None,
                 verbs: vec![
                     VerbDecl::list(),
                     VerbDecl::detail(),
@@ -846,5 +996,37 @@ mod tests {
             .collect();
         assert!(kinds.iter().any(|k| k == "container"));
         assert!(kinds.iter().any(|k| k == STACK_KIND));
+    }
+
+    #[test]
+    fn stack_declares_backup_restore_actions_and_spec() {
+        let stack = stack_declaration();
+        // The stack kind declares a paths BackupSpec; container declares none.
+        let spec = stack.backup_spec.expect("stack has a backup_spec");
+        assert_eq!(spec.strategies, vec![BackupStrategy::Paths]);
+        assert!(spec.exclude.iter().any(|e| e == ".orca-backups"));
+
+        let update = stack
+            .verbs
+            .iter()
+            .find(|v| v.verb == Verb::Update)
+            .expect("stack has Update verb");
+        let backup = update
+            .actions
+            .iter()
+            .find(|a| a.action == ACTION_BACKUP)
+            .expect("backup action");
+        assert!(backup.payload_schema.is_some() && backup.response_schema.is_some());
+        assert!(
+            update.actions.iter().any(|a| a.action == ACTION_RESTORE),
+            "restore action declared"
+        );
+    }
+
+    #[test]
+    fn stack_backup_payload_defaults_and_parses_empty() {
+        assert!(StackBackupPayload::default().dest.is_none());
+        let p: StackBackupPayload = serde_json::from_str("{}").unwrap();
+        assert!(p.dest.is_none());
     }
 }
