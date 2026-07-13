@@ -5,10 +5,11 @@
 //! Consumed by `system::topology` and surfaced on `SystemInfoReport.claims`.
 
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 
 use plugin_toolkit::anyhow;
 use plugin_toolkit::contract::TopologyClaim;
-use plugin_toolkit::contract::topology::ClaimEndpoint;
+use plugin_toolkit::contract::topology::{ClaimAddress, ClaimEndpoint};
 use plugin_toolkit::serde::Deserialize;
 use plugin_toolkit::serde_json;
 
@@ -30,6 +31,12 @@ struct NetworkSettings {
     /// the port is exposed but not published to the host).
     #[serde(rename = "Ports", default)]
     ports: BTreeMap<String, Option<Vec<PortBinding>>>,
+    /// Legacy top-level IP (set for the default bridge; empty under custom
+    /// networks, where the per-network `Networks[*].IPAddress` is used).
+    #[serde(rename = "IPAddress", default)]
+    ip_address: String,
+    #[serde(rename = "GlobalIPv6Address", default)]
+    global_ipv6_address: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -37,6 +44,10 @@ struct NetworkSettings {
 struct NetworkEntry {
     #[serde(rename = "MacAddress", default)]
     mac_address: String,
+    #[serde(rename = "IPAddress", default)]
+    ip_address: String,
+    #[serde(rename = "GlobalIPv6Address", default)]
+    global_ipv6_address: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -71,6 +82,7 @@ pub async fn collect_claims() -> anyhow::Result<Vec<TopologyClaim>> {
         let macs = extract_macs(&entries);
         let first = entries.first();
         let endpoints = first.map(extract_endpoints).unwrap_or_default();
+        let addresses = first.map(extract_addresses).unwrap_or_default();
         let image = first
             .map(|e| e.config.image.clone())
             .filter(|s| !s.is_empty());
@@ -88,6 +100,7 @@ pub async fn collect_claims() -> anyhow::Result<Vec<TopologyClaim>> {
             // Single-host provider: the reporting peer is the host.
             runs_on: None,
             endpoints,
+            addresses,
             image,
             labels,
             service_role,
@@ -140,6 +153,59 @@ fn extract_endpoints(entry: &InspectEntry) -> Vec<ClaimEndpoint> {
     }
     out.sort_by_key(|e| (e.port, e.published_port));
     out
+}
+
+/// Collect a container's reachable IPs from `NetworkSettings` — the per-network
+/// `IPAddress`/`GlobalIPv6Address` plus the legacy top-level fields as a
+/// fallback. Host-network containers expose no IP here (they're reachable at
+/// the host's own address + published port), so they yield nothing — a noted
+/// gap, not an error. Loopback/link-local/unspecified are dropped; values are
+/// deduped and tagged `lan_v4`/`lan_v6` with `source: "docker"`.
+fn extract_addresses(entry: &InspectEntry) -> Vec<ClaimAddress> {
+    let ns = &entry.network_settings;
+    let raw = ns
+        .networks
+        .values()
+        .flat_map(|n| [n.ip_address.clone(), n.global_ipv6_address.clone()])
+        .chain([ns.ip_address.clone(), ns.global_ipv6_address.clone()]);
+    let mut out: Vec<ClaimAddress> = Vec::new();
+    for r in raw {
+        if let Some((kind, value)) = classify_ip(&r)
+            && !out.iter().any(|a| a.value == value)
+        {
+            out.push(ClaimAddress {
+                kind: kind.to_string(),
+                value,
+                source: "docker".to_string(),
+            });
+        }
+    }
+    out
+}
+
+/// Classify one IP literal into its address kind, or `None` for empty /
+/// loopback / link-local / unspecified / unparseable.
+fn classify_ip(raw: &str) -> Option<(&'static str, String)> {
+    let bare = raw.trim();
+    if bare.is_empty() {
+        return None;
+    }
+    let ip: IpAddr = bare.parse().ok()?;
+    match ip {
+        IpAddr::V4(v4) => {
+            if v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() {
+                return None;
+            }
+            Some(("lan_v4", v4.to_string()))
+        }
+        IpAddr::V6(v6) => {
+            let link_local = (v6.segments()[0] & 0xffc0) == 0xfe80;
+            if v6.is_loopback() || v6.is_unspecified() || link_local {
+                return None;
+            }
+            Some(("lan_v6", v6.to_string()))
+        }
+    }
 }
 
 fn first_name(names: &str) -> String {
@@ -210,6 +276,45 @@ mod tests {
         assert_eq!(
             e.config.labels.get("orca.role").map(String::as_str),
             Some("sonarr")
+        );
+    }
+
+    #[test]
+    fn extract_addresses_pulls_bridge_ip_and_filters() {
+        let entries = parse(
+            r#"[{"NetworkSettings":{"Networks":{
+                "bridge":{"IPAddress":"172.18.0.5","GlobalIPv6Address":""},
+                "loop":{"IPAddress":"127.0.0.1"}
+            }}}]"#,
+        );
+        let got = extract_addresses(&entries[0]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].kind, "lan_v4");
+        assert_eq!(got[0].value, "172.18.0.5");
+        assert_eq!(got[0].source, "docker");
+    }
+
+    #[test]
+    fn extract_addresses_host_network_yields_none() {
+        // Host-network containers report no per-network IP.
+        let entries = parse(r#"[{"NetworkSettings":{"Networks":{"host":{}}}}]"#);
+        assert!(extract_addresses(&entries[0]).is_empty());
+    }
+
+    #[test]
+    fn extract_addresses_uses_legacy_toplevel_and_ipv6() {
+        let entries = parse(
+            r#"[{"NetworkSettings":{"IPAddress":"10.0.0.9","GlobalIPv6Address":"fd00::9","Networks":{}}}]"#,
+        );
+        let got = extract_addresses(&entries[0]);
+        assert_eq!(got.len(), 2);
+        assert!(
+            got.iter()
+                .any(|a| a.kind == "lan_v4" && a.value == "10.0.0.9")
+        );
+        assert!(
+            got.iter()
+                .any(|a| a.kind == "lan_v6" && a.value == "fd00::9")
         );
     }
 
