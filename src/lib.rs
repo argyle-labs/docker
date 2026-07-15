@@ -43,19 +43,12 @@ pub fn resolve_docker_bin() -> &'static str {
 }
 
 /// Returns the DOCKER_HOST value to inject when the engine isn't on the
-/// default unix socket. Prefers the first enabled socket/tcp entry in the
-/// docker runtime registry; falls back to auto-detecting colima's socket.
-/// Returns None when the default socket should be used.
+/// default unix socket. Resolves through the shared fallback chain: the first
+/// enabled socket/tcp registry entry → colima's socket → a docker socket
+/// present at a well-known path (e.g. Unraid's standard socket). Returns None
+/// when nothing is discoverable and the client's own default should be used.
 pub async fn docker_host() -> Option<String> {
-    if let Some(host) = tools::active_host() {
-        return Some(host);
-    }
-    let home = std::env::var("HOME").ok()?;
-    let colima = format!("{home}/.colima/default/docker.sock");
-    if std::path::Path::new(&colima).exists() {
-        return Some(format!("unix://{colima}"));
-    }
-    None
+    tools::resolve_docker_host()
 }
 
 /// Run the docker CLI with `args`, optionally in `cwd`, returning stdout.
