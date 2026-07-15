@@ -74,9 +74,12 @@ const ROLE_LABEL: &str = "orca.role";
 
 /// Enumerate local containers via the `docker` CLI and build claims.
 pub async fn collect_claims() -> anyhow::Result<Vec<TopologyClaim>> {
-    let summaries = crate::containers::list(false).await?;
+    // `all = true` so stopped containers still surface as claims (rendered
+    // with a "stopped" run-state) instead of vanishing from the topology.
+    let summaries = crate::containers::list(true).await?;
     let mut claims = Vec::with_capacity(summaries.len());
     for s in summaries {
+        let state = normalize_state(&s.state);
         let inspected = crate::containers::inspect(&s.id).await?;
         let entries: Vec<InspectEntry> = serde_json::from_value(inspected).unwrap_or_default();
         let macs = extract_macs(&entries);
@@ -104,9 +107,22 @@ pub async fn collect_claims() -> anyhow::Result<Vec<TopologyClaim>> {
             image,
             labels,
             service_role,
+            state,
         });
     }
     Ok(claims)
+}
+
+/// Map a docker `State` string onto orca's normalized run-state vocabulary.
+/// `docker ps` reports `created`/`restarting`/`running`/`removing`/`paused`/
+/// `exited`/`dead`; an empty/unknown value yields `None` (Unknown, not down).
+fn normalize_state(state: &str) -> Option<String> {
+    match state.trim().to_lowercase().as_str() {
+        "running" | "restarting" => Some("running".to_string()),
+        "paused" => Some("paused".to_string()),
+        "created" | "exited" | "dead" | "removing" => Some("stopped".to_string()),
+        _ => None,
+    }
 }
 
 fn extract_macs(entries: &[InspectEntry]) -> Vec<String> {
@@ -316,6 +332,18 @@ mod tests {
             got.iter()
                 .any(|a| a.kind == "lan_v6" && a.value == "fd00::9")
         );
+    }
+
+    #[test]
+    fn normalize_state_maps_docker_states() {
+        assert_eq!(normalize_state("running"), Some("running".into()));
+        assert_eq!(normalize_state("Restarting"), Some("running".into()));
+        assert_eq!(normalize_state("paused"), Some("paused".into()));
+        assert_eq!(normalize_state("exited"), Some("stopped".into()));
+        assert_eq!(normalize_state("created"), Some("stopped".into()));
+        assert_eq!(normalize_state("dead"), Some("stopped".into()));
+        assert_eq!(normalize_state(""), None);
+        assert_eq!(normalize_state("weird"), None);
     }
 
     #[test]
