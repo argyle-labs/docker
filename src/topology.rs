@@ -108,6 +108,9 @@ pub async fn collect_claims() -> anyhow::Result<Vec<TopologyClaim>> {
             labels,
             service_role,
             state,
+            // Left empty: the inventory layer mints the stable uuidv7 identity
+            // (docker's hex id is a descriptive field, not an identity).
+            uuid: String::new(),
         });
     }
     Ok(claims)
