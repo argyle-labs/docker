@@ -56,3 +56,63 @@ pub fn active_host() -> Option<String> {
         .filter(|r| r.enabled)
         .find_map(|r| r.docker_host())
 }
+
+/// Well-known docker socket locations probed when no runtime is registered.
+/// An unconfigured host — notably Unraid, where the engine listens on the
+/// standard socket — still yields an explicit `DOCKER_HOST` this way, so the
+/// `subprocess_env` seam injects a concrete value instead of nothing.
+const WELL_KNOWN_SOCKETS: &[&str] = &["/var/run/docker.sock", "/run/docker.sock"];
+
+/// First existing socket in `paths`, formatted as a `unix://` `DOCKER_HOST`.
+/// Pure over the filesystem so it can be unit-tested with a temp path.
+fn first_existing_socket(paths: &[&str]) -> Option<String> {
+    paths
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(|p| format!("unix://{p}"))
+}
+
+/// Resolve the `DOCKER_HOST` to inject, trying every source in order:
+/// 1. the first enabled registered runtime (socket/tcp),
+/// 2. colima's default socket,
+/// 3. a docker socket present at a well-known path (covers Unraid and any
+///    host running the engine on the standard socket without registration).
+///
+/// Returns `None` only when nothing is discoverable, in which case a direct
+/// bollard client falls back to its own compiled-in default.
+pub fn resolve_docker_host() -> Option<String> {
+    if let Some(host) = active_host() {
+        return Some(host);
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let colima = format!("{home}/.colima/default/docker.sock");
+        if std::path::Path::new(&colima).exists() {
+            return Some(format!("unix://{colima}"));
+        }
+    }
+    first_existing_socket(WELL_KNOWN_SOCKETS)
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::first_existing_socket;
+
+    #[test]
+    fn first_existing_socket_picks_present_path_and_formats_unix() {
+        let dir = std::env::temp_dir();
+        let present = dir.join("orca-docker-test.sock");
+        std::fs::write(&present, b"").unwrap();
+        let present = present.to_str().unwrap().to_string();
+        let missing = "/definitely/not/a/real/docker.sock";
+
+        // Missing-first: skips it, picks the present one.
+        assert_eq!(
+            first_existing_socket(&[missing, &present]),
+            Some(format!("unix://{present}"))
+        );
+        // Nothing present → None.
+        assert_eq!(first_existing_socket(&[missing]), None);
+
+        std::fs::remove_file(&present).ok();
+    }
+}

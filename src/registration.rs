@@ -120,16 +120,18 @@ pub fn backend_dispatch(name: &str, args_json: &str) -> Option<Result<String, St
     None
 }
 
-/// Answer the `subprocess_env` seam's `env` op: expose `DOCKER_HOST` for the
-/// active registered runtime (first enabled socket/tcp). Returns an empty set
-/// when no socket/tcp runtime is registered (web-only or none) — orca then
-/// injects nothing, and a docker-based MCP server falls back to its own default.
+/// Answer the `subprocess_env` seam's `env` op: expose `DOCKER_HOST`, resolved
+/// through the full fallback chain (registered runtime → colima → well-known
+/// socket). This is what lets an unconfigured Unraid host — where no runtime is
+/// registered but the engine listens on the standard socket — still inject a
+/// concrete `DOCKER_HOST` into a docker-based MCP subprocess. Returns an empty
+/// set only when nothing is discoverable (the subprocess then uses its default).
 fn dispatch_env(op: &str) -> Result<String, String> {
     use plugin_toolkit::contract::subprocess_env::{ENV_OP, EnvVar};
     if op != ENV_OP {
         return Err(format!("unknown subprocess_env op '{op}'"));
     }
-    let vars: Vec<EnvVar> = match crate::tools::active_host() {
+    let vars: Vec<EnvVar> = match crate::tools::resolve_docker_host() {
         Some(host) => vec![EnvVar {
             key: "DOCKER_HOST".to_string(),
             value: host,
