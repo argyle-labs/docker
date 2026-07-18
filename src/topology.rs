@@ -72,6 +72,15 @@ struct ConfigEntry {
 /// hint (the authoritative role still comes from a runtime registration).
 const ROLE_LABEL: &str = "orca.role";
 
+/// Compose project name label docker sets on every container it starts from a
+/// compose file. Fallback signal for `service_identity` when the working-dir
+/// label is absent.
+const COMPOSE_PROJECT_LABEL: &str = "com.docker.compose.project";
+
+/// Compose project working-directory label — the strongest `service_identity`
+/// signal (`/opt/stacks/<project>`); byte-for-byte the same path dockge manages.
+const COMPOSE_WORKING_DIR_LABEL: &str = "com.docker.compose.project.working_dir";
+
 /// Enumerate local containers via the `docker` CLI and build claims.
 pub async fn collect_claims() -> anyhow::Result<Vec<TopologyClaim>> {
     // `all = true` so stopped containers still surface as claims (rendered
@@ -91,6 +100,7 @@ pub async fn collect_claims() -> anyhow::Result<Vec<TopologyClaim>> {
             .filter(|s| !s.is_empty());
         let labels = first.map(|e| e.config.labels.clone()).unwrap_or_default();
         let service_role = labels.get(ROLE_LABEL).filter(|s| !s.is_empty()).cloned();
+        let service_identity = compose_service_identity(&labels);
         let id_short = s.id.chars().take(12).collect::<String>();
         let name = first_name(&s.names);
         claims.push(TopologyClaim {
@@ -107,6 +117,7 @@ pub async fn collect_claims() -> anyhow::Result<Vec<TopologyClaim>> {
             image,
             labels,
             service_role,
+            service_identity,
             state,
             // Left empty: the inventory layer mints the stable uuidv7 identity
             // (docker's hex id is a descriptive field, not an identity).
@@ -114,6 +125,25 @@ pub async fn collect_claims() -> anyhow::Result<Vec<TopologyClaim>> {
         });
     }
     Ok(claims)
+}
+
+/// Derive the host-scoped compose `service_identity` correlation key from a
+/// container's compose labels. Docker learns the stack from
+/// `com.docker.compose.project.working_dir` (preferred) / `com.docker.compose.project`;
+/// both are routed through the core normalizer so docker and dockge — observing
+/// the same stack from different angles — emit byte-identical keys and dedup
+/// onto one stack node. Returns `None` for containers not started from compose.
+fn compose_service_identity(labels: &BTreeMap<String, String>) -> Option<String> {
+    let working_dir = labels
+        .get(COMPOSE_WORKING_DIR_LABEL)
+        .map(String::as_str)
+        .filter(|s| !s.is_empty());
+    let project = labels
+        .get(COMPOSE_PROJECT_LABEL)
+        .map(String::as_str)
+        .filter(|s| !s.is_empty());
+    let host = plugin_toolkit::containers::local_hostname();
+    TopologyClaim::normalize_service_identity(host, working_dir, project)
 }
 
 /// Map a docker `State` string onto orca's normalized run-state vocabulary.
@@ -243,6 +273,48 @@ mod tests {
 
     fn parse(s: &str) -> Vec<InspectEntry> {
         serde_json::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn compose_service_identity_from_working_dir_label() {
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            COMPOSE_WORKING_DIR_LABEL.to_string(),
+            "/opt/stacks/jellyfin".to_string(),
+        );
+        labels.insert(COMPOSE_PROJECT_LABEL.to_string(), "jellyfin".to_string());
+        let got = compose_service_identity(&labels).expect("compose labels yield identity");
+        // Host-scoped via the same core normalizer; working-dir wins over name.
+        let host = plugin_toolkit::containers::local_hostname();
+        let expected = TopologyClaim::normalize_service_identity(
+            host,
+            Some("/opt/stacks/jellyfin"),
+            Some("jellyfin"),
+        )
+        .unwrap();
+        assert_eq!(got, expected);
+        assert!(got.ends_with("\u{1f}/opt/stacks/jellyfin"));
+    }
+
+    #[test]
+    fn compose_service_identity_falls_back_to_project_name() {
+        let mut labels = BTreeMap::new();
+        labels.insert(COMPOSE_PROJECT_LABEL.to_string(), "arr".to_string());
+        let got = compose_service_identity(&labels).expect("project label yields identity");
+        assert!(got.ends_with("\u{1f}arr"));
+    }
+
+    #[test]
+    fn compose_service_identity_none_without_compose_labels() {
+        // A container not started from compose carries no compose labels.
+        let mut labels = BTreeMap::new();
+        labels.insert("orca.role".to_string(), "sonarr".to_string());
+        assert_eq!(compose_service_identity(&labels), None);
+        // Empty label values are treated as absent.
+        let mut empties = BTreeMap::new();
+        empties.insert(COMPOSE_PROJECT_LABEL.to_string(), String::new());
+        empties.insert(COMPOSE_WORKING_DIR_LABEL.to_string(), String::new());
+        assert_eq!(compose_service_identity(&empties), None);
     }
 
     #[test]
