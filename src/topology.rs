@@ -31,12 +31,6 @@ struct NetworkSettings {
     /// the port is exposed but not published to the host).
     #[serde(rename = "Ports", default)]
     ports: BTreeMap<String, Option<Vec<PortBinding>>>,
-    /// Legacy top-level IP (set for the default bridge; empty under custom
-    /// networks, where the per-network `Networks[*].IPAddress` is used).
-    #[serde(rename = "IPAddress", default)]
-    ip_address: String,
-    #[serde(rename = "GlobalIPv6Address", default)]
-    global_ipv6_address: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -68,6 +62,17 @@ struct ConfigEntry {
     labels: BTreeMap<String, String>,
 }
 
+/// One row of `docker network ls --format '{{json .}}'` — the network's name
+/// and driver, used to classify container IPs as LAN-reachable or internal.
+#[derive(Debug, Default, Deserialize)]
+#[serde(crate = "plugin_toolkit::serde")]
+struct NetworkMeta {
+    #[serde(rename = "Name", default)]
+    name: String,
+    #[serde(rename = "Driver", default)]
+    driver: String,
+}
+
 /// Well-known label a container can set to declare its service role as a cheap
 /// hint (the authoritative role still comes from a runtime registration).
 const ROLE_LABEL: &str = "orca.role";
@@ -86,6 +91,9 @@ pub async fn collect_claims() -> anyhow::Result<Vec<TopologyClaim>> {
     // `all = true` so stopped containers still surface as claims (rendered
     // with a "stopped" run-state) instead of vanishing from the topology.
     let summaries = crate::containers::list(true).await?;
+    // Network name -> driver, fetched once. Lets `extract_addresses` tell an L2
+    // network (macvlan/ipvlan, real LAN IPs) from a bridge network (internal).
+    let drivers = network_drivers().await;
     let mut claims = Vec::with_capacity(summaries.len());
     for s in summaries {
         let state = normalize_state(&s.state);
@@ -94,7 +102,9 @@ pub async fn collect_claims() -> anyhow::Result<Vec<TopologyClaim>> {
         let macs = extract_macs(&entries);
         let first = entries.first();
         let endpoints = first.map(extract_endpoints).unwrap_or_default();
-        let addresses = first.map(extract_addresses).unwrap_or_default();
+        let addresses = first
+            .map(|e| extract_addresses(e, &drivers))
+            .unwrap_or_default();
         let image = first
             .map(|e| e.config.image.clone())
             .filter(|s| !s.is_empty());
@@ -204,32 +214,64 @@ fn extract_endpoints(entry: &InspectEntry) -> Vec<ClaimEndpoint> {
     out
 }
 
-/// Collect a container's reachable IPs from `NetworkSettings` — the per-network
-/// `IPAddress`/`GlobalIPv6Address` plus the legacy top-level fields as a
-/// fallback. Host-network containers expose no IP here (they're reachable at
-/// the host's own address + published port), so they yield nothing — a noted
-/// gap, not an error. Loopback/link-local/unspecified are dropped; values are
-/// deduped and tagged `lan_v4`/`lan_v6` with `source: "docker"`.
-fn extract_addresses(entry: &InspectEntry) -> Vec<ClaimAddress> {
-    let ns = &entry.network_settings;
-    let raw = ns
-        .networks
-        .values()
-        .flat_map(|n| [n.ip_address.clone(), n.global_ipv6_address.clone()])
-        .chain([ns.ip_address.clone(), ns.global_ipv6_address.clone()]);
+/// True for L2 network drivers (`macvlan`/`ipvlan`) where a container gets a
+/// REAL address on the host's LAN subnet. Bridge networks (default or user-
+/// defined) are NOT L2 — their container IPs are docker-internal.
+fn is_l2_driver(driver: &str) -> bool {
+    matches!(driver, "macvlan" | "ipvlan")
+}
+
+/// Collect a container's LAN-REACHABLE IPs from `NetworkSettings`.
+///
+/// A container IP is only reachable from the rest of the network when it sits
+/// on an L2 network (macvlan/ipvlan) — it gets a real address on the host's
+/// subnet. On BRIDGE networks (default `bridge` or user-defined) the IP is a
+/// docker-internal bridge address (e.g. `172.18.0.x`) that is NOT reachable
+/// off-host; there, reachability is the HOST's IP + PUBLISHED PORT (surfaced
+/// separately as endpoints). So we deliberately DO NOT advertise internal
+/// bridge IPs — they misrepresent the container as reachable at an address the
+/// operator's LAN can't route (the legacy top-level `IPAddress` is the default
+/// bridge and is likewise skipped). Host-network containers expose no IP here.
+/// Values are deduped and tagged `lan_v4`/`lan_v6` with `source: "docker"`.
+fn extract_addresses(
+    entry: &InspectEntry,
+    drivers: &BTreeMap<String, String>,
+) -> Vec<ClaimAddress> {
     let mut out: Vec<ClaimAddress> = Vec::new();
-    for r in raw {
-        if let Some((kind, value)) = classify_ip(&r)
-            && !out.iter().any(|a| a.value == value)
-        {
-            out.push(ClaimAddress {
-                kind: kind.to_string(),
-                value,
-                source: "docker".to_string(),
-            });
+    for (net_name, n) in &entry.network_settings.networks {
+        // Unknown driver (network ls unavailable / renamed) → treat as NOT L2,
+        // i.e. don't advertise an unverified internal-looking address.
+        let driver = drivers.get(net_name).map(String::as_str).unwrap_or("");
+        if !is_l2_driver(driver) {
+            continue;
+        }
+        for r in [n.ip_address.as_str(), n.global_ipv6_address.as_str()] {
+            if let Some((kind, value)) = classify_ip(r)
+                && !out.iter().any(|a| a.value == value)
+            {
+                out.push(ClaimAddress {
+                    kind: kind.to_string(),
+                    value,
+                    source: "docker".to_string(),
+                });
+            }
         }
     }
     out
+}
+
+/// Map docker network NAME → driver via `docker network ls`. Empty on failure
+/// (the collector then advertises no container IPs, which is the safe default —
+/// reachability still comes through published-port endpoints).
+async fn network_drivers() -> BTreeMap<String, String> {
+    let Ok(out) = crate::run(&["network", "ls", "--format", "{{json .}}"], None).await else {
+        return BTreeMap::new();
+    };
+    out.lines()
+        .filter_map(|l| serde_json::from_str::<NetworkMeta>(l).ok())
+        .filter(|m| !m.name.is_empty())
+        .map(|m| (m.name, m.driver))
+        .collect()
 }
 
 /// Classify one IP literal into its address kind, or `None` for empty /
@@ -370,43 +412,55 @@ mod tests {
         );
     }
 
+    fn drivers(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(n, d)| (n.to_string(), d.to_string()))
+            .collect()
+    }
+
     #[test]
-    fn extract_addresses_pulls_bridge_ip_and_filters() {
+    fn extract_addresses_drops_bridge_internal_ip() {
+        // A bridge container's 172.x IP is docker-internal, NOT LAN-reachable —
+        // it must NOT be advertised (reachability = host + published port).
         let entries = parse(
             r#"[{"NetworkSettings":{"Networks":{
-                "bridge":{"IPAddress":"172.18.0.5","GlobalIPv6Address":""},
-                "loop":{"IPAddress":"127.0.0.1"}
+                "bridge":{"IPAddress":"172.18.0.5","GlobalIPv6Address":""}
             }}}]"#,
         );
-        let got = extract_addresses(&entries[0]);
+        let got = extract_addresses(&entries[0], &drivers(&[("bridge", "bridge")]));
+        assert!(got.is_empty(), "bridge-internal IP must not be surfaced");
+    }
+
+    #[test]
+    fn extract_addresses_keeps_macvlan_lan_ip() {
+        // A macvlan container gets a real address on the host's LAN subnet —
+        // that IS reachable and must be surfaced.
+        let entries = parse(
+            r#"[{"NetworkSettings":{"Networks":{
+                "lan":{"IPAddress":"10.10.10.42","GlobalIPv6Address":""}
+            }}}]"#,
+        );
+        let got = extract_addresses(&entries[0], &drivers(&[("lan", "macvlan")]));
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].kind, "lan_v4");
-        assert_eq!(got[0].value, "172.18.0.5");
+        assert_eq!(got[0].value, "10.10.10.42");
         assert_eq!(got[0].source, "docker");
+    }
+
+    #[test]
+    fn extract_addresses_unknown_driver_is_dropped() {
+        // Driver not resolvable → treat as non-L2, don't advertise the address.
+        let entries =
+            parse(r#"[{"NetworkSettings":{"Networks":{"custom":{"IPAddress":"172.20.0.2"}}}}]"#);
+        assert!(extract_addresses(&entries[0], &BTreeMap::new()).is_empty());
     }
 
     #[test]
     fn extract_addresses_host_network_yields_none() {
         // Host-network containers report no per-network IP.
         let entries = parse(r#"[{"NetworkSettings":{"Networks":{"host":{}}}}]"#);
-        assert!(extract_addresses(&entries[0]).is_empty());
-    }
-
-    #[test]
-    fn extract_addresses_uses_legacy_toplevel_and_ipv6() {
-        let entries = parse(
-            r#"[{"NetworkSettings":{"IPAddress":"10.0.0.9","GlobalIPv6Address":"fd00::9","Networks":{}}}]"#,
-        );
-        let got = extract_addresses(&entries[0]);
-        assert_eq!(got.len(), 2);
-        assert!(
-            got.iter()
-                .any(|a| a.kind == "lan_v4" && a.value == "10.0.0.9")
-        );
-        assert!(
-            got.iter()
-                .any(|a| a.kind == "lan_v6" && a.value == "fd00::9")
-        );
+        assert!(extract_addresses(&entries[0], &drivers(&[("host", "host")])).is_empty());
     }
 
     #[test]
