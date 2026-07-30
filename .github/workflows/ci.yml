@@ -47,6 +47,12 @@ jobs:
             url."https://x-access-token:${{ secrets.ORCA_FETCH_TOKEN }}@github.com/".insteadOf \
             "https://github.com/"
 
+      - name: Sync orca dep to main tip
+        # The committed lockfile pins a concrete orca git rev. Advance it to the
+        # current `main` HEAD so CI validates against live orca, not a stale pin
+        # (a plain build honors the locked rev and would silently test old orca).
+        run: cargo update -p plugin-toolkit
+
       - name: Formatting
         run: cargo fmt --all -- --check
 
@@ -54,7 +60,4 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Tests
-        # Not --locked: the dep tracks orca's `dev` branch (a moving git source),
-        # and the committed lockfile reflects the local-dev path patch, so CI
-        # resolves fresh against dev.
         run: cargo test
