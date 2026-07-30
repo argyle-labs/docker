@@ -73,7 +73,7 @@ async fn run(cmd: Command) -> Result<Output> {
 // docker.install — provision + start the engine on this host
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[plugin_struct(args)]
+#[orca_struct(args)]
 pub struct DockerInstallArgs {
     /// Container runtime to provision.
     #[arg(long, value_enum, default_value_t = ContainerRuntime::Colima)]
@@ -86,7 +86,7 @@ pub struct DockerInstallArgs {
     pub bootstrap_path: Option<String>,
 }
 
-#[plugin_struct]
+#[orca_struct]
 #[serde(rename_all = "camelCase")]
 #[derive(Debug)]
 pub struct DockerInstallOutput {
@@ -116,7 +116,7 @@ async fn docker_install(args: DockerInstallArgs, _ctx: &ToolCtx) -> Result<Docke
 // docker.engine_update — upgrade the engine package / colima image
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[plugin_struct(args)]
+#[orca_struct(args)]
 pub struct DockerEngineUpdateArgs {
     /// Container runtime to upgrade.
     #[arg(long, value_enum, default_value_t = ContainerRuntime::Colima)]
@@ -128,7 +128,7 @@ pub struct DockerEngineUpdateArgs {
     pub bootstrap_path: Option<String>,
 }
 
-#[plugin_struct]
+#[orca_struct]
 #[serde(rename_all = "camelCase")]
 #[derive(Debug)]
 pub struct DockerEngineUpdateOutput {
@@ -160,7 +160,7 @@ async fn docker_engine_update(
 // docker.backup — archive the engine's persistent state
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[plugin_struct(args)]
+#[orca_struct(args)]
 pub struct DockerBackupArgs {
     /// Directory to write the `.tar.gz` into. Created if missing.
     #[arg(long)]
@@ -172,7 +172,7 @@ pub struct DockerBackupArgs {
     pub state_path: Option<String>,
 }
 
-#[plugin_struct]
+#[orca_struct]
 #[serde(rename_all = "camelCase")]
 #[derive(Debug)]
 pub struct DockerBackupOutput {
@@ -214,7 +214,7 @@ async fn docker_backup(args: DockerBackupArgs, _ctx: &ToolCtx) -> Result<DockerB
 // docker.restore — restore engine state from a backup archive
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[plugin_struct(args)]
+#[orca_struct(args)]
 pub struct DockerRestoreArgs {
     /// Path to a `.tar.gz` produced by `docker.backup`.
     #[arg(long)]
@@ -230,7 +230,7 @@ pub struct DockerRestoreArgs {
     pub bootstrap_path: Option<String>,
 }
 
-#[plugin_struct]
+#[orca_struct]
 #[serde(rename_all = "camelCase")]
 #[derive(Debug)]
 pub struct DockerRestoreOutput {

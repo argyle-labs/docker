@@ -9,7 +9,7 @@ use std::net::IpAddr;
 
 use plugin_toolkit::anyhow;
 use plugin_toolkit::contract::TopologyClaim;
-use plugin_toolkit::contract::topology::{ClaimAddress, ClaimEndpoint};
+use plugin_toolkit::contract::topology::{ClaimEndpoint, Route};
 use plugin_toolkit::serde::Deserialize;
 use plugin_toolkit::serde_json;
 
@@ -102,7 +102,7 @@ pub async fn collect_claims() -> anyhow::Result<Vec<TopologyClaim>> {
         let macs = extract_macs(&entries);
         let first = entries.first();
         let endpoints = first.map(extract_endpoints).unwrap_or_default();
-        let addresses = first
+        let routes = first
             .map(|e| extract_addresses(e, &drivers))
             .unwrap_or_default();
         let image = first
@@ -123,7 +123,7 @@ pub async fn collect_claims() -> anyhow::Result<Vec<TopologyClaim>> {
             // Single-host provider: the reporting peer is the host.
             runs_on: None,
             endpoints,
-            addresses,
+            routes: routes.into(),
             image,
             labels,
             service_role,
@@ -233,11 +233,8 @@ fn is_l2_driver(driver: &str) -> bool {
 /// operator's LAN can't route (the legacy top-level `IPAddress` is the default
 /// bridge and is likewise skipped). Host-network containers expose no IP here.
 /// Values are deduped and tagged `lan_v4`/`lan_v6` with `source: "docker"`.
-fn extract_addresses(
-    entry: &InspectEntry,
-    drivers: &BTreeMap<String, String>,
-) -> Vec<ClaimAddress> {
-    let mut out: Vec<ClaimAddress> = Vec::new();
+fn extract_addresses(entry: &InspectEntry, drivers: &BTreeMap<String, String>) -> Vec<Route> {
+    let mut out: Vec<Route> = Vec::new();
     for (net_name, n) in &entry.network_settings.networks {
         // Unknown driver (network ls unavailable / renamed) → treat as NOT L2,
         // i.e. don't advertise an unverified internal-looking address.
@@ -249,10 +246,9 @@ fn extract_addresses(
             if let Some((kind, value)) = classify_ip(r)
                 && !out.iter().any(|a| a.value == value)
             {
-                out.push(ClaimAddress {
-                    kind: kind.to_string(),
-                    value,
-                    source: "docker".to_string(),
+                out.push(Route {
+                    source: Some("docker".to_string()),
+                    ..Route::mesh(kind, value, None)
                 });
             }
         }
@@ -445,7 +441,7 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].kind, "lan_v4");
         assert_eq!(got[0].value, "10.10.10.42");
-        assert_eq!(got[0].source, "docker");
+        assert_eq!(got[0].source.as_deref(), Some("docker"));
     }
 
     #[test]
