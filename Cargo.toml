@@ -41,7 +41,7 @@ path = "src/main.rs"
 # HTTP-over-toolkit, so no `http`/`delegated-http`. It needs `tools`
 # (#[orca_tool]), `db` (endpoint_resource! + db_op routed through core's one
 # connection), and `containers` (the RuntimeAdapter seam) — nothing else.
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", default-features = false, features = ["tools", "db", "containers"] }
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", tag = "v0.1.7-rc.1", default-features = false, features = ["tools", "db", "containers"] }
 
 # The ONE domain dep this plugin owns: the Docker Engine client. Everything else
 # — reactor, process, io, stream, time — comes from orca's generic seams, so
@@ -53,7 +53,7 @@ bollard = { version = "0.21", default-features = false, features = ["pipe"] }
 [dev-dependencies]
 # Dev-only: in-crate tests reach the toolkit's seams (serde, `reactor::block_on`)
 # the same way the lib does. Not a runtime dep.
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", default-features = false, features = ["tools", "db", "containers"] }
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", tag = "v0.1.7-rc.1", default-features = false, features = ["tools", "db", "containers"] }
 tempfile = "3"
 
 # Match orca's workspace lint floor: discarding a Result/Option via
