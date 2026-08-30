@@ -383,14 +383,12 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "containers"
-version = "0.1.7-rc.1"
+version = "0.1.9-rc.19"
 dependencies = [
  "anyhow",
  "clap",
  "contract",
  "derive",
- "dispatch",
- "inventory",
  "macro-runtime",
  "notifications",
  "schemars",
@@ -404,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "contract"
-version = "0.1.7-rc.1"
+version = "0.1.9-rc.19"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -518,10 +516,10 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
 name = "deploy-target"
-version = "0.1.7-rc.1"
+version = "0.1.9-rc.19"
 dependencies = [
- "anyhow",
  "async-trait",
+ "plugin-abi",
  "schemars",
  "serde",
  "serde_json",
@@ -561,7 +559,7 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 
 [[package]]
 name = "derive"
-version = "0.1.7-rc.1"
+version = "0.1.9-rc.19"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -612,7 +610,7 @@ dependencies = [
 
 [[package]]
 name = "dispatch"
-version = "0.1.7-rc.1"
+version = "0.1.9-rc.19"
 dependencies = [
  "anyhow",
  "clap",
@@ -1329,7 +1327,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "macro-runtime"
-version = "0.1.7-rc.1"
+version = "0.1.9-rc.19"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1405,14 +1403,11 @@ dependencies = [
 
 [[package]]
 name = "notifications"
-version = "0.1.7-rc.1"
+version = "0.1.9-rc.19"
 dependencies = [
  "anyhow",
  "clap",
- "contract",
  "derive",
- "dispatch",
- "inventory",
  "macro-runtime",
  "schemars",
  "serde",
@@ -1642,7 +1637,7 @@ dependencies = [
 
 [[package]]
 name = "plugin-proto"
-version = "0.1.7-rc.1"
+version = "0.1.9-rc.19"
 dependencies = [
  "serde",
  "serde_json",
@@ -1651,7 +1646,7 @@ dependencies = [
 
 [[package]]
 name = "plugin-toolkit"
-version = "0.1.7-rc.1"
+version = "0.1.9-rc.19"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1674,6 +1669,7 @@ dependencies = [
  "service",
  "storage",
  "thiserror",
+ "tikv-jemallocator",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2230,9 +2226,8 @@ dependencies = [
 
 [[package]]
 name = "service"
-version = "0.1.7-rc.1"
+version = "0.1.9-rc.19"
 dependencies = [
- "anyhow",
  "contract",
  "deploy-target",
  "schemars",
@@ -2359,9 +2354,8 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "storage"
-version = "0.1.7-rc.1"
+version = "0.1.9-rc.19"
 dependencies = [
- "anyhow",
  "derive",
  "schemars",
  "serde",
@@ -2452,6 +2446,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "tikv-jemalloc-sys"
+version = "0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd8aa5b2ab86a2cefa406d889139c162cbb230092f7d1d7cbc1716405d852a3b"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
+name = "tikv-jemallocator"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0359b4327f954e0567e69fb191cf1436617748813819c94b8cd4a431422d053a"
+dependencies = [
+ "libc",
+ "tikv-jemalloc-sys",
 ]
 
 [[package]]
@@ -2772,14 +2786,13 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "utils"
-version = "0.1.7-rc.1"
+version = "0.1.9-rc.19"
 dependencies = [
  "anyhow",
  "base64",
  "blake3",
  "chrono",
  "cron",
- "dirs",
  "ed25519-dalek",
  "futures-util",
  "git2",
@@ -2801,7 +2814,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-util",
- "tracing",
  "url",
  "urlencoding",
  "uuid",
