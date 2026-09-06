@@ -363,9 +363,6 @@ pub(crate) fn container_from_inspect(resp: bollard::models::ContainerInspectResp
         restart_count,
         exit_code,
         startup: None,
-        // Lifecycle enumeration reports no health signal; core defaults it to
-        // Unknown until a health-reporting pass maps docker's native healthcheck.
-        health: plugin_toolkit::contract::health::Health::Unknown,
     }
 }
 
