@@ -10,10 +10,9 @@ plugin_toolkit::instrument::bootstrap!();
 
 use plugin_toolkit::plugin::Plugin;
 
-// Force-link the `#[orca_tool]` inventory surfaces so their registrations
-// survive into the final binary.
-use docker::lifecycle as _;
-use docker::tools as _;
+// Force-link the lib's `#[orca_tool]` inventory so its registrations survive
+// into the final binary (crate-level ref; a submodule `use` trips unused-import).
+use docker as _;
 
 fn main() -> plugin_toolkit::anyhow::Result<()> {
     Plugin::named("docker")
