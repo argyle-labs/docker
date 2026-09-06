@@ -383,7 +383,8 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "containers"
-version = "0.1.9-rc.19"
+version = "0.1.9-rc.29"
+source = "git+https://github.com/argyle-labs/orca?branch=main#befbc58a9c9641022d7eef6199c5fe45a87cc999"
 dependencies = [
  "anyhow",
  "clap",
@@ -402,7 +403,8 @@ dependencies = [
 
 [[package]]
 name = "contract"
-version = "0.1.9-rc.19"
+version = "0.1.9-rc.29"
+source = "git+https://github.com/argyle-labs/orca?branch=main#befbc58a9c9641022d7eef6199c5fe45a87cc999"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -516,7 +518,8 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
 name = "deploy-target"
-version = "0.1.9-rc.19"
+version = "0.1.9-rc.29"
+source = "git+https://github.com/argyle-labs/orca?branch=main#befbc58a9c9641022d7eef6199c5fe45a87cc999"
 dependencies = [
  "async-trait",
  "plugin-abi",
@@ -559,7 +562,8 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 
 [[package]]
 name = "derive"
-version = "0.1.9-rc.19"
+version = "0.1.9-rc.29"
+source = "git+https://github.com/argyle-labs/orca?branch=main#befbc58a9c9641022d7eef6199c5fe45a87cc999"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -610,7 +614,8 @@ dependencies = [
 
 [[package]]
 name = "dispatch"
-version = "0.1.9-rc.19"
+version = "0.1.9-rc.29"
+source = "git+https://github.com/argyle-labs/orca?branch=main#befbc58a9c9641022d7eef6199c5fe45a87cc999"
 dependencies = [
  "anyhow",
  "clap",
@@ -1327,7 +1332,8 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "macro-runtime"
-version = "0.1.9-rc.19"
+version = "0.1.9-rc.29"
+source = "git+https://github.com/argyle-labs/orca?branch=main#befbc58a9c9641022d7eef6199c5fe45a87cc999"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1350,6 +1356,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
 dependencies = [
  "regex-automata",
+]
+
+[[package]]
+name = "media"
+version = "0.1.9-rc.29"
+source = "git+https://github.com/argyle-labs/orca?branch=main#befbc58a9c9641022d7eef6199c5fe45a87cc999"
+dependencies = [
+ "derive",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -1403,7 +1421,8 @@ dependencies = [
 
 [[package]]
 name = "notifications"
-version = "0.1.9-rc.19"
+version = "0.1.9-rc.29"
+source = "git+https://github.com/argyle-labs/orca?branch=main#befbc58a9c9641022d7eef6199c5fe45a87cc999"
 dependencies = [
  "anyhow",
  "clap",
@@ -1630,6 +1649,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "plugin-abi"
 version = "0.1.0"
+source = "git+https://github.com/argyle-labs/orca?branch=main#befbc58a9c9641022d7eef6199c5fe45a87cc999"
 dependencies = [
  "schemars",
  "serde",
@@ -1637,7 +1657,8 @@ dependencies = [
 
 [[package]]
 name = "plugin-proto"
-version = "0.1.9-rc.19"
+version = "0.1.9-rc.29"
+source = "git+https://github.com/argyle-labs/orca?branch=main#befbc58a9c9641022d7eef6199c5fe45a87cc999"
 dependencies = [
  "serde",
  "serde_json",
@@ -1646,7 +1667,8 @@ dependencies = [
 
 [[package]]
 name = "plugin-toolkit"
-version = "0.1.9-rc.19"
+version = "0.1.9-rc.29"
+source = "git+https://github.com/argyle-labs/orca?branch=main#befbc58a9c9641022d7eef6199c5fe45a87cc999"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1660,6 +1682,7 @@ dependencies = [
  "futures-util",
  "inventory",
  "macro-runtime",
+ "media",
  "plugin-abi",
  "plugin-proto",
  "regex",
@@ -2226,7 +2249,8 @@ dependencies = [
 
 [[package]]
 name = "service"
-version = "0.1.9-rc.19"
+version = "0.1.9-rc.29"
+source = "git+https://github.com/argyle-labs/orca?branch=main#befbc58a9c9641022d7eef6199c5fe45a87cc999"
 dependencies = [
  "contract",
  "deploy-target",
@@ -2354,7 +2378,8 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "storage"
-version = "0.1.9-rc.19"
+version = "0.1.9-rc.29"
+source = "git+https://github.com/argyle-labs/orca?branch=main#befbc58a9c9641022d7eef6199c5fe45a87cc999"
 dependencies = [
  "derive",
  "schemars",
@@ -2786,7 +2811,8 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "utils"
-version = "0.1.9-rc.19"
+version = "0.1.9-rc.29"
+source = "git+https://github.com/argyle-labs/orca?branch=main#befbc58a9c9641022d7eef6199c5fe45a87cc999"
 dependencies = [
  "anyhow",
  "base64",

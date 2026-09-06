@@ -2,19 +2,26 @@
 //!
 //! An out-of-process orca plugin: orca's boot-time scan finds this executable
 //! in its install dir, spawns it, and speaks the UDS wire protocol to it. The
-//! plugin owns the `docker.` tool namespace plus its hybrid domain backends
-//! (topology / container_runtime / unit / subprocess_env), dispatched through
-//! [`docker::registration::backend_dispatch`].
+//! plugin owns the `docker.` tool namespace plus four typed domain facets
+//! (topology / container_runtime / unit / subprocess_env), wired through the
+//! toolkit's `Plugin` builder.
 
-use plugin_toolkit::serve::{PluginSpec, serve};
+plugin_toolkit::instrument::bootstrap!();
+
+use plugin_toolkit::plugin::Plugin;
+
+// Force-link the lib's `#[orca_tool]` inventory so its registrations survive
+// into the final binary (crate-level ref; a submodule `use` trips unused-import).
+use docker as _;
 
 fn main() -> plugin_toolkit::anyhow::Result<()> {
-    serve(PluginSpec {
-        name: "docker".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        prefixes: vec!["docker.".to_string()],
-        backends_json: docker::registration::backends_json(),
-        schema_json: docker::registration::schema_json(),
-        backend_dispatch: Some(docker::registration::backend_dispatch),
-    })
+    Plugin::named("docker")
+        .version(env!("CARGO_PKG_VERSION"))
+        .tools(["docker."])
+        .schema_json(docker::registration::schema_json())
+        .container_runtime(docker::runtime_adapter::DockerAdapter::new())
+        .unit(docker::registration::unit_provider())
+        .topology(docker::registration::DockerTopology)
+        .subprocess_env(docker::registration::DockerEnv)
+        .serve()
 }
