@@ -15,12 +15,13 @@ use bollard::Docker;
 use bollard::container::LogOutput;
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::models::{
-    ContainerStateStatusEnum, MountPoint, RestartPolicy as DockerRestartPolicy,
+    ContainerStateStatusEnum, HealthStatusEnum, MountPoint, RestartPolicy as DockerRestartPolicy,
     RestartPolicyNameEnum,
 };
 use bollard::query_parameters::{
     InspectContainerOptionsBuilder, ListContainersOptionsBuilder, LogsOptionsBuilder,
 };
+use plugin_toolkit::contract::health::Health;
 use plugin_toolkit::orca_async;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -336,12 +337,22 @@ pub(crate) fn container_from_inspect(resp: bollard::models::ContainerInspectResp
         .unwrap_or_default();
     let image = config.and_then(|c| c.image);
 
+    // Docker's own healthcheck verdict, when the image declares one. No
+    // `HEALTHCHECK` → `NONE` → `NotApplicable`; absent state → `Unknown`.
+    let health = state_struct
+        .as_ref()
+        .and_then(|s| s.health.as_ref())
+        .and_then(|h| h.status)
+        .map(map_health)
+        .unwrap_or(Health::Unknown);
+
     Container {
         id,
         name,
         runtime: RuntimeKind::Docker,
         host: local_hostname().to_string(),
         state,
+        health,
         restart_policy,
         image,
         labels,
@@ -382,6 +393,17 @@ fn map_state(s: ContainerStateStatusEnum) -> ContainerState {
         ContainerStateStatusEnum::EXITED => ContainerState::Exited,
         ContainerStateStatusEnum::DEAD => ContainerState::Dead,
         ContainerStateStatusEnum::EMPTY => ContainerState::Unknown,
+    }
+}
+
+fn map_health(s: HealthStatusEnum) -> Health {
+    match s {
+        HealthStatusEnum::HEALTHY => Health::Healthy,
+        HealthStatusEnum::STARTING => Health::Starting,
+        HealthStatusEnum::UNHEALTHY => Health::Unhealthy,
+        // No healthcheck declared → the signal doesn't apply here.
+        HealthStatusEnum::NONE => Health::NotApplicable,
+        HealthStatusEnum::EMPTY => Health::Unknown,
     }
 }
 
