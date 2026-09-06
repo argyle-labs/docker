@@ -20,12 +20,14 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-  # Shared sccache → MinIO S3 on frigg (10.10.10.31). CARGO_INCREMENTAL=0 is
+  # Shared sccache → MinIO S3 on frigg (endpoint in the repo Actions variable
+  # SCCACHE_ENDPOINT — a real fleet IP, kept out of this public-mirrored file).
+  # CARGO_INCREMENTAL=0 is
   # mandatory — sccache and incremental compilation are mutually exclusive.
   CARGO_INCREMENTAL: "0"
   RUSTC_WRAPPER: sccache
   SCCACHE_BUCKET: sccache
-  SCCACHE_ENDPOINT: 10.10.10.31:9000
+  SCCACHE_ENDPOINT: ${{ vars.SCCACHE_ENDPOINT }}
   SCCACHE_S3_USE_SSL: "false"
   SCCACHE_REGION: us-east-1
   AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_S3_ACCESS_KEY }}
@@ -63,7 +65,7 @@ jobs:
           ORCA_FETCH_TOKEN: ${{ secrets.ORCA_FETCH_TOKEN }}
         run: |
           # Target THIS runner's own Gitea via GITHUB_SERVER_URL: internal
-          # act_runners see http://10.10.10.20:3000 (resolves); the external
+          # act_runners see http://the runner's own internal Gitea (resolves); the external
           # hostname gitea.scottkey.me does NOT resolve on them.
           base="${GITHUB_SERVER_URL:-https://gitea.scottkey.me}"
           auth="${base/:\/\//://x-access-token:${ORCA_FETCH_TOKEN}@}"
