@@ -434,13 +434,13 @@ mod tests {
         // that IS reachable and must be surfaced.
         let entries = parse(
             r#"[{"NetworkSettings":{"Networks":{
-                "lan":{"IPAddress":"10.10.10.42","GlobalIPv6Address":""}
+                "lan":{"IPAddress":"10.0.0.42","GlobalIPv6Address":""}
             }}}]"#,
         );
         let got = extract_addresses(&entries[0], &drivers(&[("lan", "macvlan")]));
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].kind, "lan_v4");
-        assert_eq!(got[0].value, "10.10.10.42");
+        assert_eq!(got[0].value, "10.0.0.42");
         assert_eq!(got[0].source.as_deref(), Some("docker"));
     }
 
