@@ -143,25 +143,46 @@ impl RuntimeAdapter for DockerAdapter {
         Ok(container_from_inspect(resp))
     }
 
-    async fn start(&self, _id: &str) -> Result<(), AdapterError> {
-        // C2 ships read paths; start/stop/restart/logs wire up in C3
-        // alongside the reconciler loop. Returning `Refused` makes accidental
-        // call sites loud rather than silently no-op.
-        Err(AdapterError::Refused(
-            "DockerAdapter::start lands in C3".into(),
-        ))
+    async fn start(&self, id: &str) -> Result<(), AdapterError> {
+        // Idempotent by contract: the reconciler calls this whenever a
+        // container it expects to be running looks stopped, so a container
+        // that raced us into `running` must not be an error. Docker answers
+        // 304 Not Modified for an already-started container, which bollard
+        // reports as a server error; treat it as success.
+        let client = self.client()?;
+        match client
+            .start_container(id, None::<bollard::query_parameters::StartContainerOptions>)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) if is_not_modified(&e) => Ok(()),
+            Err(e) => Err(map_bollard_err(e)),
+        }
     }
 
-    async fn stop(&self, _id: &str) -> Result<(), AdapterError> {
-        Err(AdapterError::Refused(
-            "DockerAdapter::stop lands in C3".into(),
-        ))
+    async fn stop(&self, id: &str) -> Result<(), AdapterError> {
+        // Same idempotence argument in reverse: already-stopped is 304.
+        let client = self.client()?;
+        match client
+            .stop_container(id, None::<bollard::query_parameters::StopContainerOptions>)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) if is_not_modified(&e) => Ok(()),
+            Err(e) => Err(map_bollard_err(e)),
+        }
     }
 
-    async fn restart(&self, _id: &str) -> Result<(), AdapterError> {
-        Err(AdapterError::Refused(
-            "DockerAdapter::restart lands in C3".into(),
-        ))
+    async fn restart(&self, id: &str) -> Result<(), AdapterError> {
+        // No 304 case: docker restarts a stopped container happily.
+        let client = self.client()?;
+        client
+            .restart_container(
+                id,
+                None::<bollard::query_parameters::RestartContainerOptions>,
+            )
+            .await
+            .map_err(map_bollard_err)
     }
 
     async fn logs(&self, id: &str, tail: LogTail) -> Result<String, AdapterError> {
@@ -251,6 +272,19 @@ impl RuntimeAdapter for DockerAdapter {
             stderr,
         })
     }
+}
+
+/// Docker answers `304 Not Modified` when a start/stop is a no-op because the
+/// container is already in the requested state. That is success for our
+/// idempotent contract, not a failure, so callers filter it before mapping.
+fn is_not_modified(e: &bollard::errors::Error) -> bool {
+    matches!(
+        e,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 304,
+            ..
+        }
+    )
 }
 
 /// Classify a bollard error into our typed [`AdapterError`].
@@ -673,6 +707,45 @@ mod tests {
         assert!(!labels_match(
             &have,
             &[("missing".to_string(), "x".to_string())]
+        ));
+    }
+
+    fn server_err(status_code: u16) -> bollard::errors::Error {
+        bollard::errors::Error::DockerResponseServerError {
+            status_code,
+            message: "x".into(),
+        }
+    }
+
+    #[test]
+    fn not_modified_is_recognised_only_for_304() {
+        assert!(is_not_modified(&server_err(304)));
+        // Anything else must fall through to the normal mapping.
+        assert!(!is_not_modified(&server_err(404)));
+        assert!(!is_not_modified(&server_err(409)));
+        assert!(!is_not_modified(&server_err(500)));
+    }
+
+    #[test]
+    fn a_304_would_otherwise_be_mapped_to_transport() {
+        // Guards the reason `is_not_modified` exists: without filtering it
+        // first, an already-started container would surface as a transport
+        // failure and make an idempotent start look broken.
+        assert!(matches!(
+            map_bollard_err(server_err(304)),
+            AdapterError::Transport(_)
+        ));
+    }
+
+    #[test]
+    fn write_path_error_statuses_keep_their_classification() {
+        assert!(matches!(
+            map_bollard_err(server_err(404)),
+            AdapterError::NotFound(_)
+        ));
+        assert!(matches!(
+            map_bollard_err(server_err(409)),
+            AdapterError::Refused(_)
         ));
     }
 }
