@@ -53,6 +53,28 @@ impl ContainerRuntime {
     }
 }
 
+// Embedded so the tools work from any working directory: the daemon's cwd is
+// not the plugin checkout, and the install dir ships only the binary.
+const INSTALL_SH: &str = include_str!("../scripts/install.sh");
+const UPDATE_SH: &str = include_str!("../scripts/update.sh");
+const RESTORE_SH: &str = include_str!("../scripts/restore.sh");
+
+/// `bash` running a lifecycle script: the operator's `override_path` when
+/// given, else the embedded copy via `bash -c` with `name` as `$0`. The
+/// embedded body is visible in `ps`, so never put secrets in these scripts.
+fn script_command(
+    name: &str,
+    embedded: &str,
+    override_path: Option<&str>,
+    args: &[&str],
+) -> Command {
+    let cmd = match override_path {
+        Some(path) => Command::new("bash").arg(path),
+        None => Command::new("bash").arg("-c").arg(embedded).arg(name),
+    };
+    cmd.args(args)
+}
+
 async fn run(cmd: Command) -> Result<Output> {
     let output = cmd
         .output()
@@ -79,8 +101,8 @@ pub struct DockerInstallArgs {
     #[arg(long, value_enum, default_value_t = ContainerRuntime::Colima)]
     #[serde(default)]
     pub runtime: ContainerRuntime,
-    /// Path to the bootstrap script. Defaults to the repo-relative
-    /// `scripts/install.sh`; override for a non-standard layout.
+    /// Path to a bootstrap script to run instead of the `scripts/install.sh`
+    /// embedded in the plugin.
     #[arg(long)]
     #[serde(default)]
     pub bootstrap_path: Option<String>,
@@ -101,11 +123,13 @@ pub struct DockerInstallOutput {
 /// it. Idempotent: a present, running runtime is left untouched.
 #[orca_tool(domain = "docker", verb = "install", local_only = true)]
 async fn docker_install(args: DockerInstallArgs, _ctx: &ToolCtx) -> Result<DockerInstallOutput> {
-    let script = args
-        .bootstrap_path
-        .clone()
-        .unwrap_or_else(|| "scripts/install.sh".to_string());
-    let output = run(Command::new("bash").arg(&script).arg(args.runtime.as_arg())).await?;
+    let output = run(script_command(
+        "install.sh",
+        INSTALL_SH,
+        args.bootstrap_path.as_deref(),
+        &[args.runtime.as_arg()],
+    ))
+    .await?;
     Ok(DockerInstallOutput {
         provisioned: true,
         log: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -122,7 +146,8 @@ pub struct DockerEngineUpdateArgs {
     #[arg(long, value_enum, default_value_t = ContainerRuntime::Colima)]
     #[serde(default)]
     pub runtime: ContainerRuntime,
-    /// Path to the update script. Defaults to `scripts/update.sh`.
+    /// Path to an update script to run instead of the embedded
+    /// `scripts/update.sh`.
     #[arg(long)]
     #[serde(default)]
     pub bootstrap_path: Option<String>,
@@ -145,11 +170,13 @@ async fn docker_engine_update(
     args: DockerEngineUpdateArgs,
     _ctx: &ToolCtx,
 ) -> Result<DockerEngineUpdateOutput> {
-    let script = args
-        .bootstrap_path
-        .clone()
-        .unwrap_or_else(|| "scripts/update.sh".to_string());
-    let output = run(Command::new("bash").arg(&script).arg(args.runtime.as_arg())).await?;
+    let output = run(script_command(
+        "update.sh",
+        UPDATE_SH,
+        args.bootstrap_path.as_deref(),
+        &[args.runtime.as_arg()],
+    ))
+    .await?;
     Ok(DockerEngineUpdateOutput {
         updated: true,
         log: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -224,7 +251,8 @@ pub struct DockerRestoreArgs {
     #[arg(long)]
     #[serde(default)]
     pub state_path: Option<String>,
-    /// Path to the restore script. Defaults to `scripts/restore.sh`.
+    /// Path to a restore script to run instead of the embedded
+    /// `scripts/restore.sh`.
     #[arg(long)]
     #[serde(default)]
     pub bootstrap_path: Option<String>,
@@ -252,14 +280,12 @@ async fn docker_restore(args: DockerRestoreArgs, _ctx: &ToolCtx) -> Result<Docke
         .state_path
         .clone()
         .unwrap_or_else(|| format!("{home}/.colima"));
-    let script = args
-        .bootstrap_path
-        .clone()
-        .unwrap_or_else(|| "scripts/restore.sh".to_string());
-    run(Command::new("bash")
-        .arg(&script)
-        .arg(&args.archive)
-        .arg(&state))
+    run(script_command(
+        "restore.sh",
+        RESTORE_SH,
+        args.bootstrap_path.as_deref(),
+        &[&args.archive, &state],
+    ))
     .await?;
     Ok(DockerRestoreOutput {
         restored: true,
@@ -294,6 +320,64 @@ mod tests {
             let err = docker_restore(args, &test_ctx()).await.unwrap_err();
             assert!(err.to_string().contains("is not a file"), "{err}");
         });
+    }
+
+    #[test]
+    fn restore_runs_the_embedded_script_from_a_foreign_working_dir() {
+        let work = tempfile::tempdir().unwrap();
+        let src = work.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("marker"), b"state").unwrap();
+        let archive = work.path().join("state.tar.gz");
+        let status = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&src)
+            .arg(".")
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        // No `scripts/` here: a repo-relative path would fail to resolve.
+        let foreign = tempfile::tempdir().unwrap();
+        assert!(!foreign.path().join("scripts").exists());
+        let state = work.path().join("restored");
+        let cmd = script_command(
+            "restore.sh",
+            RESTORE_SH,
+            None,
+            &[archive.to_str().unwrap(), state.to_str().unwrap()],
+        )
+        .current_dir(foreign.path());
+        let out = plugin_toolkit::reactor::block_on(run(cmd)).unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("restored engine state"));
+        assert_eq!(std::fs::read(state.join("marker")).unwrap(), b"state");
+    }
+
+    #[test]
+    fn bootstrap_path_override_runs_the_given_script() {
+        let foreign = tempfile::tempdir().unwrap();
+        let script = foreign.path().join("custom.sh");
+        std::fs::write(&script, "echo \"custom $1\"\n").unwrap();
+        let cmd = script_command("install.sh", INSTALL_SH, script.to_str(), &["podman"]);
+        let out = plugin_toolkit::reactor::block_on(run(cmd)).unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "custom podman");
+    }
+
+    #[test]
+    fn embedded_scripts_are_the_shipped_ones() {
+        let shipped = |name: &str| {
+            std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("scripts")
+                    .join(name),
+            )
+            .unwrap()
+        };
+        assert_eq!(INSTALL_SH, shipped("install.sh"));
+        assert_eq!(UPDATE_SH, shipped("update.sh"));
+        assert_eq!(RESTORE_SH, shipped("restore.sh"));
     }
 
     fn test_ctx() -> ToolCtx {
