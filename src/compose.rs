@@ -262,6 +262,13 @@ impl Compose {
     pub async fn up(&self, services: &[&str]) -> Result<String, ComposeError> {
         Ok(self.docker(&up_args(services)).await?)
     }
+    /// `up --no-start`: (re)create the services' containers without starting
+    /// them.
+    pub async fn create(&self, services: &[&str]) -> Result<String, ComposeError> {
+        let mut args = vec!["up", "--no-start"];
+        args.extend_from_slice(services);
+        Ok(self.docker(&args).await?)
+    }
     /// `docker compose down`. When `services` is non-empty, falls back to
     /// `compose stop <svc>` since compose-down is project-scoped.
     pub async fn down(&self, services: &[&str]) -> Result<String, ComposeError> {

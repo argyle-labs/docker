@@ -158,9 +158,8 @@ impl DockerUnitProvider {
         if args.query.kind.as_deref() == Some("coverage") {
             let (project, volumes) = self.stack_volumes(&row).await?;
             let policies = volume_coverage::policies(&row.name)?;
-            let raw = row
-                .compose()
-                .map_err(anyhow::Error::from)?
+            let raw = ownership::refresh(&row)
+                .await?
                 .config_json()
                 .await
                 .map_err(anyhow::Error::from)?;
@@ -325,9 +324,9 @@ impl DockerUnitProvider {
         &self,
         row: &StackRow,
     ) -> Result<(String, Vec<volume_coverage::StackVolume>)> {
-        let raw = row
-            .compose()
-            .map_err(anyhow::Error::from)?
+        // Converted volumes are declared only in the orca file.
+        let raw = ownership::refresh(row)
+            .await?
             .config_json()
             .await
             .map_err(anyhow::Error::from)?;
@@ -359,11 +358,15 @@ impl DockerUnitProvider {
         let containers = ownership::project_containers(docker, &cfg.name).await?;
         let converted = ownership::read_conversions(std::path::Path::new(&row.dir))?;
         let planned = ownership::plan(&cfg, &containers, &converted);
+        let warnings = ownership::relabel_warning(&containers)
+            .into_iter()
+            .collect();
         let migrator = ownership::ComposeMigrator { row, docker };
-        let result = label_volumes_result(
+        let mut result = label_volumes_result(
             docker, &migrator, &cfg.name, &row.name, &planned, &converted, &p,
         )
         .await?;
+        result.warnings = warnings;
         Ok(VerbOutcome::Item(ItemOutcome::new(
             id.clone(),
             serde_json::to_string(&result).unwrap_or_default(),
@@ -902,6 +905,9 @@ pub struct LabelVolumesResult {
     /// `true`: nothing was changed.
     pub dry_run: bool,
     pub changes: Vec<PlannedChange>,
+    /// Side effects to expect beyond the changes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     /// What execute did (absent on a dry run).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub migrated: Option<Migrated>,
@@ -927,6 +933,7 @@ async fn label_volumes_result(
         return Ok(LabelVolumesResult {
             dry_run: true,
             changes,
+            warnings: Vec::new(),
             migrated: None,
             how_to_execute: Some(
                 "re-invoke action=label_volumes with `execute: true` and `items` set to the change targets; only those still convertible are converted".into(),
@@ -947,6 +954,7 @@ async fn label_volumes_result(
     Ok(LabelVolumesResult {
         dry_run: false,
         changes,
+        warnings: Vec::new(),
         migrated: Some(migrated),
         how_to_execute: None,
     })
@@ -1785,7 +1793,7 @@ mod tests {
         fn restore_override(&self, _: Option<&str>) -> Result<()> {
             Ok(())
         }
-        fn up<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<()>> {
+        fn up<'a>(&'a self, _: &'a str, _: bool) -> BoxFuture<'a, Result<()>> {
             Box::pin(async { Ok(()) })
         }
     }
@@ -1794,6 +1802,7 @@ mod tests {
         vec![ownership::Planned {
             conversion: ownership::Conversion::new("media", "app", "/cache"),
             old: None,
+            running: false,
             blocked: None,
         }]
     }

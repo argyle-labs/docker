@@ -227,13 +227,19 @@ impl StagedWrite {
         &self.temp
     }
 
-    pub fn commit(mut self) -> Result<()> {
+    /// [`replace`](Self::replace), keeping the original as `<name>.bak`.
+    pub fn commit(self) -> Result<()> {
         if self.target.exists() {
             let mut bak = self.target.clone().into_os_string();
             bak.push(".bak");
             std::fs::copy(&self.target, &bak)
                 .with_context(|| format!("keeping a backup at {}", bak.to_string_lossy()))?;
         }
+        self.replace()
+    }
+
+    /// Rename the temp file over the target and fsync the directory.
+    pub fn replace(mut self) -> Result<()> {
         std::fs::rename(&self.temp, &self.target)
             .with_context(|| format!("replacing {}", self.target.display()))?;
         self.committed = true;

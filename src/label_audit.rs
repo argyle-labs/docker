@@ -186,11 +186,11 @@ pub struct DockerLabelAuditArgs {}
 /// **Audit ownership labels**: every container, volume and network on this
 /// host without `orca.managed`, grouped by inferred owner (`orca.stack` or
 /// the compose project label, else the container that mounts or attaches
-/// it). Read-only.
+/// it). Read-only; admin, since it inventories every resource on the host.
 #[orca_tool(
     domain = "docker",
     verb = "label_audit",
-    role = "any",
+    role = "admin",
     execute_gated = false
 )]
 async fn docker_label_audit(_args: DockerLabelAuditArgs, _ctx: &ToolCtx) -> Result<LabelAudit> {
