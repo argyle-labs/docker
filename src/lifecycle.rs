@@ -60,7 +60,8 @@ const UPDATE_SH: &str = include_str!("../scripts/update.sh");
 const RESTORE_SH: &str = include_str!("../scripts/restore.sh");
 
 /// `bash` running a lifecycle script: the operator's `override_path` when
-/// given, else the embedded copy via `bash -c` with `name` as `$0`.
+/// given, else the embedded copy via `bash -c` with `name` as `$0`. The
+/// embedded body is visible in `ps`, so never put secrets in these scripts.
 fn script_command(
     name: &str,
     embedded: &str,
@@ -366,9 +367,17 @@ mod tests {
 
     #[test]
     fn embedded_scripts_are_the_shipped_ones() {
-        assert!(INSTALL_SH.contains("Driven by `docker.install`"));
-        assert!(UPDATE_SH.contains("Driven by `docker.engine_update`"));
-        assert!(RESTORE_SH.starts_with("#!/usr/bin/env bash"));
+        let shipped = |name: &str| {
+            std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("scripts")
+                    .join(name),
+            )
+            .unwrap()
+        };
+        assert_eq!(INSTALL_SH, shipped("install.sh"));
+        assert_eq!(UPDATE_SH, shipped("update.sh"));
+        assert_eq!(RESTORE_SH, shipped("restore.sh"));
     }
 
     fn test_ctx() -> ToolCtx {
