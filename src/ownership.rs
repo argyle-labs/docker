@@ -12,9 +12,12 @@
 //! those. Existing unlabeled volumes are reported by coverage and
 //! `docker.label_audit`, never relabeled.
 //!
-//! Networks have no data: labeling an existing compose network makes compose
-//! recreate it once (with the containers on it, which the new service labels
-//! recreate anyway).
+//! Networks follow the same rule. Compose recreates a network whose declared
+//! labels changed: it stops the stack's containers, then fails with "network
+//! has active endpoints" when another project's container is attached (the
+//! shared proxy network pattern), leaving the stack down. So an existing
+//! network is never relabeled; it is reported instead, with any other
+//! project's containers attached to it.
 //!
 //! The file is JSON (valid YAML), so it can be read back: its `x-orca` key
 //! records the anonymous volumes converted to named ones, which every
@@ -154,6 +157,28 @@ struct XOrca {
 /// Labels of every engine volume, by name.
 pub type EngineVolumes = HashMap<String, HashMap<String, String>>;
 
+/// An existing engine network of the project.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EngineNetwork {
+    pub labels: HashMap<String, String>,
+    /// Containers of other projects attached to it.
+    pub foreign: Vec<String>,
+}
+
+/// The project's existing networks, by engine name.
+pub type EngineNetworks = HashMap<String, EngineNetwork>;
+
+/// A generated [`ORCA_FILE`], and what it left unlabeled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rendered {
+    pub text: String,
+    pub notes: Vec<String>,
+}
+
+fn network_name(project: &str, key: &str, n: &crate::compose_config::NetworkConfig) -> String {
+    n.name.clone().unwrap_or_else(|| format!("{project}_{key}"))
+}
+
 /// The labels to declare on a volume: `wanted` when it does not exist yet,
 /// its own orca labels when orca already labeled it, else none (see the
 /// module doc).
@@ -197,10 +222,12 @@ pub fn render(
     stack: &str,
     conversions: &[Conversion],
     engine: &EngineVolumes,
-) -> String {
+    networks: &EngineNetworks,
+) -> Rendered {
     let project = cfg.name.as_str();
     let conversions = live_conversions(cfg, conversions);
     let mut file = OrcaFile::default();
+    let mut notes = Vec::new();
     for svc in cfg.services.keys() {
         file.services.insert(
             svc.clone(),
@@ -222,12 +249,30 @@ pub fn render(
         if n.external == Some(true) {
             continue;
         }
-        file.networks.insert(
-            key.clone(),
-            LabelsOnly {
-                labels: Labels::for_(OWNER_DOCKER, project, None, Some(stack)).to_map(),
-            },
-        );
+        let name = network_name(project, key, n);
+        let labels = match networks.get(&name) {
+            None => Labels::for_(OWNER_DOCKER, project, None, Some(stack)).to_map(),
+            Some(have) if labels::is_managed(have.labels.iter()) => have
+                .labels
+                .iter()
+                .filter(|(k, _)| k.starts_with("orca."))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            Some(have) => {
+                let mut note = format!(
+                    "network '{name}' exists without orca labels; not relabeled (compose would recreate it)"
+                );
+                if !have.foreign.is_empty() {
+                    note.push_str(&format!(
+                        "; other projects' containers are attached: {}",
+                        have.foreign.join(", ")
+                    ));
+                }
+                notes.push(note);
+                continue;
+            }
+        };
+        file.networks.insert(key.clone(), LabelsOnly { labels });
     }
     for (key, v) in &cfg.volumes {
         if v.external == Some(true) {
@@ -268,7 +313,10 @@ pub fn render(
     }
     file.x_orca.conversions = conversions;
     let body = serde_json::to_string_pretty(&file).unwrap_or_default();
-    format!("{HEADER}{body}\n")
+    Rendered {
+        text: format!("{HEADER}{body}\n"),
+        notes,
+    }
 }
 
 /// The conversions recorded in an existing [`ORCA_FILE`]. A file that exists
@@ -319,6 +367,65 @@ pub async fn engine_volumes(docker: &Docker) -> Result<EngineVolumes> {
         .collect())
 }
 
+/// The project's non-external networks that exist on the engine, with the
+/// containers of other projects attached to each.
+pub async fn engine_networks(docker: &Docker, cfg: &ComposeConfig) -> Result<EngineNetworks> {
+    let mut out = EngineNetworks::new();
+    for (key, n) in &cfg.networks {
+        if n.external == Some(true) {
+            continue;
+        }
+        let name = network_name(&cfg.name, key, n);
+        let inspected = match docker
+            .inspect_network(
+                &name,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await
+        {
+            Ok(i) => i,
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => continue,
+            Err(e) => return Err(anyhow::anyhow!("inspect network {name}: {e}")),
+        };
+        let filters = HashMap::from([("network", vec![name.clone()])]);
+        let attached = docker
+            .list_containers(Some(
+                ListContainersOptionsBuilder::new()
+                    .all(true)
+                    .filters(&filters)
+                    .build(),
+            ))
+            .await
+            .map_err(|e| anyhow::anyhow!("list containers on {name}: {e}"))?;
+        let foreign = attached
+            .iter()
+            .filter(|c| {
+                c.labels
+                    .as_ref()
+                    .and_then(|l| l.get(COMPOSE_PROJECT_LABEL))
+                    .map(String::as_str)
+                    != Some(cfg.name.as_str())
+            })
+            .filter_map(|c| {
+                c.names
+                    .as_ref()?
+                    .first()
+                    .map(|n| n.trim_start_matches('/').to_string())
+            })
+            .collect();
+        out.insert(
+            name,
+            EngineNetwork {
+                labels: inspected.labels.unwrap_or_default(),
+                foreign,
+            },
+        );
+    }
+    Ok(out)
+}
+
 /// Containers of `project`, running or stopped.
 pub async fn project_containers(docker: &Docker, project: &str) -> Result<Vec<ContainerSummary>> {
     let filters = HashMap::from([("label", vec![format!("{COMPOSE_PROJECT_LABEL}={project}")])]);
@@ -346,7 +453,7 @@ pub async fn write_with(
     row: &StackRow,
     docker: &Docker,
     conversions: Option<&[Conversion]>,
-) -> Result<Compose> {
+) -> Result<(Compose, Vec<String>)> {
     let (compose, cfg) = user_config(row).await?;
     let recorded;
     let conversions = match conversions {
@@ -357,11 +464,10 @@ pub async fn write_with(
         }
     };
     let engine = engine_volumes(docker).await?;
-    write_atomic(
-        &Path::new(&row.dir).join(ORCA_FILE),
-        &render(&cfg, &row.name, conversions, &engine),
-    )?;
-    Ok(compose.with_orca())
+    let networks = engine_networks(docker, &cfg).await?;
+    let rendered = render(&cfg, &row.name, conversions, &engine, &networks);
+    write_atomic(&Path::new(&row.dir).join(ORCA_FILE), &rendered.text)?;
+    Ok((compose.with_orca(), rendered.notes))
 }
 
 fn client() -> Result<&'static Docker> {
@@ -372,12 +478,19 @@ fn client() -> Result<&'static Docker> {
 
 /// Regenerate [`ORCA_FILE`] and return the project to run compose with.
 pub async fn refresh(row: &StackRow) -> Result<Compose> {
-    write_with(row, client()?, None).await
+    Ok(write_with(row, client()?, None).await?.0)
 }
 
-/// `compose up -d` (for `services`, or all) with a fresh [`ORCA_FILE`].
+/// `compose up -d` (for `services`, or all) with a fresh [`ORCA_FILE`]. The
+/// output leads with what was left unlabeled.
 pub async fn up(row: &StackRow, services: &[&str]) -> Result<String> {
-    Ok(refresh(row).await?.up(services).await?)
+    let (compose, notes) = write_with(row, client()?, None).await?;
+    let out = compose.up(services).await?;
+    Ok(notes
+        .iter()
+        .map(|n| format!("note: {n}\n"))
+        .chain(std::iter::once(out))
+        .collect())
 }
 
 // ── anonymous volumes ───────────────────────────────────────────────────────
@@ -869,7 +982,14 @@ mod tests {
     }
 
     fn rendered(conversions: &[Conversion], engine: &EngineVolumes) -> Value {
-        let text = render(&cfg(), "media-stack", conversions, engine);
+        let text = render(
+            &cfg(),
+            "media-stack",
+            conversions,
+            engine,
+            &EngineNetworks::new(),
+        )
+        .text;
         assert!(text.starts_with('#'));
         let json: String = text.lines().filter(|l| !l.starts_with('#')).collect();
         serde_json::from_str(&json).unwrap()
@@ -909,6 +1029,59 @@ mod tests {
         assert_eq!(data[labels::MOUNT], "/data");
         assert!(v["volumes"].get("shared").is_none(), "external");
         assert!(v["services"]["app"].get("volumes").is_none());
+    }
+
+    #[test]
+    fn an_existing_network_is_never_relabeled_and_foreign_endpoints_are_reported() {
+        // media_default exists unlabeled; caddy's proxy container is attached.
+        let e = FakeEngine::routed(vec![
+            Route::new(
+                "GET",
+                "/networks/media_default",
+                200,
+                r#"{"Name":"media_default","Id":"n1","Labels":{"com.docker.compose.project":"media"}}"#,
+            ),
+            Route::new(
+                "GET",
+                "/containers/json",
+                200,
+                r#"[{"Id":"c1","Names":["/media-app-1"],"Labels":{"com.docker.compose.project":"media"}},
+                    {"Id":"c2","Names":["/caddy"],"Labels":{"com.docker.compose.project":"caddy"}}]"#,
+            )
+            .when_query(r#""network":["media_default"]"#),
+        ]);
+        let nets = plugin_toolkit::reactor::block_on(engine_networks(&e.client(), &cfg())).unwrap();
+        assert_eq!(nets["media_default"].foreign, vec!["caddy"]);
+        assert!(
+            !nets.contains_key("caddy_proxy"),
+            "external networks are not read"
+        );
+        let r = render(&cfg(), "media-stack", &[], &EngineVolumes::new(), &nets);
+        let json: String = r.text.lines().filter(|l| !l.starts_with('#')).collect();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("networks").is_none(), "{v}");
+        assert_eq!(r.notes.len(), 1);
+        assert!(r.notes[0].contains("media_default") && r.notes[0].contains("caddy"));
+        assert!(e.paths("POST").is_empty() && e.paths("DELETE").is_empty());
+
+        // Already orca-labeled: declared with exactly its labels, no change.
+        let managed = EngineNetworks::from([(
+            "media_default".to_string(),
+            EngineNetwork {
+                labels: HashMap::from([
+                    (labels::MANAGED.to_string(), "true".to_string()),
+                    (labels::UNIT.to_string(), "older".to_string()),
+                ]),
+                foreign: vec!["caddy".into()],
+            },
+        )]);
+        let r = render(&cfg(), "media-stack", &[], &EngineVolumes::new(), &managed);
+        let json: String = r.text.lines().filter(|l| !l.starts_with('#')).collect();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        let l = v["networks"]["default"]["labels"].as_object().unwrap();
+        assert_eq!(l.len(), 2);
+        assert_eq!(l[labels::UNIT], "older");
+        assert!(r.notes.is_empty());
     }
 
     #[test]
@@ -963,7 +1136,14 @@ mod tests {
         let c = Conversion::new("media", "app", "/cache");
         std::fs::write(
             dir.path().join(ORCA_FILE),
-            render(&cfg(), "m", std::slice::from_ref(&c), &EngineVolumes::new()),
+            render(
+                &cfg(),
+                "m",
+                std::slice::from_ref(&c),
+                &EngineVolumes::new(),
+                &EngineNetworks::new(),
+            )
+            .text,
         )
         .unwrap();
         assert_eq!(read_conversions(dir.path()).unwrap(), vec![c]);
