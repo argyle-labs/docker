@@ -38,7 +38,7 @@ Once orca is on the host you never touch the scripts — drive the tools. Payloa
 | `docker.backup` | archive engine state to a `.tar.gz` | `destination`, optional `state_path` |
 | `docker.restore` | restore engine state from an archive | `archive`, optional `state_path` |
 | `docker.prune` | remove dangling images (untagged, including digest-only pulls), dangling anonymous volumes and compose networks no container (running or stopped) uses; never named volumes, never a network a managed stack declares `external`. `stack` scope covers networks only: compose does not label anonymous volumes with their project. Dry run by default | optional `stack`; `execute` + `items` from the dry run |
-| `docker.host_update` | upgrade OS packages (apk/apt), then `compose pull -q` + `up -d --remove-orphans` for every running stack, then prune dangling images; behind the pre-update backup gate. Dry run by default | `execute` + `items` from the dry run; `skip_backup_gate` until orca#767 |
+| `docker.host_update` | upgrade the confirmed upgradable OS packages (apk/apt, engine packages flagged: they restart every container), then `compose pull -q` + `up -d` for every running stack, removing a stack's orphan containers only when all of them are confirmed, then prune dangling images; behind the pre-update backup gate. Stacks whose compose can't be read are reported as skipped. Dry run by default | `execute` + `items` (`package:*`, `stack:*`, `orphan:*`, `image:*`) from the dry run; `skip_backup_gate` until orca#767 |
 
 > Individual **containers** and managed **Compose stacks** are not `docker.*` tools — they are surfaced on orca's generic five-verb **unit** surface (`docker.__unit.*`). The `docker.*` tools above manage the runtime, its registered engines, and one-off Compose projects by path. See **[Managing Compose stacks](#managing-compose-stacks-orca-as-config-manager)** below.
 
@@ -85,6 +85,10 @@ vocabulary spans both). Every operation is available through `unit` list / detai
 | **view** compose YAML + `.env` + status | `detail` | `id.kind = "stack"`, `id.id = <name>` |
 | **tail** stack logs | `detail` | `id.kind = "stack"`, `query.kind = "logs"` |
 | **edit** (rewrite YAML/env, no deploy) | `update` | `action = "edit"`, `{ compose_yaml?, compose_env? }` |
+| **audit** (lint: restart policy, bind sources, named volumes) | `detail` | `query.kind = "audit"`, optional `query.extra = { managed_roots }` |
+| **fix** audit findings (dry run by default, shows the diff) | `update` | `action = "fix"`, `{ execute?, items?, managed_roots? }` |
+| **coverage** of named volumes by the stack backup | `detail` | `query.kind = "coverage"` |
+| **declare** how a named volume is backed up (dry run by default) | `update` | `action = "volume_policy"`, `{ volume, strategy?: export\|dump, service?, command?, execute? }` |
 | **deploy / lifecycle** | `update` | `action = up`\|`down`\|`start`\|`stop`\|`restart`\|`build`\|`pull` |
 | **register + deploy** (add-only) | `create` | `action = "deploy"`, deploy payload |
 | **register-or-replace + deploy** | `upsert` | `action = "set"`, deploy payload |
@@ -113,6 +117,32 @@ vocabulary spans both). Every operation is available through `unit` list / detai
 
 // update (deploy the edit) — bring the changed stack up
 { "id": { "kind": "stack", "id": "myapp", ... }, "action": "up" }
+
+// detail (audit) — flags restart `no`/unset/`on-failure[:N]` (proposes unless-stopped),
+// bind sources that are missing or outside the managed mounts (proposes the same
+// tail under a managed root, e.g. /mnt/willow/media → /mnt/data/media), and data
+// in named volumes. Managed roots default to /mnt/data, /mnt/backups,
+// /mnt/downloads, /opt/appdata; override per call or with ORCA_DOCKER_MANAGED_ROOTS.
+{ "id": { "kind": "stack", "id": "myapp", ... }, "query": { "kind": "audit" } }
+
+// update (fix) — dry run returns the changes + diff; execute writes only the
+// confirmed finding ids that still apply. Does not deploy: run action=up after.
+{ "id": { "kind": "stack", "id": "myapp", ... }, "action": "fix" }
+{ "id": { "kind": "stack", "id": "myapp", ... }, "action": "fix",
+  "payload": { "execute": true, "items": ["restart:app", "bind:app:/mnt/willow/media"] } }
+
+// detail (coverage) — named volumes from compose + engine, each `covered_by`
+// export | dump, with a warning per uncovered volume.
+{ "id": { "kind": "stack", "id": "immich", ... }, "query": { "kind": "coverage" } }
+
+// update (volume_policy) — `export` tars the volume through a helper container
+// (alpine:3, volume mounted read-only); `dump` runs an app-native command in a
+// service and keeps its stdout. Either lands in the stack backup under
+// .orca-volumes/. Omit `strategy` to clear. Restore unpacks them into
+// <stack dir>/.orca-volumes/; importing them back into the volume is manual.
+{ "id": { "kind": "stack", "id": "immich", ... }, "action": "volume_policy",
+  "payload": { "volume": "pgdata", "strategy": "dump", "service": "database",
+               "command": "pg_dumpall -U postgres", "execute": true } }
 ```
 
 To **tear down** a stack, run `update action=down` first, then `delete` to

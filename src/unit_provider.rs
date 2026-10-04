@@ -14,9 +14,13 @@
 //! plugin's `stack` kind so orca sees one unified stack surface):
 //! - [`Verb::List`]   → registered stacks + per-service status
 //! - [`Verb::Detail`] → **view**: compose YAML + `.env` + status; `query.kind =
-//!   "logs"` → tail logs
-//! - [`Verb::Update`] → **edit** (action `edit`, rewrite YAML/env, no deploy) or
-//!   lifecycle (`up` / `down` / `start` / `stop` / `restart` / `build` / `pull`)
+//!   "logs"` → tail logs; `query.kind = "audit"` → lint findings (see
+//!   [`crate::lint`]); `query.kind = "coverage"` → named-volume backup
+//!   coverage (see [`crate::volume_coverage`])
+//! - [`Verb::Update`] → **edit** (action `edit`, rewrite YAML/env, no deploy),
+//!   **fix** (rewrite lint findings, dry run by default), **volume_policy**
+//!   (declare how a named volume is backed up), or lifecycle (`up` /
+//!   `down` / `start` / `stop` / `restart` / `build` / `pull`)
 //! - [`Verb::Create`] → action `deploy`: register + write + `up` (add-only)
 //! - [`Verb::Upsert`] → action `set`: register-or-replace, then deploy
 //! - [`Verb::Delete`] → deregister the stack (leaves containers running)
@@ -25,6 +29,7 @@ use plugin_toolkit::anyhow::{self, Result};
 use plugin_toolkit::containers::{AdapterError, Container, ListFilter, LogTail, RuntimeAdapter};
 use plugin_toolkit::contract::BoxFuture;
 use plugin_toolkit::contract::backup::{BackupRef, BackupSpec, BackupStrategy, RestorePayload};
+use plugin_toolkit::contract::plan::PlannedChange;
 use plugin_toolkit::contract::unit::{
     ACTION_BACKUP, ACTION_RESTORE, ActionDecl, ActionOutcome, CreateArgs, DeleteArgs, DetailArgs,
     ItemOutcome, ItemsOutcome, KindDeclaration, ListArgs, UnitDescriptor, UnitId, UnitProvider,
@@ -34,8 +39,11 @@ use plugin_toolkit::schemars::{JsonSchema, schema_for};
 use plugin_toolkit::serde::{Deserialize, Serialize};
 use plugin_toolkit::serde_json;
 
+use crate::compose_config::ComposeConfig;
+use crate::lint::{self, Finding, NotFixed};
 use crate::runtime_adapter::DockerAdapter;
 use crate::stacks::{self, StackRow};
+use crate::volume_coverage::{self, Strategy, VolumePolicy};
 
 const KIND: &str = "container";
 const STACK_KIND: &str = "stack";
@@ -143,6 +151,34 @@ impl DockerUnitProvider {
     /// "logs"` tails the project's compose logs instead.
     async fn stack_detail(&self, args: DetailArgs) -> Result<VerbOutcome> {
         let row = stacks::require(&args.id.id)?;
+        if args.query.kind.as_deref() == Some("coverage") {
+            let (project, volumes) = self.stack_volumes(&row).await?;
+            let policies = volume_coverage::policies(&row.name)?;
+            let report = volume_coverage::coverage(&row.name, &project, volumes, &policies);
+            return Ok(VerbOutcome::Item(ItemOutcome::new(
+                self.stack_unit_id(&row),
+                serde_json::to_string(&report).unwrap_or_default(),
+            )));
+        }
+        if args.query.kind.as_deref() == Some("audit") {
+            let q: AuditQuery = match args.query.extra.as_deref() {
+                Some(raw) => {
+                    serde_json::from_str(raw).map_err(|e| anyhow::anyhow!("audit query: {e}"))?
+                }
+                None => AuditQuery::default(),
+            };
+            let roots = lint::managed_roots(q.managed_roots.as_deref());
+            let findings = stack_findings(&row, &roots).await?;
+            return Ok(VerbOutcome::Item(ItemOutcome::new(
+                self.stack_unit_id(&row),
+                serde_json::to_string(&StackAudit {
+                    name: row.name.clone(),
+                    managed_roots: roots,
+                    findings,
+                })
+                .unwrap_or_default(),
+            )));
+        }
         if args.query.kind.as_deref() == Some("logs") {
             let tail = args.query.limit.unwrap_or(200);
             let logs = row
@@ -197,6 +233,8 @@ impl DockerUnitProvider {
                     message: format!("edited stack '{}'", row.name),
                 }))
             }
+            "fix" => self.stack_fix(&args.id, &row, args.payload).await,
+            "volume_policy" => self.stack_volume_policy(&args.id, &row, args.payload).await,
             ACTION_BACKUP => self.do_stack_backup(&args.id, &row, args.payload).await,
             ACTION_RESTORE => self.do_stack_restore(&args.id, &row, args.payload).await,
             action if STACK_LIFECYCLE.contains(&action) => {
@@ -215,10 +253,102 @@ impl DockerUnitProvider {
         }
     }
 
+    /// **fix** — rewrite the fixable lint findings in the compose file through
+    /// the edit path. Dry run by default: returns the changes and the diff.
+    /// Execute applies only the confirmed `items` that still apply cleanly to
+    /// the file as it is now. Does not deploy; run `up` afterwards.
+    async fn stack_fix(
+        &self,
+        id: &UnitId,
+        row: &StackRow,
+        payload: Option<String>,
+    ) -> Result<VerbOutcome> {
+        let p: StackFixPayload = match payload {
+            Some(raw) => {
+                serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("fix payload: {e}"))?
+            }
+            None => StackFixPayload::default(),
+        };
+        let roots = lint::managed_roots(p.managed_roots.as_deref());
+        let findings = stack_findings(row, &roots).await?;
+        let yaml = row.read_compose()?;
+        let override_yaml = row
+            .compose()
+            .map_err(anyhow::Error::from)?
+            .override_file()
+            .map(std::fs::read_to_string)
+            .transpose()?;
+        let (result, new_yaml) = fix_result(&yaml, override_yaml.as_deref(), &findings, &p)?;
+        if let Some(new_yaml) = new_yaml {
+            row.write_compose_if_unchanged(&new_yaml, &yaml)?;
+        }
+        Ok(VerbOutcome::Item(ItemOutcome::new(
+            id.clone(),
+            serde_json::to_string(&result).unwrap_or_default(),
+        )))
+    }
+
+    /// The stack's compose project name and its named volumes, from the
+    /// resolved config and the engine.
+    async fn stack_volumes(
+        &self,
+        row: &StackRow,
+    ) -> Result<(String, Vec<volume_coverage::StackVolume>)> {
+        let raw = row
+            .compose()
+            .map_err(anyhow::Error::from)?
+            .config_json()
+            .await
+            .map_err(anyhow::Error::from)?;
+        let cfg = ComposeConfig::parse(&raw)?;
+        let docker = self.adapter.client().map_err(adapter_err)?;
+        let engine = volume_coverage::engine_volumes(docker, &cfg.name).await?;
+        Ok((cfg.name.clone(), volume_coverage::detect(&cfg, &engine)))
+    }
+
+    /// **volume_policy**: declare (or with no `strategy`, clear) how one named
+    /// volume is backed up. Dry run by default.
+    async fn stack_volume_policy(
+        &self,
+        id: &UnitId,
+        row: &StackRow,
+        payload: Option<String>,
+    ) -> Result<VerbOutcome> {
+        let raw = payload.ok_or_else(|| anyhow::anyhow!("volume_policy requires a payload"))?;
+        let p: VolumePolicyPayload = serde_json::from_str(&raw)
+            .map_err(|e| anyhow::anyhow!("volume_policy payload: {e}"))?;
+        let raw_cfg = row
+            .compose()
+            .map_err(anyhow::Error::from)?
+            .config_json()
+            .await
+            .map_err(anyhow::Error::from)?;
+        let cfg = ComposeConfig::parse(&raw_cfg)?;
+        let result = volume_policy_result(&row.name, &cfg, &p)?;
+        if !result.dry_run {
+            match p.strategy {
+                Some(strategy) => volume_coverage::put(&VolumePolicy {
+                    stack: row.name.clone(),
+                    volume: p.volume.clone(),
+                    strategy,
+                    service: p.service.clone(),
+                    command: p.command.clone(),
+                })?,
+                None => {
+                    volume_coverage::remove(&row.name, &p.volume)?;
+                }
+            }
+        }
+        Ok(VerbOutcome::Item(ItemOutcome::new(
+            id.clone(),
+            serde_json::to_string(&result).unwrap_or_default(),
+        )))
+    }
+
     /// Minimal backup of a stack: tar its project directory (compose file, `.env`,
-    /// and any bind-mounted config under it) into a `.tar.gz`. That directory is
-    /// the stack's restore-sufficient state; bulk data on named volumes / external
-    /// mounts is out of scope (reproducible or on network storage). Returns a
+    /// and any bind-mounted config under it) into a `.tar.gz`, plus an export or
+    /// dump of each named volume with a policy (under `.orca-volumes/`). Data on
+    /// external mounts is out of scope (on network storage). Returns a
     /// [`BackupRef`] whose locator is the archive path — a later `restore`
     /// consumes it directly. Routed to the stack's host over the mesh.
     async fn do_stack_backup(
@@ -249,9 +379,24 @@ impl DockerUnitProvider {
         };
         std::fs::create_dir_all(&dest)
             .map_err(|e| anyhow::anyhow!("create backup dir {}: {e}", dest.display()))?;
+        let policies = volume_coverage::policies(&row.name)?;
+        let volumes = if policies.is_empty() {
+            Vec::new()
+        } else {
+            self.stack_volumes(row).await?.1
+        };
+        let compose = row.compose().map_err(anyhow::Error::from)?;
+        volume_coverage::stage(dir, &compose, &volumes, &policies).await?;
         let ts = plugin_toolkit::time::now().unix_seconds();
         let archive = dest.join(format!("{}-{ts}.tar.gz", row.name));
-        run_tar(&["czf", &archive.to_string_lossy(), "-C", &row.dir, "."]).await?;
+        let tarred = run_tar(&["czf", &archive.to_string_lossy(), "-C", &row.dir, "."]).await;
+        // Exports can be large; they live on only inside the archive.
+        let staging = dir.join(volume_coverage::STAGING_DIR);
+        if staging.exists() {
+            std::fs::remove_dir_all(&staging)
+                .map_err(|e| anyhow::anyhow!("clear {}: {e}", staging.display()))?;
+        }
+        tarred?;
 
         let backup = BackupRef {
             locator: archive.to_string_lossy().into_owned(),
@@ -582,6 +727,149 @@ pub struct StackEditPayload {
     pub compose_env: Option<String>,
 }
 
+/// Payload for `Update{action:"volume_policy"}`.
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(crate = "plugin_toolkit::serde")]
+#[schemars(crate = "plugin_toolkit::schemars")]
+pub struct VolumePolicyPayload {
+    /// The compose volume key.
+    pub volume: String,
+    /// `export` or `dump`; omit to clear the policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<Strategy>,
+    /// `dump` only: the service to run the command in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    /// `dump` only: run with `sh -c` in the service; its stdout is the dump
+    /// (e.g. `pg_dumpall -U postgres`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Write the policy. Omitted, returns the change only.
+    #[serde(default)]
+    pub execute: bool,
+}
+
+/// Response for `Update{action:"volume_policy"}`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(crate = "plugin_toolkit::serde")]
+#[schemars(crate = "plugin_toolkit::schemars")]
+pub struct VolumePolicyResult {
+    /// `true`: nothing was written.
+    pub dry_run: bool,
+    pub change: PlannedChange,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub how_to_execute: Option<String>,
+}
+
+/// Validate a policy change against the stack's config and describe it.
+/// Validation runs on the dry run and again on execute, so a policy that has
+/// stopped matching the stack is never written.
+fn volume_policy_result(
+    stack: &str,
+    cfg: &ComposeConfig,
+    p: &VolumePolicyPayload,
+) -> Result<VolumePolicyResult> {
+    let target = format!("volume:{stack}/{}", p.volume);
+    let change = match p.strategy {
+        Some(strategy) => {
+            let declared = cfg.volumes.contains_key(&p.volume)
+                || cfg.services.values().any(|s| {
+                    s.volumes
+                        .iter()
+                        .any(|m| m.named_volume() == Some(&p.volume))
+                });
+            if !declared {
+                return Err(anyhow::anyhow!(
+                    "stack '{stack}' declares no named volume '{}'",
+                    p.volume
+                ));
+            }
+            let policy = VolumePolicy {
+                stack: stack.to_string(),
+                volume: p.volume.clone(),
+                strategy,
+                service: p.service.clone(),
+                command: p.command.clone(),
+            };
+            policy.validate(cfg)?;
+            let detail = match strategy {
+                Strategy::Export => "back up by exporting through a helper container".to_string(),
+                Strategy::Dump => format!(
+                    "back up by running `{}` in service '{}'",
+                    p.command.as_deref().unwrap_or_default(),
+                    p.service.as_deref().unwrap_or_default()
+                ),
+            };
+            PlannedChange::new(target, "set-policy").with_detail(detail)
+        }
+        None => PlannedChange::new(target, "clear-policy"),
+    };
+    Ok(VolumePolicyResult {
+        dry_run: !p.execute,
+        change,
+        how_to_execute: (!p.execute)
+            .then(|| "re-invoke action=volume_policy with `execute: true`".to_string()),
+    })
+}
+
+/// `Detail` `query.extra` for `query.kind = "audit"`.
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(crate = "plugin_toolkit::serde")]
+#[schemars(crate = "plugin_toolkit::schemars")]
+pub struct AuditQuery {
+    /// Managed mount roots to judge bind sources against. Default: the
+    /// daemon's `ORCA_DOCKER_MANAGED_ROOTS`, else `/mnt/data`, `/mnt/backups`,
+    /// `/mnt/downloads`, `/opt/appdata`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_roots: Option<Vec<String>>,
+}
+
+/// `Detail` payload when `query.kind = "audit"`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(crate = "plugin_toolkit::serde")]
+#[schemars(crate = "plugin_toolkit::schemars")]
+pub struct StackAudit {
+    pub name: String,
+    pub managed_roots: Vec<String>,
+    pub findings: Vec<Finding>,
+}
+
+/// Payload for `Update{action:"fix"}`. Every field defaults: no payload is a
+/// dry run.
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(crate = "plugin_toolkit::serde")]
+#[schemars(crate = "plugin_toolkit::schemars")]
+pub struct StackFixPayload {
+    /// Write the file. Omitted, returns the changes and diff only.
+    #[serde(default)]
+    pub execute: bool,
+    /// The dry run's change targets (finding ids) to apply.
+    #[serde(default)]
+    pub items: Vec<String>,
+    /// As for the audit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_roots: Option<Vec<String>>,
+}
+
+/// Response for `Update{action:"fix"}`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(crate = "plugin_toolkit::serde")]
+#[schemars(crate = "plugin_toolkit::schemars")]
+pub struct StackFixResult {
+    /// `true`: nothing was written.
+    pub dry_run: bool,
+    /// The rewrites (planned on a dry run, made on execute).
+    pub changes: Vec<PlannedChange>,
+    /// Line diff of the compose file.
+    pub diff: String,
+    /// Finding ids written (execute only).
+    pub applied: Vec<String>,
+    /// Findings that could not be rewritten, and why.
+    pub not_fixed: Vec<NotFixed>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub how_to_execute: Option<String>,
+}
+
 /// Optional payload for `Update{action:"backup"}`. Every field defaults, so the
 /// core pre-mutation guard (which dispatches `backup` with no payload) drives a
 /// minimal backup of the stack's project directory.
@@ -645,6 +933,16 @@ fn stack_declaration() -> KindDeclaration {
         payload_schema: Some(schema_for!(StackEditPayload)),
         response_schema: None,
     }];
+    update_actions.push(ActionDecl {
+        action: "fix".into(),
+        payload_schema: Some(schema_for!(StackFixPayload)),
+        response_schema: Some(schema_for!(StackFixResult)),
+    });
+    update_actions.push(ActionDecl {
+        action: "volume_policy".into(),
+        payload_schema: Some(schema_for!(VolumePolicyPayload)),
+        response_schema: Some(schema_for!(VolumePolicyResult)),
+    });
     update_actions.extend(STACK_LIFECYCLE.iter().map(|a| ActionDecl {
         action: (*a).into(),
         payload_schema: None,
@@ -677,7 +975,11 @@ fn stack_declaration() -> KindDeclaration {
         backup_spec: Some(spec),
         verbs: vec![
             VerbDecl::list(),
-            VerbDecl::detail(),
+            VerbDecl {
+                verb: Verb::Detail,
+                query_schema: Some(schema_for!(AuditQuery)),
+                actions: vec![],
+            },
             VerbDecl {
                 verb: Verb::Update,
                 query_schema: None,
@@ -708,6 +1010,79 @@ fn stack_declaration() -> KindDeclaration {
             },
         ],
     }
+}
+
+/// Lint findings for a stack's resolved compose config.
+async fn stack_findings(row: &StackRow, roots: &[String]) -> Result<Vec<Finding>> {
+    let raw = row
+        .compose()
+        .map_err(anyhow::Error::from)?
+        .config_json()
+        .await
+        .map_err(anyhow::Error::from)?;
+    let cfg = ComposeConfig::parse(&raw)?;
+    Ok(lint::audit(&cfg, &row.dir, roots, &|p| p.exists()))
+}
+
+const FIX_TOOL: &str = "stack fix";
+
+/// The plan (dry run) or the record (execute) of a `fix` over `yaml`, plus the
+/// file to write when execute changed anything. Pure, so the plan/intersect
+/// contract is testable without a compose CLI.
+fn fix_result(
+    yaml: &str,
+    override_yaml: Option<&str>,
+    findings: &[Finding],
+    p: &StackFixPayload,
+) -> Result<(StackFixResult, Option<String>)> {
+    let fixable: Vec<String> = findings
+        .iter()
+        .filter(|f| f.fixable)
+        .map(|f| f.id.clone())
+        .collect();
+    let planned = lint::apply_fixes(yaml, override_yaml, findings, &fixable);
+    let change = |id: &String| {
+        let f = findings.iter().find(|f| &f.id == id);
+        PlannedChange::new(id, "rewrite").with_detail(match f {
+            Some(f) => format!(
+                "{} → {}",
+                f.current,
+                f.proposed.as_deref().unwrap_or_default()
+            ),
+            None => String::new(),
+        })
+    };
+    if !p.execute {
+        let result = StackFixResult {
+            dry_run: true,
+            changes: planned.applied.iter().map(change).collect(),
+            diff: lint::diff(yaml, &planned.yaml),
+            applied: Vec::new(),
+            not_fixed: planned.not_fixed,
+            how_to_execute: Some(
+                "re-invoke action=fix with `execute: true` and `items` set to the change targets; only those still applicable are written".into(),
+            ),
+        };
+        return Ok((result, None));
+    }
+    crate::execute::require_confirmed(FIX_TOOL, &p.items, &planned.applied)?;
+    let (act, dropped) = crate::execute::intersect(&p.items, &planned.applied);
+    let outcome = lint::apply_fixes(yaml, override_yaml, findings, &act);
+    let mut not_fixed = outcome.not_fixed;
+    not_fixed.extend(dropped.into_iter().map(|id| NotFixed {
+        id,
+        reason: "no longer a fixable finding".into(),
+    }));
+    let write = (!outcome.applied.is_empty()).then(|| outcome.yaml.clone());
+    let result = StackFixResult {
+        dry_run: false,
+        changes: outcome.applied.iter().map(change).collect(),
+        diff: lint::diff(yaml, &outcome.yaml),
+        applied: outcome.applied,
+        not_fixed,
+        how_to_execute: None,
+    };
+    Ok((result, write))
 }
 
 /// Run `tar` through the orca process seam (no runtime named). Used for stack
@@ -1021,6 +1396,120 @@ mod tests {
             update.actions.iter().any(|a| a.action == ACTION_RESTORE),
             "restore action declared"
         );
+    }
+
+    const FIX_YAML: &str =
+        "services:\n  app:\n    image: x\n    restart: \"no\"\n  worker:\n    image: y\n";
+
+    fn fix_findings() -> Vec<Finding> {
+        let cfg = ComposeConfig::parse(
+            r#"{"name":"s","services":{"app":{"restart":"no","volumes":[{"type":"volume","source":"data","target":"/data"}]},"worker":{}}}"#,
+        )
+        .unwrap();
+        lint::audit(&cfg, "/srv/s", &[], &|_| true)
+    }
+
+    #[test]
+    fn fix_dry_run_returns_changes_and_diff_and_writes_nothing() {
+        let (result, write) =
+            fix_result(FIX_YAML, None, &fix_findings(), &StackFixPayload::default()).unwrap();
+        assert!(result.dry_run && write.is_none());
+        let targets: Vec<_> = result.changes.iter().map(|c| c.target.as_str()).collect();
+        assert_eq!(targets, vec!["restart:app", "restart:worker"]);
+        assert!(
+            result.diff.contains("-    restart: \"no\""),
+            "{}",
+            result.diff
+        );
+        assert!(result.diff.contains("+    restart: unless-stopped"));
+        // The named volume is a finding but not a rewrite.
+        assert!(!targets.contains(&"volume:app:data"));
+    }
+
+    #[test]
+    fn fix_execute_writes_only_confirmed_items_still_applicable() {
+        let p = StackFixPayload {
+            execute: true,
+            items: vec!["restart:app".into(), "restart:gone".into()],
+            managed_roots: None,
+        };
+        let (result, write) = fix_result(FIX_YAML, None, &fix_findings(), &p).unwrap();
+        assert!(!result.dry_run);
+        assert_eq!(result.applied, vec!["restart:app"]);
+        assert_eq!(result.not_fixed[0].id, "restart:gone");
+        let written = write.expect("a rewrite");
+        assert!(written.contains("restart: unless-stopped"));
+        // worker was fixable but not confirmed.
+        assert!(!written.contains("worker:\n    restart"), "{written}");
+    }
+
+    #[test]
+    fn fix_execute_without_items_is_refused() {
+        let p = StackFixPayload {
+            execute: true,
+            ..Default::default()
+        };
+        let err = fix_result(FIX_YAML, None, &fix_findings(), &p).unwrap_err();
+        assert!(err.to_string().contains("items from the dry run"), "{err}");
+    }
+
+    #[test]
+    fn stack_declares_fix_and_an_audit_query() {
+        let d = stack_declaration();
+        let update = d.verbs.iter().find(|v| v.verb == Verb::Update).unwrap();
+        let fix = update.actions.iter().find(|a| a.action == "fix").unwrap();
+        assert!(fix.payload_schema.is_some() && fix.response_schema.is_some());
+        let detail = d.verbs.iter().find(|v| v.verb == Verb::Detail).unwrap();
+        let q = serde_json::to_string(detail.query_schema.as_ref().unwrap()).unwrap();
+        assert!(q.contains("managed_roots"));
+    }
+
+    fn vp(volume: &str, strategy: Option<Strategy>, execute: bool) -> VolumePolicyPayload {
+        VolumePolicyPayload {
+            volume: volume.into(),
+            strategy,
+            service: (strategy == Some(Strategy::Dump)).then(|| "db".into()),
+            command: (strategy == Some(Strategy::Dump)).then(|| "pg_dumpall -U postgres".into()),
+            execute,
+        }
+    }
+
+    #[test]
+    fn volume_policy_dry_run_describes_and_execute_flags_write() {
+        let cfg = ComposeConfig::parse(crate::compose_config::FIXTURE).unwrap();
+        let r =
+            volume_policy_result("media", &cfg, &vp("pg", Some(Strategy::Dump), false)).unwrap();
+        assert!(r.dry_run && r.how_to_execute.is_some());
+        assert_eq!(r.change.target, "volume:media/pg");
+        assert!(r.change.detail.as_deref().unwrap().contains("pg_dumpall"));
+        let r =
+            volume_policy_result("media", &cfg, &vp("data", Some(Strategy::Export), true)).unwrap();
+        assert!(!r.dry_run);
+        let r = volume_policy_result("media", &cfg, &vp("data", None, false)).unwrap();
+        assert_eq!(r.change.action, "clear-policy");
+    }
+
+    #[test]
+    fn volume_policy_rejects_unknown_volumes_and_bad_dumps() {
+        let cfg = ComposeConfig::parse(crate::compose_config::FIXTURE).unwrap();
+        let err = volume_policy_result("media", &cfg, &vp("nope", Some(Strategy::Export), false))
+            .unwrap_err();
+        assert!(err.to_string().contains("no named volume"), "{err}");
+        let mut p = vp("pg", Some(Strategy::Dump), true);
+        p.command = None;
+        assert!(volume_policy_result("media", &cfg, &p).is_err());
+    }
+
+    #[test]
+    fn stack_declares_volume_policy_action() {
+        let d = stack_declaration();
+        let update = d.verbs.iter().find(|v| v.verb == Verb::Update).unwrap();
+        let a = update
+            .actions
+            .iter()
+            .find(|a| a.action == "volume_policy")
+            .unwrap();
+        assert!(a.payload_schema.is_some() && a.response_schema.is_some());
     }
 
     #[test]
