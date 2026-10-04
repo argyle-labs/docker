@@ -85,6 +85,8 @@ vocabulary spans both). Every operation is available through `unit` list / detai
 | **view** compose YAML + `.env` + status | `detail` | `id.kind = "stack"`, `id.id = <name>` |
 | **tail** stack logs | `detail` | `id.kind = "stack"`, `query.kind = "logs"` |
 | **edit** (rewrite YAML/env, no deploy) | `update` | `action = "edit"`, `{ compose_yaml?, compose_env? }` |
+| **audit** (lint: restart policy, bind sources, named volumes) | `detail` | `query.kind = "audit"`, optional `query.extra = { managed_roots }` |
+| **fix** audit findings (dry run by default, shows the diff) | `update` | `action = "fix"`, `{ execute?, items?, managed_roots? }` |
 | **deploy / lifecycle** | `update` | `action = up`\|`down`\|`start`\|`stop`\|`restart`\|`build`\|`pull` |
 | **register + deploy** (add-only) | `create` | `action = "deploy"`, deploy payload |
 | **register-or-replace + deploy** | `upsert` | `action = "set"`, deploy payload |
@@ -113,6 +115,19 @@ vocabulary spans both). Every operation is available through `unit` list / detai
 
 // update (deploy the edit) — bring the changed stack up
 { "id": { "kind": "stack", "id": "myapp", ... }, "action": "up" }
+
+// detail (audit) — flags restart `no`/unset/`on-failure[:N]` (proposes unless-stopped),
+// bind sources that are missing or outside the managed mounts (proposes the same
+// tail under a managed root, e.g. /mnt/willow/media → /mnt/data/media), and data
+// in named volumes. Managed roots default to /mnt/data, /mnt/backups,
+// /mnt/downloads, /opt/appdata; override per call or with ORCA_DOCKER_MANAGED_ROOTS.
+{ "id": { "kind": "stack", "id": "myapp", ... }, "query": { "kind": "audit" } }
+
+// update (fix) — dry run returns the changes + diff; execute writes only the
+// confirmed finding ids that still apply. Does not deploy: run action=up after.
+{ "id": { "kind": "stack", "id": "myapp", ... }, "action": "fix" }
+{ "id": { "kind": "stack", "id": "myapp", ... }, "action": "fix",
+  "payload": { "execute": true, "items": ["restart:app", "bind:app:/mnt/willow/media"] } }
 ```
 
 To **tear down** a stack, run `update action=down` first, then `delete` to
