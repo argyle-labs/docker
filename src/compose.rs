@@ -119,6 +119,11 @@ impl Compose {
         &self.file
     }
 
+    /// The override file passed after the compose file, if any.
+    pub fn override_file(&self) -> Option<&Path> {
+        self.override_file.as_deref()
+    }
+
     /// The compose files in `-f` order: the compose file, then its override.
     pub fn files(&self) -> Vec<&Path> {
         std::iter::once(self.file.as_path())

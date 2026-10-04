@@ -8,11 +8,13 @@
 //! event subscription) we'll add a third layer rather than retro-fitting.
 
 pub mod compose;
+pub mod compose_config;
 pub mod containers;
 pub mod engine;
 pub mod execute;
 pub mod host_update;
 pub mod lifecycle;
+pub mod lint;
 pub mod prune;
 pub mod registration;
 pub mod runtime_adapter;
