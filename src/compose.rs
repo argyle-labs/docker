@@ -67,10 +67,21 @@ pub struct ServiceSummary {
     pub ports: Vec<String>,
 }
 
+/// Override files compose would auto-load next to the compose file, in its
+/// order. Passing `-f` turns auto-loading off, so the first one present must
+/// be passed explicitly.
+const OVERRIDE_FILES: &[&str] = &[
+    "compose.override.yml",
+    "compose.override.yaml",
+    "docker-compose.override.yml",
+    "docker-compose.override.yaml",
+];
+
 /// A located compose project.
 #[derive(Debug, Clone)]
 pub struct Compose {
     file: PathBuf,
+    override_file: Option<PathBuf>,
 }
 
 impl Compose {
@@ -85,7 +96,14 @@ impl Compose {
         ] {
             let full = project_path.join(name);
             if full.exists() {
-                return Some(Compose { file: full });
+                let override_file = OVERRIDE_FILES
+                    .iter()
+                    .map(|o| project_path.join(o))
+                    .find(|o| o.exists());
+                return Some(Compose {
+                    file: full,
+                    override_file,
+                });
             }
         }
         None
@@ -99,6 +117,21 @@ impl Compose {
 
     pub fn file(&self) -> &Path {
         &self.file
+    }
+
+    /// The compose files in `-f` order: the compose file, then its override.
+    pub fn files(&self) -> Vec<&Path> {
+        std::iter::once(self.file.as_path())
+            .chain(self.override_file.as_deref())
+            .collect()
+    }
+
+    /// `-f <file>` for each of [`files`](Self::files).
+    pub fn file_args(&self) -> Vec<String> {
+        self.files()
+            .into_iter()
+            .flat_map(|f| ["-f".to_string(), f.to_string_lossy().into_owned()])
+            .collect()
     }
 
     /// Service names declared in the compose file.
@@ -169,9 +202,15 @@ impl Compose {
     pub async fn restart(&self, services: &[&str]) -> Result<String, ComposeError> {
         self.lifecycle("restart", services).await
     }
-    /// `docker compose up -d --remove-orphans` for the given services (or all).
+    /// `docker compose up -d` for the given services (or all).
     pub async fn up(&self, services: &[&str]) -> Result<String, ComposeError> {
-        Ok(self.docker(&up_args(services)).await?)
+        Ok(self.docker(&up_args(services, false)).await?)
+    }
+    /// `up -d --remove-orphans`: also removes containers of services the
+    /// compose files no longer declare. Only for callers that listed those
+    /// orphans and had them confirmed.
+    pub async fn up_removing_orphans(&self) -> Result<String, ComposeError> {
+        Ok(self.docker(&up_args(&[], true)).await?)
     }
     /// `docker compose down`. When `services` is non-empty, falls back to
     /// `compose stop <svc>` since compose-down is project-scoped.
@@ -228,17 +267,19 @@ impl Compose {
     }
 
     async fn docker(&self, sub: &[&str]) -> Result<String, anyhow::Error> {
-        let cf = self.file.to_string_lossy();
-        let mut args: Vec<&str> = vec!["compose", "-f", &cf];
+        let files = self.file_args();
+        let mut args: Vec<&str> = vec!["compose"];
+        args.extend(files.iter().map(String::as_str));
         args.extend_from_slice(sub);
         super::run(&args, None).await
     }
 }
 
-/// `up` removes containers of services dropped from the compose file, which
-/// would otherwise keep running unmanaged.
-fn up_args<'a>(services: &[&'a str]) -> Vec<&'a str> {
-    let mut args = vec!["up", "-d", "--remove-orphans"];
+fn up_args<'a>(services: &[&'a str], remove_orphans: bool) -> Vec<&'a str> {
+    let mut args = vec!["up", "-d"];
+    if remove_orphans {
+        args.push("--remove-orphans");
+    }
     args.extend_from_slice(services);
     args
 }
@@ -336,6 +377,22 @@ mod tests {
     }
 
     #[test]
+    fn find_passes_the_override_compose_would_auto_load() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("docker-compose.yml"), "services: {}").unwrap();
+        let c = Compose::find(dir.path()).unwrap();
+        assert_eq!(c.file_args().len(), 2, "no override yet");
+        std::fs::write(dir.path().join("docker-compose.override.yaml"), "").unwrap();
+        std::fs::write(dir.path().join("compose.override.yml"), "").unwrap();
+        let c = Compose::find(dir.path()).unwrap();
+        let args = c.file_args();
+        assert_eq!(args.len(), 4);
+        assert_eq!(args[0], "-f");
+        assert!(args[1].ends_with("docker-compose.yml"));
+        assert!(args[3].ends_with("compose.override.yml"), "{args:?}");
+    }
+
+    #[test]
     fn find_returns_none_when_absent() {
         let dir = tempdir().unwrap();
         assert!(Compose::find(dir.path()).is_none());
@@ -362,12 +419,10 @@ mod tests {
     }
 
     #[test]
-    fn up_removes_orphans_and_pull_is_quiet() {
-        assert_eq!(up_args(&[]), vec!["up", "-d", "--remove-orphans"]);
-        assert_eq!(
-            up_args(&["web"]),
-            vec!["up", "-d", "--remove-orphans", "web"]
-        );
+    fn up_removes_orphans_only_when_asked_and_pull_is_quiet() {
+        assert_eq!(up_args(&[], false), vec!["up", "-d"]);
+        assert_eq!(up_args(&["web"], false), vec!["up", "-d", "web"]);
+        assert_eq!(up_args(&[], true), vec!["up", "-d", "--remove-orphans"]);
         assert_eq!(pull_args(&[]), vec!["pull", "-q"]);
         assert_eq!(pull_args(&["web"]), vec!["pull", "-q", "web"]);
     }
