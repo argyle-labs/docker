@@ -169,11 +169,9 @@ impl Compose {
     pub async fn restart(&self, services: &[&str]) -> Result<String, ComposeError> {
         self.lifecycle("restart", services).await
     }
-    /// `docker compose up -d` (detached) for the given services (or all).
+    /// `docker compose up -d --remove-orphans` for the given services (or all).
     pub async fn up(&self, services: &[&str]) -> Result<String, ComposeError> {
-        let mut args = vec!["up", "-d"];
-        args.extend_from_slice(services);
-        Ok(self.docker(&args).await?)
+        Ok(self.docker(&up_args(services)).await?)
     }
     /// `docker compose down`. When `services` is non-empty, falls back to
     /// `compose stop <svc>` since compose-down is project-scoped.
@@ -190,9 +188,7 @@ impl Compose {
         Ok(self.docker(&args).await?)
     }
     pub async fn pull(&self, services: &[&str]) -> Result<String, ComposeError> {
-        let mut args = vec!["pull"];
-        args.extend_from_slice(services);
-        Ok(self.docker(&args).await?)
+        Ok(self.docker(&pull_args(services)).await?)
     }
     pub async fn logs(&self, services: &[&str], tail: u32) -> Result<String, ComposeError> {
         let tail_str = tail.to_string();
@@ -237,6 +233,21 @@ impl Compose {
         args.extend_from_slice(sub);
         super::run(&args, None).await
     }
+}
+
+/// `up` removes containers of services dropped from the compose file, which
+/// would otherwise keep running unmanaged.
+fn up_args<'a>(services: &[&'a str]) -> Vec<&'a str> {
+    let mut args = vec!["up", "-d", "--remove-orphans"];
+    args.extend_from_slice(services);
+    args
+}
+
+/// `pull -q`: progress bars would fill the returned output.
+fn pull_args<'a>(services: &[&'a str]) -> Vec<&'a str> {
+    let mut args = vec!["pull", "-q"];
+    args.extend_from_slice(services);
+    args
 }
 
 /// The top-level `name` of `docker compose config --format json` output.
@@ -348,6 +359,17 @@ mod tests {
 "#;
         let out = parse_compose_ps(raw);
         assert_eq!(out["web"].ports, vec!["80:80"]);
+    }
+
+    #[test]
+    fn up_removes_orphans_and_pull_is_quiet() {
+        assert_eq!(up_args(&[]), vec!["up", "-d", "--remove-orphans"]);
+        assert_eq!(
+            up_args(&["web"]),
+            vec!["up", "-d", "--remove-orphans", "web"]
+        );
+        assert_eq!(pull_args(&[]), vec!["pull", "-q"]);
+        assert_eq!(pull_args(&["web"]), vec!["pull", "-q", "web"]);
     }
 
     #[test]

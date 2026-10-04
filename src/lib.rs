@@ -11,6 +11,7 @@ pub mod compose;
 pub mod containers;
 pub mod engine;
 pub mod execute;
+pub mod host_update;
 pub mod lifecycle;
 pub mod prune;
 pub mod registration;
