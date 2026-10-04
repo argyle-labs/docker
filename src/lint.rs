@@ -101,15 +101,28 @@ fn under(path: &str, root: &str) -> bool {
 }
 
 /// The same tail of `source` under a managed root, if it exists there:
-/// `/mnt/willow/media` → `/mnt/data/media`. Longest matching tail wins.
+/// `/mnt/willow/media` → `/mnt/data/media`. Longest matching tail wins. A
+/// one-component tail (`config`, `data`) matches unrelated directories, so it
+/// counts only when it names the stack or service (`names`).
 pub fn propose_equivalent(
     source: &str,
     roots: &[String],
+    names: &[&str],
     exists: &dyn Fn(&Path) -> bool,
 ) -> Option<String> {
     let parts: Vec<&str> = source.split('/').filter(|p| !p.is_empty()).collect();
     for skip in 1..parts.len() {
-        let tail = parts[skip..].join("/");
+        let tail_parts = &parts[skip..];
+        let named = tail_parts.iter().any(|p| {
+            let p = p.to_ascii_lowercase();
+            names
+                .iter()
+                .any(|n| !n.is_empty() && p.contains(&n.to_ascii_lowercase()))
+        });
+        if tail_parts.len() < 2 && !named {
+            continue;
+        }
+        let tail = tail_parts.join("/");
         for root in roots {
             let candidate = PathBuf::from(root).join(&tail);
             let candidate = candidate.to_string_lossy();
@@ -131,6 +144,7 @@ pub fn audit(
 ) -> Vec<Finding> {
     let mut out = Vec::new();
     for (svc, s) in &cfg.services {
+        let names = [cfg.name.as_str(), svc.as_str()];
         let restart = s.restart.as_deref().unwrap_or("");
         if restart.is_empty() || restart == "no" || restart.starts_with("on-failure") {
             let current = if restart.is_empty() {
@@ -161,7 +175,7 @@ pub fn audit(
                     // A missing path under a managed root is a mount that is
                     // down, not a path to move elsewhere.
                     let proposed = (!managed)
-                        .then(|| propose_equivalent(src, roots, exists))
+                        .then(|| propose_equivalent(src, roots, &names, exists))
                         .flatten();
                     (
                         FindingKind::BindMissing,
@@ -176,7 +190,7 @@ pub fn audit(
                             m.target,
                             roots.join(", ")
                         ),
-                        propose_equivalent(src, roots, exists),
+                        propose_equivalent(src, roots, &names, exists),
                     )
                 } else {
                     continue;
@@ -282,40 +296,122 @@ fn fix_restart(lines: &mut Vec<String>, svc: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Replace `old` where it stands as a whole path: the next char must end it,
-/// so `/mnt/a` does not match inside `/mnt/ab`.
-fn replace_path(line: &str, old: &str, new: &str) -> Option<String> {
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line;
+/// Replace `old` where it stands as a whole path: it must start the text or
+/// follow a space, quote, `-` or `=`, and the next char must end it, so
+/// `/mnt/a` matches neither inside `/mnt/ab` nor inside `/x/mnt/a`.
+fn replace_path(text: &str, old: &str, new: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut prev: Option<char> = None;
     let mut hit = false;
     while let Some(pos) = rest.find(old) {
+        let before = rest[..pos].chars().next_back().or(prev);
+        let starts = matches!(before, None | Some(' ' | '"' | '\'' | '-' | '='));
         let after = rest[pos + old.len()..].chars().next();
-        let ends = matches!(after, None | Some(':' | '"' | '\'' | ' ' | ',' | ']' | '/'));
+        let ends = matches!(after, None | Some(':' | '"' | '\'' | ' ' | ',' | ']'));
         out.push_str(&rest[..pos]);
-        out.push_str(if ends && after != Some('/') { new } else { old });
-        hit |= ends && after != Some('/');
+        out.push_str(if starts && ends { new } else { old });
+        hit |= starts && ends;
+        prev = old.chars().next_back();
         rest = &rest[pos + old.len()..];
     }
     out.push_str(rest);
     hit.then_some(out)
 }
 
+/// `(start, end)` of the lines of a `volumes:` list directly under a block
+/// whose keys sit at `child` indent. List items may sit at the key's indent.
+fn volumes_block(lines: &[String], from: usize, to: usize, child: usize) -> Option<(usize, usize)> {
+    let key = (from..to).find(|&i| {
+        indent_of(&lines[i]) == child && lines[i].trim_start().trim_end() == "volumes:"
+    })?;
+    let end = (key + 1..to)
+        .find(|&i| {
+            let l = &lines[i];
+            is_content(l)
+                && (indent_of(l) < child
+                    || (indent_of(l) == child && !l.trim_start().starts_with('-')))
+        })
+        .unwrap_or(to);
+    Some((key + 1, end))
+}
+
+/// Rewrite the source of one volume entry line when it is `old`: short
+/// syntax (`- /src:/dst[:ro]`, optionally quoted) or a long-syntax
+/// `source:` key. Targets, options and every other key are left alone.
+fn rewrite_volume_source(line: &str, old: &str, new: &str) -> Option<String> {
+    let body_at = line.len() - line.trim_start().len();
+    let mut body = &line[body_at..];
+    let mut offset = body_at;
+    if let Some(rest) = body.strip_prefix("- ") {
+        offset += 2 + (rest.len() - rest.trim_start().len());
+        body = rest.trim_start();
+    }
+    if let Some(v) = body.strip_prefix("source:") {
+        let value_at = offset + "source:".len() + (v.len() - v.trim_start().len());
+        let value = line[value_at..].trim_end();
+        let bare = value.trim_matches(|c| c == '"' || c == '\'');
+        if bare != old {
+            return None;
+        }
+        let rewritten = replace_path(value, old, new)?;
+        return Some(format!("{}{rewritten}", &line[..value_at]));
+    }
+    if offset == body_at || body.contains(": ") {
+        return None;
+    }
+    let unquoted = body.trim_start_matches(['"', '\'']);
+    let src_end = unquoted.find(':').unwrap_or(unquoted.len());
+    if &unquoted[..src_end] != old {
+        return None;
+    }
+    let src_at = offset + (body.len() - unquoted.len());
+    let segment = &line[src_at..src_at + src_end];
+    let rewritten = replace_path(segment, old, new)?;
+    Some(format!(
+        "{}{rewritten}{}",
+        &line[..src_at],
+        &line[src_at + src_end..]
+    ))
+}
+
 fn fix_bind(lines: &mut [String], svc: &str, old: &str, new: &str) -> Result<(), String> {
-    let (header, end, _) = service_block(lines, svc)
+    let (header, end, child) = service_block(lines, svc)
         .ok_or_else(|| format!("service '{svc}' not found in the file"))?;
+    let not_literal = || {
+        format!(
+            "{old} is not written literally in service '{svc}' volumes (interpolated or relative); fix by hand"
+        )
+    };
+    let (from, to) = volumes_block(lines, header + 1, end, child).ok_or_else(not_literal)?;
     let mut hit = false;
-    for line in &mut lines[header + 1..end] {
-        if let Some(rewritten) = replace_path(line, old, new) {
+    for line in &mut lines[from..to] {
+        if let Some(rewritten) = rewrite_volume_source(line, old, new) {
             *line = rewritten;
             hit = true;
         }
     }
-    if hit {
-        Ok(())
-    } else {
-        Err(format!(
-            "{old} is not written literally in service '{svc}' (interpolated or relative); fix by hand"
-        ))
+    if hit { Ok(()) } else { Err(not_literal()) }
+}
+
+/// Whether the override file sets what `f` would fix: compose applies the
+/// override last, so an edit to the compose file would not take effect.
+fn set_in_override(lines: &[String], f: &Finding) -> bool {
+    let Some((header, end, child)) = service_block(lines, &f.service) else {
+        return false;
+    };
+    match f.kind {
+        FindingKind::Restart => (header + 1..end).any(|i| {
+            indent_of(&lines[i]) == child && lines[i].trim_start().starts_with("restart:")
+        }),
+        FindingKind::BindMissing | FindingKind::BindUnmanaged => {
+            volumes_block(lines, header + 1, end, child).is_some_and(|(from, to)| {
+                lines[from..to]
+                    .iter()
+                    .any(|l| rewrite_volume_source(l, &f.current, "").is_some())
+            })
+        }
+        FindingKind::NamedVolume => false,
     }
 }
 
@@ -334,10 +430,21 @@ pub struct FixOutcome {
     pub not_fixed: Vec<NotFixed>,
 }
 
-/// Apply the fixes for `ids` to `yaml`. Findings that cannot be applied are
-/// reported in `not_fixed`; the rest of the file is untouched.
-pub fn apply_fixes(yaml: &str, findings: &[Finding], ids: &[String]) -> FixOutcome {
+/// Apply the fixes for `ids` to `yaml`. Findings that cannot be applied, or
+/// whose value the override file (`override_yaml`, when there is one) sets,
+/// are reported in `not_fixed`; the rest of the file is untouched.
+pub fn apply_fixes(
+    yaml: &str,
+    override_yaml: Option<&str>,
+    findings: &[Finding],
+    ids: &[String],
+) -> FixOutcome {
     let mut lines: Vec<String> = yaml.lines().map(str::to_string).collect();
+    let override_lines: Vec<String> = override_yaml
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
     let mut outcome = FixOutcome::default();
     for id in ids {
         let Some(f) = findings.iter().find(|f| &f.id == id) else {
@@ -345,6 +452,10 @@ pub fn apply_fixes(yaml: &str, findings: &[Finding], ids: &[String]) -> FixOutco
         };
         let result = match (f.kind, f.proposed.as_deref()) {
             (_, _) if !f.fixable => Err("not auto-fixable".to_string()),
+            (_, _) if set_in_override(&override_lines, f) => Err(
+                "the override file sets this value and compose applies it last; fix it there"
+                    .to_string(),
+            ),
             (FindingKind::Restart, _) => fix_restart(&mut lines, &f.service),
             (FindingKind::BindMissing | FindingKind::BindUnmanaged, Some(new)) => {
                 fix_bind(&mut lines, &f.service, &f.current, new)
@@ -553,7 +664,7 @@ volumes:
             "bind:app:/mnt/willow/media".to_string(),
             "restart:worker".to_string(),
         ];
-        let out = apply_fixes(YAML, &f, &wanted);
+        let out = apply_fixes(YAML, None, &f, &wanted);
         assert_eq!(out.applied, wanted);
         assert!(out.not_fixed.is_empty(), "{:?}", out.not_fixed);
         assert_eq!(
@@ -580,7 +691,7 @@ volumes:
     #[test]
     fn fix_only_touches_the_requested_ids() {
         let f = yaml_findings();
-        let out = apply_fixes(YAML, &f, &["restart:worker".to_string()]);
+        let out = apply_fixes(YAML, None, &f, &["restart:worker".to_string()]);
         assert!(out.yaml.contains("restart: on-failure:3"));
         assert!(out.yaml.contains("/mnt/willow/media:/media"));
     }
@@ -591,6 +702,7 @@ volumes:
         let interpolated = "services:\n  app:\n    volumes:\n      - ${MEDIA}:/media\n";
         let out = apply_fixes(
             interpolated,
+            None,
             &f,
             &[
                 "bind:app:/mnt/willow/media".to_string(),
@@ -601,6 +713,128 @@ volumes:
         assert_eq!(out.not_fixed.len(), 2);
         assert!(out.not_fixed[0].reason.contains("not written literally"));
         assert_eq!(out.yaml, interpolated);
+    }
+
+    #[test]
+    fn replace_path_needs_a_left_boundary() {
+        assert_eq!(
+            replace_path("/mnt/a", "/mnt/a", "/x").as_deref(),
+            Some("/x")
+        );
+        assert_eq!(
+            replace_path("\"/mnt/a\"", "/mnt/a", "/x").as_deref(),
+            Some("\"/x\"")
+        );
+        assert_eq!(replace_path("/srv/mnt/a:/a", "/mnt/a", "/x"), None);
+        assert_eq!(replace_path("/mnt/ab", "/mnt/a", "/x"), None);
+        assert_eq!(replace_path("/mnt/a/sub", "/mnt/a", "/x"), None);
+    }
+
+    fn bind_finding(svc: &str, current: &str, proposed: &str) -> Finding {
+        Finding {
+            id: format!("bind:{svc}:{current}"),
+            kind: FindingKind::BindUnmanaged,
+            service: svc.into(),
+            detail: String::new(),
+            current: current.into(),
+            proposed: Some(proposed.into()),
+            fixable: true,
+        }
+    }
+
+    #[test]
+    fn bind_fix_edits_only_the_matching_volume_source() {
+        let yaml = "\
+services:
+  app:
+    image: x
+    command: [\"--dir\", \"/mnt/willow/media\"]
+    environment:
+      - MEDIA=/mnt/willow/media
+    labels:
+      path: /mnt/willow/media
+    volumes:
+      - /mnt/willow/media:/mnt/willow/media:ro
+      - type: bind
+        source: \"/mnt/willow/media\"
+        target: /mirror
+      - /mnt/willow/media2:/other
+";
+        let f = bind_finding("app", "/mnt/willow/media", "/mnt/data/media");
+        let out = apply_fixes(
+            yaml,
+            None,
+            &[f],
+            &["bind:app:/mnt/willow/media".to_string()],
+        );
+        assert!(out.not_fixed.is_empty(), "{:?}", out.not_fixed);
+        assert_eq!(
+            out.yaml,
+            "\
+services:
+  app:
+    image: x
+    command: [\"--dir\", \"/mnt/willow/media\"]
+    environment:
+      - MEDIA=/mnt/willow/media
+    labels:
+      path: /mnt/willow/media
+    volumes:
+      - /mnt/data/media:/mnt/willow/media:ro
+      - type: bind
+        source: \"/mnt/data/media\"
+        target: /mirror
+      - /mnt/willow/media2:/other
+"
+        );
+    }
+
+    #[test]
+    fn a_bind_only_outside_volumes_is_not_fixed() {
+        let yaml = "services:\n  app:\n    environment:\n      - MEDIA=/mnt/willow/media\n";
+        let f = bind_finding("app", "/mnt/willow/media", "/mnt/data/media");
+        let out = apply_fixes(
+            yaml,
+            None,
+            &[f],
+            &["bind:app:/mnt/willow/media".to_string()],
+        );
+        assert!(out.applied.is_empty());
+        assert_eq!(out.yaml, yaml);
+    }
+
+    #[test]
+    fn a_one_component_tail_needs_the_stack_or_service_name() {
+        let roots = vec!["/mnt/data".to_string()];
+        let there = fs(&["/mnt/data/config", "/mnt/data/sonarr", "/mnt/data/tv/shows"]);
+        assert_eq!(
+            propose_equivalent("/mnt/willow/config", &roots, &["media", "app"], &there),
+            None
+        );
+        assert_eq!(
+            propose_equivalent("/mnt/willow/sonarr", &roots, &["arr", "sonarr"], &there).as_deref(),
+            Some("/mnt/data/sonarr")
+        );
+        assert_eq!(
+            propose_equivalent("/mnt/willow/tv/shows", &roots, &[], &there).as_deref(),
+            Some("/mnt/data/tv/shows")
+        );
+    }
+
+    #[test]
+    fn a_value_the_override_sets_is_not_fixed() {
+        let f = yaml_findings();
+        let override_yaml = "services:\n  app:\n    restart: on-failure:3\n    volumes:\n      - /mnt/willow/media:/media\n";
+        let wanted = vec![
+            "restart:app".to_string(),
+            "bind:app:/mnt/willow/media".to_string(),
+            "restart:worker".to_string(),
+        ];
+        let out = apply_fixes(YAML, Some(override_yaml), &f, &wanted);
+        assert_eq!(out.applied, vec!["restart:worker"]);
+        assert_eq!(out.not_fixed.len(), 2);
+        assert!(out.not_fixed.iter().all(|n| n.reason.contains("override")));
+        assert!(out.yaml.contains("restart: on-failure:3"));
     }
 
     #[test]

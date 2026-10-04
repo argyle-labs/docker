@@ -82,12 +82,35 @@ impl StackRow {
     }
 
     /// Write compose file contents (the `edit` operation), creating `dir` if
-    /// needed.
+    /// needed. The previous file is kept as `<file>.bak`, and the new one is
+    /// written to a temp file and renamed over it, so a crash never leaves a
+    /// half-written compose file.
     pub fn write_compose(&self, yaml: &str) -> Result<()> {
         std::fs::create_dir_all(&self.dir)
             .with_context(|| format!("creating stack dir {}", self.dir))?;
         let p = self.compose_path();
-        std::fs::write(&p, yaml).with_context(|| format!("writing compose file {}", p.display()))
+        if p.exists() {
+            let bak = Path::new(&self.dir).join(format!("{}.bak", self.file));
+            std::fs::copy(&p, &bak)
+                .with_context(|| format!("keeping a backup at {}", bak.display()))?;
+        }
+        let tmp = Path::new(&self.dir).join(format!(".{}.orca-tmp", self.file));
+        std::fs::write(&tmp, yaml).with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, &p).with_context(|| format!("replacing compose file {}", p.display()))
+    }
+
+    /// [`write_compose`](Self::write_compose), refused when the file on disk
+    /// no longer hashes to `read_before`: someone edited it since it was read,
+    /// and writing would discard their change.
+    pub fn write_compose_if_unchanged(&self, yaml: &str, read_before: &str) -> Result<()> {
+        let now = self.read_compose()?;
+        if content_hash(&now) != content_hash(read_before) {
+            anyhow::bail!(
+                "compose file {} changed since it was read; re-run the dry run",
+                self.compose_path().display()
+            );
+        }
+        self.write_compose(yaml)
     }
 
     /// Write `.env` contents. Empty input is a no-op (leaves any existing file
@@ -105,6 +128,13 @@ impl StackRow {
     pub fn compose(&self) -> Result<Compose, crate::ComposeError> {
         Compose::open(Path::new(&self.dir))
     }
+}
+
+fn content_hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
 }
 
 fn to_dbrow(row: &StackRow) -> DbRow {
@@ -213,6 +243,39 @@ mod tests {
         r.write_compose("services:\n  web:\n    image: nginx\n")
             .unwrap();
         assert!(r.read_compose().unwrap().contains("nginx"));
+    }
+
+    #[test]
+    fn write_compose_keeps_a_backup_and_leaves_no_temp_file() {
+        let dir = tempdir().unwrap();
+        let r = row(dir.path());
+        r.write_compose("services: {}\n").unwrap();
+        r.write_compose("services:\n  web: {}\n").unwrap();
+        let bak = dir.path().join(format!("{DEFAULT_COMPOSE_FILE}.bak"));
+        assert_eq!(std::fs::read_to_string(bak).unwrap(), "services: {}\n");
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(!names.iter().any(|n| n.ends_with(".orca-tmp")), "{names:?}");
+    }
+
+    #[test]
+    fn write_compose_if_unchanged_refuses_a_file_edited_since_it_was_read() {
+        let dir = tempdir().unwrap();
+        let r = row(dir.path());
+        r.write_compose("a: 1\n").unwrap();
+        let read = r.read_compose().unwrap();
+        std::fs::write(r.compose_path(), "a: 2\n").unwrap();
+        let err = r.write_compose_if_unchanged("a: 3\n", &read).unwrap_err();
+        assert!(
+            err.to_string().contains("changed since it was read"),
+            "{err}"
+        );
+        assert_eq!(r.read_compose().unwrap(), "a: 2\n");
+        let read = r.read_compose().unwrap();
+        r.write_compose_if_unchanged("a: 3\n", &read).unwrap();
+        assert_eq!(r.read_compose().unwrap(), "a: 3\n");
     }
 
     #[test]

@@ -259,9 +259,15 @@ impl DockerUnitProvider {
         let roots = lint::managed_roots(p.managed_roots.as_deref());
         let findings = stack_findings(row, &roots).await?;
         let yaml = row.read_compose()?;
-        let (result, new_yaml) = fix_result(&yaml, &findings, &p)?;
+        let override_yaml = row
+            .compose()
+            .map_err(anyhow::Error::from)?
+            .override_file()
+            .map(std::fs::read_to_string)
+            .transpose()?;
+        let (result, new_yaml) = fix_result(&yaml, override_yaml.as_deref(), &findings, &p)?;
         if let Some(new_yaml) = new_yaml {
-            row.write_compose(&new_yaml)?;
+            row.write_compose_if_unchanged(&new_yaml, &yaml)?;
         }
         Ok(VerbOutcome::Item(ItemOutcome::new(
             id.clone(),
@@ -850,6 +856,7 @@ const FIX_TOOL: &str = "stack fix";
 /// contract is testable without a compose CLI.
 fn fix_result(
     yaml: &str,
+    override_yaml: Option<&str>,
     findings: &[Finding],
     p: &StackFixPayload,
 ) -> Result<(StackFixResult, Option<String>)> {
@@ -858,7 +865,7 @@ fn fix_result(
         .filter(|f| f.fixable)
         .map(|f| f.id.clone())
         .collect();
-    let planned = lint::apply_fixes(yaml, findings, &fixable);
+    let planned = lint::apply_fixes(yaml, override_yaml, findings, &fixable);
     let change = |id: &String| {
         let f = findings.iter().find(|f| &f.id == id);
         PlannedChange::new(id, "rewrite").with_detail(match f {
@@ -885,7 +892,7 @@ fn fix_result(
     }
     crate::execute::require_confirmed(FIX_TOOL, &p.items, &planned.applied)?;
     let (act, dropped) = crate::execute::intersect(&p.items, &planned.applied);
-    let outcome = lint::apply_fixes(yaml, findings, &act);
+    let outcome = lint::apply_fixes(yaml, override_yaml, findings, &act);
     let mut not_fixed = outcome.not_fixed;
     not_fixed.extend(dropped.into_iter().map(|id| NotFixed {
         id,
@@ -1230,7 +1237,7 @@ mod tests {
     #[test]
     fn fix_dry_run_returns_changes_and_diff_and_writes_nothing() {
         let (result, write) =
-            fix_result(FIX_YAML, &fix_findings(), &StackFixPayload::default()).unwrap();
+            fix_result(FIX_YAML, None, &fix_findings(), &StackFixPayload::default()).unwrap();
         assert!(result.dry_run && write.is_none());
         let targets: Vec<_> = result.changes.iter().map(|c| c.target.as_str()).collect();
         assert_eq!(targets, vec!["restart:app", "restart:worker"]);
@@ -1251,7 +1258,7 @@ mod tests {
             items: vec!["restart:app".into(), "restart:gone".into()],
             managed_roots: None,
         };
-        let (result, write) = fix_result(FIX_YAML, &fix_findings(), &p).unwrap();
+        let (result, write) = fix_result(FIX_YAML, None, &fix_findings(), &p).unwrap();
         assert!(!result.dry_run);
         assert_eq!(result.applied, vec!["restart:app"]);
         assert_eq!(result.not_fixed[0].id, "restart:gone");
@@ -1267,7 +1274,7 @@ mod tests {
             execute: true,
             ..Default::default()
         };
-        let err = fix_result(FIX_YAML, &fix_findings(), &p).unwrap_err();
+        let err = fix_result(FIX_YAML, None, &fix_findings(), &p).unwrap_err();
         assert!(err.to_string().contains("items from the dry run"), "{err}");
     }
 
