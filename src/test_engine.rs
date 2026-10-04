@@ -7,12 +7,14 @@ use std::sync::{Arc, Mutex};
 
 use bollard::Docker;
 
-/// One canned answer: `method` plus a path suffix (the `/v1.xx` prefix and
-/// query string are ignored) mapped to a status and JSON body.
+/// One canned answer: `method` plus a path suffix (the `/v1.xx` prefix is
+/// ignored), optionally narrowed to requests whose percent-decoded query
+/// contains `query`, mapped to a status and JSON body. The first match wins.
 #[derive(Clone)]
 pub struct Route {
     pub method: &'static str,
     pub path: String,
+    pub query: Option<String>,
     pub status: u16,
     pub body: String,
 }
@@ -27,10 +29,37 @@ impl Route {
         Self {
             method,
             path: path.into(),
+            query: None,
             status,
             body: body.into(),
         }
     }
+
+    pub fn when_query(mut self, contains: impl Into<String>) -> Self {
+        self.query = Some(contains.into());
+        self
+    }
+}
+
+/// Percent-decode a request target (`+` stays as is; bollard encodes spaces
+/// as `%20`).
+pub fn decode(target: &str) -> String {
+    let bytes = target.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(b) = u8::from_str_radix(&target[i + 1..i + 3], 16)
+        {
+            out.push(b);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 pub struct FakeEngine {
@@ -69,9 +98,14 @@ impl FakeEngine {
                 let method = parts.next().unwrap_or_default();
                 let target = parts.next().unwrap_or_default();
                 let path = target.split('?').next().unwrap_or_default();
+                let query = decode(target.split_once('?').map(|(_, q)| q).unwrap_or_default());
                 let (status, body) = routes
                     .iter()
-                    .find(|r| r.method == method && path.ends_with(&r.path))
+                    .find(|r| {
+                        r.method == method
+                            && path.ends_with(&r.path)
+                            && r.query.as_ref().is_none_or(|q| query.contains(q.as_str()))
+                    })
                     .map(|r| (r.status, r.body.clone()))
                     .unwrap_or((404, r#"{"message":"no such route"}"#.to_string()));
                 let response = format!(
@@ -102,6 +136,17 @@ impl FakeEngine {
     /// Request lines seen so far, e.g. `DELETE /v1.52/volumes/abc HTTP/1.1`.
     pub fn requests(&self) -> Vec<String> {
         self.seen.lock().expect("lock").clone()
+    }
+
+    /// Percent-decoded request targets (path and query) with the given method.
+    pub fn targets(&self, method: &str) -> Vec<String> {
+        self.requests()
+            .iter()
+            .filter_map(|l| {
+                let mut p = l.split(' ');
+                (p.next() == Some(method)).then(|| decode(p.next().unwrap_or_default()))
+            })
+            .collect()
     }
 
     /// The request lines with the given method, path only.

@@ -136,10 +136,17 @@ impl Compose {
             .collect())
     }
 
+    /// `docker compose config --format json`: the file as compose resolves
+    /// it, with interpolation applied, paths made absolute and mounts in long
+    /// syntax.
+    pub async fn config_json(&self) -> Result<String, ComposeError> {
+        Ok(self.docker(&["config", "--format", "json"]).await?)
+    }
+
     /// The project name from the resolved config: the value the engine stamps
     /// on `com.docker.compose.project`, which need not match the stack name.
     pub async fn project_name(&self) -> Result<String, ComposeError> {
-        let raw = self.docker(&["config", "--format", "json"]).await?;
+        let raw = self.config_json().await?;
         parse_project_name(&raw).ok_or_else(|| {
             ComposeError::Docker(anyhow::anyhow!(
                 "compose config for {} has no project name",
@@ -162,11 +169,9 @@ impl Compose {
     pub async fn restart(&self, services: &[&str]) -> Result<String, ComposeError> {
         self.lifecycle("restart", services).await
     }
-    /// `docker compose up -d` (detached) for the given services (or all).
+    /// `docker compose up -d --remove-orphans` for the given services (or all).
     pub async fn up(&self, services: &[&str]) -> Result<String, ComposeError> {
-        let mut args = vec!["up", "-d"];
-        args.extend_from_slice(services);
-        Ok(self.docker(&args).await?)
+        Ok(self.docker(&up_args(services)).await?)
     }
     /// `docker compose down`. When `services` is non-empty, falls back to
     /// `compose stop <svc>` since compose-down is project-scoped.
@@ -183,9 +188,7 @@ impl Compose {
         Ok(self.docker(&args).await?)
     }
     pub async fn pull(&self, services: &[&str]) -> Result<String, ComposeError> {
-        let mut args = vec!["pull"];
-        args.extend_from_slice(services);
-        Ok(self.docker(&args).await?)
+        Ok(self.docker(&pull_args(services)).await?)
     }
     pub async fn logs(&self, services: &[&str], tail: u32) -> Result<String, ComposeError> {
         let tail_str = tail.to_string();
@@ -232,6 +235,21 @@ impl Compose {
     }
 }
 
+/// `up` removes containers of services dropped from the compose file, which
+/// would otherwise keep running unmanaged.
+fn up_args<'a>(services: &[&'a str]) -> Vec<&'a str> {
+    let mut args = vec!["up", "-d", "--remove-orphans"];
+    args.extend_from_slice(services);
+    args
+}
+
+/// `pull -q`: progress bars would fill the returned output.
+fn pull_args<'a>(services: &[&'a str]) -> Vec<&'a str> {
+    let mut args = vec!["pull", "-q"];
+    args.extend_from_slice(services);
+    args
+}
+
 /// The top-level `name` of `docker compose config --format json` output.
 pub fn parse_project_name(raw: &str) -> Option<String> {
     let v: Value = serde_json::from_str(raw).ok()?;
@@ -239,6 +257,21 @@ pub fn parse_project_name(raw: &str) -> Option<String> {
         .as_str()
         .filter(|n| !n.is_empty())
         .map(str::to_string)
+}
+
+/// Engine-side names of the networks a resolved config declares
+/// `external: true` (its `name`, else its key).
+pub fn parse_external_networks(raw: &str) -> Vec<String> {
+    let Ok(v): Result<Value, _> = serde_json::from_str(raw) else {
+        return Vec::new();
+    };
+    let Some(nets) = v["networks"].as_object() else {
+        return Vec::new();
+    };
+    nets.iter()
+        .filter(|(_, n)| n["external"].as_bool() == Some(true))
+        .map(|(key, n)| n["name"].as_str().unwrap_or(key).to_string())
+        .collect()
 }
 
 /// Parse JSON-lines output of `docker compose ps --format json` into a map
@@ -329,6 +362,17 @@ mod tests {
     }
 
     #[test]
+    fn up_removes_orphans_and_pull_is_quiet() {
+        assert_eq!(up_args(&[]), vec!["up", "-d", "--remove-orphans"]);
+        assert_eq!(
+            up_args(&["web"]),
+            vec!["up", "-d", "--remove-orphans", "web"]
+        );
+        assert_eq!(pull_args(&[]), vec!["pull", "-q"]);
+        assert_eq!(pull_args(&["web"]), vec!["pull", "-q", "web"]);
+    }
+
+    #[test]
     fn parse_project_name_reads_top_level_name() {
         assert_eq!(
             parse_project_name(r#"{"name":"media","services":{}}"#).as_deref(),
@@ -336,6 +380,15 @@ mod tests {
         );
         assert_eq!(parse_project_name(r#"{"services":{}}"#), None);
         assert_eq!(parse_project_name("not json"), None);
+    }
+
+    #[test]
+    fn parse_external_networks_reads_external_names() {
+        let raw = r#"{"networks":{"default":{"name":"media_default"},"proxy":{"name":"caddy_proxy","external":true},"bare":{"external":true}}}"#;
+        let mut nets = parse_external_networks(raw);
+        nets.sort();
+        assert_eq!(nets, vec!["bare", "caddy_proxy"]);
+        assert!(parse_external_networks(r#"{"services":{}}"#).is_empty());
     }
 
     #[test]
