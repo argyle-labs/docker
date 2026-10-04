@@ -38,6 +38,7 @@ Once orca is on the host you never touch the scripts — drive the tools. Payloa
 | `docker.backup` | archive engine state to a `.tar.gz` | `destination`, optional `state_path` |
 | `docker.restore` | restore engine state from an archive | `archive`, optional `state_path` |
 | `docker.prune` | remove dangling images, dangling anonymous volumes and unused compose networks; never named volumes. Dry run by default | optional `stack`; `execute` + `items` from the dry run |
+| `docker.host_update` | upgrade OS packages (apk/apt), then `compose pull -q` + `up -d --remove-orphans` for every running stack, then prune dangling images; behind the pre-update backup gate. Dry run by default | `execute` + `items` from the dry run; `skip_backup_gate` until orca#767 |
 
 > Individual **containers** and managed **Compose stacks** are not `docker.*` tools — they are surfaced on orca's generic five-verb **unit** surface (`docker.__unit.*`). The `docker.*` tools above manage the runtime, its registered engines, and one-off Compose projects by path. See **[Managing Compose stacks](#managing-compose-stacks-orca-as-config-manager)** below.
 

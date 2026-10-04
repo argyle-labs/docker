@@ -172,15 +172,26 @@ fn label_filter(project: Option<&str>) -> HashMap<&'static str, Vec<String>> {
     HashMap::from([("label", vec![label])])
 }
 
-/// Every current candidate, optionally limited to one compose project.
-pub async fn candidates(docker: &Docker, project: Option<&str>) -> Result<Vec<Candidate>> {
-    let dangling = HashMap::from([("dangling", vec!["true"])]);
+fn dangling_filter() -> HashMap<&'static str, Vec<&'static str>> {
+    HashMap::from([("dangling", vec!["true"])])
+}
+
+/// The dangling-image candidates alone.
+pub async fn dangling_images(docker: &Docker) -> Result<Vec<Candidate>> {
     let images = docker
         .list_images(Some(
-            ListImagesOptionsBuilder::new().filters(&dangling).build(),
+            ListImagesOptionsBuilder::new()
+                .filters(&dangling_filter())
+                .build(),
         ))
         .await
         .map_err(|e| engine_err("list images", e))?;
+    Ok(image_candidates(&images, None))
+}
+
+/// Every current candidate, optionally limited to one compose project.
+pub async fn candidates(docker: &Docker, project: Option<&str>) -> Result<Vec<Candidate>> {
+    let dangling = dangling_filter();
     let volumes = docker
         .list_volumes(Some(
             ListVolumesOptionsBuilder::new().filters(&dangling).build(),
@@ -202,7 +213,10 @@ pub async fn candidates(docker: &Docker, project: Option<&str>) -> Result<Vec<Ca
         .await
         .map_err(|e| engine_err("list containers", e))?;
 
-    let mut out = image_candidates(&images, project);
+    let mut out = match project {
+        Some(_) => Vec::new(),
+        None => dangling_images(docker).await?,
+    };
     out.extend(volume_candidates(&volumes, project));
     out.extend(network_candidates(&networks, &containers, project));
     Ok(out)
