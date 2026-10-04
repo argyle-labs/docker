@@ -51,6 +51,13 @@ impl DockerAdapter {
         }
     }
 
+    #[cfg(test)]
+    fn with_client(client: Docker) -> Self {
+        Self {
+            client: OnceLock::from(client),
+        }
+    }
+
     fn client(&self) -> Result<&Docker, AdapterError> {
         if let Some(c) = self.client.get() {
             return Ok(c);
@@ -310,6 +317,12 @@ fn map_bollard_err(e: bollard::errors::Error) -> AdapterError {
         B::HyperResponseError { .. } | B::HttpClientError { .. } | B::IOError { .. } => {
             AdapterError::Unavailable(e.to_string())
         }
+        // A dead engine socket surfaces as a legacy-client connect error, and
+        // the contract classes "socket down / API timeout" as Unavailable.
+        B::HyperLegacyError { ref err } if err.is_connect() => {
+            AdapterError::Unavailable(e.to_string())
+        }
+        B::RequestTimeoutError => AdapterError::Unavailable(e.to_string()),
         B::JsonDataError { .. } | B::JsonSerdeError { .. } => {
             AdapterError::Malformed(e.to_string())
         }
@@ -747,5 +760,196 @@ mod tests {
             map_bollard_err(server_err(409)),
             AdapterError::Refused(_)
         ));
+    }
+
+    /// One-shot fake Docker Engine on a Unix socket: answers every request
+    /// with `status` and records the request lines it saw.
+    struct FakeEngine {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl FakeEngine {
+        fn answering(status: u16) -> Self {
+            use std::io::{BufRead, BufReader, Write};
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("docker.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = seen.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { return };
+                    let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).is_err() {
+                        continue;
+                    }
+                    log.lock()
+                        .expect("lock")
+                        .push(request_line.trim_end().to_string());
+                    let mut header = String::new();
+                    while reader
+                        .read_line(&mut header)
+                        .map(|n| n > 2)
+                        .unwrap_or(false)
+                    {
+                        header.clear();
+                    }
+                    // 204/304 must not carry a body; error statuses carry
+                    // docker's `{"message": ...}` envelope.
+                    let body = if status >= 400 {
+                        format!(r#"{{"message":"fake {status}"}}"#)
+                    } else {
+                        String::new()
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status} Fake\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).expect("write");
+                }
+            });
+            Self {
+                _dir: dir,
+                path,
+                seen,
+            }
+        }
+
+        fn adapter(&self) -> DockerAdapter {
+            let client = Docker::connect_with_unix(
+                self.path.to_str().expect("utf8 path"),
+                5,
+                bollard::API_DEFAULT_VERSION,
+            )
+            .expect("client");
+            DockerAdapter::with_client(client)
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.seen.lock().expect("lock").clone()
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Write {
+        Start,
+        Stop,
+        Restart,
+    }
+
+    impl Write {
+        const ALL: [Write; 3] = [Write::Start, Write::Stop, Write::Restart];
+
+        fn path_suffix(self) -> &'static str {
+            match self {
+                Write::Start => "/containers/abc/start",
+                Write::Stop => "/containers/abc/stop",
+                Write::Restart => "/containers/abc/restart",
+            }
+        }
+
+        fn run(self, adapter: &DockerAdapter) -> Result<(), AdapterError> {
+            plugin_toolkit::reactor::block_on(async {
+                match self {
+                    Write::Start => adapter.start("abc").await,
+                    Write::Stop => adapter.stop("abc").await,
+                    Write::Restart => adapter.restart("abc").await,
+                }
+            })
+        }
+    }
+
+    fn run_against(op: Write, status: u16) -> (Result<(), AdapterError>, Vec<String>) {
+        let engine = FakeEngine::answering(status);
+        let result = op.run(&engine.adapter());
+        (result, engine.requests())
+    }
+
+    #[test]
+    fn writes_post_to_the_engine_and_succeed_on_204() {
+        for op in Write::ALL {
+            let (result, requests) = run_against(op, 204);
+            assert!(result.is_ok(), "{op:?}: {result:?}");
+            assert_eq!(requests.len(), 1, "{op:?}: {requests:?}");
+            let line = &requests[0];
+            assert!(line.starts_with("POST "), "{op:?}: {line}");
+            let path = line.split(' ').nth(1).unwrap_or_default();
+            assert!(
+                path.split('?')
+                    .next()
+                    .unwrap_or_default()
+                    .ends_with(op.path_suffix()),
+                "{op:?}: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn start_and_stop_treat_304_as_already_in_state() {
+        for op in [Write::Start, Write::Stop] {
+            let (result, _) = run_against(op, 304);
+            assert!(result.is_ok(), "{op:?}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn writes_map_404_to_not_found() {
+        for op in Write::ALL {
+            let (result, _) = run_against(op, 404);
+            assert!(
+                matches!(result, Err(AdapterError::NotFound(_))),
+                "{op:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn writes_map_409_to_refused() {
+        for op in Write::ALL {
+            let (result, _) = run_against(op, 409);
+            assert!(
+                matches!(result, Err(AdapterError::Refused(_))),
+                "{op:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn writes_map_engine_500_to_transport() {
+        for op in Write::ALL {
+            let (result, _) = run_against(op, 500);
+            assert!(
+                matches!(result, Err(AdapterError::Transport(_))),
+                "{op:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn writes_map_an_unreachable_engine_to_unavailable() {
+        // bollard checks the socket exists at construction, so build against a
+        // live one and then take the engine away.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("gone.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        let client = Docker::connect_with_unix(
+            path.to_str().expect("utf8 path"),
+            5,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .expect("client");
+        drop(listener);
+        std::fs::remove_file(&path).expect("remove socket");
+        let adapter = DockerAdapter::with_client(client);
+        for op in Write::ALL {
+            let result = op.run(&adapter);
+            assert!(
+                matches!(result, Err(AdapterError::Unavailable(_))),
+                "{op:?}: {result:?}"
+            );
+        }
     }
 }
