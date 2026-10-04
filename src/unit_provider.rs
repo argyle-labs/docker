@@ -385,7 +385,8 @@ impl DockerUnitProvider {
         } else {
             self.stack_volumes(row).await?.1
         };
-        volume_coverage::stage(dir, &row.compose_path(), &volumes, &policies).await?;
+        let compose = row.compose().map_err(anyhow::Error::from)?;
+        volume_coverage::stage(dir, &compose, &volumes, &policies).await?;
         let ts = plugin_toolkit::time::now().unix_seconds();
         let archive = dest.join(format!("{}-{ts}.tar.gz", row.name));
         let tarred = run_tar(&["czf", &archive.to_string_lossy(), "-C", &row.dir, "."]).await;

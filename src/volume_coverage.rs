@@ -32,8 +32,20 @@ const TABLE: &str = "volume_policies";
 /// Directory inside the stack dir that carries volume exports and dumps.
 pub const STAGING_DIR: &str = ".orca-volumes";
 
-/// Image for the export helper container.
-pub const HELPER_IMAGE: &str = "alpine:3";
+/// Image for the export helper container, pinned to the multi-arch index
+/// digest so a retagged `alpine:3` cannot change what reads volume data.
+pub const HELPER_IMAGE: &str =
+    "alpine:3@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6";
+
+/// Lists the policies a backup skipped, inside the staging dir, so the
+/// archive itself says what it lacks.
+pub const SKIPPED_FILE: &str = "SKIPPED";
+
+/// Runs the dump command in the container with `pipefail` where that shell
+/// has it, so `pg_dump | gzip` fails when `pg_dump` does. The command is
+/// `$1`, never spliced into the script.
+const DUMP_WRAPPER: &str =
+    r#"if (set -o pipefail) 2>/dev/null; then set -o pipefail; fi; eval "$1""#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(crate = "plugin_toolkit::serde")]
@@ -343,13 +355,16 @@ pub fn artifact_name(p: &VolumePolicy) -> String {
     }
 }
 
-/// `docker` arguments that tar `engine_name` into `out_dir` read-only.
+/// `docker` arguments that tar `engine_name` into `out_dir` read-only, from a
+/// helper with no network.
 pub fn export_args(engine_name: &str, out_dir: &Path, artifact: &str) -> Vec<String> {
     vec![
         "run".into(),
         "--rm".into(),
-        "-v".into(),
-        format!("{engine_name}:/v:ro"),
+        "--network".into(),
+        "none".into(),
+        "--mount".into(),
+        format!("type=volume,src={engine_name},dst=/v,readonly"),
         "-v".into(),
         format!("{}:/out", out_dir.display()),
         HELPER_IMAGE.into(),
@@ -363,24 +378,36 @@ pub fn export_args(engine_name: &str, out_dir: &Path, artifact: &str) -> Vec<Str
 }
 
 /// `sh` arguments that stream a dump to `out_file` without holding it in
-/// memory. Values travel as positional parameters, never spliced into the
-/// script.
+/// memory, through every compose file of the stack (`compose_files`, the
+/// `-f` pairs). Values travel as positional parameters, never spliced into
+/// either script.
 pub fn dump_args(
     docker_bin: &str,
-    compose_file: &Path,
+    compose_files: &[String],
     service: &str,
     command: &str,
     out_file: &Path,
 ) -> Vec<String> {
-    vec![
+    let mut args: Vec<String> = vec![
         "-c".into(),
-        r#""$0" compose -f "$1" exec -T "$2" sh -c "$3" > "$4""#.into(),
-        docker_bin.into(),
-        compose_file.display().to_string(),
-        service.into(),
-        command.into(),
+        r#"out="$1"; shift; exec "$@" > "$out""#.into(),
+        "sh".into(),
         out_file.display().to_string(),
-    ]
+        docker_bin.into(),
+        "compose".into(),
+    ];
+    args.extend(compose_files.iter().cloned());
+    args.extend([
+        "exec".into(),
+        "-T".into(),
+        service.into(),
+        "sh".into(),
+        "-c".into(),
+        DUMP_WRAPPER.into(),
+        "orca-dump".into(),
+        command.into(),
+    ]);
+    args
 }
 
 async fn run_checked(program: &str, args: &[String], what: &str) -> Result<()> {
@@ -395,42 +422,75 @@ async fn run_checked(program: &str, args: &[String], what: &str) -> Result<()> {
     Ok(())
 }
 
-/// Write every policy's export or dump into `<stack dir>/.orca-volumes/`,
-/// replacing what was there. Any failure fails the backup: an archive that
+/// A policy the backup did not stage, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedVolume {
+    pub volume: String,
+    pub reason: String,
+}
+
+/// What [`stage`] wrote and what it skipped.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Staged {
+    pub artifacts: Vec<String>,
+    pub skipped: Vec<SkippedVolume>,
+}
+
+/// Write every policy's export or dump into `<stack dir>/.orca-volumes/`
+/// (mode 0700; dumps 0600), replacing what was there. A policy whose volume
+/// does not exist on the engine is skipped and listed in [`SKIPPED_FILE`]:
+/// exporting it would create and archive an empty volume. Any export or dump
+/// failure fails the backup and removes the staging dir: an archive that
 /// claims coverage it lacks is worse than none.
 pub async fn stage(
     stack_dir: &Path,
-    compose_file: &Path,
+    compose: &crate::Compose,
     volumes: &[StackVolume],
     policies: &[VolumePolicy],
-) -> Result<Vec<String>> {
+) -> Result<Staged> {
     let staging: PathBuf = stack_dir.join(STAGING_DIR);
     if staging.exists() {
         std::fs::remove_dir_all(&staging)
             .map_err(|e| anyhow::anyhow!("clear {}: {e}", staging.display()))?;
     }
     if policies.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Staged::default());
     }
-    std::fs::create_dir_all(&staging)
+    let result = stage_into(&staging, compose, volumes, policies).await;
+    if result.is_err() && staging.exists() {
+        std::fs::remove_dir_all(&staging)
+            .map_err(|e| anyhow::anyhow!("clear {}: {e}", staging.display()))?;
+    }
+    result
+}
+
+async fn stage_into(
+    staging: &Path,
+    compose: &crate::Compose,
+    volumes: &[StackVolume],
+    policies: &[VolumePolicy],
+) -> Result<Staged> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(staging)
         .map_err(|e| anyhow::anyhow!("create {}: {e}", staging.display()))?;
-    let mut staged = Vec::new();
+    let mut staged = Staged::default();
     for p in policies {
+        let Some(v) = volumes.iter().find(|v| v.volume == p.volume && v.exists) else {
+            staged.skipped.push(SkippedVolume {
+                volume: p.volume.clone(),
+                reason: "the volume does not exist on the engine; nothing to back up".into(),
+            });
+            continue;
+        };
         let artifact = artifact_name(p);
         match p.strategy {
             Strategy::Export => {
-                let v = volumes
-                    .iter()
-                    .find(|v| v.volume == p.volume)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "volume '{}' has an export policy but does not exist",
-                            p.volume
-                        )
-                    })?;
                 run_checked(
                     crate::resolve_docker_bin(),
-                    &export_args(&v.engine_name, &staging, &artifact),
+                    &export_args(&v.engine_name, staging, &artifact),
                     &format!("export volume '{}'", p.volume),
                 )
                 .await?;
@@ -439,21 +499,41 @@ pub async fn stage(
                 let (Some(svc), Some(command)) = (&p.service, &p.command) else {
                     anyhow::bail!("dump policy for '{}' lacks a service or command", p.volume);
                 };
+                let out = staging.join(&artifact);
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&out)
+                    .map_err(|e| anyhow::anyhow!("create {}: {e}", out.display()))?;
                 run_checked(
                     "sh",
                     &dump_args(
                         crate::resolve_docker_bin(),
-                        compose_file,
+                        &compose.file_args(),
                         svc,
                         command,
-                        &staging.join(&artifact),
+                        &out,
                     ),
                     &format!("dump volume '{}'", p.volume),
                 )
                 .await?;
             }
         }
-        staged.push(format!("{STAGING_DIR}/{artifact}"));
+        staged.artifacts.push(format!("{STAGING_DIR}/{artifact}"));
+    }
+    if !staged.skipped.is_empty() {
+        let lines: String = staged
+            .skipped
+            .iter()
+            .map(|s| format!("{}: {}\n", s.volume, s.reason))
+            .collect();
+        let path = staging.join(SKIPPED_FILE);
+        std::fs::write(&path, lines)
+            .map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
+        for s in &staged.skipped {
+            plugin_toolkit::tracing::warn!(target: "docker::volumes", volume = %s.volume, reason = %s.reason, "volume backup skipped");
+        }
     }
     Ok(staged)
 }
@@ -578,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn export_mounts_the_volume_read_only_into_a_helper() {
+    fn export_mounts_the_volume_read_only_into_a_networkless_pinned_helper() {
         let a = export_args(
             "media_data",
             Path::new("/srv/media/.orca-volumes"),
@@ -589,8 +669,10 @@ mod tests {
             vec![
                 "run",
                 "--rm",
-                "-v",
-                "media_data:/v:ro",
+                "--network",
+                "none",
+                "--mount",
+                "type=volume,src=media_data,dst=/v,readonly",
                 "-v",
                 "/srv/media/.orca-volumes:/out",
                 HELPER_IMAGE,
@@ -602,24 +684,47 @@ mod tests {
                 "."
             ]
         );
+        assert!(HELPER_IMAGE.contains("@sha256:"));
     }
 
     #[test]
-    fn dump_passes_values_as_positional_parameters() {
+    fn dump_passes_values_as_positional_parameters_through_every_compose_file() {
+        let files = vec![
+            "-f".to_string(),
+            "/srv/media/docker-compose.yml".to_string(),
+            "-f".to_string(),
+            "/srv/media/compose.override.yml".to_string(),
+        ];
         let a = dump_args(
             "/usr/bin/docker",
-            Path::new("/srv/media/docker-compose.yml"),
+            &files,
             "db",
             "pg_dumpall -U postgres; rm -rf /",
             Path::new("/srv/media/.orca-volumes/pg.dump"),
         );
-        // The script is fixed; the command is an argument to `sh -c` inside
-        // the container, never part of the host script.
+        // Both scripts are fixed; the command is the last positional argument.
+        assert_eq!(a[1], r#"out="$1"; shift; exec "$@" > "$out""#);
+        assert_eq!(a[3], "/srv/media/.orca-volumes/pg.dump");
         assert_eq!(
-            a[1],
-            r#""$0" compose -f "$1" exec -T "$2" sh -c "$3" > "$4""#
+            a[4..10],
+            [
+                "/usr/bin/docker",
+                "compose",
+                "-f",
+                "/srv/media/docker-compose.yml",
+                "-f",
+                "/srv/media/compose.override.yml"
+            ]
         );
-        assert_eq!(a[5], "pg_dumpall -U postgres; rm -rf /");
+        assert_eq!(a[10..13], ["exec", "-T", "db"]);
+        assert_eq!(a[15], DUMP_WRAPPER);
+        assert!(DUMP_WRAPPER.contains("set -o pipefail") && DUMP_WRAPPER.contains(r#"eval "$1""#));
+        assert_eq!(a.last().unwrap(), "pg_dumpall -U postgres; rm -rf /");
+    }
+
+    fn compose_in(dir: &Path) -> crate::Compose {
+        std::fs::write(dir.join("docker-compose.yml"), "services: {}\n").unwrap();
+        crate::Compose::open(dir).unwrap()
     }
 
     #[test]
@@ -628,28 +733,63 @@ mod tests {
         let stale = dir.path().join(STAGING_DIR);
         std::fs::create_dir_all(&stale).unwrap();
         std::fs::write(stale.join("old.tar.gz"), b"x").unwrap();
-        let staged = plugin_toolkit::reactor::block_on(stage(
-            dir.path(),
-            &dir.path().join("docker-compose.yml"),
-            &[],
-            &[],
-        ))
-        .unwrap();
-        assert!(staged.is_empty());
+        let staged =
+            plugin_toolkit::reactor::block_on(stage(dir.path(), &compose_in(dir.path()), &[], &[]))
+                .unwrap();
+        assert_eq!(staged, Staged::default());
         assert!(!stale.exists());
     }
 
     #[test]
-    fn stage_fails_closed_when_an_export_volume_is_missing() {
+    fn stage_skips_and_reports_volumes_that_do_not_exist() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
+        // Declared in compose but never created on the engine.
+        let declared_only = detect(&cfg(), &[]);
+        let staged = plugin_toolkit::reactor::block_on(stage(
+            dir.path(),
+            &compose_in(dir.path()),
+            &declared_only,
+            &[
+                policy("data", Strategy::Export),
+                policy("gone", Strategy::Export),
+            ],
+        ))
+        .unwrap();
+        assert!(staged.artifacts.is_empty(), "nothing exported: {staged:?}");
+        let skipped: Vec<_> = staged.skipped.iter().map(|s| s.volume.as_str()).collect();
+        assert_eq!(skipped, vec!["data", "gone"]);
+        let staging = dir.path().join(STAGING_DIR);
+        let listed = std::fs::read_to_string(staging.join(SKIPPED_FILE)).unwrap();
+        assert!(
+            listed.contains("data: ") && listed.contains("gone: "),
+            "{listed}"
+        );
+        let mode = std::fs::metadata(&staging).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn a_failed_stage_removes_the_staging_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = policy("pg", Strategy::Dump);
+        p.command = None;
+        let mut vols = detect(&cfg(), &[]);
+        for v in &mut vols {
+            v.exists = true;
+        }
         let err = plugin_toolkit::reactor::block_on(stage(
             dir.path(),
-            &dir.path().join("docker-compose.yml"),
-            &[],
-            &[policy("data", Strategy::Export)],
+            &compose_in(dir.path()),
+            &vols,
+            &[p],
         ))
         .unwrap_err();
-        assert!(err.to_string().contains("does not exist"), "{err}");
+        assert!(
+            err.to_string().contains("lacks a service or command"),
+            "{err}"
+        );
+        assert!(!dir.path().join(STAGING_DIR).exists());
     }
 
     #[test]
