@@ -87,6 +87,8 @@ vocabulary spans both). Every operation is available through `unit` list / detai
 | **edit** (rewrite YAML/env, no deploy) | `update` | `action = "edit"`, `{ compose_yaml?, compose_env? }` |
 | **audit** (lint: restart policy, bind sources, named volumes) | `detail` | `query.kind = "audit"`, optional `query.extra = { managed_roots }` |
 | **fix** audit findings (dry run by default, shows the diff) | `update` | `action = "fix"`, `{ execute?, items?, managed_roots? }` |
+| **coverage** of named volumes by the stack backup | `detail` | `query.kind = "coverage"` |
+| **declare** how a named volume is backed up (dry run by default) | `update` | `action = "volume_policy"`, `{ volume, strategy?: export\|dump, service?, command?, execute? }` |
 | **deploy / lifecycle** | `update` | `action = up`\|`down`\|`start`\|`stop`\|`restart`\|`build`\|`pull` |
 | **register + deploy** (add-only) | `create` | `action = "deploy"`, deploy payload |
 | **register-or-replace + deploy** | `upsert` | `action = "set"`, deploy payload |
@@ -128,6 +130,19 @@ vocabulary spans both). Every operation is available through `unit` list / detai
 { "id": { "kind": "stack", "id": "myapp", ... }, "action": "fix" }
 { "id": { "kind": "stack", "id": "myapp", ... }, "action": "fix",
   "payload": { "execute": true, "items": ["restart:app", "bind:app:/mnt/willow/media"] } }
+
+// detail (coverage) — named volumes from compose + engine, each `covered_by`
+// export | dump, with a warning per uncovered volume.
+{ "id": { "kind": "stack", "id": "immich", ... }, "query": { "kind": "coverage" } }
+
+// update (volume_policy) — `export` tars the volume through a helper container
+// (alpine:3, volume mounted read-only); `dump` runs an app-native command in a
+// service and keeps its stdout. Either lands in the stack backup under
+// .orca-volumes/. Omit `strategy` to clear. Restore unpacks them into
+// <stack dir>/.orca-volumes/; importing them back into the volume is manual.
+{ "id": { "kind": "stack", "id": "immich", ... }, "action": "volume_policy",
+  "payload": { "volume": "pgdata", "strategy": "dump", "service": "database",
+               "command": "pg_dumpall -U postgres", "execute": true } }
 ```
 
 To **tear down** a stack, run `update action=down` first, then `delete` to
