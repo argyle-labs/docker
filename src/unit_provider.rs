@@ -334,7 +334,9 @@ impl DockerUnitProvider {
         let cfg = ComposeConfig::parse(&raw)?;
         let docker = self.adapter.client().map_err(adapter_err)?;
         let engine = volume_coverage::engine_volumes(docker, &cfg.name).await?;
-        Ok((cfg.name.clone(), volume_coverage::detect(&cfg, &engine)))
+        let mut volumes = volume_coverage::detect(&cfg, &engine);
+        volume_coverage::mark_existing(docker, &mut volumes).await?;
+        Ok((cfg.name.clone(), volumes))
     }
 
     /// **label_volumes**: convert the stack's anonymous volumes into labeled
@@ -448,17 +450,31 @@ impl DockerUnitProvider {
             self.stack_volumes(row).await?.1
         };
         let compose = row.compose().map_err(anyhow::Error::from)?;
-        volume_coverage::stage(dir, &compose, &volumes, &policies).await?;
+        let docker = self.adapter.client().map_err(adapter_err)?;
+        let root = volume_coverage::staging_root(&dest, &row.name)?;
         let ts = plugin_toolkit::time::now().unix_seconds();
         let archive = dest.join(format!("{}-{ts}.tar.gz", row.name));
-        let tarred = run_tar(&["czf", &archive.to_string_lossy(), "-C", &row.dir, "."]).await;
-        // Exports can be large; they live on only inside the archive.
-        let staging = dir.join(volume_coverage::STAGING_DIR);
-        if staging.exists() {
-            std::fs::remove_dir_all(&staging)
-                .map_err(|e| anyhow::anyhow!("clear {}: {e}", staging.display()))?;
+        let result = async {
+            let staged =
+                volume_coverage::stage(docker, &root, &compose, &volumes, &policies).await?;
+            // The archive holds config and secrets: private from creation, and
+            // tar keeps an existing file's mode.
+            volume_coverage::create_private(&archive)?;
+            let has_staging = !staged.artifacts.is_empty() || !staged.skipped.is_empty();
+            let args = tar_args(&archive, &row.dir, &root, has_staging);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            run_tar(&args).await
         }
-        tarred?;
+        .await;
+        // Exports can be large; they live on only inside the archive.
+        let cleared = std::fs::remove_dir_all(&root)
+            .map_err(|e| anyhow::anyhow!("clear {}: {e}", root.display()));
+        if result.is_err() && archive.exists() {
+            std::fs::remove_file(&archive)
+                .map_err(|e| anyhow::anyhow!("remove {}: {e}", archive.display()))?;
+        }
+        result?;
+        cleared?;
 
         let backup = BackupRef {
             locator: archive.to_string_lossy().into_owned(),
@@ -1240,6 +1256,33 @@ fn fix_result(
     Ok((result, write))
 }
 
+/// `tar` arguments for a stack archive: the stack dir (without any stale
+/// `.orca-volumes`), plus the staged `.orca-volumes` from `root` when
+/// `staged`.
+fn tar_args(
+    archive: &std::path::Path,
+    dir: &str,
+    root: &std::path::Path,
+    staged: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        "czf".to_string(),
+        archive.to_string_lossy().into_owned(),
+        format!("--exclude=./{}", volume_coverage::STAGING_DIR),
+        "-C".to_string(),
+        dir.to_string(),
+        ".".to_string(),
+    ];
+    if staged {
+        args.extend([
+            "-C".to_string(),
+            root.to_string_lossy().into_owned(),
+            volume_coverage::STAGING_DIR.to_string(),
+        ]);
+    }
+    args
+}
+
 /// Run `tar` through the orca process seam (no runtime named). Used for stack
 /// backup/restore; errors carry tar's stderr.
 async fn run_tar(args: &[&str]) -> Result<String> {
@@ -1665,6 +1708,47 @@ mod tests {
             .find(|a| a.action == "volume_policy")
             .unwrap();
         assert!(a.payload_schema.is_some() && a.response_schema.is_some());
+    }
+
+    #[test]
+    fn the_archive_takes_staged_volumes_from_the_run_root_and_never_a_stale_copy() {
+        let root = std::path::Path::new("/b/.orca-staging-x");
+        let a = tar_args(std::path::Path::new("/b/x.tar.gz"), "/srv/x", root, true);
+        assert_eq!(
+            a,
+            vec![
+                "czf",
+                "/b/x.tar.gz",
+                "--exclude=./.orca-volumes",
+                "-C",
+                "/srv/x",
+                ".",
+                "-C",
+                "/b/.orca-staging-x",
+                ".orca-volumes"
+            ]
+        );
+        assert_eq!(
+            tar_args(std::path::Path::new("/b/x.tar.gz"), "/srv/x", root, false).len(),
+            6
+        );
+    }
+
+    #[test]
+    fn a_backup_archive_is_private_and_tar_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let stack = dir.path().join("stack");
+        std::fs::create_dir_all(&stack).unwrap();
+        std::fs::write(stack.join("compose.yaml"), "services: {}\n").unwrap();
+        let archive = dir.path().join("x.tar.gz");
+        volume_coverage::create_private(&archive).unwrap();
+        let args = tar_args(&archive, &stack.to_string_lossy(), dir.path(), false);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        plugin_toolkit::reactor::block_on(run_tar(&args)).unwrap();
+        let meta = std::fs::metadata(&archive).unwrap();
+        assert!(meta.len() > 0);
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
     }
 
     #[test]
