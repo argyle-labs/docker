@@ -136,6 +136,18 @@ impl Compose {
             .collect())
     }
 
+    /// The project name from the resolved config: the value the engine stamps
+    /// on `com.docker.compose.project`, which need not match the stack name.
+    pub async fn project_name(&self) -> Result<String, ComposeError> {
+        let raw = self.docker(&["config", "--format", "json"]).await?;
+        parse_project_name(&raw).ok_or_else(|| {
+            ComposeError::Docker(anyhow::anyhow!(
+                "compose config for {} has no project name",
+                self.file.display()
+            ))
+        })
+    }
+
     pub async fn ps(&self) -> Result<HashMap<String, ServiceStatus>, ComposeError> {
         let raw = self.docker(&["ps", "--format", "json"]).await?;
         Ok(parse_compose_ps(&raw))
@@ -218,6 +230,15 @@ impl Compose {
         args.extend_from_slice(sub);
         super::run(&args, None).await
     }
+}
+
+/// The top-level `name` of `docker compose config --format json` output.
+pub fn parse_project_name(raw: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(raw).ok()?;
+    v["name"]
+        .as_str()
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
 }
 
 /// Parse JSON-lines output of `docker compose ps --format json` into a map
@@ -305,6 +326,16 @@ mod tests {
 "#;
         let out = parse_compose_ps(raw);
         assert_eq!(out["web"].ports, vec!["80:80"]);
+    }
+
+    #[test]
+    fn parse_project_name_reads_top_level_name() {
+        assert_eq!(
+            parse_project_name(r#"{"name":"media","services":{}}"#).as_deref(),
+            Some("media")
+        );
+        assert_eq!(parse_project_name(r#"{"services":{}}"#), None);
+        assert_eq!(parse_project_name("not json"), None);
     }
 
     #[test]

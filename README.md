@@ -37,6 +37,7 @@ Once orca is on the host you never touch the scripts — drive the tools. Payloa
 | `docker.delete` | remove a registered docker runtime | `runtime` |
 | `docker.backup` | archive engine state to a `.tar.gz` | `destination`, optional `state_path` |
 | `docker.restore` | restore engine state from an archive | `archive`, optional `state_path` |
+| `docker.prune` | remove dangling images, dangling anonymous volumes and unused compose networks; never named volumes. Dry run by default | optional `stack`; `execute` + `items` from the dry run |
 
 > Individual **containers** and managed **Compose stacks** are not `docker.*` tools — they are surfaced on orca's generic five-verb **unit** surface (`docker.__unit.*`). The `docker.*` tools above manage the runtime, its registered engines, and one-off Compose projects by path. See **[Managing Compose stacks](#managing-compose-stacks-orca-as-config-manager)** below.
 
@@ -56,6 +57,10 @@ Once orca is on the host you never touch the scripts — drive the tools. Payloa
 // docker.backup / docker.restore
 { "destination": "/srv/backups" }
 { "archive": "/srv/backups/docker-engine-state-20260702-120000.tar.gz" }
+
+// docker.prune — dry run lists candidates; execute removes only confirmed ones still orphaned
+{ "stack": "media" }
+{ "execute": true, "items": ["volume:3f2a…", "network:9b1c…"] }
 ```
 
 The lifecycle tools are `local_only` — they act on the host orca is running on.
