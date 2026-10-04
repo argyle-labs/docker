@@ -60,9 +60,18 @@ fn default_true() -> bool {
 }
 
 impl StackRow {
-    /// Absolute path to the stack's compose file.
+    /// The stack's compose file: `<dir>/<file>` when it exists, else the
+    /// conventional file compose would pick in `dir`, else `<dir>/<file>` (to
+    /// be created). Audit, view, edit and every compose call use this one
+    /// path.
     pub fn compose_path(&self) -> PathBuf {
-        Path::new(&self.dir).join(&self.file)
+        let named = Path::new(&self.dir).join(&self.file);
+        if named.is_file() {
+            return named;
+        }
+        Compose::find(Path::new(&self.dir))
+            .map(|c| c.file().to_path_buf())
+            .unwrap_or(named)
     }
 
     /// Absolute path to the stack's `.env` file.
@@ -82,27 +91,18 @@ impl StackRow {
     }
 
     /// Write compose file contents (the `edit` operation), creating `dir` if
-    /// needed. The previous file is kept as `<file>.bak`, and the new one is
-    /// written to a temp file and renamed over it, so a crash never leaves a
-    /// half-written compose file.
+    /// needed. See [`StagedWrite`].
     pub fn write_compose(&self, yaml: &str) -> Result<()> {
         std::fs::create_dir_all(&self.dir)
             .with_context(|| format!("creating stack dir {}", self.dir))?;
-        let p = self.compose_path();
-        if p.exists() {
-            let bak = Path::new(&self.dir).join(format!("{}.bak", self.file));
-            std::fs::copy(&p, &bak)
-                .with_context(|| format!("keeping a backup at {}", bak.display()))?;
-        }
-        let tmp = Path::new(&self.dir).join(format!(".{}.orca-tmp", self.file));
-        std::fs::write(&tmp, yaml).with_context(|| format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, &p).with_context(|| format!("replacing compose file {}", p.display()))
+        StagedWrite::new(&self.compose_path(), yaml)?.commit()
     }
 
-    /// [`write_compose`](Self::write_compose), refused when the file on disk
-    /// no longer hashes to `read_before`: someone edited it since it was read,
-    /// and writing would discard their change.
-    pub fn write_compose_if_unchanged(&self, yaml: &str, read_before: &str) -> Result<()> {
+    /// Rewrite the compose file for `fix`: refused when the file on disk no
+    /// longer hashes to `read_before` (someone edited it since it was read),
+    /// or when compose rejects the new content. Nothing is replaced unless
+    /// both pass.
+    pub async fn write_compose_if_unchanged(&self, yaml: &str, read_before: &str) -> Result<()> {
         let now = self.read_compose()?;
         if content_hash(&now) != content_hash(read_before) {
             anyhow::bail!(
@@ -110,7 +110,9 @@ impl StackRow {
                 self.compose_path().display()
             );
         }
-        self.write_compose(yaml)
+        let staged = StagedWrite::new(&self.compose_path(), yaml)?;
+        validate_compose(&self.dir, staged.temp_path()).await?;
+        staged.commit()
     }
 
     /// Write `.env` contents. Empty input is a no-op (leaves any existing file
@@ -123,10 +125,144 @@ impl StackRow {
         std::fs::write(&p, env).with_context(|| format!("writing env file {}", p.display()))
     }
 
-    /// Open the located [`Compose`] project for lifecycle actions. Errors when
-    /// no compose file is present under `dir`.
+    /// The [`Compose`] project of [`compose_path`](Self::compose_path).
+    /// Errors when that file does not exist.
     pub fn compose(&self) -> Result<Compose, crate::ComposeError> {
-        Compose::open(Path::new(&self.dir))
+        Compose::at(&self.compose_path())
+            .ok_or_else(|| crate::ComposeError::NoComposeFile(PathBuf::from(&self.dir)))
+    }
+}
+
+/// `docker compose config -q` over `file` in place of the stack's compose
+/// file (with the override compose would load), from `dir`.
+async fn validate_compose(dir: &str, file: &Path) -> Result<()> {
+    let args = validate_args(dir, file);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    crate::run(&argv, None)
+        .await
+        .map(|_| ())
+        .context("compose rejects the rewritten file; nothing was written")
+}
+
+fn validate_args(dir: &str, file: &Path) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "compose".into(),
+        "--project-directory".into(),
+        dir.into(),
+        "-f".into(),
+        file.to_string_lossy().into_owned(),
+    ];
+    if let Some(o) =
+        Compose::find(Path::new(dir)).and_then(|c| c.override_file().map(Path::to_path_buf))
+    {
+        args.extend(["-f".into(), o.to_string_lossy().into_owned()]);
+    }
+    args.extend(["config".into(), "-q".into()]);
+    args
+}
+
+/// A file replacement staged next to its target. The target is resolved
+/// through symlinks, so a symlinked compose file is rewritten where it lives
+/// and stays a symlink. The temp file has a unique name, the original's mode
+/// and owner, and is fsynced; [`commit`](Self::commit) keeps the original as
+/// `<name>.bak`, renames over it and fsyncs the directory. Dropped without a
+/// commit, the temp file is removed and the original is untouched.
+pub struct StagedWrite {
+    target: PathBuf,
+    temp: PathBuf,
+    committed: bool,
+}
+
+impl StagedWrite {
+    pub fn new(path: &Path, contents: &str) -> Result<Self> {
+        use std::io::Write;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let target = if path.exists() {
+            std::fs::canonicalize(path).with_context(|| format!("resolving {}", path.display()))?
+        } else {
+            path.to_path_buf()
+        };
+        let dir = target
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("{} has no directory", target.display()))?;
+        let name = target
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp = dir.join(format!(
+            ".{name}.orca-{}-{nanos}-{seq}.tmp",
+            std::process::id()
+        ));
+        let original = std::fs::metadata(&target).ok();
+        let staged = StagedWrite {
+            target: target.clone(),
+            temp: temp.clone(),
+            committed: false,
+        };
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)
+            .with_context(|| format!("creating {}", temp.display()))?;
+        f.write_all(contents.as_bytes())
+            .with_context(|| format!("writing {}", temp.display()))?;
+        if let Some(meta) = &original {
+            std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(meta.mode() & 0o7777))
+                .with_context(|| format!("setting the mode of {}", temp.display()))?;
+            // Only root may give a file away; a same-owner chown is a no-op.
+            if let Err(e) = std::os::unix::fs::chown(&temp, Some(meta.uid()), Some(meta.gid()))
+                && e.kind() != std::io::ErrorKind::PermissionDenied
+            {
+                return Err(e).with_context(|| format!("setting the owner of {}", temp.display()));
+            }
+        }
+        f.sync_all()
+            .with_context(|| format!("syncing {}", temp.display()))?;
+        Ok(staged)
+    }
+
+    pub fn temp_path(&self) -> &Path {
+        &self.temp
+    }
+
+    /// [`replace`](Self::replace), keeping the original as `<name>.bak`.
+    pub fn commit(self) -> Result<()> {
+        if self.target.exists() {
+            let mut bak = self.target.clone().into_os_string();
+            bak.push(".bak");
+            std::fs::copy(&self.target, &bak)
+                .with_context(|| format!("keeping a backup at {}", bak.to_string_lossy()))?;
+        }
+        self.replace()
+    }
+
+    /// Rename the temp file over the target and fsync the directory.
+    pub fn replace(mut self) -> Result<()> {
+        std::fs::rename(&self.temp, &self.target)
+            .with_context(|| format!("replacing {}", self.target.display()))?;
+        self.committed = true;
+        if let Some(dir) = self.target.parent() {
+            std::fs::File::open(dir)
+                .and_then(|d| d.sync_all())
+                .with_context(|| format!("syncing {}", dir.display()))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for StagedWrite {
+    fn drop(&mut self) {
+        if !self.committed {
+            // Best effort: a leftover temp file is inert.
+            let _removed = std::fs::remove_file(&self.temp);
+        }
     }
 }
 
@@ -257,7 +393,7 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert!(!names.iter().any(|n| n.ends_with(".orca-tmp")), "{names:?}");
+        assert!(!names.iter().any(|n| n.ends_with(".tmp")), "{names:?}");
     }
 
     #[test]
@@ -267,15 +403,106 @@ mod tests {
         r.write_compose("a: 1\n").unwrap();
         let read = r.read_compose().unwrap();
         std::fs::write(r.compose_path(), "a: 2\n").unwrap();
-        let err = r.write_compose_if_unchanged("a: 3\n", &read).unwrap_err();
+        let err = plugin_toolkit::reactor::block_on(r.write_compose_if_unchanged("a: 3\n", &read))
+            .unwrap_err();
         assert!(
             err.to_string().contains("changed since it was read"),
             "{err}"
         );
         assert_eq!(r.read_compose().unwrap(), "a: 2\n");
-        let read = r.read_compose().unwrap();
-        r.write_compose_if_unchanged("a: 3\n", &read).unwrap();
-        assert_eq!(r.read_compose().unwrap(), "a: 3\n");
+    }
+
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_staged_write_keeps_mode_and_leaves_the_original_until_commit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("compose.yaml");
+        std::fs::write(&p, "old\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let a = StagedWrite::new(&p, "new\n").unwrap();
+        let b = StagedWrite::new(&p, "other\n").unwrap();
+        assert_ne!(a.temp_path(), b.temp_path(), "temp names are unique");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "old\n");
+        drop(b);
+        a.commit().unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "new\n");
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+        assert_eq!(
+            entries(dir.path()),
+            vec!["compose.yaml", "compose.yaml.bak"]
+        );
+    }
+
+    #[test]
+    fn validation_checks_the_temp_file_with_the_stack_override() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("compose.yaml"), "services: {}\n").unwrap();
+        std::fs::write(dir.path().join("compose.override.yaml"), "").unwrap();
+        let d = dir.path().to_string_lossy().into_owned();
+        let tmp = dir.path().join(".compose.yaml.orca-1.tmp");
+        let a = validate_args(&d, &tmp);
+        assert_eq!(
+            a[..5],
+            [
+                "compose".to_string(),
+                "--project-directory".into(),
+                d.clone(),
+                "-f".into(),
+                tmp.to_string_lossy().into_owned()
+            ]
+        );
+        assert!(a[6].ends_with("compose.override.yaml"), "{a:?}");
+        assert_eq!(a[7..], ["config".to_string(), "-q".into()]);
+    }
+
+    #[test]
+    fn an_uncommitted_write_leaves_nothing_behind() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("compose.yaml");
+        std::fs::write(&p, "old\n").unwrap();
+        drop(StagedWrite::new(&p, "new\n").unwrap());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "old\n");
+        assert_eq!(entries(dir.path()), vec!["compose.yaml"]);
+    }
+
+    #[test]
+    fn a_symlinked_compose_file_is_written_through_and_stays_a_link() {
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("real.yaml");
+        std::fs::write(&real, "old\n").unwrap();
+        let link = dir.path().join("compose.yaml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        StagedWrite::new(&link, "new\n").unwrap().commit().unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new\n");
+    }
+
+    #[test]
+    fn compose_path_is_the_named_file_else_the_one_compose_picks() {
+        let dir = tempdir().unwrap();
+        let mut r = row(dir.path());
+        r.file = "prod.yml".into();
+        assert!(r.compose_path().ends_with("prod.yml"), "to be created");
+        std::fs::write(dir.path().join("compose.yaml"), "services: {}\n").unwrap();
+        assert!(r.compose_path().ends_with("compose.yaml"));
+        std::fs::write(dir.path().join("prod.yml"), "services: {}\n").unwrap();
+        assert!(r.compose_path().ends_with("prod.yml"));
+        assert!(r.compose().unwrap().file().ends_with("prod.yml"));
     }
 
     #[test]

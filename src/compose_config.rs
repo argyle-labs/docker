@@ -26,6 +26,9 @@ pub struct ComposeConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(crate = "plugin_toolkit::serde")]
 pub struct NetworkConfig {
+    /// The engine-side name (`<project>_<key>` unless set explicitly).
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub external: Option<bool>,
 }

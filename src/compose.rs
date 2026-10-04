@@ -99,21 +99,31 @@ impl Compose {
             "compose.yml",
             "compose.yaml",
         ] {
-            let full = project_path.join(name);
-            if full.exists() {
-                let override_file = OVERRIDE_FILES
-                    .iter()
-                    .map(|o| project_path.join(o))
-                    .find(|o| o.exists());
-                let orca_file = Some(project_path.join(ORCA_FILE)).filter(|o| o.exists());
-                return Some(Compose {
-                    file: full,
-                    override_file,
-                    orca_file,
-                });
+            if let Some(c) = Compose::at(&project_path.join(name)) {
+                return Some(c);
             }
         }
         None
+    }
+
+    /// The project of exactly `file`, with the override compose would
+    /// auto-load next to it. [`ORCA_FILE`] is not included: it is passed only
+    /// after it is regenerated ([`crate::ownership::refresh`]), so a stale one
+    /// never breaks a compose call.
+    pub fn at(file: &Path) -> Option<Compose> {
+        if !file.is_file() {
+            return None;
+        }
+        let dir = file.parent()?;
+        let override_file = OVERRIDE_FILES
+            .iter()
+            .map(|o| dir.join(o))
+            .find(|o| o.exists());
+        Some(Compose {
+            file: file.to_path_buf(),
+            override_file,
+            orca_file: None,
+        })
     }
 
     /// Same as [`find`](Self::find) but errors out when nothing is found.
@@ -176,6 +186,20 @@ impl Compose {
             .collect())
     }
 
+    /// Every service name, including ones only enabled by a profile: the set
+    /// compose judges orphans against.
+    pub async fn all_service_names(&self) -> Result<Vec<String>, ComposeError> {
+        let out = self
+            .docker(&["--profile", "*", "config", "--services"])
+            .await?;
+        Ok(out
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
     /// Service names + runtime status from `docker compose ps`.
     pub async fn services(&self) -> Result<Vec<ServiceSummary>, ComposeError> {
         let names = self.service_names().await?;
@@ -233,15 +257,17 @@ impl Compose {
     pub async fn restart(&self, services: &[&str]) -> Result<String, ComposeError> {
         self.lifecycle("restart", services).await
     }
-    /// `docker compose up -d` for the given services (or all).
+    /// `docker compose up -d` for the given services (or all). Never
+    /// `--remove-orphans`: orphans are removed by id after confirmation.
     pub async fn up(&self, services: &[&str]) -> Result<String, ComposeError> {
-        Ok(self.docker(&up_args(services, false)).await?)
+        Ok(self.docker(&up_args(services)).await?)
     }
-    /// `up -d --remove-orphans`: also removes containers of services the
-    /// compose files no longer declare. Only for callers that listed those
-    /// orphans and had them confirmed.
-    pub async fn up_removing_orphans(&self) -> Result<String, ComposeError> {
-        Ok(self.docker(&up_args(&[], true)).await?)
+    /// `up --no-start`: (re)create the services' containers without starting
+    /// them.
+    pub async fn create(&self, services: &[&str]) -> Result<String, ComposeError> {
+        let mut args = vec!["up", "--no-start"];
+        args.extend_from_slice(services);
+        Ok(self.docker(&args).await?)
     }
     /// `docker compose down`. When `services` is non-empty, falls back to
     /// `compose stop <svc>` since compose-down is project-scoped.
@@ -306,11 +332,8 @@ impl Compose {
     }
 }
 
-fn up_args<'a>(services: &[&'a str], remove_orphans: bool) -> Vec<&'a str> {
+fn up_args<'a>(services: &[&'a str]) -> Vec<&'a str> {
     let mut args = vec!["up", "-d"];
-    if remove_orphans {
-        args.push("--remove-orphans");
-    }
     args.extend_from_slice(services);
     args
 }
@@ -424,18 +447,30 @@ mod tests {
     }
 
     #[test]
-    fn the_orca_file_is_passed_last_and_can_be_left_out() {
+    fn the_orca_file_is_passed_last_and_only_when_asked() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("compose.yaml"), "services: {}").unwrap();
         std::fs::write(dir.path().join("compose.override.yaml"), "").unwrap();
+        // A stale orca file on disk is not picked up by itself.
         std::fs::write(dir.path().join(ORCA_FILE), "{}").unwrap();
         let c = Compose::find(dir.path()).unwrap();
-        let files = c.files();
+        assert_eq!(c.files().len(), 2);
+        let with = c.with_orca();
+        let files = with.files();
         assert_eq!(files.len(), 3);
         assert!(files[1].ends_with("compose.override.yaml"));
         assert!(files[2].ends_with(ORCA_FILE));
-        assert_eq!(c.without_orca().files().len(), 2);
-        assert_eq!(c.without_orca().with_orca().files(), files);
+        assert_eq!(c.with_orca().without_orca().files().len(), 2);
+    }
+
+    #[test]
+    fn at_opens_exactly_the_named_file() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("docker-compose.yml"), "services: {}").unwrap();
+        std::fs::write(dir.path().join("prod.yml"), "services: {}").unwrap();
+        let c = Compose::at(&dir.path().join("prod.yml")).unwrap();
+        assert!(c.file().ends_with("prod.yml"));
+        assert!(Compose::at(&dir.path().join("missing.yml")).is_none());
     }
 
     #[test]
@@ -465,10 +500,9 @@ mod tests {
     }
 
     #[test]
-    fn up_removes_orphans_only_when_asked_and_pull_is_quiet() {
-        assert_eq!(up_args(&[], false), vec!["up", "-d"]);
-        assert_eq!(up_args(&["web"], false), vec!["up", "-d", "web"]);
-        assert_eq!(up_args(&[], true), vec!["up", "-d", "--remove-orphans"]);
+    fn up_never_removes_orphans_and_pull_is_quiet() {
+        assert_eq!(up_args(&[]), vec!["up", "-d"]);
+        assert_eq!(up_args(&["web"]), vec!["up", "-d", "web"]);
         assert_eq!(pull_args(&[]), vec!["pull", "-q"]);
         assert_eq!(pull_args(&["web"]), vec!["pull", "-q", "web"]);
     }

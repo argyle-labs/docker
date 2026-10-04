@@ -12,9 +12,12 @@
 //! those. Existing unlabeled volumes are reported by coverage and
 //! `docker.label_audit`, never relabeled.
 //!
-//! Networks have no data: labeling an existing compose network makes compose
-//! recreate it once (with the containers on it, which the new service labels
-//! recreate anyway).
+//! Networks follow the same rule. Compose recreates a network whose declared
+//! labels changed: it stops the stack's containers, then fails with "network
+//! has active endpoints" when another project's container is attached (the
+//! shared proxy network pattern), leaving the stack down. So an existing
+//! network is never relabeled; it is reported instead, with any other
+//! project's containers attached to it.
 //!
 //! The file is JSON (valid YAML), so it can be read back: its `x-orca` key
 //! records the anonymous volumes converted to named ones, which every
@@ -42,7 +45,6 @@ use crate::compose_config::ComposeConfig;
 use crate::labels::{self, Labels, OWNER_DOCKER};
 use crate::prune::{COMPOSE_PROJECT_LABEL, COMPOSE_VOLUME_LABEL};
 use crate::stacks::StackRow;
-use crate::volume_coverage::HELPER_IMAGE;
 
 pub const COMPOSE_SERVICE_LABEL: &str = "com.docker.compose.service";
 pub const COMPOSE_ONEOFF_LABEL: &str = "com.docker.compose.oneoff";
@@ -154,6 +156,28 @@ struct XOrca {
 /// Labels of every engine volume, by name.
 pub type EngineVolumes = HashMap<String, HashMap<String, String>>;
 
+/// An existing engine network of the project.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EngineNetwork {
+    pub labels: HashMap<String, String>,
+    /// Containers of other projects attached to it.
+    pub foreign: Vec<String>,
+}
+
+/// The project's existing networks, by engine name.
+pub type EngineNetworks = HashMap<String, EngineNetwork>;
+
+/// A generated [`ORCA_FILE`], and what it left unlabeled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rendered {
+    pub text: String,
+    pub notes: Vec<String>,
+}
+
+fn network_name(project: &str, key: &str, n: &crate::compose_config::NetworkConfig) -> String {
+    n.name.clone().unwrap_or_else(|| format!("{project}_{key}"))
+}
+
 /// The labels to declare on a volume: `wanted` when it does not exist yet,
 /// its own orca labels when orca already labeled it, else none (see the
 /// module doc).
@@ -197,10 +221,12 @@ pub fn render(
     stack: &str,
     conversions: &[Conversion],
     engine: &EngineVolumes,
-) -> String {
+    networks: &EngineNetworks,
+) -> Rendered {
     let project = cfg.name.as_str();
     let conversions = live_conversions(cfg, conversions);
     let mut file = OrcaFile::default();
+    let mut notes = Vec::new();
     for svc in cfg.services.keys() {
         file.services.insert(
             svc.clone(),
@@ -222,12 +248,30 @@ pub fn render(
         if n.external == Some(true) {
             continue;
         }
-        file.networks.insert(
-            key.clone(),
-            LabelsOnly {
-                labels: Labels::for_(OWNER_DOCKER, project, None, Some(stack)).to_map(),
-            },
-        );
+        let name = network_name(project, key, n);
+        let labels = match networks.get(&name) {
+            None => Labels::for_(OWNER_DOCKER, project, None, Some(stack)).to_map(),
+            Some(have) if labels::is_managed(have.labels.iter()) => have
+                .labels
+                .iter()
+                .filter(|(k, _)| k.starts_with("orca."))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            Some(have) => {
+                let mut note = format!(
+                    "network '{name}' exists without orca labels; not relabeled (compose would recreate it)"
+                );
+                if !have.foreign.is_empty() {
+                    note.push_str(&format!(
+                        "; other projects' containers are attached: {}",
+                        have.foreign.join(", ")
+                    ));
+                }
+                notes.push(note);
+                continue;
+            }
+        };
+        file.networks.insert(key.clone(), LabelsOnly { labels });
     }
     for (key, v) in &cfg.volumes {
         if v.external == Some(true) {
@@ -268,7 +312,10 @@ pub fn render(
     }
     file.x_orca.conversions = conversions;
     let body = serde_json::to_string_pretty(&file).unwrap_or_default();
-    format!("{HEADER}{body}\n")
+    Rendered {
+        text: format!("{HEADER}{body}\n"),
+        notes,
+    }
 }
 
 /// The conversions recorded in an existing [`ORCA_FILE`]. A file that exists
@@ -276,8 +323,10 @@ pub fn render(
 /// silently swap converted volumes back to fresh anonymous ones.
 pub fn read_conversions(dir: &Path) -> Result<Vec<Conversion>> {
     let path = dir.join(ORCA_FILE);
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Ok(Vec::new());
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(anyhow::anyhow!("read {}: {e}", path.display())),
     };
     let json: String = text
         .lines()
@@ -296,15 +345,13 @@ pub fn read_conversions(dir: &Path) -> Result<Vec<Conversion>> {
     })
 }
 
-/// Write `text` to `path` through a temp file and a rename; unchanged
-/// content is not rewritten.
+/// Write `text` to `path` through a fsynced temp file and a rename;
+/// unchanged content is not rewritten.
 fn write_atomic(path: &Path, text: &str) -> Result<()> {
     if std::fs::read_to_string(path).is_ok_and(|old| old == text) {
         return Ok(());
     }
-    let tmp = path.with_extension("yaml.orca-tmp");
-    std::fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))
+    crate::stacks::StagedWrite::new(path, text)?.replace()
 }
 
 pub async fn engine_volumes(docker: &Docker) -> Result<EngineVolumes> {
@@ -317,6 +364,65 @@ pub async fn engine_volumes(docker: &Docker) -> Result<EngineVolumes> {
         .into_iter()
         .map(|v| (v.name, v.labels))
         .collect())
+}
+
+/// The project's non-external networks that exist on the engine, with the
+/// containers of other projects attached to each.
+pub async fn engine_networks(docker: &Docker, cfg: &ComposeConfig) -> Result<EngineNetworks> {
+    let mut out = EngineNetworks::new();
+    for (key, n) in &cfg.networks {
+        if n.external == Some(true) {
+            continue;
+        }
+        let name = network_name(&cfg.name, key, n);
+        let inspected = match docker
+            .inspect_network(
+                &name,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await
+        {
+            Ok(i) => i,
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => continue,
+            Err(e) => return Err(anyhow::anyhow!("inspect network {name}: {e}")),
+        };
+        let filters = HashMap::from([("network", vec![name.clone()])]);
+        let attached = docker
+            .list_containers(Some(
+                ListContainersOptionsBuilder::new()
+                    .all(true)
+                    .filters(&filters)
+                    .build(),
+            ))
+            .await
+            .map_err(|e| anyhow::anyhow!("list containers on {name}: {e}"))?;
+        let foreign = attached
+            .iter()
+            .filter(|c| {
+                c.labels
+                    .as_ref()
+                    .and_then(|l| l.get(COMPOSE_PROJECT_LABEL))
+                    .map(String::as_str)
+                    != Some(cfg.name.as_str())
+            })
+            .filter_map(|c| {
+                c.names
+                    .as_ref()?
+                    .first()
+                    .map(|n| n.trim_start_matches('/').to_string())
+            })
+            .collect();
+        out.insert(
+            name,
+            EngineNetwork {
+                labels: inspected.labels.unwrap_or_default(),
+                foreign,
+            },
+        );
+    }
+    Ok(out)
 }
 
 /// Containers of `project`, running or stopped.
@@ -346,7 +452,7 @@ pub async fn write_with(
     row: &StackRow,
     docker: &Docker,
     conversions: Option<&[Conversion]>,
-) -> Result<Compose> {
+) -> Result<(Compose, Vec<String>)> {
     let (compose, cfg) = user_config(row).await?;
     let recorded;
     let conversions = match conversions {
@@ -357,11 +463,10 @@ pub async fn write_with(
         }
     };
     let engine = engine_volumes(docker).await?;
-    write_atomic(
-        &Path::new(&row.dir).join(ORCA_FILE),
-        &render(&cfg, &row.name, conversions, &engine),
-    )?;
-    Ok(compose.with_orca())
+    let networks = engine_networks(docker, &cfg).await?;
+    let rendered = render(&cfg, &row.name, conversions, &engine, &networks);
+    write_atomic(&Path::new(&row.dir).join(ORCA_FILE), &rendered.text)?;
+    Ok((compose.with_orca(), rendered.notes))
 }
 
 fn client() -> Result<&'static Docker> {
@@ -372,12 +477,19 @@ fn client() -> Result<&'static Docker> {
 
 /// Regenerate [`ORCA_FILE`] and return the project to run compose with.
 pub async fn refresh(row: &StackRow) -> Result<Compose> {
-    write_with(row, client()?, None).await
+    Ok(write_with(row, client()?, None).await?.0)
 }
 
-/// `compose up -d` (for `services`, or all) with a fresh [`ORCA_FILE`].
+/// `compose up -d` (for `services`, or all) with a fresh [`ORCA_FILE`]. The
+/// output leads with what was left unlabeled.
 pub async fn up(row: &StackRow, services: &[&str]) -> Result<String> {
-    Ok(refresh(row).await?.up(services).await?)
+    let (compose, notes) = write_with(row, client()?, None).await?;
+    let out = compose.up(services).await?;
+    Ok(notes
+        .iter()
+        .map(|n| format!("note: {n}\n"))
+        .chain(std::iter::once(out))
+        .collect())
 }
 
 // ── anonymous volumes ───────────────────────────────────────────────────────
@@ -435,12 +547,41 @@ pub fn anonymous_volumes(
 
 // ── label_volumes ───────────────────────────────────────────────────────────
 
+/// Containers of the stack that do not carry orca's labels yet are recreated
+/// by the first `up` that applies them, whether or not a volume is converted.
+pub fn relabel_warning(containers: &[ContainerSummary]) -> Option<String> {
+    let names: Vec<String> = containers
+        .iter()
+        .filter(|c| {
+            let l = c.labels.clone().unwrap_or_default();
+            l.get(COMPOSE_ONEOFF_LABEL).map(String::as_str) != Some("True")
+                && !labels::is_managed(l.iter())
+        })
+        .filter_map(|c| {
+            c.names
+                .as_ref()?
+                .first()
+                .map(|n| n.trim_start_matches('/').to_string())
+        })
+        .collect();
+    (!names.is_empty()).then(|| {
+        format!(
+            "the first labeled up recreates {} container(s) of this stack: {}",
+            names.len(),
+            names.join(", ")
+        )
+    })
+}
+
 /// One anonymous volume `label_volumes` would convert.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Planned {
     pub conversion: Conversion,
     /// The current anonymous volume; `None` when no container exists yet.
     pub old: Option<String>,
+    /// Whether the service has a running container. A stopped service is
+    /// left stopped.
+    pub running: bool,
     /// Why it cannot be converted automatically.
     pub blocked: Option<String>,
 }
@@ -452,16 +593,39 @@ pub fn plan(
     containers: &[ContainerSummary],
     converted: &[Conversion],
 ) -> Vec<Planned> {
-    anonymous_volumes(cfg, containers)
+    let pending: Vec<AnonymousVolume> = anonymous_volumes(cfg, containers)
         .into_iter()
         .filter(|a| {
             !converted
                 .iter()
                 .any(|c| c.service == a.service && c.target == a.target)
         })
+        .collect();
+    // Compose keys and engine names compare case-insensitively on some
+    // filesystems and to the eye; a clash is refused, never merged.
+    let mut taken: HashMap<String, usize> = HashMap::new();
+    for k in cfg.volumes.keys() {
+        *taken.entry(k.to_lowercase()).or_default() += 1;
+    }
+    for c in converted {
+        *taken.entry(c.volume.to_lowercase()).or_default() += 1;
+    }
+    for a in &pending {
+        *taken
+            .entry(
+                Conversion::new(&cfg.name, &a.service, &a.target)
+                    .volume
+                    .to_lowercase(),
+            )
+            .or_default() += 1;
+    }
+    pending
+        .into_iter()
         .map(|a| {
             let conversion = Conversion::new(&cfg.name, &a.service, &a.target);
-            let (old, blocked) = match a.engine_names.as_slice() {
+            let running = service_containers(containers, &a.service)
+                .any(|c| c.state.as_ref().is_some_and(|s| format!("{s}") == "running"));
+            let (old, mut blocked) = match a.engine_names.as_slice() {
                 [] => (None, None),
                 [one] => (Some(one.clone()), None),
                 many => (
@@ -472,9 +636,16 @@ pub fn plan(
                     )),
                 ),
             };
+            if blocked.is_none() && taken.get(&conversion.volume.to_lowercase()) > Some(&1) {
+                blocked = Some(format!(
+                    "the generated volume key '{}' collides with another volume of the stack; convert by hand",
+                    conversion.volume
+                ));
+            }
             Planned {
                 conversion,
                 old,
+                running,
                 blocked,
             }
         })
@@ -485,8 +656,12 @@ pub fn planned_change(p: &Planned) -> PlannedChange {
     let c = &p.conversion;
     let detail = match (&p.blocked, &p.old) {
         (Some(why), _) => format!("not convertible: {why}"),
-        (None, Some(old)) => format!(
+        (None, Some(old)) if p.running => format!(
             "stop '{}', copy {old} into new volume {} and verify it, declare it at {}, up, then remove {old} if no container uses it",
+            c.service, c.name, c.target
+        ),
+        (None, Some(old)) => format!(
+            "'{}' is stopped and stays stopped: copy {old} into new volume {} and verify it, declare it at {}, recreate without starting, then remove {old} if no container uses it",
             c.service, c.name, c.target
         ),
         (None, None) => format!(
@@ -503,12 +678,15 @@ pub trait Migrator: Send + Sync {
     fn stop<'a>(&'a self, service: &'a str) -> BoxFuture<'a, Result<()>>;
     fn start<'a>(&'a self, service: &'a str) -> BoxFuture<'a, Result<()>>;
     fn copy<'a>(&'a self, from: &'a str, to: &'a str) -> BoxFuture<'a, Result<()>>;
-    /// A digest of every path's type, mode, owner, size and content.
+    /// A digest of every path's type, mode, owner, mtime, xattrs, ACLs,
+    /// link target, device number and content.
     fn manifest<'a>(&'a self, volume: &'a str) -> BoxFuture<'a, Result<String>>;
     fn current_override(&self) -> Result<Option<String>>;
     fn write_override<'a>(&'a self, conversions: &'a [Conversion]) -> BoxFuture<'a, Result<()>>;
     fn restore_override(&self, previous: Option<&str>) -> Result<()>;
-    fn up<'a>(&'a self, service: &'a str) -> BoxFuture<'a, Result<()>>;
+    /// Recreate the service from the current override; `start` false leaves
+    /// it created but stopped.
+    fn up<'a>(&'a self, service: &'a str, start: bool) -> BoxFuture<'a, Result<()>>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -559,28 +737,42 @@ pub async fn create_volume(
     Ok(())
 }
 
-async fn volume_exists(docker: &Docker, name: &str) -> Result<bool> {
-    match docker.inspect_volume(name).await {
-        Ok(_) => Ok(true),
-        Err(bollard::errors::Error::DockerResponseServerError {
-            status_code: 404, ..
-        }) => Ok(false),
-        Err(e) => Err(anyhow::anyhow!("inspect volume {name}: {e}")),
-    }
-}
-
-async fn referenced(docker: &Docker, volume: &str) -> Result<bool> {
+/// Containers mounting `volume`: all of them, or only running ones.
+async fn users(docker: &Docker, volume: &str, all: bool) -> Result<Vec<String>> {
     let filters = HashMap::from([("volume", vec![volume.to_string()])]);
-    let users = docker
+    let found = docker
         .list_containers(Some(
             ListContainersOptionsBuilder::new()
-                .all(true)
+                .all(all)
                 .filters(&filters)
                 .build(),
         ))
         .await
         .map_err(|e| anyhow::anyhow!("list containers using {volume}: {e}"))?;
-    Ok(!users.is_empty())
+    Ok(found
+        .iter()
+        .map(|c| {
+            c.names
+                .as_ref()
+                .and_then(|n| n.first())
+                .map(|n| n.trim_start_matches('/').to_string())
+                .or_else(|| c.id.clone())
+                .unwrap_or_default()
+        })
+        .collect())
+}
+
+/// Refuse while a running container can still write to `old`: the copy
+/// would miss its writes.
+async fn ensure_quiet(docker: &Docker, old: &str) -> Result<()> {
+    let running = users(docker, old, false).await?;
+    if !running.is_empty() {
+        anyhow::bail!(
+            "{old} is mounted by running containers ({}); stop them first",
+            running.join(", ")
+        );
+    }
+    Ok(())
 }
 
 async fn remove_volume(docker: &Docker, name: &str) -> Result<()> {
@@ -593,8 +785,8 @@ async fn remove_volume(docker: &Docker, name: &str) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("remove volume {name}: {e}"))
 }
 
-/// Copy and verify one conversion into a volume this call creates. Returns
-/// whether the target was created, so a failure can remove it.
+/// Copy and verify one conversion into a volume this call creates; created
+/// volumes are recorded so a failure can remove them.
 async fn copy_one(
     docker: &Docker,
     m: &dyn Migrator,
@@ -604,11 +796,14 @@ async fn copy_one(
     created: &mut Vec<String>,
 ) -> Result<()> {
     let c = &p.conversion;
-    if volume_exists(docker, &c.name).await? {
+    if crate::volume_coverage::volume_exists(docker, &c.name).await? {
         anyhow::bail!(
             "target volume {} already exists; remove it or convert by hand",
             c.name
         );
+    }
+    if let Some(old) = &p.old {
+        ensure_quiet(docker, old).await?;
     }
     create_volume(docker, project, stack, c).await?;
     created.push(c.name.clone());
@@ -625,11 +820,32 @@ async fn copy_one(
     Ok(())
 }
 
+/// Remove the volumes this call created that no container references; the
+/// reasons for any left behind are appended to `reason`.
+async fn drop_created(docker: &Docker, created: &[String], reason: &mut String) {
+    for name in created {
+        match users(docker, name, true).await {
+            Ok(u) if u.is_empty() => {
+                if let Err(e) = remove_volume(docker, name).await {
+                    reason.push_str(&format!("; {e}"));
+                }
+            }
+            Ok(u) => reason.push_str(&format!("; {name} kept: used by {}", u.join(", "))),
+            Err(e) => reason.push_str(&format!("; {e}")),
+        }
+    }
+}
+
 /// Convert the confirmed `act` keys, one service at a time:
-/// stop → create + copy + verify → declare in the override → up → remove
-/// the old volume if no container references it. A failure before `up`
-/// restores the previous override, removes the volumes it created and
-/// starts the service again; the old volume is never touched.
+/// stop (if running) → refuse while a running container still mounts the old
+/// volume → create + copy + verify → declare in the override → check again →
+/// up (or recreate without starting a stopped service) → remove the old
+/// volume if no container references it.
+///
+/// A failure before `up` restores the previous override, removes the volumes
+/// it created and starts the service again if it stopped it. A failed `up`
+/// restores the previous override and recreates the service from it. The old
+/// volume is never touched on any failure.
 pub async fn migrate(
     docker: &Docker,
     m: &dyn Migrator,
@@ -667,12 +883,14 @@ pub async fn migrate(
                 continue;
             }
         };
-        let running = items.iter().any(|p| p.old.is_some());
-        if running && let Err(e) = m.stop(svc).await {
-            fail(&mut out, format!("stop: {e}"));
+        let running = items.iter().any(|p| p.running);
+        let stop = running && items.iter().any(|p| p.old.is_some());
+        if stop && let Err(e) = m.stop(svc).await {
+            let mut reason = format!("stop: {e}");
             if let Err(e) = m.start(svc).await {
-                fail(&mut out, format!("start after failed stop: {e}"));
+                reason.push_str(&format!("; start: {e}"));
             }
+            fail(&mut out, reason);
             continue;
         }
         let mut created = Vec::new();
@@ -683,12 +901,17 @@ pub async fn migrate(
                 break;
             }
         }
+        let mut next = conversions.clone();
+        next.extend(items.iter().map(|p| p.conversion.clone()));
         if step.is_ok() {
-            let mut next = conversions.clone();
-            next.extend(items.iter().map(|p| p.conversion.clone()));
             step = m.write_override(&next).await;
-            if step.is_ok() {
-                conversions = next;
+        }
+        if step.is_ok() {
+            for old in items.iter().filter_map(|p| p.old.as_deref()) {
+                step = ensure_quiet(docker, old).await;
+                if step.is_err() {
+                    break;
+                }
             }
         }
         if let Err(e) = step {
@@ -696,40 +919,44 @@ pub async fn migrate(
             if let Err(e) = m.restore_override(previous.as_deref()) {
                 reason.push_str(&format!("; restoring the override failed: {e}"));
             }
-            for name in &created {
-                if let Err(e) = remove_volume(docker, name).await {
-                    reason.push_str(&format!("; {e}"));
-                }
-            }
-            if running && let Err(e) = m.start(svc).await {
+            drop_created(docker, &created, &mut reason).await;
+            if stop && let Err(e) = m.start(svc).await {
                 reason.push_str(&format!("; start: {e}"));
             }
             fail(&mut out, reason);
             continue;
         }
-        if let Err(e) = m.up(svc).await {
-            fail(
-                &mut out,
-                format!(
-                    "up after the copy failed: {e}; the data is in the new volume, the old one is kept"
-                ),
-            );
+        if let Err(e) = m.up(svc, running).await {
+            let mut reason = format!("up after the copy failed: {e}; the old volume is kept");
+            match m.restore_override(previous.as_deref()) {
+                Ok(()) => {
+                    if let Err(e) = m.up(svc, running).await {
+                        reason.push_str(&format!(
+                            "; recreating from the previous override failed too: {e}"
+                        ));
+                    }
+                }
+                Err(e) => reason.push_str(&format!("; restoring the override failed: {e}")),
+            }
+            drop_created(docker, &created, &mut reason).await;
+            fail(&mut out, reason);
             continue;
         }
+        conversions = next;
         for p in items {
             out.converted.push(p.conversion.key());
             let Some(old) = &p.old else { continue };
-            match referenced(docker, old).await {
-                Ok(false) => match remove_volume(docker, old).await {
+            match users(docker, old, true).await {
+                Ok(u) if u.is_empty() => match remove_volume(docker, old).await {
                     Ok(()) => out.removed.push(old.clone()),
                     Err(e) => out.kept.push(NotDone {
                         item: old.clone(),
                         reason: e.to_string(),
                     }),
                 },
-                Ok(true) => out.kept.push(NotDone {
+                Ok(u) => out.kept.push(NotDone {
                     item: old.clone(),
-                    reason: "a container still references it".into(),
+                    reason: format!("a container still references it: {}", u.join(", ")),
                 }),
                 Err(e) => out.kept.push(NotDone {
                     item: old.clone(),
@@ -741,9 +968,31 @@ pub async fn migrate(
     out
 }
 
-/// Builds the manifest inside the helper. `stat`/`find`/`sha256sum` are
-/// busybox; paths are relative so source and target compare equal.
-const MANIFEST_SCRIPT: &str = r#"set -eo pipefail; cd /v; { find . -exec stat -c '%n %F %a %u:%g' {} + | sort; find . -type f -exec stat -c '%n %s' {} + | sort; find . -type f -exec sha256sum {} + | sort -k2; } | sha256sum"#;
+/// Image for the copy and manifest helpers: Debian slim (the fleet's
+/// container base) for GNU tar with xattr, ACL and sparse support, pinned to
+/// the multi-arch index digest.
+pub const MIGRATE_IMAGE: &str =
+    "debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251";
+
+const TAR: &str = "tar --xattrs --xattrs-include='*' --acls --sparse --numeric-owner";
+
+/// Copies through a tar pipe so hardlinks, sparse files, devices, xattrs and
+/// ACLs survive.
+fn copy_script() -> String {
+    format!(
+        "set -euo pipefail; {TAR} -C /from -cf - . | {TAR} --same-permissions --same-owner -C /to -xf -"
+    )
+}
+
+/// Hashes a name-sorted POSIX tar of the volume: every entry's type, mode,
+/// owner, mtime, xattrs, ACLs, link target, device number and content.
+/// atime, ctime and the per-process header names are dropped so equal trees
+/// hash equal.
+fn manifest_script() -> String {
+    format!(
+        "set -euo pipefail; cd /v; {TAR} --sort=name --format=posix --pax-option=delete=atime,delete=ctime,exthdr.name=%d/PaxHeaders/%f,globexthdr.name=/GlobalHead -cf - . | sha256sum"
+    )
+}
 
 pub fn copy_args(from: &str, to: &str) -> Vec<String> {
     vec![
@@ -755,10 +1004,10 @@ pub fn copy_args(from: &str, to: &str) -> Vec<String> {
         format!("type=volume,src={from},dst=/from,readonly"),
         "--mount".into(),
         format!("type=volume,src={to},dst=/to"),
-        HELPER_IMAGE.into(),
-        "sh".into(),
+        MIGRATE_IMAGE.into(),
+        "bash".into(),
         "-c".into(),
-        "cp -a /from/. /to/".into(),
+        copy_script(),
     ]
 }
 
@@ -770,10 +1019,10 @@ pub fn manifest_args(volume: &str) -> Vec<String> {
         "none".into(),
         "--mount".into(),
         format!("type=volume,src={volume},dst=/v,readonly"),
-        HELPER_IMAGE.into(),
-        "sh".into(),
+        MIGRATE_IMAGE.into(),
+        "bash".into(),
         "-c".into(),
-        MANIFEST_SCRIPT.into(),
+        manifest_script(),
     ]
 }
 
@@ -849,9 +1098,21 @@ impl Migrator for ComposeMigrator<'_> {
             None => Ok(()),
         }
     }
-    fn up<'a>(&'a self, service: &'a str) -> BoxFuture<'a, Result<()>> {
+    fn up<'a>(&'a self, service: &'a str, start: bool) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            up(self.row, &[service]).await?;
+            // The override on disk is what this step means to apply: a
+            // regeneration here would undo a restored one.
+            let compose = self.row.compose()?;
+            let compose = if Path::new(&self.row.dir).join(ORCA_FILE).exists() {
+                compose.with_orca()
+            } else {
+                compose
+            };
+            if start {
+                compose.up(&[service]).await?;
+            } else {
+                compose.create(&[service]).await?;
+            }
             Ok(())
         })
     }
@@ -869,7 +1130,14 @@ mod tests {
     }
 
     fn rendered(conversions: &[Conversion], engine: &EngineVolumes) -> Value {
-        let text = render(&cfg(), "media-stack", conversions, engine);
+        let text = render(
+            &cfg(),
+            "media-stack",
+            conversions,
+            engine,
+            &EngineNetworks::new(),
+        )
+        .text;
         assert!(text.starts_with('#'));
         let json: String = text.lines().filter(|l| !l.starts_with('#')).collect();
         serde_json::from_str(&json).unwrap()
@@ -909,6 +1177,59 @@ mod tests {
         assert_eq!(data[labels::MOUNT], "/data");
         assert!(v["volumes"].get("shared").is_none(), "external");
         assert!(v["services"]["app"].get("volumes").is_none());
+    }
+
+    #[test]
+    fn an_existing_network_is_never_relabeled_and_foreign_endpoints_are_reported() {
+        // media_default exists unlabeled; caddy's proxy container is attached.
+        let e = FakeEngine::routed(vec![
+            Route::new(
+                "GET",
+                "/networks/media_default",
+                200,
+                r#"{"Name":"media_default","Id":"n1","Labels":{"com.docker.compose.project":"media"}}"#,
+            ),
+            Route::new(
+                "GET",
+                "/containers/json",
+                200,
+                r#"[{"Id":"c1","Names":["/media-app-1"],"Labels":{"com.docker.compose.project":"media"}},
+                    {"Id":"c2","Names":["/caddy"],"Labels":{"com.docker.compose.project":"caddy"}}]"#,
+            )
+            .when_query(r#""network":["media_default"]"#),
+        ]);
+        let nets = plugin_toolkit::reactor::block_on(engine_networks(&e.client(), &cfg())).unwrap();
+        assert_eq!(nets["media_default"].foreign, vec!["caddy"]);
+        assert!(
+            !nets.contains_key("caddy_proxy"),
+            "external networks are not read"
+        );
+        let r = render(&cfg(), "media-stack", &[], &EngineVolumes::new(), &nets);
+        let json: String = r.text.lines().filter(|l| !l.starts_with('#')).collect();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("networks").is_none(), "{v}");
+        assert_eq!(r.notes.len(), 1);
+        assert!(r.notes[0].contains("media_default") && r.notes[0].contains("caddy"));
+        assert!(e.paths("POST").is_empty() && e.paths("DELETE").is_empty());
+
+        // Already orca-labeled: declared with exactly its labels, no change.
+        let managed = EngineNetworks::from([(
+            "media_default".to_string(),
+            EngineNetwork {
+                labels: HashMap::from([
+                    (labels::MANAGED.to_string(), "true".to_string()),
+                    (labels::UNIT.to_string(), "older".to_string()),
+                ]),
+                foreign: vec!["caddy".into()],
+            },
+        )]);
+        let r = render(&cfg(), "media-stack", &[], &EngineVolumes::new(), &managed);
+        let json: String = r.text.lines().filter(|l| !l.starts_with('#')).collect();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        let l = v["networks"]["default"]["labels"].as_object().unwrap();
+        assert_eq!(l.len(), 2);
+        assert_eq!(l[labels::UNIT], "older");
+        assert!(r.notes.is_empty());
     }
 
     #[test]
@@ -963,7 +1284,14 @@ mod tests {
         let c = Conversion::new("media", "app", "/cache");
         std::fs::write(
             dir.path().join(ORCA_FILE),
-            render(&cfg(), "m", std::slice::from_ref(&c), &EngineVolumes::new()),
+            render(
+                &cfg(),
+                "m",
+                std::slice::from_ref(&c),
+                &EngineVolumes::new(),
+                &EngineNetworks::new(),
+            )
+            .text,
         )
         .unwrap();
         assert_eq!(read_conversions(dir.path()).unwrap(), vec![c]);
@@ -977,7 +1305,7 @@ mod tests {
             .map(|(n, d)| format!(r#"{{"Name":"{n}","Destination":"{d}"}}"#))
             .collect();
         serde_json::from_str(&format!(
-            r#"{{"Id":"{name}","Names":["/{name}"],"Labels":{{"{COMPOSE_SERVICE_LABEL}":"{service}"}},"Mounts":[{}]}}"#,
+            r#"{{"Id":"{name}","Names":["/{name}"],"State":"running","Labels":{{"{COMPOSE_SERVICE_LABEL}":"{service}"}},"Mounts":[{}]}}"#,
             mounts.join(",")
         ))
         .unwrap()
@@ -994,6 +1322,7 @@ mod tests {
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].conversion.key(), "app:/cache");
         assert_eq!(p[0].old.as_deref(), Some("anon-cache"));
+        assert!(p[0].running);
         assert!(
             planned_change(&p[0])
                 .detail
@@ -1007,13 +1336,52 @@ mod tests {
         ];
         let p = plan(&cfg(), &two, &[]);
         assert!(p[0].blocked.as_deref().unwrap().contains("2 containers"));
-        assert!(plan(&cfg(), &[], &[])[0].old.is_none());
+        let p = plan(&cfg(), &[], &[]);
+        assert!(p[0].old.is_none() && !p[0].running);
+    }
+
+    #[test]
+    fn the_plan_warns_that_unlabeled_containers_will_be_recreated() {
+        let mut labeled = container("media-db-1", "db", &[]);
+        labeled
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert(labels::MANAGED.into(), "true".into());
+        let w = relabel_warning(&[container("media-app-1", "app", &[]), labeled.clone()]).unwrap();
+        assert!(
+            w.contains("1 container(s)") && w.contains("media-app-1"),
+            "{w}"
+        );
+        assert!(relabel_warning(&[labeled]).is_none());
+    }
+
+    #[test]
+    fn plan_refuses_generated_keys_that_collide() {
+        // A user volume already named like the generated key.
+        let mut c = cfg();
+        c.volumes.insert("App_Cache".into(), Default::default());
+        let p = plan(&c, &[], &[]);
+        assert!(
+            p[0].blocked.as_deref().unwrap().contains("collides"),
+            "{p:?}"
+        );
+        // Two paths that slug alike.
+        let c = ComposeConfig::parse(
+            r#"{"name":"m","services":{"app":{"volumes":[{"type":"volume","target":"/a-b"},{"type":"volume","target":"/a_b"}]}}}"#,
+        )
+        .unwrap();
+        let p = plan(&c, &[], &[]);
+        assert_eq!(p.len(), 2);
+        assert!(p.iter().all(|x| x.blocked.is_some()), "{p:?}");
     }
 
     #[derive(Default)]
     struct FakeMigrator {
         calls: Mutex<Vec<String>>,
         bad_manifest: bool,
+        fail_write: bool,
+        fail_first_up: bool,
         written: Mutex<Option<Vec<Conversion>>>,
     }
 
@@ -1056,24 +1424,53 @@ mod tests {
             conversions: &'a [Conversion],
         ) -> BoxFuture<'a, Result<()>> {
             self.log("write".into());
-            *self.written.lock().unwrap() = Some(conversions.to_vec());
-            Box::pin(async { Ok(()) })
+            let fail = self.fail_write;
+            if !fail {
+                *self.written.lock().unwrap() = Some(conversions.to_vec());
+            }
+            Box::pin(async move {
+                if fail {
+                    anyhow::bail!("disk full")
+                }
+                Ok(())
+            })
         }
         fn restore_override(&self, previous: Option<&str>) -> Result<()> {
             self.log(format!("restore {}", previous.unwrap_or("-")));
             Ok(())
         }
-        fn up<'a>(&'a self, service: &'a str) -> BoxFuture<'a, Result<()>> {
-            self.log(format!("up {service}"));
-            Box::pin(async { Ok(()) })
+        fn up<'a>(&'a self, service: &'a str, start: bool) -> BoxFuture<'a, Result<()>> {
+            let n = self
+                .calls()
+                .iter()
+                .filter(|c| c.starts_with("up ") || c.starts_with("create "))
+                .count();
+            self.log(format!("{} {service}", if start { "up" } else { "create" }));
+            let fail = self.fail_first_up && n == 0;
+            Box::pin(async move {
+                if fail {
+                    anyhow::bail!("port already allocated")
+                }
+                Ok(())
+            })
         }
     }
 
     fn engine(extra: Vec<Route>) -> FakeEngine {
         let mut routes = extra;
         routes.extend([
-            Route::new("GET", "/volumes/media_app_cache", 404, r#"{"message":"no such volume"}"#),
-            Route::new("POST", "/volumes/create", 201, r#"{"Name":"media_app_cache","Driver":"local","Mountpoint":"","Labels":{},"Scope":"local","Options":{}}"#),
+            Route::new(
+                "GET",
+                "/volumes/media_app_cache",
+                404,
+                r#"{"message":"no such volume"}"#,
+            ),
+            Route::new(
+                "POST",
+                "/volumes/create",
+                201,
+                r#"{"Name":"media_app_cache","Driver":"local","Mountpoint":"","Labels":{},"Scope":"local","Options":{}}"#,
+            ),
             Route::new("GET", "/containers/json", 200, "[]"),
             Route::new("DELETE", "/volumes/anon-cache", 204, ""),
             Route::new("DELETE", "/volumes/media_app_cache", 204, ""),
@@ -1081,24 +1478,33 @@ mod tests {
         FakeEngine::routed(routes)
     }
 
-    fn planned() -> Vec<Planned> {
+    fn planned_with(running: bool, blocked: Option<&str>) -> Vec<Planned> {
         vec![Planned {
             conversion: Conversion::new("media", "app", "/cache"),
             old: Some("anon-cache".into()),
-            blocked: None,
+            running,
+            blocked: blocked.map(str::to_string),
         }]
     }
 
-    fn run(e: &FakeEngine, m: &FakeMigrator) -> Migrated {
+    fn run_with(e: &FakeEngine, m: &FakeMigrator, planned: &[Planned]) -> Migrated {
         plugin_toolkit::reactor::block_on(migrate(
             &e.client(),
             m,
             "media",
             "media-stack",
-            &planned(),
+            planned,
             &["app:/cache".to_string()],
             &[],
         ))
+    }
+
+    fn run(e: &FakeEngine, m: &FakeMigrator) -> Migrated {
+        run_with(e, m, &planned_with(true, None))
+    }
+
+    fn deletes(e: &FakeEngine) -> Vec<String> {
+        e.paths("DELETE")
     }
 
     #[test]
@@ -1135,13 +1541,17 @@ mod tests {
         assert_eq!(l[labels::MOUNT], "/cache");
         assert_eq!(l[COMPOSE_PROJECT_LABEL], "media");
         assert_eq!(l[COMPOSE_VOLUME_LABEL], "app_cache");
-        // The old volume is checked for users right before removal.
+        let gets = e.targets("GET");
+        // Writers were checked (running only) before the copy and again before up.
+        let quiet = gets
+            .iter()
+            .filter(|t| t.contains("all=false") && t.contains(r#""volume":["anon-cache"]"#))
+            .count();
+        assert_eq!(quiet, 2, "{gets:?}");
         assert!(
-            e.targets("GET")
-                .iter()
-                .any(|t| t.contains(r#""volume":["anon-cache"]"#)),
-            "{:?}",
-            e.targets("GET")
+            gets.iter()
+                .any(|t| t.contains("all=true") && t.contains(r#""volume":["anon-cache"]"#)),
+            "{gets:?}"
         );
     }
 
@@ -1161,12 +1571,106 @@ mod tests {
         let calls = m.calls();
         assert!(!calls.contains(&"write".to_string()) && !calls.contains(&"up app".to_string()));
         assert_eq!(calls[calls.len() - 2..], ["restore previous", "start app"]);
-        let deletes = e.paths("DELETE");
-        assert_eq!(deletes.len(), 1, "{deletes:?}");
+        let d = deletes(&e);
+        assert_eq!(d.len(), 1, "{d:?}");
         assert!(
-            deletes[0].ends_with("/volumes/media_app_cache"),
+            d[0].ends_with("/volumes/media_app_cache"),
             "only the new volume"
         );
+    }
+
+    #[test]
+    fn a_failed_override_write_rolls_back() {
+        let e = engine(vec![]);
+        let m = FakeMigrator {
+            fail_write: true,
+            ..Default::default()
+        };
+        let out = run(&e, &m);
+        assert!(out.failed[0].reason.contains("disk full"), "{out:?}");
+        let calls = m.calls();
+        assert!(!calls.iter().any(|c| c.starts_with("up ")));
+        assert_eq!(calls[calls.len() - 2..], ["restore previous", "start app"]);
+        let d = deletes(&e);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].ends_with("/volumes/media_app_cache"));
+    }
+
+    #[test]
+    fn a_failed_up_restores_the_previous_override_and_recreates_from_it() {
+        let e = engine(vec![]);
+        let m = FakeMigrator {
+            fail_first_up: true,
+            ..Default::default()
+        };
+        let out = run(&e, &m);
+        assert!(out.converted.is_empty() && out.removed.is_empty());
+        assert!(
+            out.failed[0].reason.contains("port already allocated"),
+            "{out:?}"
+        );
+        let calls = m.calls();
+        assert_eq!(
+            calls[calls.len() - 3..],
+            ["up app", "restore previous", "up app"]
+        );
+        let d = deletes(&e);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(
+            d[0].ends_with("/volumes/media_app_cache"),
+            "the old volume stays"
+        );
+    }
+
+    #[test]
+    fn a_stopped_service_is_converted_without_being_started() {
+        let e = engine(vec![]);
+        let m = FakeMigrator::default();
+        let out = run_with(&e, &m, &planned_with(false, None));
+        assert_eq!(out.converted, vec!["app:/cache"]);
+        let calls = m.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c == "stop app" || c == "start app" || c == "up app"),
+            "{calls:?}"
+        );
+        assert_eq!(calls.last().unwrap(), "create app");
+    }
+
+    #[test]
+    fn a_running_writer_on_the_old_volume_stops_the_migration() {
+        let e = engine(vec![
+            Route::new(
+                "GET",
+                "/containers/json",
+                200,
+                r#"[{"Id":"w","Names":["/sidecar"]}]"#,
+            )
+            .when_query("all=false"),
+        ]);
+        let m = FakeMigrator::default();
+        let out = run(&e, &m);
+        assert!(out.failed[0].reason.contains("sidecar"), "{out:?}");
+        assert!(e.bodies("/volumes/create").is_empty(), "nothing created");
+        assert!(!m.calls().iter().any(|c| c.starts_with("copy")));
+        assert_eq!(m.calls().last().unwrap(), "start app");
+        assert!(deletes(&e).is_empty());
+    }
+
+    #[test]
+    fn a_blocked_item_is_skipped_without_touching_anything() {
+        let e = engine(vec![]);
+        let m = FakeMigrator::default();
+        let out = run_with(
+            &e,
+            &m,
+            &planned_with(true, Some("2 containers each hold their own volume here")),
+        );
+        assert_eq!(out.skipped[0].item, "app:/cache");
+        assert!(out.converted.is_empty() && out.failed.is_empty());
+        assert!(m.calls().is_empty());
+        assert!(e.requests().is_empty());
     }
 
     #[test]
@@ -1178,14 +1682,14 @@ mod tests {
                 200,
                 r#"[{"Id":"x","Names":["/x"]}]"#,
             )
-            .when_query(r#""volume""#),
+            .when_query("all=true"),
         ]);
         let m = FakeMigrator::default();
         let out = run(&e, &m);
         assert_eq!(out.converted, vec!["app:/cache"]);
         assert!(out.removed.is_empty());
         assert!(out.kept[0].reason.contains("references it"));
-        assert!(e.paths("DELETE").is_empty());
+        assert!(deletes(&e).is_empty());
     }
 
     #[test]
@@ -1200,18 +1704,46 @@ mod tests {
         let out = run(&e, &m);
         assert!(out.failed[0].reason.contains("already exists"), "{out:?}");
         assert!(e.bodies("/volumes/create").is_empty());
-        assert!(e.paths("DELETE").is_empty(), "neither volume is removed");
+        assert!(deletes(&e).is_empty(), "neither volume is removed");
     }
 
     #[test]
-    fn helper_commands_are_read_only_where_they_read() {
+    fn helpers_use_gnu_tar_on_pinned_debian_without_network() {
         let c = copy_args("old", "new");
         assert!(c.contains(&"type=volume,src=old,dst=/from,readonly".to_string()));
         assert!(c.contains(&"type=volume,src=new,dst=/to".to_string()));
-        assert_eq!(c.last().unwrap(), "cp -a /from/. /to/");
+        assert!(c.contains(&MIGRATE_IMAGE.to_string()));
+        assert!(MIGRATE_IMAGE.starts_with("debian:") && MIGRATE_IMAGE.contains("@sha256:"));
+        let script = c.last().unwrap();
+        for flag in [
+            "--xattrs",
+            "--acls",
+            "--sparse",
+            "--numeric-owner",
+            "pipefail",
+        ] {
+            assert!(script.contains(flag), "{flag}: {script}");
+        }
         let m = manifest_args("v");
         assert!(m.contains(&"type=volume,src=v,dst=/v,readonly".to_string()));
         assert!(m.contains(&"none".to_string()));
-        assert!(MANIFEST_SCRIPT.contains("sha256sum") && MANIFEST_SCRIPT.contains("%a %u:%g"));
+        let script = m.last().unwrap();
+        for flag in [
+            "--xattrs",
+            "--acls",
+            "--sort=name",
+            "delete=atime,delete=ctime",
+            "sha256sum",
+        ] {
+            assert!(script.contains(flag), "{flag}: {script}");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_orca_file_is_an_error_but_a_missing_one_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_conversions(dir.path()).unwrap().is_empty());
+        std::fs::create_dir(dir.path().join(ORCA_FILE)).unwrap();
+        assert!(read_conversions(dir.path()).is_err());
     }
 }

@@ -158,9 +158,8 @@ impl DockerUnitProvider {
         if args.query.kind.as_deref() == Some("coverage") {
             let (project, volumes) = self.stack_volumes(&row).await?;
             let policies = volume_coverage::policies(&row.name)?;
-            let raw = row
-                .compose()
-                .map_err(anyhow::Error::from)?
+            let raw = ownership::refresh(&row)
+                .await?
                 .config_json()
                 .await
                 .map_err(anyhow::Error::from)?;
@@ -311,7 +310,7 @@ impl DockerUnitProvider {
             .transpose()?;
         let (result, new_yaml) = fix_result(&yaml, override_yaml.as_deref(), &findings, &p)?;
         if let Some(new_yaml) = new_yaml {
-            row.write_compose_if_unchanged(&new_yaml, &yaml)?;
+            row.write_compose_if_unchanged(&new_yaml, &yaml).await?;
         }
         Ok(VerbOutcome::Item(ItemOutcome::new(
             id.clone(),
@@ -325,16 +324,18 @@ impl DockerUnitProvider {
         &self,
         row: &StackRow,
     ) -> Result<(String, Vec<volume_coverage::StackVolume>)> {
-        let raw = row
-            .compose()
-            .map_err(anyhow::Error::from)?
+        // Converted volumes are declared only in the orca file.
+        let raw = ownership::refresh(row)
+            .await?
             .config_json()
             .await
             .map_err(anyhow::Error::from)?;
         let cfg = ComposeConfig::parse(&raw)?;
         let docker = self.adapter.client().map_err(adapter_err)?;
         let engine = volume_coverage::engine_volumes(docker, &cfg.name).await?;
-        Ok((cfg.name.clone(), volume_coverage::detect(&cfg, &engine)))
+        let mut volumes = volume_coverage::detect(&cfg, &engine);
+        volume_coverage::mark_existing(docker, &mut volumes).await?;
+        Ok((cfg.name.clone(), volumes))
     }
 
     /// **label_volumes**: convert the stack's anonymous volumes into labeled
@@ -357,11 +358,15 @@ impl DockerUnitProvider {
         let containers = ownership::project_containers(docker, &cfg.name).await?;
         let converted = ownership::read_conversions(std::path::Path::new(&row.dir))?;
         let planned = ownership::plan(&cfg, &containers, &converted);
+        let warnings = ownership::relabel_warning(&containers)
+            .into_iter()
+            .collect();
         let migrator = ownership::ComposeMigrator { row, docker };
-        let result = label_volumes_result(
+        let mut result = label_volumes_result(
             docker, &migrator, &cfg.name, &row.name, &planned, &converted, &p,
         )
         .await?;
+        result.warnings = warnings;
         Ok(VerbOutcome::Item(ItemOutcome::new(
             id.clone(),
             serde_json::to_string(&result).unwrap_or_default(),
@@ -448,17 +453,31 @@ impl DockerUnitProvider {
             self.stack_volumes(row).await?.1
         };
         let compose = row.compose().map_err(anyhow::Error::from)?;
-        volume_coverage::stage(dir, &compose, &volumes, &policies).await?;
+        let docker = self.adapter.client().map_err(adapter_err)?;
+        let root = volume_coverage::staging_root(&dest, &row.name)?;
         let ts = plugin_toolkit::time::now().unix_seconds();
         let archive = dest.join(format!("{}-{ts}.tar.gz", row.name));
-        let tarred = run_tar(&["czf", &archive.to_string_lossy(), "-C", &row.dir, "."]).await;
-        // Exports can be large; they live on only inside the archive.
-        let staging = dir.join(volume_coverage::STAGING_DIR);
-        if staging.exists() {
-            std::fs::remove_dir_all(&staging)
-                .map_err(|e| anyhow::anyhow!("clear {}: {e}", staging.display()))?;
+        let result = async {
+            let staged =
+                volume_coverage::stage(docker, &root, &compose, &volumes, &policies).await?;
+            // The archive holds config and secrets: private from creation, and
+            // tar keeps an existing file's mode.
+            volume_coverage::create_private(&archive)?;
+            let has_staging = !staged.artifacts.is_empty() || !staged.skipped.is_empty();
+            let args = tar_args(&archive, &row.dir, &root, has_staging);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            run_tar(&args).await
         }
-        tarred?;
+        .await;
+        // Exports can be large; they live on only inside the archive.
+        let cleared = std::fs::remove_dir_all(&root)
+            .map_err(|e| anyhow::anyhow!("clear {}: {e}", root.display()));
+        if result.is_err() && archive.exists() {
+            std::fs::remove_file(&archive)
+                .map_err(|e| anyhow::anyhow!("remove {}: {e}", archive.display()))?;
+        }
+        result?;
+        cleared?;
 
         let backup = BackupRef {
             locator: archive.to_string_lossy().into_owned(),
@@ -886,6 +905,9 @@ pub struct LabelVolumesResult {
     /// `true`: nothing was changed.
     pub dry_run: bool,
     pub changes: Vec<PlannedChange>,
+    /// Side effects to expect beyond the changes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     /// What execute did (absent on a dry run).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub migrated: Option<Migrated>,
@@ -911,6 +933,7 @@ async fn label_volumes_result(
         return Ok(LabelVolumesResult {
             dry_run: true,
             changes,
+            warnings: Vec::new(),
             migrated: None,
             how_to_execute: Some(
                 "re-invoke action=label_volumes with `execute: true` and `items` set to the change targets; only those still convertible are converted".into(),
@@ -931,6 +954,7 @@ async fn label_volumes_result(
     Ok(LabelVolumesResult {
         dry_run: false,
         changes,
+        warnings: Vec::new(),
         migrated: Some(migrated),
         how_to_execute: None,
     })
@@ -1150,7 +1174,33 @@ async fn stack_findings(row: &StackRow, roots: &[String]) -> Result<Vec<Finding>
         .await
         .map_err(anyhow::Error::from)?;
     let cfg = ComposeConfig::parse(&raw)?;
-    Ok(lint::audit(&cfg, &row.dir, roots, &|p| p.exists()))
+    let bound = bound_sources(
+        crate::registration::adapter()
+            .client()
+            .map_err(adapter_err)?,
+    )
+    .await?;
+    Ok(lint::audit(&cfg, &row.dir, roots, &|p| p.exists(), &|p| {
+        lint::is_taken(p, &bound)
+    }))
+}
+
+/// Host paths bind-mounted by any container on this engine.
+async fn bound_sources(docker: &bollard::Docker) -> Result<Vec<String>> {
+    let all = docker
+        .list_containers(Some(
+            bollard::query_parameters::ListContainersOptionsBuilder::new()
+                .all(true)
+                .build(),
+        ))
+        .await
+        .map_err(|e| anyhow::anyhow!("list containers: {e}"))?;
+    Ok(all
+        .into_iter()
+        .flat_map(|c| c.mounts.unwrap_or_default())
+        .filter(|m| m.name.is_none())
+        .filter_map(|m| m.source)
+        .collect())
 }
 
 const FIX_TOOL: &str = "stack fix";
@@ -1212,6 +1262,33 @@ fn fix_result(
         how_to_execute: None,
     };
     Ok((result, write))
+}
+
+/// `tar` arguments for a stack archive: the stack dir (without any stale
+/// `.orca-volumes`), plus the staged `.orca-volumes` from `root` when
+/// `staged`.
+fn tar_args(
+    archive: &std::path::Path,
+    dir: &str,
+    root: &std::path::Path,
+    staged: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        "czf".to_string(),
+        archive.to_string_lossy().into_owned(),
+        format!("--exclude=./{}", volume_coverage::STAGING_DIR),
+        "-C".to_string(),
+        dir.to_string(),
+        ".".to_string(),
+    ];
+    if staged {
+        args.extend([
+            "-C".to_string(),
+            root.to_string_lossy().into_owned(),
+            volume_coverage::STAGING_DIR.to_string(),
+        ]);
+    }
+    args
 }
 
 /// Run `tar` through the orca process seam (no runtime named). Used for stack
@@ -1535,7 +1612,7 @@ mod tests {
             r#"{"name":"s","services":{"app":{"restart":"no","volumes":[{"type":"volume","source":"data","target":"/data"}]},"worker":{}}}"#,
         )
         .unwrap();
-        lint::audit(&cfg, "/srv/s", &[], &|_| true)
+        lint::audit(&cfg, "/srv/s", &[], &|_| true, &|_| false)
     }
 
     #[test]
@@ -1642,6 +1719,47 @@ mod tests {
     }
 
     #[test]
+    fn the_archive_takes_staged_volumes_from_the_run_root_and_never_a_stale_copy() {
+        let root = std::path::Path::new("/b/.orca-staging-x");
+        let a = tar_args(std::path::Path::new("/b/x.tar.gz"), "/srv/x", root, true);
+        assert_eq!(
+            a,
+            vec![
+                "czf",
+                "/b/x.tar.gz",
+                "--exclude=./.orca-volumes",
+                "-C",
+                "/srv/x",
+                ".",
+                "-C",
+                "/b/.orca-staging-x",
+                ".orca-volumes"
+            ]
+        );
+        assert_eq!(
+            tar_args(std::path::Path::new("/b/x.tar.gz"), "/srv/x", root, false).len(),
+            6
+        );
+    }
+
+    #[test]
+    fn a_backup_archive_is_private_and_tar_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let stack = dir.path().join("stack");
+        std::fs::create_dir_all(&stack).unwrap();
+        std::fs::write(stack.join("compose.yaml"), "services: {}\n").unwrap();
+        let archive = dir.path().join("x.tar.gz");
+        volume_coverage::create_private(&archive).unwrap();
+        let args = tar_args(&archive, &stack.to_string_lossy(), dir.path(), false);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        plugin_toolkit::reactor::block_on(run_tar(&args)).unwrap();
+        let meta = std::fs::metadata(&archive).unwrap();
+        assert!(meta.len() > 0);
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
     fn stack_backup_payload_defaults_and_parses_empty() {
         assert!(StackBackupPayload::default().dest.is_none());
         let p: StackBackupPayload = serde_json::from_str("{}").unwrap();
@@ -1675,7 +1793,7 @@ mod tests {
         fn restore_override(&self, _: Option<&str>) -> Result<()> {
             Ok(())
         }
-        fn up<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<()>> {
+        fn up<'a>(&'a self, _: &'a str, _: bool) -> BoxFuture<'a, Result<()>> {
             Box::pin(async { Ok(()) })
         }
     }
@@ -1684,6 +1802,7 @@ mod tests {
         vec![ownership::Planned {
             conversion: ownership::Conversion::new("media", "app", "/cache"),
             old: None,
+            running: false,
             blocked: None,
         }]
     }
