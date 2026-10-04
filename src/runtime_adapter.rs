@@ -58,7 +58,7 @@ impl DockerAdapter {
         }
     }
 
-    fn client(&self) -> Result<&Docker, AdapterError> {
+    pub(crate) fn client(&self) -> Result<&Docker, AdapterError> {
         if let Some(c) = self.client.get() {
             return Ok(c);
         }

@@ -10,10 +10,14 @@
 pub mod compose;
 pub mod containers;
 pub mod engine;
+pub mod execute;
 pub mod lifecycle;
+pub mod prune;
 pub mod registration;
 pub mod runtime_adapter;
 pub mod stacks;
+#[cfg(test)]
+mod test_engine;
 pub mod tools;
 pub mod topology;
 pub mod unit_provider;
