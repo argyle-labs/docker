@@ -436,7 +436,8 @@ async fn docker_host_update(args: DockerHostUpdateArgs, ctx: &ToolCtx) -> Result
     let prune = if keys.is_empty() {
         PruneApplied::default()
     } else {
-        prune::apply(docker, None, &keys).await?
+        // `keys` are images only; the default scope also withholds networks.
+        prune::apply(docker, prune::Scope::default(), &keys).await?
     };
 
     Ok(HostUpdateChange::Applied(HostUpdateApplied {

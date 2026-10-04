@@ -136,10 +136,17 @@ impl Compose {
             .collect())
     }
 
+    /// `docker compose config --format json`: the file as compose resolves
+    /// it, with interpolation applied, paths made absolute and mounts in long
+    /// syntax.
+    pub async fn config_json(&self) -> Result<String, ComposeError> {
+        Ok(self.docker(&["config", "--format", "json"]).await?)
+    }
+
     /// The project name from the resolved config: the value the engine stamps
     /// on `com.docker.compose.project`, which need not match the stack name.
     pub async fn project_name(&self) -> Result<String, ComposeError> {
-        let raw = self.docker(&["config", "--format", "json"]).await?;
+        let raw = self.config_json().await?;
         parse_project_name(&raw).ok_or_else(|| {
             ComposeError::Docker(anyhow::anyhow!(
                 "compose config for {} has no project name",
@@ -252,6 +259,21 @@ pub fn parse_project_name(raw: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Engine-side names of the networks a resolved config declares
+/// `external: true` (its `name`, else its key).
+pub fn parse_external_networks(raw: &str) -> Vec<String> {
+    let Ok(v): Result<Value, _> = serde_json::from_str(raw) else {
+        return Vec::new();
+    };
+    let Some(nets) = v["networks"].as_object() else {
+        return Vec::new();
+    };
+    nets.iter()
+        .filter(|(_, n)| n["external"].as_bool() == Some(true))
+        .map(|(key, n)| n["name"].as_str().unwrap_or(key).to_string())
+        .collect()
+}
+
 /// Parse JSON-lines output of `docker compose ps --format json` into a map
 /// keyed by service name.
 pub fn parse_compose_ps(raw: &str) -> HashMap<String, ServiceStatus> {
@@ -358,6 +380,15 @@ mod tests {
         );
         assert_eq!(parse_project_name(r#"{"services":{}}"#), None);
         assert_eq!(parse_project_name("not json"), None);
+    }
+
+    #[test]
+    fn parse_external_networks_reads_external_names() {
+        let raw = r#"{"networks":{"default":{"name":"media_default"},"proxy":{"name":"caddy_proxy","external":true},"bare":{"external":true}}}"#;
+        let mut nets = parse_external_networks(raw);
+        nets.sort();
+        assert_eq!(nets, vec!["bare", "caddy_proxy"]);
+        assert!(parse_external_networks(r#"{"services":{}}"#).is_empty());
     }
 
     #[test]
