@@ -142,7 +142,7 @@ The old volume is removed only after verification, and only when no container re
 // confirmed finding ids that still apply. Does not deploy: run action=up after.
 { "id": { "kind": "stack", "id": "myapp", ... }, "action": "fix" }
 { "id": { "kind": "stack", "id": "myapp", ... }, "action": "fix",
-  "payload": { "execute": true, "items": ["restart:app", "bind:app:/mnt/willow/media"] } }
+  "payload": { "execute": true, "items": ["restart:app", "bind:app:/mnt/willow/media->/mnt/data/media"] } }
 
 // detail (coverage) — named volumes from compose + engine, each `covered_by`
 // export | dump, with a warning per uncovered volume.

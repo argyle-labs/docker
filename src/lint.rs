@@ -100,24 +100,32 @@ fn under(path: &str, root: &str) -> bool {
     path == root || path.starts_with(&format!("{root}/"))
 }
 
+/// Whether `candidate` is, contains or sits inside one of `bound`.
+pub fn is_taken(candidate: &Path, bound: &[String]) -> bool {
+    let c = candidate.to_string_lossy();
+    bound.iter().any(|b| under(&c, b) || under(b, &c))
+}
+
 /// The same tail of `source` under a managed root, if it exists there:
 /// `/mnt/willow/media` → `/mnt/data/media`. Longest matching tail wins. A
 /// one-component tail (`config`, `data`) matches unrelated directories, so it
-/// counts only when it names the stack or service (`names`).
+/// counts only when a component of it is the stack or service name
+/// (`names`). A candidate some container already binds (`taken`) is
+/// another app's data and is never proposed.
 pub fn propose_equivalent(
     source: &str,
     roots: &[String],
     names: &[&str],
     exists: &dyn Fn(&Path) -> bool,
+    taken: &dyn Fn(&Path) -> bool,
 ) -> Option<String> {
     let parts: Vec<&str> = source.split('/').filter(|p| !p.is_empty()).collect();
     for skip in 1..parts.len() {
         let tail_parts = &parts[skip..];
         let named = tail_parts.iter().any(|p| {
-            let p = p.to_ascii_lowercase();
             names
                 .iter()
-                .any(|n| !n.is_empty() && p.contains(&n.to_ascii_lowercase()))
+                .any(|n| !n.is_empty() && p.eq_ignore_ascii_case(n))
         });
         if tail_parts.len() < 2 && !named {
             continue;
@@ -126,7 +134,8 @@ pub fn propose_equivalent(
         for root in roots {
             let candidate = PathBuf::from(root).join(&tail);
             let candidate = candidate.to_string_lossy();
-            if candidate != source && exists(Path::new(candidate.as_ref())) {
+            let path = Path::new(candidate.as_ref());
+            if candidate != source && exists(path) && !taken(path) {
                 return Some(candidate.into_owned());
             }
         }
@@ -136,11 +145,13 @@ pub fn propose_equivalent(
 
 /// Lint one stack's resolved config. `stack_dir` holds the stack's own
 /// config binds, which are backed up with the stack and never "unmanaged".
+/// `taken` says whether some container already binds a path.
 pub fn audit(
     cfg: &ComposeConfig,
     stack_dir: &str,
     roots: &[String],
     exists: &dyn Fn(&Path) -> bool,
+    taken: &dyn Fn(&Path) -> bool,
 ) -> Vec<Finding> {
     let mut out = Vec::new();
     for (svc, s) in &cfg.services {
@@ -175,7 +186,7 @@ pub fn audit(
                     // A missing path under a managed root is a mount that is
                     // down, not a path to move elsewhere.
                     let proposed = (!managed)
-                        .then(|| propose_equivalent(src, roots, &names, exists))
+                        .then(|| propose_equivalent(src, roots, &names, exists, taken))
                         .flatten();
                     (
                         FindingKind::BindMissing,
@@ -190,13 +201,19 @@ pub fn audit(
                             m.target,
                             roots.join(", ")
                         ),
-                        propose_equivalent(src, roots, &names, exists),
+                        propose_equivalent(src, roots, &names, exists, taken),
                     )
                 } else {
                     continue;
                 };
+                // The id pins the proposal: a confirmed id never applies a
+                // different path than the one the dry run showed.
+                let id = match &proposed {
+                    Some(new) => format!("bind:{svc}:{src}->{new}"),
+                    None => format!("bind:{svc}:{src}"),
+                };
                 out.push(Finding {
-                    id: format!("bind:{svc}:{src}"),
+                    id,
                     kind,
                     service: svc.clone(),
                     detail,
@@ -282,9 +299,26 @@ fn service_block(lines: &[String], svc: &str) -> Option<(usize, usize, usize)> {
     Some((header, end, child))
 }
 
-fn fix_restart(lines: &mut Vec<String>, svc: &str) -> Result<(), String> {
+/// [`service_block`] for an edit: refused when the service is written in
+/// flow style (`app: {image: x}`), which line edits would turn into invalid
+/// YAML.
+fn block_service(lines: &[String], svc: &str) -> Result<(usize, usize, usize), String> {
     let (header, end, child) = service_block(lines, svc)
         .ok_or_else(|| format!("service '{svc}' not found in the file"))?;
+    let rest = lines[header]
+        .split_once(':')
+        .map(|(_, r)| r.split('#').next().unwrap_or_default().trim())
+        .unwrap_or_default();
+    if !rest.is_empty() {
+        return Err(format!(
+            "service '{svc}' is written in flow style; fix by hand"
+        ));
+    }
+    Ok((header, end, child))
+}
+
+fn fix_restart(lines: &mut Vec<String>, svc: &str) -> Result<(), String> {
+    let (header, end, child) = block_service(lines, svc)?;
     let pad = " ".repeat(child);
     let new = format!("{pad}restart: {PROPOSED_RESTART}");
     match (header + 1..end)
@@ -376,8 +410,7 @@ fn rewrite_volume_source(line: &str, old: &str, new: &str) -> Option<String> {
 }
 
 fn fix_bind(lines: &mut [String], svc: &str, old: &str, new: &str) -> Result<(), String> {
-    let (header, end, child) = service_block(lines, svc)
-        .ok_or_else(|| format!("service '{svc}' not found in the file"))?;
+    let (header, end, child) = block_service(lines, svc)?;
     let not_literal = || {
         format!(
             "{old} is not written literally in service '{svc}' volumes (interpolated or relative); fix by hand"
@@ -550,7 +583,9 @@ mod tests {
 
     fn findings(present: &[&str]) -> Vec<Finding> {
         let cfg = ComposeConfig::parse(FIXTURE).unwrap();
-        audit(&cfg, "/srv/stacks/media", &roots(), &fs(present))
+        audit(&cfg, "/srv/stacks/media", &roots(), &fs(present), &|_| {
+            false
+        })
     }
 
     fn ids(f: &[Finding]) -> Vec<&str> {
@@ -568,7 +603,7 @@ mod tests {
             ids(&f),
             vec![
                 "restart:app",
-                "bind:app:/mnt/willow/media",
+                "bind:app:/mnt/willow/media->/mnt/data/media",
                 "volume:app:data",
                 "volume:db:pg",
                 "bind:db:/mnt/data/gone",
@@ -586,7 +621,7 @@ mod tests {
         let f = findings(&["/mnt/willow/media", "/mnt/data/media"]);
         let bind = f
             .iter()
-            .find(|f| f.id == "bind:app:/mnt/willow/media")
+            .find(|f| f.id == "bind:app:/mnt/willow/media->/mnt/data/media")
             .unwrap();
         assert_eq!(bind.kind, FindingKind::BindUnmanaged);
         assert_eq!(bind.proposed.as_deref(), Some("/mnt/data/media"));
@@ -598,7 +633,7 @@ mod tests {
         let f = findings(&["/mnt/data/media"]);
         let bind = f
             .iter()
-            .find(|f| f.id == "bind:app:/mnt/willow/media")
+            .find(|f| f.id == "bind:app:/mnt/willow/media->/mnt/data/media")
             .unwrap();
         assert_eq!(bind.kind, FindingKind::BindMissing);
         assert_eq!(bind.proposed.as_deref(), Some("/mnt/data/media"));
@@ -661,7 +696,7 @@ volumes:
         let f = yaml_findings();
         let wanted = vec![
             "restart:app".to_string(),
-            "bind:app:/mnt/willow/media".to_string(),
+            "bind:app:/mnt/willow/media->/mnt/data/media".to_string(),
             "restart:worker".to_string(),
         ];
         let out = apply_fixes(YAML, None, &f, &wanted);
@@ -705,7 +740,7 @@ volumes:
             None,
             &f,
             &[
-                "bind:app:/mnt/willow/media".to_string(),
+                "bind:app:/mnt/willow/media->/mnt/data/media".to_string(),
                 "volume:app:data".to_string(),
             ],
         );
@@ -732,7 +767,7 @@ volumes:
 
     fn bind_finding(svc: &str, current: &str, proposed: &str) -> Finding {
         Finding {
-            id: format!("bind:{svc}:{current}"),
+            id: format!("bind:{svc}:{current}->{proposed}"),
             kind: FindingKind::BindUnmanaged,
             service: svc.into(),
             detail: String::new(),
@@ -765,7 +800,7 @@ services:
             yaml,
             None,
             &[f],
-            &["bind:app:/mnt/willow/media".to_string()],
+            &["bind:app:/mnt/willow/media->/mnt/data/media".to_string()],
         );
         assert!(out.not_fixed.is_empty(), "{:?}", out.not_fixed);
         assert_eq!(
@@ -797,7 +832,7 @@ services:
             yaml,
             None,
             &[f],
-            &["bind:app:/mnt/willow/media".to_string()],
+            &["bind:app:/mnt/willow/media->/mnt/data/media".to_string()],
         );
         assert!(out.applied.is_empty());
         assert_eq!(out.yaml, yaml);
@@ -807,17 +842,106 @@ services:
     fn a_one_component_tail_needs_the_stack_or_service_name() {
         let roots = vec!["/mnt/data".to_string()];
         let there = fs(&["/mnt/data/config", "/mnt/data/sonarr", "/mnt/data/tv/shows"]);
+        let none = |_: &Path| false;
         assert_eq!(
-            propose_equivalent("/mnt/willow/config", &roots, &["media", "app"], &there),
+            propose_equivalent(
+                "/mnt/willow/config",
+                &roots,
+                &["media", "app"],
+                &there,
+                &none
+            ),
             None
         );
         assert_eq!(
-            propose_equivalent("/mnt/willow/sonarr", &roots, &["arr", "sonarr"], &there).as_deref(),
+            propose_equivalent(
+                "/mnt/willow/sonarr",
+                &roots,
+                &["arr", "sonarr"],
+                &there,
+                &none
+            )
+            .as_deref(),
             Some("/mnt/data/sonarr")
         );
         assert_eq!(
-            propose_equivalent("/mnt/willow/tv/shows", &roots, &[], &there).as_deref(),
+            propose_equivalent("/mnt/willow/tv/shows", &roots, &[], &there, &none).as_deref(),
             Some("/mnt/data/tv/shows")
+        );
+        // A name merely contained in a component is not the stack's.
+        assert_eq!(
+            propose_equivalent("/mnt/willow/sonarr", &roots, &["arr"], &there, &none),
+            None
+        );
+    }
+
+    #[test]
+    fn a_path_another_container_binds_is_never_proposed() {
+        let roots = vec!["/mnt/data".to_string()];
+        let there = fs(&["/mnt/data/tv/shows"]);
+        let bound = vec!["/mnt/data/tv".to_string()];
+        assert_eq!(
+            propose_equivalent("/mnt/willow/tv/shows", &roots, &[], &there, &|p| {
+                is_taken(p, &bound)
+            }),
+            None
+        );
+        assert!(is_taken(
+            Path::new("/mnt/data/tv"),
+            &["/mnt/data/tv/shows".into()]
+        ));
+        assert!(!is_taken(Path::new("/mnt/data/tvx"), &bound));
+    }
+
+    #[test]
+    fn a_flow_style_service_is_not_edited() {
+        let yaml = "services:\n  app: {image: x, restart: \"no\"}\n";
+        let f = Finding {
+            id: "restart:app".into(),
+            kind: FindingKind::Restart,
+            service: "app".into(),
+            detail: String::new(),
+            current: "no".into(),
+            proposed: Some(PROPOSED_RESTART.into()),
+            fixable: true,
+        };
+        let out = apply_fixes(yaml, None, &[f], &["restart:app".to_string()]);
+        assert!(out.applied.is_empty());
+        assert!(
+            out.not_fixed[0].reason.contains("flow style"),
+            "{:?}",
+            out.not_fixed
+        );
+        assert_eq!(out.yaml, yaml);
+    }
+
+    #[test]
+    fn a_bind_fix_leaves_devices_alone() {
+        let yaml = "services:\n  app:\n    devices:\n      - /mnt/willow/media:/dev/x\n    volumes:\n      - /mnt/willow/media:/media\n";
+        let f = bind_finding("app", "/mnt/willow/media", "/mnt/data/media");
+        let id = f.id.clone();
+        let out = apply_fixes(yaml, None, &[f], &[id]);
+        assert!(out.not_fixed.is_empty(), "{:?}", out.not_fixed);
+        assert!(
+            out.yaml.contains("      - /mnt/willow/media:/dev/x\n"),
+            "{}",
+            out.yaml
+        );
+        assert!(
+            out.yaml.contains("      - /mnt/data/media:/media\n"),
+            "{}",
+            out.yaml
+        );
+    }
+
+    #[test]
+    fn a_bind_id_pins_the_proposed_path() {
+        let f = findings(&["/mnt/willow/media", "/mnt/data/media"]);
+        assert!(
+            f.iter()
+                .any(|f| f.id == "bind:app:/mnt/willow/media->/mnt/data/media"),
+            "{:?}",
+            ids(&f)
         );
     }
 
@@ -827,7 +951,7 @@ services:
         let override_yaml = "services:\n  app:\n    restart: on-failure:3\n    volumes:\n      - /mnt/willow/media:/media\n";
         let wanted = vec![
             "restart:app".to_string(),
-            "bind:app:/mnt/willow/media".to_string(),
+            "bind:app:/mnt/willow/media->/mnt/data/media".to_string(),
             "restart:worker".to_string(),
         ];
         let out = apply_fixes(YAML, Some(override_yaml), &f, &wanted);

@@ -311,7 +311,7 @@ impl DockerUnitProvider {
             .transpose()?;
         let (result, new_yaml) = fix_result(&yaml, override_yaml.as_deref(), &findings, &p)?;
         if let Some(new_yaml) = new_yaml {
-            row.write_compose_if_unchanged(&new_yaml, &yaml)?;
+            row.write_compose_if_unchanged(&new_yaml, &yaml).await?;
         }
         Ok(VerbOutcome::Item(ItemOutcome::new(
             id.clone(),
@@ -1150,7 +1150,33 @@ async fn stack_findings(row: &StackRow, roots: &[String]) -> Result<Vec<Finding>
         .await
         .map_err(anyhow::Error::from)?;
     let cfg = ComposeConfig::parse(&raw)?;
-    Ok(lint::audit(&cfg, &row.dir, roots, &|p| p.exists()))
+    let bound = bound_sources(
+        crate::registration::adapter()
+            .client()
+            .map_err(adapter_err)?,
+    )
+    .await?;
+    Ok(lint::audit(&cfg, &row.dir, roots, &|p| p.exists(), &|p| {
+        lint::is_taken(p, &bound)
+    }))
+}
+
+/// Host paths bind-mounted by any container on this engine.
+async fn bound_sources(docker: &bollard::Docker) -> Result<Vec<String>> {
+    let all = docker
+        .list_containers(Some(
+            bollard::query_parameters::ListContainersOptionsBuilder::new()
+                .all(true)
+                .build(),
+        ))
+        .await
+        .map_err(|e| anyhow::anyhow!("list containers: {e}"))?;
+    Ok(all
+        .into_iter()
+        .flat_map(|c| c.mounts.unwrap_or_default())
+        .filter(|m| m.name.is_none())
+        .filter_map(|m| m.source)
+        .collect())
 }
 
 const FIX_TOOL: &str = "stack fix";
@@ -1535,7 +1561,7 @@ mod tests {
             r#"{"name":"s","services":{"app":{"restart":"no","volumes":[{"type":"volume","source":"data","target":"/data"}]},"worker":{}}}"#,
         )
         .unwrap();
-        lint::audit(&cfg, "/srv/s", &[], &|_| true)
+        lint::audit(&cfg, "/srv/s", &[], &|_| true, &|_| false)
     }
 
     #[test]

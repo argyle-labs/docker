@@ -99,21 +99,31 @@ impl Compose {
             "compose.yml",
             "compose.yaml",
         ] {
-            let full = project_path.join(name);
-            if full.exists() {
-                let override_file = OVERRIDE_FILES
-                    .iter()
-                    .map(|o| project_path.join(o))
-                    .find(|o| o.exists());
-                let orca_file = Some(project_path.join(ORCA_FILE)).filter(|o| o.exists());
-                return Some(Compose {
-                    file: full,
-                    override_file,
-                    orca_file,
-                });
+            if let Some(c) = Compose::at(&project_path.join(name)) {
+                return Some(c);
             }
         }
         None
+    }
+
+    /// The project of exactly `file`, with the override compose would
+    /// auto-load next to it. [`ORCA_FILE`] is not included: it is passed only
+    /// after it is regenerated ([`crate::ownership::refresh`]), so a stale one
+    /// never breaks a compose call.
+    pub fn at(file: &Path) -> Option<Compose> {
+        if !file.is_file() {
+            return None;
+        }
+        let dir = file.parent()?;
+        let override_file = OVERRIDE_FILES
+            .iter()
+            .map(|o| dir.join(o))
+            .find(|o| o.exists());
+        Some(Compose {
+            file: file.to_path_buf(),
+            override_file,
+            orca_file: None,
+        })
     }
 
     /// Same as [`find`](Self::find) but errors out when nothing is found.
@@ -430,18 +440,30 @@ mod tests {
     }
 
     #[test]
-    fn the_orca_file_is_passed_last_and_can_be_left_out() {
+    fn the_orca_file_is_passed_last_and_only_when_asked() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("compose.yaml"), "services: {}").unwrap();
         std::fs::write(dir.path().join("compose.override.yaml"), "").unwrap();
+        // A stale orca file on disk is not picked up by itself.
         std::fs::write(dir.path().join(ORCA_FILE), "{}").unwrap();
         let c = Compose::find(dir.path()).unwrap();
-        let files = c.files();
+        assert_eq!(c.files().len(), 2);
+        let with = c.with_orca();
+        let files = with.files();
         assert_eq!(files.len(), 3);
         assert!(files[1].ends_with("compose.override.yaml"));
         assert!(files[2].ends_with(ORCA_FILE));
-        assert_eq!(c.without_orca().files().len(), 2);
-        assert_eq!(c.without_orca().with_orca().files(), files);
+        assert_eq!(c.with_orca().without_orca().files().len(), 2);
+    }
+
+    #[test]
+    fn at_opens_exactly_the_named_file() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("docker-compose.yml"), "services: {}").unwrap();
+        std::fs::write(dir.path().join("prod.yml"), "services: {}").unwrap();
+        let c = Compose::at(&dir.path().join("prod.yml")).unwrap();
+        assert!(c.file().ends_with("prod.yml"));
+        assert!(Compose::at(&dir.path().join("missing.yml")).is_none());
     }
 
     #[test]
