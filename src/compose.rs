@@ -176,6 +176,20 @@ impl Compose {
             .collect())
     }
 
+    /// Every service name, including ones only enabled by a profile: the set
+    /// compose judges orphans against.
+    pub async fn all_service_names(&self) -> Result<Vec<String>, ComposeError> {
+        let out = self
+            .docker(&["--profile", "*", "config", "--services"])
+            .await?;
+        Ok(out
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
     /// Service names + runtime status from `docker compose ps`.
     pub async fn services(&self) -> Result<Vec<ServiceSummary>, ComposeError> {
         let names = self.service_names().await?;
@@ -233,15 +247,10 @@ impl Compose {
     pub async fn restart(&self, services: &[&str]) -> Result<String, ComposeError> {
         self.lifecycle("restart", services).await
     }
-    /// `docker compose up -d` for the given services (or all).
+    /// `docker compose up -d` for the given services (or all). Never
+    /// `--remove-orphans`: orphans are removed by id after confirmation.
     pub async fn up(&self, services: &[&str]) -> Result<String, ComposeError> {
-        Ok(self.docker(&up_args(services, false)).await?)
-    }
-    /// `up -d --remove-orphans`: also removes containers of services the
-    /// compose files no longer declare. Only for callers that listed those
-    /// orphans and had them confirmed.
-    pub async fn up_removing_orphans(&self) -> Result<String, ComposeError> {
-        Ok(self.docker(&up_args(&[], true)).await?)
+        Ok(self.docker(&up_args(services)).await?)
     }
     /// `docker compose down`. When `services` is non-empty, falls back to
     /// `compose stop <svc>` since compose-down is project-scoped.
@@ -306,11 +315,8 @@ impl Compose {
     }
 }
 
-fn up_args<'a>(services: &[&'a str], remove_orphans: bool) -> Vec<&'a str> {
+fn up_args<'a>(services: &[&'a str]) -> Vec<&'a str> {
     let mut args = vec!["up", "-d"];
-    if remove_orphans {
-        args.push("--remove-orphans");
-    }
     args.extend_from_slice(services);
     args
 }
@@ -465,10 +471,9 @@ mod tests {
     }
 
     #[test]
-    fn up_removes_orphans_only_when_asked_and_pull_is_quiet() {
-        assert_eq!(up_args(&[], false), vec!["up", "-d"]);
-        assert_eq!(up_args(&["web"], false), vec!["up", "-d", "web"]);
-        assert_eq!(up_args(&[], true), vec!["up", "-d", "--remove-orphans"]);
+    fn up_never_removes_orphans_and_pull_is_quiet() {
+        assert_eq!(up_args(&[]), vec!["up", "-d"]);
+        assert_eq!(up_args(&["web"]), vec!["up", "-d", "web"]);
         assert_eq!(pull_args(&[]), vec!["pull", "-q"]);
         assert_eq!(pull_args(&["web"]), vec!["pull", "-q", "web"]);
     }

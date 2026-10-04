@@ -58,7 +58,11 @@ impl Package {
     /// Upgrading the engine restarts every container on the host.
     pub fn is_engine(&self) -> bool {
         let n = self.name.as_str();
-        n == "docker" || n.starts_with("docker-") || n.starts_with("containerd")
+        n == "docker"
+            || n == "docker.io"
+            || n.starts_with("docker-")
+            || n.starts_with("containerd")
+            || n.starts_with("moby-")
     }
 }
 
@@ -137,6 +141,7 @@ impl PkgManager {
                     "Dpkg::Options::=--force-confold",
                     "install",
                     "--only-upgrade",
+                    "--no-remove",
                 ]);
                 upgrade.extend(names.iter().cloned());
                 vec![owned(&["apt-get", "update"]), upgrade]
@@ -176,28 +181,60 @@ pub fn check_gate(status: &GateStatus, skip: bool) -> Result<String> {
     }
 }
 
-/// Pull and up one stack. A seam so the per-stack loop is testable without a
-/// docker CLI.
-pub trait StackRunner: Send + Sync {
-    fn pull<'a>(&'a self, row: &'a StackRow) -> BoxFuture<'a, Result<String>>;
-    fn up<'a>(&'a self, row: &'a StackRow, remove_orphans: bool) -> BoxFuture<'a, Result<String>>;
+/// A container of the project whose service the compose files do not
+/// declare.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Orphan {
+    pub name: String,
+    pub id: String,
 }
 
-struct ComposeRunner;
+/// Pull, orphan lookup, orphan removal and up for one stack. A seam so the
+/// per-stack loop is testable without a docker CLI.
+pub trait StackRunner: Send + Sync {
+    fn pull<'a>(&'a self, row: &'a StackRow) -> BoxFuture<'a, Result<String>>;
+    fn orphans<'a>(&'a self, row: &'a StackRow) -> BoxFuture<'a, Result<Vec<Orphan>>>;
+    fn remove<'a>(&'a self, orphan: &'a Orphan) -> BoxFuture<'a, Result<()>>;
+    fn up<'a>(&'a self, row: &'a StackRow) -> BoxFuture<'a, Result<String>>;
+}
 
-impl StackRunner for ComposeRunner {
+struct ComposeRunner<'d> {
+    docker: &'d Docker,
+}
+
+impl StackRunner for ComposeRunner<'_> {
     fn pull<'a>(&'a self, row: &'a StackRow) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move { Ok(row.compose()?.pull(&[]).await?) })
     }
-    fn up<'a>(&'a self, row: &'a StackRow, remove_orphans: bool) -> BoxFuture<'a, Result<String>> {
+    fn orphans<'a>(&'a self, row: &'a StackRow) -> BoxFuture<'a, Result<Vec<Orphan>>> {
+        Box::pin(async move { stack_orphans(self.docker, &row.compose()?).await })
+    }
+    fn remove<'a>(&'a self, orphan: &'a Orphan) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            let compose = row.compose()?;
-            Ok(if remove_orphans {
-                compose.up_removing_orphans().await?
-            } else {
-                compose.up(&[]).await?
-            })
+            self.docker
+                .stop_container(
+                    &orphan.id,
+                    None::<bollard::query_parameters::StopContainerOptions>,
+                )
+                .await
+                .or_else(|e| match e {
+                    bollard::errors::Error::DockerResponseServerError {
+                        status_code: 304, ..
+                    } => Ok(()),
+                    e => Err(e),
+                })
+                .map_err(|e| anyhow!("stop {}: {e}", orphan.name))?;
+            self.docker
+                .remove_container(
+                    &orphan.id,
+                    None::<bollard::query_parameters::RemoveContainerOptions>,
+                )
+                .await
+                .map_err(|e| anyhow!("remove {}: {e}", orphan.name))
         })
+    }
+    fn up<'a>(&'a self, row: &'a StackRow) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move { crate::ownership::up(row, &[]).await })
     }
 }
 
@@ -233,40 +270,70 @@ pub struct StackReport {
     pub pull: StepReport,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub up: Option<StepReport>,
-    /// Orphan containers `up --remove-orphans` was asked to remove.
+    /// Orphan containers removed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub orphans_removed: Vec<String>,
+    /// Confirmed orphans not removed, and why.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub orphans_skipped: Vec<Skipped>,
 }
 
-/// A stack to update and the orphans its `up` may remove.
+/// A stack to update and the orphan containers confirmed for removal.
 #[derive(Debug, Clone)]
 pub struct StackJob {
     pub row: StackRow,
     pub remove_orphans: Vec<String>,
 }
 
-/// Pull then up each stack. A failed stack does not stop the others.
+/// Pull, remove the confirmed orphans, then up each stack. Orphans are
+/// looked up again right before removal and removed by id, so only a
+/// confirmed container that is still an orphan goes. A failed stack does not
+/// stop the others.
 pub async fn update_stacks(runner: &dyn StackRunner, jobs: &[StackJob]) -> Vec<StackReport> {
     let mut out = Vec::with_capacity(jobs.len());
     for job in jobs {
-        let pull = StepReport::from_result(runner.pull(&job.row).await);
-        let remove = !job.remove_orphans.is_empty();
-        let up = if pull.ok {
-            Some(StepReport::from_result(runner.up(&job.row, remove).await))
-        } else {
-            None
-        };
-        let orphans_removed = if up.as_ref().is_some_and(|u| u.ok) {
-            job.remove_orphans.clone()
-        } else {
-            Vec::new()
-        };
-        out.push(StackReport {
+        let mut report = StackReport {
             stack: job.row.name.clone(),
-            pull,
-            up,
-            orphans_removed,
-        });
+            pull: StepReport::from_result(runner.pull(&job.row).await),
+            up: None,
+            orphans_removed: Vec::new(),
+            orphans_skipped: Vec::new(),
+        };
+        if !report.pull.ok {
+            out.push(report);
+            continue;
+        }
+        if !job.remove_orphans.is_empty() {
+            match runner.orphans(&job.row).await {
+                Ok(now) => {
+                    for name in &job.remove_orphans {
+                        let item = orphan_target(&job.row.name, name);
+                        let Some(o) = now.iter().find(|o| &o.name == name) else {
+                            report.orphans_skipped.push(Skipped {
+                                item,
+                                reason: "no longer an orphan".into(),
+                            });
+                            continue;
+                        };
+                        match runner.remove(o).await {
+                            Ok(()) => report.orphans_removed.push(name.clone()),
+                            Err(e) => report.orphans_skipped.push(Skipped {
+                                item,
+                                reason: e.to_string(),
+                            }),
+                        }
+                    }
+                }
+                Err(e) => report
+                    .orphans_skipped
+                    .extend(job.remove_orphans.iter().map(|n| Skipped {
+                        item: orphan_target(&job.row.name, n),
+                        reason: format!("orphans could not be listed again: {e}"),
+                    })),
+            }
+        }
+        report.up = Some(StepReport::from_result(runner.up(&job.row).await));
+        out.push(report);
     }
     out
 }
@@ -305,8 +372,8 @@ pub struct HostState {
     /// `Err` when the package listing failed.
     pub packages: std::result::Result<Vec<Package>, String>,
     pub running: Vec<StackRow>,
-    /// Orphan container names per running stack.
-    pub orphans: BTreeMap<String, Vec<String>>,
+    /// Orphan containers per running stack.
+    pub orphans: BTreeMap<String, Vec<Orphan>>,
     /// Enabled stacks whose compose could not be read.
     pub unreadable: Vec<Skipped>,
 }
@@ -320,34 +387,54 @@ impl HostState {
             .map(|p| p.iter().map(Package::target).collect())
             .unwrap_or_default();
         out.extend(self.running.iter().map(|r| stack_target(&r.name)));
-        for (stack, names) in &self.orphans {
-            out.extend(names.iter().map(|n| orphan_target(stack, n)));
+        for (stack, orphans) in &self.orphans {
+            out.extend(orphans.iter().map(|o| orphan_target(stack, &o.name)));
         }
         out
     }
 }
 
 /// Containers of `project` (`containers` is already filtered to it) whose
-/// service the compose files no longer declare. `compose run` one-offs are
-/// not orphans: `up --remove-orphans` leaves them (measured, compose 2.31).
-pub fn orphans(containers: &[ContainerSummary], services: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = containers
+/// service is not among `services`, as compose judges orphans: `services`
+/// includes profile-gated ones, and a container without a service label is
+/// an orphan. `compose run` one-offs are not orphans: `up --remove-orphans`
+/// leaves them (measured, compose 2.31).
+pub fn orphans(containers: &[ContainerSummary], services: &[String]) -> Vec<Orphan> {
+    let mut out: Vec<Orphan> = containers
         .iter()
         .filter_map(|c| {
-            let labels = c.labels.as_ref()?;
+            let labels = c.labels.clone().unwrap_or_default();
             if labels.get(COMPOSE_ONEOFF_LABEL).map(String::as_str) == Some("True") {
                 return None;
             }
-            let service = labels.get(COMPOSE_SERVICE_LABEL)?;
-            if services.contains(service) {
+            if labels
+                .get(COMPOSE_SERVICE_LABEL)
+                .is_some_and(|s| services.contains(s))
+            {
                 return None;
             }
-            let name = c.names.as_ref()?.first()?.trim_start_matches('/');
-            Some(name.to_string())
+            let id = c.id.clone()?;
+            let name = c
+                .names
+                .as_ref()
+                .and_then(|n| n.first())
+                .map(|n| n.trim_start_matches('/').to_string())
+                .unwrap_or_else(|| id.clone());
+            Some(Orphan { name, id })
         })
         .collect();
-    out.sort();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+/// The stack's orphans now.
+async fn stack_orphans(docker: &Docker, compose: &crate::Compose) -> Result<Vec<Orphan>> {
+    let services = compose.all_service_names().await?;
+    let project = compose.project_name().await?;
+    Ok(orphans(
+        &project_containers(docker, &project).await?,
+        &services,
+    ))
 }
 
 async fn list_packages(pkg: Option<PkgManager>) -> std::result::Result<Vec<Package>, String> {
@@ -403,15 +490,13 @@ async fn host_state(docker: &Docker, pkg: Option<PkgManager>) -> Result<HostStat
         if !services.iter().any(|s| s.running) {
             continue;
         }
-        let project = match compose.project_name().await {
-            Ok(p) => p,
+        let found = match stack_orphans(docker, &compose).await {
+            Ok(o) => o,
             Err(e) => {
                 state.unreadable.push(unreadable(&row, e));
                 continue;
             }
         };
-        let names: Vec<String> = services.into_iter().map(|s| s.name).collect();
-        let found = orphans(&project_containers(docker, &project).await?, &names);
         if !found.is_empty() {
             state.orphans.insert(row.name.clone(), found);
         }
@@ -472,10 +557,10 @@ pub fn plan<A: Serialize>(
             PlannedChange::new(stack_target(&row.name), "pull+up")
                 .with_detail("compose pull -q && compose up -d"),
         );
-        for name in state.orphans.get(&row.name).into_iter().flatten() {
+        for o in state.orphans.get(&row.name).into_iter().flatten() {
             changes.push(
-                PlannedChange::new(orphan_target(&row.name, name), "remove").with_detail(
-                    "container of a service the compose files no longer declare; removed by `up --remove-orphans` only if every orphan of the stack is confirmed",
+                PlannedChange::new(orphan_target(&row.name, &o.name), "remove").with_detail(
+                    "container of a service the compose files do not declare; removed by id before up, if it is still an orphan then",
                 ),
             );
         }
@@ -537,16 +622,18 @@ pub fn prune_keys(
     keys
 }
 
-/// The stacks to update, and per stack whether `up` removes its orphans:
-/// only when every current orphan was confirmed, since `--remove-orphans`
-/// removes them all. Confirmed orphans not removed are returned as skipped.
+/// The stacks to update, each with its confirmed orphans. Orphans confirmed
+/// without their stack are not removed.
 pub fn stack_jobs(state: &HostState, act: &[String]) -> (Vec<StackJob>, Vec<Skipped>) {
     let mut jobs = Vec::new();
     let mut skipped = Vec::new();
     for row in &state.running {
-        let current = state.orphans.get(&row.name).cloned().unwrap_or_default();
-        let confirmed: Vec<&String> = current
-            .iter()
+        let confirmed: Vec<String> = state
+            .orphans
+            .get(&row.name)
+            .into_iter()
+            .flatten()
+            .map(|o| o.name.clone())
             .filter(|n| act.contains(&orphan_target(&row.name, n)))
             .collect();
         if !act.contains(&stack_target(&row.name)) {
@@ -556,19 +643,60 @@ pub fn stack_jobs(state: &HostState, act: &[String]) -> (Vec<StackJob>, Vec<Skip
             }));
             continue;
         }
-        let all_confirmed = !current.is_empty() && confirmed.len() == current.len();
-        if !all_confirmed {
-            skipped.extend(confirmed.iter().map(|n| Skipped {
-                item: orphan_target(&row.name, n),
-                reason: "kept: the stack has orphans that were not confirmed, and --remove-orphans would remove them all".into(),
-            }));
-        }
         jobs.push(StackJob {
             row: row.clone(),
-            remove_orphans: if all_confirmed { current } else { Vec::new() },
+            remove_orphans: confirmed,
         });
     }
     (jobs, skipped)
+}
+
+/// What an execute acts on: the confirmed targets still valid now.
+#[derive(Debug, Clone)]
+pub struct Selection {
+    pub packages: Vec<String>,
+    pub jobs: Vec<StackJob>,
+    pub images: Vec<String>,
+    pub skipped: Vec<Skipped>,
+}
+
+/// Intersect the confirmed `items` with `state`. Images are handled by the
+/// prune, which re-checks them itself.
+pub fn select(state: &HostState, items: &[String]) -> Result<Selection> {
+    let current = state.targets();
+    let images: Vec<String> = items
+        .iter()
+        .filter(|i| i.starts_with("image:"))
+        .cloned()
+        .collect();
+    let others: Vec<String> = items
+        .iter()
+        .filter(|i| !i.starts_with("image:"))
+        .cloned()
+        .collect();
+    execute::require_confirmed(TOOL, items, &current)?;
+    let (act, dropped) = execute::intersect(&others, &current);
+    let mut skipped: Vec<Skipped> = dropped
+        .into_iter()
+        .map(|item| Skipped {
+            item,
+            reason: "no longer valid on this host".into(),
+        })
+        .collect();
+    skipped.extend(state.unreadable.iter().cloned());
+    let packages = act
+        .iter()
+        .filter_map(|a| a.strip_prefix("package:"))
+        .map(str::to_string)
+        .collect();
+    let (jobs, kept) = stack_jobs(state, &act);
+    skipped.extend(kept);
+    Ok(Selection {
+        packages,
+        jobs,
+        images,
+        skipped,
+    })
 }
 
 async fn run_packages(pkg: PkgManager, names: &[String]) -> Result<Vec<StepReport>> {
@@ -616,7 +744,7 @@ pub struct DockerHostUpdateArgs {
 
 /// **Update this docker host**: upgrade the confirmed OS packages (apk/apt),
 /// then `compose pull -q` + `up -d` for every confirmed running stack
-/// (removing its orphans only when all were confirmed), then prune dangling
+/// (removing its confirmed orphans by id first), then prune dangling
 /// images. The pre-update backup gate runs first; a failed gate aborts.
 /// Without `execute`, returns the plan and changes nothing.
 #[orca_tool(
@@ -646,49 +774,24 @@ async fn docker_host_update(args: DockerHostUpdateArgs, ctx: &ToolCtx) -> Result
     let backup_gate = check_gate(&gate, args.skip_backup_gate)?;
 
     let state = host_state(docker, pkg).await?;
-    let current = state.targets();
-    let confirmed_images: Vec<String> = args
-        .items
-        .iter()
-        .filter(|i| i.starts_with("image:"))
-        .cloned()
-        .collect();
-    let others: Vec<String> = args
-        .items
-        .iter()
-        .filter(|i| !i.starts_with("image:"))
-        .cloned()
-        .collect();
-    execute::require_confirmed(TOOL, &args.items, &current)?;
-    let (act, dropped) = execute::intersect(&others, &current);
-    let mut skipped: Vec<Skipped> = dropped
-        .into_iter()
-        .map(|item| Skipped {
-            item,
-            reason: "no longer valid on this host".into(),
-        })
-        .collect();
-    skipped.extend(state.unreadable.iter().cloned());
-
-    let names: Vec<String> = act
-        .iter()
-        .filter_map(|a| a.strip_prefix("package:"))
-        .map(str::to_string)
-        .collect();
+    let Selection {
+        packages: names,
+        jobs,
+        images: confirmed_images,
+        skipped,
+    } = select(&state, &args.items)?;
     let packages = match pkg {
         Some(p) if !names.is_empty() => Some(run_packages(p, &names).await?),
         _ => None,
     };
 
-    let (jobs, kept) = stack_jobs(&state, &act);
-    skipped.extend(kept);
     let mut replaced = HashSet::new();
     for job in &jobs {
         if let Ok(project) = project_of(&job.row).await {
             replaced.extend(project_images(docker, &project).await.unwrap_or_default());
         }
     }
-    let stacks = update_stacks(&ComposeRunner, &jobs).await;
+    let stacks = update_stacks(&ComposeRunner { docker }, &jobs).await;
 
     let dangling_now = prune::dangling_images(docker).await?;
     let keys = prune_keys(&confirmed_images, &replaced, &dangling_now);
@@ -743,7 +846,12 @@ mod tests {
         let apt = PkgManager::Apt.commands(&["curl".to_string()]);
         assert_eq!(apt[0], vec!["apt-get", "update"]);
         assert!(apt[1].contains(&"-y".to_string()));
-        assert!(apt[1].ends_with(&["install".into(), "--only-upgrade".into(), "curl".into()]));
+        assert!(apt[1].ends_with(&[
+            "install".into(),
+            "--only-upgrade".into(),
+            "--no-remove".into(),
+            "curl".into()
+        ]));
     }
 
     #[test]
@@ -754,6 +862,16 @@ mod tests {
         let names: Vec<_> = apt.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["curl", "docker-ce", "containerd.io"]);
         assert!(!apt[0].is_engine() && apt[1].is_engine() && apt[2].is_engine());
+        for engine in ["docker.io", "moby-engine", "moby-containerd"] {
+            assert!(
+                Package {
+                    name: engine.into(),
+                    detail: String::new()
+                }
+                .is_engine(),
+                "{engine}"
+            );
+        }
         let apk = PkgManager::Apk.parse_upgradable(
             "Installed:                                Available:\nmusl-1.2.5-r0                           < 1.2.5-r1\npy3-foo-bar-2.0.1-r3                    < 2.0.2-r0\ndocker-27.3.1-r0                        < 27.3.1-r1\n",
         );
@@ -788,15 +906,20 @@ mod tests {
 
     struct FakeRunner {
         fail_pull: &'static str,
+        /// Orphans each stack has when looked up again before up.
+        now: Vec<(&'static str, &'static str)>,
         calls: Mutex<Vec<String>>,
+    }
+
+    impl FakeRunner {
+        fn log(&self, s: String) {
+            self.calls.lock().unwrap().push(s);
+        }
     }
 
     impl StackRunner for FakeRunner {
         fn pull<'a>(&'a self, row: &'a StackRow) -> BoxFuture<'a, Result<String>> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("pull {}", row.name));
+            self.log(format!("pull {}", row.name));
             let fail = row.name == self.fail_pull;
             Box::pin(async move {
                 if fail {
@@ -805,20 +928,25 @@ mod tests {
                 Ok("pulled".to_string())
             })
         }
-        fn up<'a>(
-            &'a self,
-            row: &'a StackRow,
-            remove_orphans: bool,
-        ) -> BoxFuture<'a, Result<String>> {
-            let flag = if remove_orphans {
-                " --remove-orphans"
-            } else {
-                ""
-            };
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("up {}{flag}", row.name));
+        fn orphans<'a>(&'a self, row: &'a StackRow) -> BoxFuture<'a, Result<Vec<Orphan>>> {
+            self.log(format!("orphans {}", row.name));
+            let now = self
+                .now
+                .iter()
+                .filter(|(s, _)| *s == row.name)
+                .map(|(_, n)| Orphan {
+                    name: n.to_string(),
+                    id: format!("id-{n}"),
+                })
+                .collect();
+            Box::pin(async move { Ok(now) })
+        }
+        fn remove<'a>(&'a self, orphan: &'a Orphan) -> BoxFuture<'a, Result<()>> {
+            self.log(format!("remove {}", orphan.id));
+            Box::pin(async { Ok(()) })
+        }
+        fn up<'a>(&'a self, row: &'a StackRow) -> BoxFuture<'a, Result<String>> {
+            self.log(format!("up {}", row.name));
             Box::pin(async { Ok("started".to_string()) })
         }
     }
@@ -827,6 +955,7 @@ mod tests {
     fn a_failed_pull_skips_that_stack_up_and_continues() {
         let runner = FakeRunner {
             fail_pull: "b",
+            now: vec![("c", "c-old-1"), ("c", "c-unconfirmed-1")],
             calls: Mutex::new(Vec::new()),
         };
         let job = |n: &str, orphans: &[&str]| StackJob {
@@ -848,7 +977,9 @@ mod tests {
                 "up a",
                 "pull b",
                 "pull c",
-                "up c --remove-orphans"
+                "orphans c",
+                "remove id-c-old-1",
+                "up c"
             ]
         );
         assert!(reports[1].orphans_removed.is_empty(), "b never came up");
@@ -857,6 +988,36 @@ mod tests {
         assert!(!reports[1].pull.ok && reports[1].up.is_none());
         assert!(reports[1].pull.output.contains("denied"));
         assert!(reports[2].up.as_ref().unwrap().ok);
+    }
+
+    #[test]
+    fn a_confirmed_orphan_that_is_no_longer_one_is_kept() {
+        // Between the plan and the up, the stack's file declared its service again.
+        let runner = FakeRunner {
+            fail_pull: "",
+            now: vec![],
+            calls: Mutex::new(Vec::new()),
+        };
+        let reports = plugin_toolkit::reactor::block_on(update_stacks(
+            &runner,
+            &[StackJob {
+                row: row("media"),
+                remove_orphans: vec!["media-old-1".into()],
+            }],
+        ));
+        assert!(reports[0].orphans_removed.is_empty());
+        assert_eq!(
+            reports[0].orphans_skipped[0].item,
+            "orphan:media/media-old-1"
+        );
+        assert!(
+            !runner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("remove"))
+        );
     }
 
     fn candidate(id: &str) -> prune::Candidate {
@@ -889,7 +1050,16 @@ mod tests {
             running: vec![row("media"), row("web")],
             orphans: BTreeMap::from([(
                 "media".to_string(),
-                vec!["media-old-1".to_string(), "media-older-1".to_string()],
+                vec![
+                    Orphan {
+                        name: "media-old-1".into(),
+                        id: "o1".into(),
+                    },
+                    Orphan {
+                        name: "media-older-1".into(),
+                        id: "o2".into(),
+                    },
+                ],
             )]),
             unreadable: vec![Skipped {
                 item: "stack:broken".into(),
@@ -962,31 +1132,38 @@ mod tests {
     }
 
     #[test]
-    fn orphans_are_removed_only_when_every_orphan_of_the_stack_is_confirmed() {
+    fn select_acts_only_on_confirmed_targets_still_valid() {
         let st = state();
-        let all = vec![
-            "stack:media".to_string(),
-            "orphan:media/media-old-1".to_string(),
-            "orphan:media/media-older-1".to_string(),
-            "stack:web".to_string(),
-        ];
-        let (jobs, skipped) = stack_jobs(&st, &all);
-        assert_eq!(jobs[0].remove_orphans.len(), 2);
-        assert!(jobs[1].remove_orphans.is_empty());
-        assert!(skipped.is_empty());
+        let sel = select(
+            &st,
+            &[
+                "package:docker-ce".to_string(),
+                "package:gone".to_string(),
+                "stack:media".to_string(),
+                "orphan:media/media-old-1".to_string(),
+                "orphan:web/not-an-orphan".to_string(),
+                "image:sha256:dead".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(sel.packages, vec!["docker-ce"], "curl was not confirmed");
+        assert_eq!(sel.jobs.len(), 1, "web was not confirmed");
+        assert_eq!(sel.jobs[0].row.name, "media");
+        assert_eq!(sel.jobs[0].remove_orphans, vec!["media-old-1"]);
+        assert_eq!(sel.images, vec!["image:sha256:dead"]);
+        let skipped: Vec<_> = sel.skipped.iter().map(|s| s.item.as_str()).collect();
+        assert!(skipped.contains(&"package:gone"));
+        assert!(skipped.contains(&"orphan:web/not-an-orphan"));
+        assert!(
+            skipped.contains(&"stack:broken"),
+            "unreadable stacks are reported"
+        );
+        assert!(select(&st, &[]).is_err(), "execute needs the plan's items");
+    }
 
-        // One orphan unconfirmed: `--remove-orphans` would take it too.
-        let partial = vec![
-            "stack:media".to_string(),
-            "orphan:media/media-old-1".to_string(),
-        ];
-        let (jobs, skipped) = stack_jobs(&st, &partial);
-        assert_eq!(jobs.len(), 1);
-        assert!(jobs[0].remove_orphans.is_empty());
-        assert_eq!(skipped[0].item, "orphan:media/media-old-1");
-        assert!(skipped[0].reason.contains("not confirmed"), "{skipped:?}");
-
-        // Orphans confirmed without their stack are not removed.
+    #[test]
+    fn orphans_confirmed_without_their_stack_are_not_removed() {
+        let st = state();
         let (jobs, skipped) = stack_jobs(
             &st,
             &[
@@ -996,11 +1173,15 @@ mod tests {
         );
         assert!(jobs.is_empty());
         assert_eq!(skipped.len(), 2);
+        assert!(skipped[0].reason.contains("stack was not confirmed"));
     }
 
-    fn summary(name: &str, service: &str, oneoff: bool) -> ContainerSummary {
+    fn summary(name: &str, service: Option<&str>, oneoff: bool) -> ContainerSummary {
+        let service = service
+            .map(|s| format!(r#""{COMPOSE_SERVICE_LABEL}":"{s}","#))
+            .unwrap_or_default();
         plugin_toolkit::serde_json::from_str(&format!(
-            r#"{{"Id":"{name}","Names":["/{name}"],"Labels":{{"{COMPOSE_SERVICE_LABEL}":"{service}","{COMPOSE_ONEOFF_LABEL}":"{}"}}}}"#,
+            r#"{{"Id":"{name}","Names":["/{name}"],"Labels":{{{service}"{COMPOSE_ONEOFF_LABEL}":"{}"}}}}"#,
             if oneoff { "True" } else { "False" }
         ))
         .unwrap()
@@ -1009,13 +1190,17 @@ mod tests {
     #[test]
     fn orphans_are_undeclared_services_but_never_compose_run_one_offs() {
         let containers = [
-            summary("media-app-1", "app", false),
-            summary("media-old-1", "old", false),
-            summary("media_app_run_1", "old", true),
+            summary("media-app-1", Some("app"), false),
+            summary("media-debug-1", Some("debug"), false),
+            summary("media-old-1", Some("old"), false),
+            summary("media-unlabeled", None, false),
+            summary("media_app_run_1", Some("old"), true),
         ];
-        assert_eq!(
-            orphans(&containers, &["app".to_string()]),
-            vec!["media-old-1"]
-        );
+        // `debug` is profile-gated: still a declared service.
+        let names: Vec<_> = orphans(&containers, &["app".to_string(), "debug".to_string()])
+            .into_iter()
+            .map(|o| o.name)
+            .collect();
+        assert_eq!(names, vec!["media-old-1", "media-unlabeled"]);
     }
 }
