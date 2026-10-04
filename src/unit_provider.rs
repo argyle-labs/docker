@@ -19,7 +19,9 @@
 //!   coverage (see [`crate::volume_coverage`])
 //! - [`Verb::Update`] → **edit** (action `edit`, rewrite YAML/env, no deploy),
 //!   **fix** (rewrite lint findings, dry run by default), **volume_policy**
-//!   (declare how a named volume is backed up), or lifecycle (`up` /
+//!   (declare how a named volume is backed up), **label_volumes** (convert
+//!   anonymous volumes into labeled named ones, see [`crate::ownership`]), or
+//!   lifecycle (`up` regenerates `compose.orca.yaml` first; `up` /
 //!   `down` / `start` / `stop` / `restart` / `build` / `pull`)
 //! - [`Verb::Create`] → action `deploy`: register + write + `up` (add-only)
 //! - [`Verb::Upsert`] → action `set`: register-or-replace, then deploy
@@ -39,8 +41,10 @@ use plugin_toolkit::schemars::{JsonSchema, schema_for};
 use plugin_toolkit::serde::{Deserialize, Serialize};
 use plugin_toolkit::serde_json;
 
+use crate::compose::ORCA_FILE;
 use crate::compose_config::ComposeConfig;
 use crate::lint::{self, Finding, NotFixed};
+use crate::ownership::{self, Migrated, Migrator};
 use crate::runtime_adapter::DockerAdapter;
 use crate::stacks::{self, StackRow};
 use crate::volume_coverage::{self, Strategy, VolumePolicy};
@@ -154,7 +158,18 @@ impl DockerUnitProvider {
         if args.query.kind.as_deref() == Some("coverage") {
             let (project, volumes) = self.stack_volumes(&row).await?;
             let policies = volume_coverage::policies(&row.name)?;
-            let report = volume_coverage::coverage(&row.name, &project, volumes, &policies);
+            let raw = row
+                .compose()
+                .map_err(anyhow::Error::from)?
+                .config_json()
+                .await
+                .map_err(anyhow::Error::from)?;
+            let cfg = ComposeConfig::parse(&raw)?;
+            let docker = self.adapter.client().map_err(adapter_err)?;
+            let containers = ownership::project_containers(docker, &project).await?;
+            let engine = ownership::engine_volumes(docker).await?;
+            let report = volume_coverage::coverage(&row.name, &project, volumes, &policies)
+                .with_ownership(ownership::anonymous_volumes(&cfg, &containers), &engine);
             return Ok(VerbOutcome::Item(ItemOutcome::new(
                 self.stack_unit_id(&row),
                 serde_json::to_string(&report).unwrap_or_default(),
@@ -228,15 +243,31 @@ impl DockerUnitProvider {
                 if let Some(env) = &p.compose_env {
                     row.write_env(env)?;
                 }
+                // A stale orca override naming a removed service breaks every
+                // compose command, so regenerate the one that exists.
+                let mut message = format!("edited stack '{}'", row.name);
+                if std::path::Path::new(&row.dir).join(ORCA_FILE).exists()
+                    && let Err(e) = ownership::refresh(&row).await
+                {
+                    message.push_str(&format!("; {ORCA_FILE} not regenerated: {e}"));
+                }
                 Ok(VerbOutcome::Action(ActionOutcome {
                     changed: true,
-                    message: format!("edited stack '{}'", row.name),
+                    message,
                 }))
             }
             "fix" => self.stack_fix(&args.id, &row, args.payload).await,
             "volume_policy" => self.stack_volume_policy(&args.id, &row, args.payload).await,
             ACTION_BACKUP => self.do_stack_backup(&args.id, &row, args.payload).await,
             ACTION_RESTORE => self.do_stack_restore(&args.id, &row, args.payload).await,
+            "label_volumes" => self.stack_label_volumes(&args.id, &row, args.payload).await,
+            "up" => {
+                let out = ownership::up(&row, &[]).await?;
+                Ok(VerbOutcome::Action(ActionOutcome {
+                    changed: true,
+                    message: format!("stack '{}' up: {}", row.name, out.trim()),
+                }))
+            }
             action if STACK_LIFECYCLE.contains(&action) => {
                 let out = row
                     .compose()
@@ -304,6 +335,37 @@ impl DockerUnitProvider {
         let docker = self.adapter.client().map_err(adapter_err)?;
         let engine = volume_coverage::engine_volumes(docker, &cfg.name).await?;
         Ok((cfg.name.clone(), volume_coverage::detect(&cfg, &engine)))
+    }
+
+    /// **label_volumes**: convert the stack's anonymous volumes into labeled
+    /// named volumes declared in [`ORCA_FILE`], copying and verifying their
+    /// data. Dry run by default; execute acts only on confirmed items that
+    /// are still convertible.
+    async fn stack_label_volumes(
+        &self,
+        id: &UnitId,
+        row: &StackRow,
+        payload: Option<String>,
+    ) -> Result<VerbOutcome> {
+        let p: LabelVolumesPayload = match payload {
+            Some(raw) => serde_json::from_str(&raw)
+                .map_err(|e| anyhow::anyhow!("label_volumes payload: {e}"))?,
+            None => LabelVolumesPayload::default(),
+        };
+        let (_, cfg) = ownership::user_config(row).await?;
+        let docker = self.adapter.client().map_err(adapter_err)?;
+        let containers = ownership::project_containers(docker, &cfg.name).await?;
+        let converted = ownership::read_conversions(std::path::Path::new(&row.dir))?;
+        let planned = ownership::plan(&cfg, &containers, &converted);
+        let migrator = ownership::ComposeMigrator { row, docker };
+        let result = label_volumes_result(
+            docker, &migrator, &cfg.name, &row.name, &planned, &converted, &p,
+        )
+        .await?;
+        Ok(VerbOutcome::Item(ItemOutcome::new(
+            id.clone(),
+            serde_json::to_string(&result).unwrap_or_default(),
+        )))
     }
 
     /// **volume_policy**: declare (or with no `strategy`, clear) how one named
@@ -438,12 +500,7 @@ impl DockerUnitProvider {
         std::fs::create_dir_all(&row.dir)
             .map_err(|e| anyhow::anyhow!("create stack dir {}: {e}", row.dir))?;
         run_tar(&["xzf", &archive, "-C", &row.dir]).await?;
-        let out = row
-            .compose()
-            .map_err(anyhow::Error::from)?
-            .run_action("up", None, None)
-            .await
-            .map_err(anyhow::Error::from)?;
+        let out = ownership::up(row, &[]).await?;
         Ok(VerbOutcome::Action(ActionOutcome {
             changed: true,
             message: format!(
@@ -484,11 +541,7 @@ impl DockerUnitProvider {
         }
         stacks::put(&row)?;
         if p.deploy {
-            row.compose()
-                .map_err(anyhow::Error::from)?
-                .up(&[])
-                .await
-                .map_err(anyhow::Error::from)?;
+            ownership::up(&row, &[]).await?;
         }
         Ok(VerbOutcome::Item(ItemOutcome::new(
             self.stack_unit_id(&row),
@@ -812,6 +865,77 @@ fn volume_policy_result(
     })
 }
 
+/// Payload for `Update{action:"label_volumes"}`. No payload is a dry run.
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(crate = "plugin_toolkit::serde")]
+#[schemars(crate = "plugin_toolkit::schemars")]
+pub struct LabelVolumesPayload {
+    /// Convert. Omitted, returns the plan only.
+    #[serde(default)]
+    pub execute: bool,
+    /// The dry run's change targets (`<service>:<path>`) to convert.
+    #[serde(default)]
+    pub items: Vec<String>,
+}
+
+/// Response for `Update{action:"label_volumes"}`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(crate = "plugin_toolkit::serde")]
+#[schemars(crate = "plugin_toolkit::schemars")]
+pub struct LabelVolumesResult {
+    /// `true`: nothing was changed.
+    pub dry_run: bool,
+    pub changes: Vec<PlannedChange>,
+    /// What execute did (absent on a dry run).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migrated: Option<Migrated>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub how_to_execute: Option<String>,
+}
+
+const LABEL_VOLUMES_TOOL: &str = "stack label_volumes";
+
+/// The plan, or on execute the migration of the confirmed items still
+/// planned. Confirmed items no longer planned are reported as skipped.
+async fn label_volumes_result(
+    docker: &bollard::Docker,
+    migrator: &dyn Migrator,
+    project: &str,
+    stack: &str,
+    planned: &[ownership::Planned],
+    converted: &[ownership::Conversion],
+    p: &LabelVolumesPayload,
+) -> Result<LabelVolumesResult> {
+    let changes: Vec<PlannedChange> = planned.iter().map(ownership::planned_change).collect();
+    if !p.execute {
+        return Ok(LabelVolumesResult {
+            dry_run: true,
+            changes,
+            migrated: None,
+            how_to_execute: Some(
+                "re-invoke action=label_volumes with `execute: true` and `items` set to the change targets; only those still convertible are converted".into(),
+            ),
+        });
+    }
+    let current: Vec<String> = planned.iter().map(|x| x.conversion.key()).collect();
+    crate::execute::require_confirmed(LABEL_VOLUMES_TOOL, &p.items, &current)?;
+    let (act, dropped) = crate::execute::intersect(&p.items, &current);
+    let mut migrated =
+        ownership::migrate(docker, migrator, project, stack, planned, &act, converted).await;
+    migrated
+        .skipped
+        .extend(dropped.into_iter().map(|item| ownership::NotDone {
+            item,
+            reason: "no longer an unconverted anonymous volume".into(),
+        }));
+    Ok(LabelVolumesResult {
+        dry_run: false,
+        changes,
+        migrated: Some(migrated),
+        how_to_execute: None,
+    })
+}
+
 /// `Detail` `query.extra` for `query.kind = "audit"`.
 #[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(crate = "plugin_toolkit::serde")]
@@ -937,6 +1061,11 @@ fn stack_declaration() -> KindDeclaration {
         action: "fix".into(),
         payload_schema: Some(schema_for!(StackFixPayload)),
         response_schema: Some(schema_for!(StackFixResult)),
+    });
+    update_actions.push(ActionDecl {
+        action: "label_volumes".into(),
+        payload_schema: Some(schema_for!(LabelVolumesPayload)),
+        response_schema: Some(schema_for!(LabelVolumesResult)),
     });
     update_actions.push(ActionDecl {
         action: "volume_policy".into(),
@@ -1517,5 +1646,107 @@ mod tests {
         assert!(StackBackupPayload::default().dest.is_none());
         let p: StackBackupPayload = serde_json::from_str("{}").unwrap();
         assert!(p.dest.is_none());
+    }
+
+    struct NoopMigrator;
+
+    impl Migrator for NoopMigrator {
+        fn stop<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn start<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn copy<'a>(&'a self, _: &'a str, _: &'a str) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn manifest<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<String>> {
+            Box::pin(async { Ok("x".to_string()) })
+        }
+        fn current_override(&self) -> Result<Option<String>> {
+            Ok(None)
+        }
+        fn write_override<'a>(
+            &'a self,
+            _: &'a [ownership::Conversion],
+        ) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn restore_override(&self, _: Option<&str>) -> Result<()> {
+            Ok(())
+        }
+        fn up<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn label_plan() -> Vec<ownership::Planned> {
+        vec![ownership::Planned {
+            conversion: ownership::Conversion::new("media", "app", "/cache"),
+            old: None,
+            blocked: None,
+        }]
+    }
+
+    fn label_run(
+        e: &crate::test_engine::FakeEngine,
+        p: LabelVolumesPayload,
+    ) -> Result<LabelVolumesResult> {
+        plugin_toolkit::reactor::block_on(label_volumes_result(
+            &e.client(),
+            &NoopMigrator,
+            "media",
+            "media",
+            &label_plan(),
+            &[],
+            &p,
+        ))
+    }
+
+    #[test]
+    fn label_volumes_dry_run_plans_and_touches_nothing() {
+        let e = crate::test_engine::FakeEngine::routed(vec![]);
+        let r = label_run(&e, LabelVolumesPayload::default()).unwrap();
+        assert!(r.dry_run && r.migrated.is_none() && r.how_to_execute.is_some());
+        assert_eq!(r.changes[0].target, "app:/cache");
+        assert!(e.requests().is_empty());
+    }
+
+    #[test]
+    fn label_volumes_execute_needs_items_and_skips_stale_ones() {
+        let e = crate::test_engine::FakeEngine::routed(vec![]);
+        let err = label_run(
+            &e,
+            LabelVolumesPayload {
+                execute: true,
+                items: vec![],
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("items from the dry run"), "{err}");
+        let r = label_run(
+            &e,
+            LabelVolumesPayload {
+                execute: true,
+                items: vec!["app:/gone".into()],
+            },
+        )
+        .unwrap();
+        let m = r.migrated.unwrap();
+        assert!(m.converted.is_empty());
+        assert_eq!(m.skipped[0].item, "app:/gone");
+        assert!(e.requests().is_empty());
+    }
+
+    #[test]
+    fn stack_declares_label_volumes_action() {
+        let d = stack_declaration();
+        let update = d.verbs.iter().find(|v| v.verb == Verb::Update).unwrap();
+        let a = update
+            .actions
+            .iter()
+            .find(|a| a.action == "label_volumes")
+            .unwrap();
+        assert!(a.payload_schema.is_some() && a.response_schema.is_some());
     }
 }

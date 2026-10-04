@@ -66,6 +66,7 @@ pub struct FakeEngine {
     _dir: tempfile::TempDir,
     path: PathBuf,
     seen: Arc<Mutex<Vec<String>>>,
+    bodies: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 impl FakeEngine {
@@ -76,6 +77,8 @@ impl FakeEngine {
         let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
         let seen = Arc::new(Mutex::new(Vec::new()));
         let log = seen.clone();
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let body_log = bodies.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { return };
@@ -87,12 +90,27 @@ impl FakeEngine {
                 let request_line = request_line.trim_end().to_string();
                 log.lock().expect("lock").push(request_line.clone());
                 let mut header = String::new();
+                let mut length = 0usize;
                 while reader
                     .read_line(&mut header)
                     .map(|n| n > 2)
                     .unwrap_or(false)
                 {
+                    if let Some((k, v)) = header.split_once(':')
+                        && k.eq_ignore_ascii_case("content-length")
+                    {
+                        length = v.trim().parse().unwrap_or(0);
+                    }
                     header.clear();
+                }
+                if length > 0 {
+                    let mut buf = vec![0u8; length];
+                    if std::io::Read::read_exact(&mut reader, &mut buf).is_ok() {
+                        body_log.lock().expect("lock").push((
+                            request_line.clone(),
+                            String::from_utf8_lossy(&buf).into_owned(),
+                        ));
+                    }
                 }
                 let mut parts = request_line.split(' ');
                 let method = parts.next().unwrap_or_default();
@@ -121,6 +139,7 @@ impl FakeEngine {
             _dir: dir,
             path,
             seen,
+            bodies,
         }
     }
 
@@ -136,6 +155,22 @@ impl FakeEngine {
     /// Request lines seen so far, e.g. `DELETE /v1.52/volumes/abc HTTP/1.1`.
     pub fn requests(&self) -> Vec<String> {
         self.seen.lock().expect("lock").clone()
+    }
+
+    /// Bodies of requests whose path ends with `path`, in order.
+    pub fn bodies(&self, path: &str) -> Vec<String> {
+        self.bodies
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|(line, _)| {
+                line.split(' ')
+                    .nth(1)
+                    .and_then(|t| t.split('?').next())
+                    .is_some_and(|p| p.ends_with(path))
+            })
+            .map(|(_, b)| b.clone())
+            .collect()
     }
 
     /// Percent-decoded request targets (path and query) with the given method.

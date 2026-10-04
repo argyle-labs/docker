@@ -18,24 +18,22 @@
 //! confirmed stacks produce them.
 #![allow(clippy::disallowed_types)]
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use bollard::Docker;
 use bollard::models::ContainerSummary;
-use bollard::query_parameters::ListContainersOptionsBuilder;
 use plugin_toolkit::contract::BoxFuture;
 use plugin_toolkit::contract::plan::{ExecutionPlan, PlannedChange};
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::process::Command;
 
 use crate::execute;
-use crate::prune::{self, COMPOSE_PROJECT_LABEL, PruneApplied, Skipped};
+use crate::ownership::{COMPOSE_ONEOFF_LABEL, COMPOSE_SERVICE_LABEL, project_containers};
+use crate::prune::{self, PruneApplied, Skipped};
 use crate::stacks::{self, StackRow};
 
 const TOOL: &str = "docker.host_update";
 const OS_RELEASE: &str = "/etc/os-release";
-const COMPOSE_SERVICE_LABEL: &str = "com.docker.compose.service";
-const COMPOSE_ONEOFF_LABEL: &str = "com.docker.compose.oneoff";
 
 /// The OS package manager this verb drives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -350,19 +348,6 @@ pub fn orphans(containers: &[ContainerSummary], services: &[String]) -> Vec<Stri
         .collect();
     out.sort();
     out
-}
-
-async fn project_containers(docker: &Docker, project: &str) -> Result<Vec<ContainerSummary>> {
-    let filters = HashMap::from([("label", vec![format!("{COMPOSE_PROJECT_LABEL}={project}")])]);
-    docker
-        .list_containers(Some(
-            ListContainersOptionsBuilder::new()
-                .all(true)
-                .filters(&filters)
-                .build(),
-        ))
-        .await
-        .map_err(|e| anyhow!("list containers of {project}: {e}"))
 }
 
 async fn list_packages(pkg: Option<PkgManager>) -> std::result::Result<Vec<Package>, String> {

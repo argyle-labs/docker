@@ -75,7 +75,7 @@ struct NetworkMeta {
 
 /// Well-known label a container can set to declare its service role as a cheap
 /// hint (the authoritative role still comes from a runtime registration).
-const ROLE_LABEL: &str = "orca.role";
+const ROLE_LABEL: &str = crate::labels::ROLE;
 
 /// Compose project name label docker sets on every container it starts from a
 /// compose file. Fallback signal for `service_identity` when the working-dir

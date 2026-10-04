@@ -37,7 +37,8 @@ Once orca is on the host you never touch the scripts — drive the tools. Payloa
 | `docker.delete` | remove a registered docker runtime | `runtime` |
 | `docker.backup` | archive engine state to a `.tar.gz` | `destination`, optional `state_path` |
 | `docker.restore` | restore engine state from an archive | `archive`, optional `state_path` |
-| `docker.prune` | remove dangling images (untagged, including digest-only pulls), dangling anonymous volumes and compose networks no container (running or stopped) uses; never named volumes, never a network a managed stack declares `external`. `stack` scope covers networks only: compose does not label anonymous volumes with their project. Dry run by default | optional `stack`; `execute` + `items` from the dry run |
+| `docker.prune` | remove dangling images (untagged, including digest-only pulls), dangling anonymous volumes and compose networks no container (running or stopped) uses; never named volumes, never a network a managed stack declares `external`. `stack` scope attributes a volume by `orca.stack`, else `com.docker.compose.project`, else a container mounting it (compose labels anonymous volumes with neither, so only orca-labeled ones are found). Dry run by default | optional `stack`; `execute` + `items` from the dry run |
+| `docker.label_audit` | every container, volume and network without `orca.managed`, grouped by inferred owner (`orca.stack` or the compose project label, else the container that mounts or attaches it). Read-only | none |
 | `docker.host_update` | upgrade the confirmed upgradable OS packages (apk/apt, engine packages flagged: they restart every container), then `compose pull -q` + `up -d` for every running stack, removing a stack's orphan containers only when all of them are confirmed, then prune dangling images; behind the pre-update backup gate. Stacks whose compose can't be read are reported as skipped. Dry run by default | `execute` + `items` (`package:*`, `stack:*`, `orphan:*`, `image:*`) from the dry run; `skip_backup_gate` until orca#767 |
 
 > Individual **containers** and managed **Compose stacks** are not `docker.*` tools — they are surfaced on orca's generic five-verb **unit** surface (`docker.__unit.*`). The `docker.*` tools above manage the runtime, its registered engines, and one-off Compose projects by path. See **[Managing Compose stacks](#managing-compose-stacks-orca-as-config-manager)** below.
@@ -87,12 +88,24 @@ vocabulary spans both). Every operation is available through `unit` list / detai
 | **edit** (rewrite YAML/env, no deploy) | `update` | `action = "edit"`, `{ compose_yaml?, compose_env? }` |
 | **audit** (lint: restart policy, bind sources, named volumes) | `detail` | `query.kind = "audit"`, optional `query.extra = { managed_roots }` |
 | **fix** audit findings (dry run by default, shows the diff) | `update` | `action = "fix"`, `{ execute?, items?, managed_roots? }` |
-| **coverage** of named volumes by the stack backup | `detail` | `query.kind = "coverage"` |
+| **coverage** of named volumes by the stack backup, plus anonymous and unlabeled volumes | `detail` | `query.kind = "coverage"` |
+| **convert anonymous volumes** to labeled named volumes, copying and verifying the data (dry run by default) | `update` | `action = "label_volumes"`, `{ execute?, items? }` |
 | **declare** how a named volume is backed up (dry run by default) | `update` | `action = "volume_policy"`, `{ volume, strategy?: export\|dump, service?, command?, execute? }` |
 | **deploy / lifecycle** | `update` | `action = up`\|`down`\|`start`\|`stop`\|`restart`\|`build`\|`pull` |
 | **register + deploy** (add-only) | `create` | `action = "deploy"`, deploy payload |
 | **register-or-replace + deploy** | `upsert` | `action = "set"`, deploy payload |
 | **deregister** (leaves containers running) | `delete` | `id.kind = "stack"`, `id.id = <name>` |
+
+**Ownership labels.** Every `up`, deploy and restore regenerates `compose.orca.yaml` next to the compose file and passes it last (`-f`); every other compose call on the stack passes the same files. The user's compose file is never edited. It labels each service, each non-external network and each top-level named volume with the orca#772 contract: `orca.managed=true`, `orca.owner=docker`, `orca.stack=<project>`, `orca.service`, `orca.unit=<stack name>`, `orca.mount`. A volume that already exists without orca's labels is left unlabeled, because volume labels are immutable and a changed declaration can make compose offer to recreate it. `coverage` and `docker.label_audit` report those volumes. The first labeled `up` recreates the stack's containers and its compose networks once.
+
+`label_volumes` converts each anonymous volume into the named volume `<project>_<service>_<path-slug>`, declared in `compose.orca.yaml`. For each service it:
+1. stops the service;
+2. creates the target volume with labels;
+3. copies through a helper container with no network, mounting the old volume read-only;
+4. compares sha256 manifests of type, mode, owner, size and content;
+5. runs `up`.
+
+The old volume is removed only after verification, and only when no container references it. A failure before `up` restores the previous override, removes the new volume and starts the service again.
 
 ```jsonc
 // create (action=deploy) — write a brand-new stack's compose file and bring it up.

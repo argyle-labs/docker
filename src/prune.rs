@@ -5,9 +5,12 @@
 //! qualifies only when the engine stamped it `com.docker.volume.anonymous`,
 //! and never when compose declared it by name (`com.docker.compose.volume`).
 //!
-//! Compose (2.31 and 2.40, measured on the fleet) does not label anonymous
-//! volumes with `com.docker.compose.project`, and a dangling volume has no
-//! container to attribute it by, so a `--stack` prune finds no volumes.
+//! A `--stack` prune attributes a volume by its `orca.stack` label, else its
+//! `com.docker.compose.project` label, else a container that mounts it.
+//! Compose (2.31 and 2.40, measured on the fleet) labels anonymous volumes
+//! with neither, and a dangling volume has no container by definition, so
+//! only anonymous volumes created with orca's labels (`volume-label`, by
+//! core's container create per orca#772) are found that way.
 //!
 //! Networks that any managed stack declares `external: true` are never
 //! candidates. When a stack's config cannot be read, no network is a
@@ -118,14 +121,19 @@ pub fn image_candidates(images: &[ImageSummary], project: Option<&str>) -> Vec<C
 }
 
 /// Anonymous volumes from a `dangling=true` listing. In a project scope, a
-/// volume without that project's label is left alone.
-pub fn volume_candidates(volumes: &[Volume], project: Option<&str>) -> Vec<Candidate> {
+/// volume not attributed to that project (see the module doc; `mounts` maps
+/// volume names to the owner of a container mounting them) is left alone.
+pub fn volume_candidates(
+    volumes: &[Volume],
+    project: Option<&str>,
+    mounts: &HashMap<String, String>,
+) -> Vec<Candidate> {
     volumes
         .iter()
         .filter(|v| v.labels.contains_key(ANONYMOUS_VOLUME_LABEL))
         .filter(|v| !v.labels.contains_key(COMPOSE_VOLUME_LABEL))
         .filter(|v| match project {
-            Some(p) => v.labels.get(COMPOSE_PROJECT_LABEL).map(String::as_str) == Some(p),
+            Some(p) => crate::label_audit::volume_owner(v, mounts).as_deref() == Some(p),
             None => true,
         })
         .map(|v| {
@@ -245,7 +253,11 @@ pub async fn candidates(docker: &Docker, scope: Scope<'_>) -> Result<Vec<Candida
         Some(_) => Vec::new(),
         None => dangling_images(docker).await?,
     };
-    out.extend(volume_candidates(&volumes, project));
+    out.extend(volume_candidates(
+        &volumes,
+        project,
+        &crate::label_audit::mount_owners(&containers),
+    ));
     out.extend(network_candidates(&networks, &containers, scope));
     Ok(out)
 }
@@ -692,7 +704,7 @@ mod tests {
             &[(ANONYMOUS_VOLUME_LABEL, ""), (COMPOSE_VOLUME_LABEL, "data")],
         ))
         .unwrap();
-        assert!(volume_candidates(&[v], None).is_empty());
+        assert!(volume_candidates(&[v], None, &HashMap::new()).is_empty());
     }
 
     #[test]
@@ -704,6 +716,48 @@ mod tests {
             external_networks: Some(&ext),
         };
         assert_eq!(keys(&found(&e, scope)), vec!["network:n-media-orphan"]);
+    }
+
+    #[test]
+    fn stack_scope_prefers_orca_stack_then_compose_project_then_mounts() {
+        let parse = |name: &str, labels: &[(&str, &str)]| -> Volume {
+            plugin_toolkit::serde_json::from_str(&volume(name, labels)).unwrap()
+        };
+        let vols = [
+            parse(
+                "a",
+                &[
+                    (ANONYMOUS_VOLUME_LABEL, ""),
+                    (crate::labels::STACK, "media"),
+                    (COMPOSE_PROJECT_LABEL, "other"),
+                ],
+            ),
+            parse(
+                "b",
+                &[
+                    (ANONYMOUS_VOLUME_LABEL, ""),
+                    (COMPOSE_PROJECT_LABEL, "media"),
+                ],
+            ),
+            parse("c", &[(ANONYMOUS_VOLUME_LABEL, "")]),
+            parse(
+                "d",
+                &[
+                    (ANONYMOUS_VOLUME_LABEL, ""),
+                    (crate::labels::STACK, "other"),
+                ],
+            ),
+        ];
+        let mounts = HashMap::from([
+            ("c".to_string(), "media".to_string()),
+            ("d".to_string(), "media".to_string()),
+        ]);
+        let ids: Vec<_> = volume_candidates(&vols, Some("media"), &mounts)
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        // `d` names another stack itself; a mount does not override that.
+        assert_eq!(ids, vec!["a", "b", "c"]);
     }
 
     #[test]
