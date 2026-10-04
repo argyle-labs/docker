@@ -18,6 +18,16 @@ pub struct ComposeConfig {
     /// Top-level named volumes, keyed by the name services refer to.
     #[serde(default)]
     pub volumes: BTreeMap<String, VolumeConfig>,
+    /// Networks the project uses, keyed as services refer to them.
+    #[serde(default)]
+    pub networks: BTreeMap<String, NetworkConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(crate = "plugin_toolkit::serde")]
+pub struct NetworkConfig {
+    #[serde(default)]
+    pub external: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -59,6 +69,11 @@ impl ComposeConfig {
 }
 
 impl MountConfig {
+    /// An anonymous volume: type `volume` without a source.
+    pub fn is_anonymous(&self) -> bool {
+        self.kind == "volume" && self.source.as_deref().is_none_or(str::is_empty)
+    }
+
     /// A named volume: type `volume` with a source.
     pub fn named_volume(&self) -> Option<&str> {
         (self.kind == "volume")
@@ -106,6 +121,10 @@ pub(crate) const FIXTURE: &str = r#"{
     "data": {"name": "media_data"},
     "pg": {"name": "media_pg"},
     "shared": {"name": "shared", "external": true}
+  },
+  "networks": {
+    "default": {"name": "media_default"},
+    "proxy": {"name": "caddy_proxy", "external": true}
   }
 }"#;
 
@@ -122,6 +141,8 @@ mod tests {
         assert_eq!(app.volumes[0].bind_source(), Some("/mnt/willow/media"));
         assert_eq!(app.volumes[3].named_volume(), Some("data"));
         assert_eq!(app.volumes[4].named_volume(), None, "anonymous");
+        assert!(app.volumes[4].is_anonymous() && !app.volumes[3].is_anonymous());
+        assert_eq!(c.networks["proxy"].external, Some(true));
         assert!(c.services["worker"].restart.is_none());
         assert_eq!(c.volumes["data"].name.as_deref(), Some("media_data"));
         assert_eq!(c.volumes["shared"].external, Some(true));

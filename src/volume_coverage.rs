@@ -300,9 +300,56 @@ pub struct StackCoverage {
     pub name: String,
     pub project: String,
     pub volumes: Vec<VolumeCoverage>,
-    /// One line per uncovered volume, and per policy naming a volume the
-    /// stack no longer has.
+    /// Anonymous volumes: compose cannot label them, and no policy can name
+    /// them. `stack update action=label_volumes` converts them.
+    #[serde(default)]
+    pub anonymous: Vec<crate::ownership::AnonymousVolume>,
+    /// Engine volumes of the stack without `orca.managed`.
+    #[serde(default)]
+    pub unlabeled: Vec<String>,
+    /// One line per uncovered volume, per policy naming a volume the stack
+    /// no longer has, and per anonymous or unlabeled volume.
     pub warnings: Vec<String>,
+}
+
+impl StackCoverage {
+    /// Add the stack's anonymous volumes and its engine volumes (named or
+    /// anonymous) that lack orca's labels; `engine` is every engine volume's
+    /// labels.
+    pub fn with_ownership(
+        mut self,
+        anonymous: Vec<crate::ownership::AnonymousVolume>,
+        engine: &crate::ownership::EngineVolumes,
+    ) -> Self {
+        let names = self
+            .volumes
+            .iter()
+            .filter(|v| v.volume.exists && !v.volume.external)
+            .map(|v| v.volume.engine_name.clone())
+            .chain(anonymous.iter().flat_map(|a| a.engine_names.clone()));
+        let mut unlabeled: Vec<String> = names
+            .filter(|n| {
+                engine
+                    .get(n)
+                    .is_some_and(|l| !crate::labels::is_managed(l.iter()))
+            })
+            .collect();
+        unlabeled.sort();
+        unlabeled.dedup();
+        for a in &anonymous {
+            self.warnings.push(format!(
+                "anonymous volume at {}:{} cannot be labeled or backed up by policy; run action=label_volumes",
+                a.service, a.target
+            ));
+        }
+        for n in &unlabeled {
+            self.warnings
+                .push(format!("volume '{n}' has no orca ownership labels"));
+        }
+        self.anonymous = anonymous;
+        self.unlabeled = unlabeled;
+        self
+    }
 }
 
 pub fn coverage(
@@ -343,6 +390,8 @@ pub fn coverage(
         name: stack.to_string(),
         project: project.to_string(),
         volumes,
+        anonymous: Vec::new(),
+        unlabeled: Vec::new(),
         warnings,
     }
 }
@@ -633,6 +682,34 @@ mod tests {
                 .any(|w| w.contains("'gone' matches no volume"))
         );
         assert!(!c.warnings.iter().any(|w| w.contains("'data' (")));
+    }
+
+    #[test]
+    fn coverage_reports_anonymous_and_unlabeled_volumes() {
+        let engine = [
+            engine_volume("media_data", Some("data")),
+            engine_volume("media_pg", Some("pg")),
+        ];
+        let mut labels: crate::ownership::EngineVolumes = engine
+            .iter()
+            .map(|v| (v.name.clone(), v.labels.clone()))
+            .collect();
+        labels
+            .get_mut("media_pg")
+            .unwrap()
+            .insert(crate::labels::MANAGED.into(), "true".into());
+        labels.insert("abc123".into(), Default::default());
+        let anon = vec![crate::ownership::AnonymousVolume {
+            service: "app".into(),
+            target: "/cache".into(),
+            engine_names: vec!["abc123".into()],
+        }];
+        let c =
+            coverage("media", "media", detect(&cfg(), &engine), &[]).with_ownership(anon, &labels);
+        assert_eq!(c.unlabeled, vec!["abc123", "media_data"]);
+        assert_eq!(c.anonymous[0].target, "/cache");
+        assert!(c.warnings.iter().any(|w| w.contains("app:/cache")));
+        assert!(!c.warnings.iter().any(|w| w.contains("'media_pg' has no")));
     }
 
     #[test]

@@ -614,7 +614,7 @@ mod tests {
 
     fn full_inspect_response() -> ContainerInspectResponse {
         let mut labels = HashMap::new();
-        labels.insert("orca.heal".to_string(), "manual".to_string());
+        labels.insert(crate::labels::HEAL.to_string(), "manual".to_string());
         labels.insert(
             "com.docker.compose.project".to_string(),
             "media".to_string(),
@@ -677,7 +677,7 @@ mod tests {
         let labels_have_heal = c
             .labels
             .iter()
-            .any(|(k, v)| k == "orca.heal" && v == "manual");
+            .any(|(k, v)| k == crate::labels::HEAL && v == "manual");
         assert!(labels_have_heal);
         assert!(c.startup.is_none()); // docker has no ordering
     }

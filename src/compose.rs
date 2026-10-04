@@ -77,11 +77,16 @@ const OVERRIDE_FILES: &[&str] = &[
     "docker-compose.override.yaml",
 ];
 
+/// orca's generated override (ownership labels, converted volumes), passed
+/// last so it applies over the user's files. See [`crate::ownership`].
+pub const ORCA_FILE: &str = "compose.orca.yaml";
+
 /// A located compose project.
 #[derive(Debug, Clone)]
 pub struct Compose {
     file: PathBuf,
     override_file: Option<PathBuf>,
+    orca_file: Option<PathBuf>,
 }
 
 impl Compose {
@@ -100,9 +105,11 @@ impl Compose {
                     .iter()
                     .map(|o| project_path.join(o))
                     .find(|o| o.exists());
+                let orca_file = Some(project_path.join(ORCA_FILE)).filter(|o| o.exists());
                 return Some(Compose {
                     file: full,
                     override_file,
+                    orca_file,
                 });
             }
         }
@@ -124,10 +131,29 @@ impl Compose {
         self.override_file.as_deref()
     }
 
-    /// The compose files in `-f` order: the compose file, then its override.
+    /// The project with only the user's files, as orca reads it to generate
+    /// [`ORCA_FILE`].
+    pub fn without_orca(&self) -> Compose {
+        Compose {
+            orca_file: None,
+            ..self.clone()
+        }
+    }
+
+    /// The project with [`ORCA_FILE`] (next to the compose file) passed last.
+    pub fn with_orca(&self) -> Compose {
+        Compose {
+            orca_file: self.file.parent().map(|d| d.join(ORCA_FILE)),
+            ..self.clone()
+        }
+    }
+
+    /// The compose files in `-f` order: the compose file, its override, then
+    /// orca's override.
     pub fn files(&self) -> Vec<&Path> {
         std::iter::once(self.file.as_path())
             .chain(self.override_file.as_deref())
+            .chain(self.orca_file.as_deref())
             .collect()
     }
 
@@ -395,6 +421,21 @@ mod tests {
         assert_eq!(args[0], "-f");
         assert!(args[1].ends_with("docker-compose.yml"));
         assert!(args[3].ends_with("compose.override.yml"), "{args:?}");
+    }
+
+    #[test]
+    fn the_orca_file_is_passed_last_and_can_be_left_out() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("compose.yaml"), "services: {}").unwrap();
+        std::fs::write(dir.path().join("compose.override.yaml"), "").unwrap();
+        std::fs::write(dir.path().join(ORCA_FILE), "{}").unwrap();
+        let c = Compose::find(dir.path()).unwrap();
+        let files = c.files();
+        assert_eq!(files.len(), 3);
+        assert!(files[1].ends_with("compose.override.yaml"));
+        assert!(files[2].ends_with(ORCA_FILE));
+        assert_eq!(c.without_orca().files().len(), 2);
+        assert_eq!(c.without_orca().with_orca().files(), files);
     }
 
     #[test]
