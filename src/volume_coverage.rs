@@ -479,6 +479,17 @@ pub fn create_private(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// An export or dump that wrote nothing backs nothing up.
+pub fn ensure_nonempty(path: &Path, what: &str) -> Result<()> {
+    let len = std::fs::metadata(path)
+        .map_err(|e| anyhow::anyhow!("stat {}: {e}", path.display()))?
+        .len();
+    if len == 0 {
+        anyhow::bail!("{what} produced no output");
+    }
+    Ok(())
+}
+
 /// Whether the engine has a volume named `name`. External volumes and ones
 /// with an explicit `name:` carry no project label, so only an inspect by
 /// name answers this.
@@ -621,12 +632,7 @@ pub async fn stage(
                 what
             }
         };
-        let len = std::fs::metadata(&out)
-            .map_err(|e| anyhow::anyhow!("stat {}: {e}", out.display()))?
-            .len();
-        if len == 0 {
-            anyhow::bail!("{what} produced no output");
-        }
+        ensure_nonempty(&out, &what)?;
         staged.artifacts.push(format!("{STAGING_DIR}/{artifact}"));
     }
     if !staged.skipped.is_empty() {
@@ -959,6 +965,17 @@ mod tests {
         let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         assert!(create_private(&p).is_err());
+    }
+
+    #[test]
+    fn an_empty_artifact_fails_the_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("pg.dump");
+        create_private(&p).unwrap();
+        let err = ensure_nonempty(&p, "dump volume 'pg'").unwrap_err();
+        assert!(err.to_string().contains("produced no output"), "{err}");
+        std::fs::write(&p, b"x").unwrap();
+        assert!(ensure_nonempty(&p, "dump").is_ok());
     }
 
     #[test]

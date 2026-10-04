@@ -136,6 +136,15 @@ impl StackRow {
 /// `docker compose config -q` over `file` in place of the stack's compose
 /// file (with the override compose would load), from `dir`.
 async fn validate_compose(dir: &str, file: &Path) -> Result<()> {
+    let args = validate_args(dir, file);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    crate::run(&argv, None)
+        .await
+        .map(|_| ())
+        .context("compose rejects the rewritten file; nothing was written")
+}
+
+fn validate_args(dir: &str, file: &Path) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "compose".into(),
         "--project-directory".into(),
@@ -149,11 +158,7 @@ async fn validate_compose(dir: &str, file: &Path) -> Result<()> {
         args.extend(["-f".into(), o.to_string_lossy().into_owned()]);
     }
     args.extend(["config".into(), "-q".into()]);
-    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    crate::run(&argv, None)
-        .await
-        .map(|_| ())
-        .context("compose rejects the rewritten file; nothing was written")
+    args
 }
 
 /// A file replacement staged next to its target. The target is resolved
@@ -436,6 +441,28 @@ mod tests {
             entries(dir.path()),
             vec!["compose.yaml", "compose.yaml.bak"]
         );
+    }
+
+    #[test]
+    fn validation_checks_the_temp_file_with_the_stack_override() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("compose.yaml"), "services: {}\n").unwrap();
+        std::fs::write(dir.path().join("compose.override.yaml"), "").unwrap();
+        let d = dir.path().to_string_lossy().into_owned();
+        let tmp = dir.path().join(".compose.yaml.orca-1.tmp");
+        let a = validate_args(&d, &tmp);
+        assert_eq!(
+            a[..5],
+            [
+                "compose".to_string(),
+                "--project-directory".into(),
+                d.clone(),
+                "-f".into(),
+                tmp.to_string_lossy().into_owned()
+            ]
+        );
+        assert!(a[6].ends_with("compose.override.yaml"), "{a:?}");
+        assert_eq!(a[7..], ["config".to_string(), "-q".into()]);
     }
 
     #[test]
