@@ -24,7 +24,7 @@ use crate::unit_provider::DockerUnitProvider;
 /// Process-wide docker adapter used to back the [`DockerUnitProvider`], which
 /// borrows a `'static` adapter. The `container_runtime` facet gets its own
 /// owned adapter (construction does no I/O; the bollard client is lazy).
-fn adapter() -> &'static DockerAdapter {
+pub(crate) fn adapter() -> &'static DockerAdapter {
     static ADAPTER: OnceLock<DockerAdapter> = OnceLock::new();
     ADAPTER.get_or_init(DockerAdapter::new)
 }
