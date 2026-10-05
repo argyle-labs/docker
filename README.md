@@ -35,8 +35,8 @@ Once orca is on the host you never touch the scripts — drive the tools. Payloa
 | `docker.detail` | inspect one Compose project: services, logs, stats | `path`, optional `service`, `tail` |
 | `docker.create` | register a docker runtime | `runtime_name`, one of `socket_path`\|`host`\|`url` |
 | `docker.delete` | remove a registered docker runtime | `runtime` |
-| `docker.backup` | archive engine state to a `.tar.gz` | `destination`, optional `state_path` |
-| `docker.restore` | restore engine state from an archive (the embedded `scripts/restore.sh`). `state_path` must be absolute and resolve, symlinks included, inside `$HOME/.colima` (the default). Admin; dry run by default validates the paths and returns the resolved target | `archive`, optional `state_path`; `execute` |
+| `docker.backup` | archive engine state to a `.tar.gz`. `destination` must be absolute and resolve, symlinks included, inside one of the daemon's managed roots (`ORCA_DOCKER_MANAGED_ROOTS`, else `/mnt/data`, `/mnt/backups`, `/mnt/downloads`, `/opt/appdata`); `state_path` inside `$HOME/.colima` (the default). Admin; dry run by default validates the paths and returns the resolved ones | `destination`, optional `state_path`; `execute` |
+| `docker.restore` | restore engine state from an archive (the embedded `scripts/restore.sh`). `state_path` must be absolute and resolve, symlinks included, inside `$HOME/.colima` (the default). An archive with an absolute or `..` entry, a link whose target is absolute or contains `..`, or any entry that is not a file, directory or link is refused before extraction. Admin; dry run by default validates the paths and returns the resolved target | `archive`, optional `state_path`; `execute` |
 | `docker.prune` | remove dangling images (untagged, including digest-only pulls), dangling anonymous volumes and compose networks no container (running or stopped) uses; never named volumes, never a network a managed stack declares `external`. `stack` scope attributes a volume by `orca.stack`, else `com.docker.compose.project`, else a container mounting it (compose labels anonymous volumes with neither, so only orca-labeled ones are found). Dry run by default | optional `stack`; `execute` + `items` from the dry run |
 | `docker.label_audit` | every container, volume and network without `orca.managed`, grouped by inferred owner (`orca.stack` or the compose project label, else the container that mounts or attaches it). Read-only; admin | none |
 | `docker.host_update` | upgrade the confirmed upgradable OS packages (apk/apt, engine packages flagged: they restart every container), then `compose pull -q` + `up -d` for every running stack, first removing, by id, each confirmed orphan container that is still an orphan at that moment (orphans as compose defines them: services from every profile count as declared), then prune dangling images; behind the pre-update backup gate. Stacks whose compose can't be read are reported as skipped. Dry run by default | `execute` + `items` (`package:*`, `stack:*`, `orphan:*`, `image:*`) from the dry run; `skip_backup_gate` until orca#767 |
@@ -58,8 +58,8 @@ Once orca is on the host you never touch the scripts — drive the tools. Payloa
 { "runtimeName": "remote-host", "host": "tcp://10.0.0.5:2375" }
 
 // docker.backup / docker.restore
-{ "destination": "/srv/backups" }
-{ "archive": "/srv/backups/docker-engine-state-20260702-120000.tar.gz", "execute": true }
+{ "destination": "/mnt/backups/docker", "execute": true }
+{ "archive": "/mnt/backups/docker/docker-engine-state-20260702-120000.tar.gz", "execute": true }
 
 // docker.prune — dry run lists candidates; execute removes only confirmed ones still orphaned
 { "stack": "media" }

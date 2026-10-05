@@ -21,6 +21,7 @@ use crate::execute;
 
 const INSTALL_TOOL: &str = "docker.install";
 const ENGINE_UPDATE_TOOL: &str = "docker.engine_update";
+const BACKUP_TOOL: &str = "docker.backup";
 const RESTORE_TOOL: &str = "docker.restore";
 
 /// Which container runtime the lifecycle tools install/upgrade on this host.
@@ -106,8 +107,9 @@ fn resolve(path: &Path) -> Result<PathBuf> {
     Ok(out)
 }
 
-/// The engine state dir to restore into: `requested`, or the colima profile
-/// dir by default, and in every case inside `$HOME/.colima` once resolved.
+/// The engine state dir to back up or restore into: `requested`, or the colima
+/// profile dir by default, and in every case inside `$HOME/.colima` once
+/// resolved.
 fn state_dir(requested: Option<&str>, home: &str) -> Result<PathBuf> {
     if home.is_empty() {
         bail!("HOME is unset, so the engine state root cannot be located");
@@ -125,6 +127,82 @@ fn state_dir(requested: Option<&str>, home: &str) -> Result<PathBuf> {
         );
     }
     Ok(state)
+}
+
+/// The backup directory, resolved, refused unless it lies inside one of
+/// `roots`: the daemon's managed roots, which a caller cannot widen.
+fn backup_destination(requested: &str, roots: &[String]) -> Result<PathBuf> {
+    let dest = resolve(Path::new(requested))?;
+    let allowed: Vec<PathBuf> = roots
+        .iter()
+        .filter_map(|r| resolve(Path::new(r)).ok())
+        .collect();
+    if !allowed.iter().any(|root| dest.starts_with(root)) {
+        bail!(
+            "destination '{requested}' resolves to '{}', outside the backup roots ({}); set {} on the daemon to allow another root",
+            dest.display(),
+            roots.join(", "),
+            crate::lint::MANAGED_ROOTS_ENV
+        );
+    }
+    Ok(dest)
+}
+
+/// Refuse an archive any of whose entries could land outside the extraction
+/// dir: an absolute or `..` name, a link whose target is absolute or has a
+/// `..` component, or anything but a file, directory or link. A relative link
+/// target without `..` can only descend, so chains of such links stay inside
+/// too; a lexical check that allowed `..` would not, since `a -> .` then
+/// `b -> a/..` resolves above the root.
+async fn check_archive(archive: &str) -> Result<()> {
+    // `-P` lists stored names verbatim instead of the stripped form some tars
+    // print, so the check sees exactly what the archive carries.
+    let names = run(Command::new("tar").arg("-tzPf").arg(archive)).await?;
+    let verbose = run(Command::new("tar").arg("-tzvPf").arg(archive)).await?;
+    check_listing(
+        &String::from_utf8_lossy(&names.stdout),
+        &String::from_utf8_lossy(&verbose.stdout),
+    )
+}
+
+/// `names` is `tar -t`, `verbose` is `tar -tv` of the same archive. GNU tar
+/// and bsdtar agree on the parts read here: the type in the first column,
+/// then `<name> -> <target>` for a symlink and `<name> link to <target>` for
+/// a hard link.
+fn check_listing(names: &str, verbose: &str) -> Result<()> {
+    let names: Vec<&str> = names.lines().collect();
+    let lines: Vec<&str> = verbose.lines().collect();
+    if names.len() != lines.len() {
+        bail!("archive listings disagree on the entry count; refusing to extract");
+    }
+    for (name, line) in names.into_iter().zip(lines) {
+        check_member(name, name)?;
+        match line.chars().next() {
+            Some('-' | 'd') => {}
+            Some('l') => check_member(name, link_target(line, name, " -> ")?)?,
+            Some('h') => check_member(name, link_target(line, name, " link to ")?)?,
+            _ => bail!("archive entry '{name}' is not a file, directory or link"),
+        }
+    }
+    Ok(())
+}
+
+fn check_member(entry: &str, path: &str) -> Result<()> {
+    let p = Path::new(path);
+    if p.is_absolute() || p.components().any(|c| c == Component::ParentDir) {
+        if entry == path {
+            bail!("archive entry '{entry}' would extract outside the state dir");
+        }
+        bail!("archive entry '{entry}' links to '{path}', outside the state dir");
+    }
+    Ok(())
+}
+
+fn link_target<'a>(line: &'a str, name: &str, sep: &str) -> Result<&'a str> {
+    let marker = format!(" {name}{sep}");
+    line.find(&marker)
+        .map(|i| &line[i + marker.len()..])
+        .ok_or_else(|| anyhow!("cannot read the link target of archive entry '{name}'"))
 }
 
 async fn run(cmd: Command) -> Result<Output> {
@@ -289,44 +367,86 @@ async fn docker_engine_update(
 
 #[orca_struct(args)]
 pub struct DockerBackupArgs {
-    /// Directory to write the `.tar.gz` into. Created if missing.
+    /// Absolute directory to write the `.tar.gz` into, created if missing.
+    /// Must resolve, symlinks included, inside one of the daemon's managed
+    /// roots (`ORCA_DOCKER_MANAGED_ROOTS`, else `/mnt/data`, `/mnt/backups`,
+    /// `/mnt/downloads`, `/opt/appdata`).
     #[arg(long)]
     pub destination: String,
-    /// Host path of the docker/colima state dir to archive
-    /// (default `$HOME/.colima`).
+    /// Absolute host path of the colima state dir to archive (default
+    /// `$HOME/.colima`). Must resolve inside `$HOME/.colima`.
     #[arg(long)]
     #[serde(default)]
     pub state_path: Option<String>,
+    /// Write the archive. Omitted, validates the paths, returns what would
+    /// run and changes nothing.
+    #[arg(long)]
+    #[serde(default)]
+    pub execute: bool,
 }
 
 #[orca_struct]
 #[serde(rename_all = "camelCase")]
 #[derive(Debug)]
 pub struct DockerBackupOutput {
-    /// Absolute path of the archive written.
-    pub archive: String,
+    /// `true`: nothing was written.
+    pub dry_run: bool,
+    /// Resolved directory the archive is (or would be) written into.
+    pub destination: String,
+    /// Resolved state dir that is (or would be) archived.
+    pub state_path: String,
+    /// Absolute path of the archive written (execute only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub how_to_execute: Option<String>,
 }
 
 /// **Back up the engine's persistent state** (the colima/lima profile dir, or a
-/// supplied state path) to a `.tar.gz` in the destination directory. Captures
-/// the engine VM profile + config so a reprovisioned host can be restored.
-#[orca_tool(domain = "docker", verb = "backup", local_only = true)]
-async fn docker_backup(args: DockerBackupArgs, _ctx: &ToolCtx) -> Result<DockerBackupOutput> {
+/// supplied state path inside it) to a `.tar.gz` in the destination directory.
+/// Captures the engine VM profile + config so a reprovisioned host can be
+/// restored. Without `execute`, returns what would run and changes nothing.
+#[orca_tool(
+    domain = "docker",
+    verb = "backup",
+    local_only = true,
+    role = "admin",
+    execute_gated = false
+)]
+async fn docker_backup(args: DockerBackupArgs, ctx: &ToolCtx) -> Result<DockerBackupOutput> {
     let home = std::env::var("HOME").unwrap_or_default();
-    let state = args
-        .state_path
-        .clone()
-        .unwrap_or_else(|| format!("{home}/.colima"));
-    if !std::path::Path::new(&state).is_dir() {
-        bail!("state path '{state}' is not a directory");
+    backup(args, &home, &crate::lint::managed_roots(None), ctx).await
+}
+
+async fn backup(
+    args: DockerBackupArgs,
+    home: &str,
+    roots: &[String],
+    ctx: &ToolCtx,
+) -> Result<DockerBackupOutput> {
+    execute::guard(BACKUP_TOOL, args.execute, ctx)?;
+    let state = state_dir(args.state_path.as_deref(), home)?;
+    if !state.is_dir() {
+        bail!("state path '{}' is not a directory", state.display());
     }
-    run(Command::new("mkdir").arg("-p").arg(&args.destination)).await?;
+    let destination = backup_destination(&args.destination, roots)?;
+    let state_path = state.to_string_lossy().into_owned();
+    let dest = destination.to_string_lossy().into_owned();
+    if !args.execute {
+        return Ok(DockerBackupOutput {
+            dry_run: true,
+            destination: dest,
+            state_path,
+            archive: None,
+            how_to_execute: Some(format!("re-invoke {BACKUP_TOOL} with `execute: true`")),
+        });
+    }
+    run(Command::new("mkdir").arg("-p").arg(&destination)).await?;
     let stamp = plugin_toolkit::time::now().compact();
-    let archive = format!(
-        "{}/docker-engine-state-{}.tar.gz",
-        args.destination.trim_end_matches('/'),
-        stamp
-    );
+    let archive = destination
+        .join(format!("docker-engine-state-{stamp}.tar.gz"))
+        .to_string_lossy()
+        .into_owned();
     run(Command::new("tar")
         .arg("-czf")
         .arg(&archive)
@@ -334,7 +454,13 @@ async fn docker_backup(args: DockerBackupArgs, _ctx: &ToolCtx) -> Result<DockerB
         .arg(&state)
         .arg("."))
     .await?;
-    Ok(DockerBackupOutput { archive })
+    Ok(DockerBackupOutput {
+        dry_run: false,
+        destination: dest,
+        state_path,
+        archive: Some(archive),
+        how_to_execute: None,
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -375,7 +501,8 @@ pub struct DockerRestoreOutput {
 /// **Restore the engine's persistent state** from a `.tar.gz` produced by
 /// `docker.backup`, unpacking it into the colima/lima profile dir (or a supplied
 /// state path inside it). Pair with `docker.install` to rebuild a host from a
-/// backup. Without `execute`, returns what would run and changes nothing.
+/// backup. An archive with any entry that could land outside the state dir is
+/// refused. Without `execute`, returns what would run and changes nothing.
 #[orca_tool(
     domain = "docker",
     verb = "restore",
@@ -398,6 +525,7 @@ async fn restore(
         bail!("archive '{}' is not a file", args.archive);
     }
     let state = state_dir(args.state_path.as_deref(), home)?;
+    check_archive(&args.archive).await?;
     let state_path = state.to_string_lossy().into_owned();
     if !args.execute {
         return Ok(DockerRestoreOutput {
@@ -428,14 +556,246 @@ mod tests {
 
     #[test]
     fn backup_rejects_missing_state_dir() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let roots = [dest.path().to_str().unwrap().to_string()];
+        let args = DockerBackupArgs {
+            destination: dest.path().to_str().unwrap().to_string(),
+            state_path: None,
+            execute: false,
+        };
+        let err = plugin_toolkit::reactor::block_on(backup(
+            args,
+            home.path().to_str().unwrap(),
+            &roots,
+            &test_ctx(),
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("not a directory"), "{err}");
+    }
+
+    /// A home with a populated `.colima`, and a backup root.
+    fn backup_fixture() -> (tempfile::TempDir, tempfile::TempDir) {
+        let home = tempfile::tempdir().unwrap();
+        let state = home.path().join(".colima");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("marker"), b"state").unwrap();
+        (home, tempfile::tempdir().unwrap())
+    }
+
+    #[test]
+    fn backup_dry_run_and_refused_execute_write_nothing() {
+        let (home, root) = backup_fixture();
+        let roots = [root.path().to_str().unwrap().to_string()];
+        let dest = root.path().join("engine");
+        let args = |execute| DockerBackupArgs {
+            destination: dest.to_str().unwrap().to_string(),
+            state_path: None,
+            execute,
+        };
+        let h = home.path().to_str().unwrap();
         plugin_toolkit::reactor::block_on(async {
-            let args = DockerBackupArgs {
-                destination: "/tmp/docker-bk-dest".to_string(),
-                state_path: Some("/nonexistent/docker/state".to_string()),
-            };
-            let err = docker_backup(args, &test_ctx()).await.unwrap_err();
-            assert!(err.to_string().contains("not a directory"), "{err}");
+            let out = backup(args(false), h, &roots, &test_ctx()).await.unwrap();
+            assert!(out.dry_run && out.archive.is_none() && out.how_to_execute.is_some());
+            let ctx = test_ctx().with_auth(caller("user"));
+            let err = backup(args(true), h, &roots, &ctx).await.unwrap_err();
+            assert!(err.to_string().contains("requires role 'admin'"), "{err}");
         });
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn backup_executes_for_an_admin_into_the_root() {
+        let (home, root) = backup_fixture();
+        let roots = [root.path().to_str().unwrap().to_string()];
+        let args = DockerBackupArgs {
+            destination: root.path().join("engine").to_str().unwrap().to_string(),
+            state_path: None,
+            execute: true,
+        };
+        let ctx = test_ctx().with_auth(caller("admin"));
+        let out = plugin_toolkit::reactor::block_on(backup(
+            args,
+            home.path().to_str().unwrap(),
+            &roots,
+            &ctx,
+        ))
+        .unwrap();
+        assert!(!out.dry_run);
+        assert!(Path::new(&out.archive.unwrap()).is_file());
+    }
+
+    #[test]
+    fn backup_destination_must_resolve_inside_a_root() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("escape")).unwrap();
+        let roots = [root.path().to_str().unwrap().to_string()];
+        let r = root.path().to_str().unwrap();
+        let err = |p: &str| backup_destination(p, &roots).unwrap_err().to_string();
+        assert!(err("relative/dir").contains("not an absolute path"));
+        assert!(err(&format!("{r}/a/../../etc")).contains("contains '..'"));
+        assert!(err("/etc").contains("outside the backup roots"));
+        assert!(err(&format!("{r}/escape/sub")).contains("outside the backup roots"));
+        assert_eq!(
+            backup_destination(&format!("{r}/engine"), &roots).unwrap(),
+            root.path().canonicalize().unwrap().join("engine")
+        );
+    }
+
+    #[test]
+    fn backup_state_path_must_resolve_inside_the_colima_root() {
+        let (home, root) = backup_fixture();
+        let roots = [root.path().to_str().unwrap().to_string()];
+        let args = DockerBackupArgs {
+            destination: root.path().to_str().unwrap().to_string(),
+            state_path: Some(root.path().to_str().unwrap().to_string()),
+            execute: false,
+        };
+        let err = plugin_toolkit::reactor::block_on(backup(
+            args,
+            home.path().to_str().unwrap(),
+            &roots,
+            &test_ctx(),
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("outside the engine state root"),
+            "{err}"
+        );
+    }
+
+    /// `tar -czPf <work>/crafted.tar.gz -C <work>/src <members>`, after `setup`
+    /// populates `<work>/src`.
+    fn crafted_archive(setup: impl FnOnce(&Path), members: &[&str]) -> (tempfile::TempDir, String) {
+        let work = tempfile::tempdir().unwrap();
+        let src = work.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        setup(&src);
+        let archive = work.path().join("crafted.tar.gz");
+        let status = std::process::Command::new("tar")
+            .arg("-czPf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&src)
+            .args(members)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        (work, archive.to_str().unwrap().to_string())
+    }
+
+    fn archive_error(archive: &str) -> String {
+        plugin_toolkit::reactor::block_on(check_archive(archive))
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn archive_check_accepts_files_dirs_and_inward_links() {
+        let (_work, archive) = crafted_archive(
+            |src| {
+                std::fs::create_dir_all(src.join("sub")).unwrap();
+                std::fs::write(src.join("sub/a"), b"x").unwrap();
+                std::fs::hard_link(src.join("sub/a"), src.join("h")).unwrap();
+                std::os::unix::fs::symlink("sub/a", src.join("my link")).unwrap();
+            },
+            &["."],
+        );
+        plugin_toolkit::reactor::block_on(check_archive(&archive)).unwrap();
+    }
+
+    #[test]
+    fn archive_check_refuses_an_absolute_entry() {
+        let outside = tempfile::tempdir().unwrap();
+        let file = outside.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        let (_work, archive) = crafted_archive(|_| {}, &[file.to_str().unwrap()]);
+        let err = archive_error(&archive);
+        assert!(err.contains("would extract outside"), "{err}");
+    }
+
+    #[test]
+    fn archive_check_refuses_a_dotdot_entry() {
+        let (work, archive) = crafted_archive(
+            |src| std::fs::write(src.parent().unwrap().join("up"), b"x").unwrap(),
+            &["../up"],
+        );
+        let err = archive_error(&archive);
+        assert!(err.contains("would extract outside"), "{err}");
+        drop(work);
+    }
+
+    #[test]
+    fn archive_check_refuses_escaping_symlinks() {
+        for target in ["/etc", "../outside", "sub/../.."] {
+            let (_work, archive) = crafted_archive(
+                |src| std::os::unix::fs::symlink(target, src.join("link")).unwrap(),
+                &["."],
+            );
+            let err = archive_error(&archive);
+            assert!(
+                err.contains(&format!("links to '{target}'")),
+                "{target}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn archive_check_refuses_an_escaping_hard_link() {
+        let (work, archive) = crafted_archive(
+            |src| {
+                let up = src.parent().unwrap().join("up");
+                std::fs::write(&up, b"x").unwrap();
+                std::fs::hard_link(&up, src.join("h")).unwrap();
+            },
+            &["../up", "h"],
+        );
+        let err = archive_error(&archive);
+        assert!(err.contains("outside"), "{err}");
+        drop(work);
+    }
+
+    #[test]
+    fn listing_check_refuses_odd_types_mismatched_listings_and_escaping_hard_links() {
+        let err =
+            check_listing("./fifo\n", "prw-r--r-- u/g 0 2026-10-04 12:00 ./fifo\n").unwrap_err();
+        assert!(
+            err.to_string().contains("not a file, directory or link"),
+            "{err}"
+        );
+        let err = check_listing(
+            "./a\n",
+            "-rw-r--r-- u/g 0 2026-10-04 12:00 ./a\n-rw-r--r-- u/g 0 2026-10-04 12:00 ./b\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("disagree"), "{err}");
+        let err = check_listing(
+            "./h\n",
+            "hrw-r--r-- u/g 0 2026-10-04 12:00 ./h link to ../x\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("links to '../x'"), "{err}");
+    }
+
+    #[test]
+    fn restore_refuses_an_escaping_archive_before_extracting() {
+        let (_work, archive) = crafted_archive(
+            |src| std::os::unix::fs::symlink("/etc", src.join("link")).unwrap(),
+            &["."],
+        );
+        let home = tempfile::tempdir().unwrap();
+        let args = DockerRestoreArgs {
+            archive,
+            state_path: None,
+            execute: true,
+        };
+        let ctx = test_ctx().with_auth(caller("admin"));
+        let err =
+            plugin_toolkit::reactor::block_on(restore(args, home.path().to_str().unwrap(), &ctx))
+                .unwrap_err();
+        assert!(err.to_string().contains("links to '/etc'"), "{err}");
+        assert!(!home.path().join(".colima").exists());
     }
 
     #[test]
@@ -460,6 +820,7 @@ mod tests {
         }
         admin_self_gated::<DockerInstall>();
         admin_self_gated::<DockerEngineUpdate>();
+        admin_self_gated::<DockerBackup>();
         admin_self_gated::<DockerRestore>();
     }
 
@@ -482,6 +843,10 @@ mod tests {
         assert_eq!(
             properties::<DockerEngineUpdateArgs>(),
             ["execute", "runtime"]
+        );
+        assert_eq!(
+            properties::<DockerBackupArgs>(),
+            ["destination", "execute", "state_path"]
         );
         assert_eq!(
             properties::<DockerRestoreArgs>(),
