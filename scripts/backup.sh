@@ -13,8 +13,13 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 ARCHIVE="$DEST/docker-engine-state-$STAMP.tar.gz"
 LOCAL=()
 tar --version 2>/dev/null | grep -q 'GNU tar' && LOCAL=(--force-local)
-# Lima's VM ssh keypair is regenerated on start, so it never leaves the host.
+# Config only: lima's VM ssh keypair is regenerated on start, and VM and
+# disk images (colima's data disk holds container images and volumes) are
+# never backed up.
 tar "${LOCAL[@]}" -czf "$ARCHIVE" \
   --exclude=_lima/_config/user --exclude=_lima/_config/user.pub \
+  --exclude=_lima/_disks \
+  --exclude='_lima/*/basedisk' --exclude='_lima/*/diffdisk' --exclude='_lima/*/disk' \
+  --exclude='*.iso' --exclude='*.img' --exclude='*.qcow2' --exclude='*.raw' \
   -C "$STATE" .
 echo "$ARCHIVE"

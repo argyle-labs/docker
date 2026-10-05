@@ -25,6 +25,31 @@ const DEFAULT_BACKUP_ROOT: &str = "/mnt/backups";
 /// restored host needs neither.
 pub const EXCLUDED: &[&str] = &["_lima/_config/user", "_lima/_config/user.pub"];
 
+/// Lima's disk dir: colima's persistent data disk, holding the VM's container
+/// images and volumes.
+const DISKS_DIR: &str = "_lima/_disks";
+/// Per-instance VM disks under `_lima/<instance>/` (`disk` links to
+/// `diffdisk`).
+const INSTANCE_DISKS: &[&str] = &["basedisk", "diffdisk", "disk"];
+const IMAGE_EXTENSIONS: &[&str] = &["iso", "img", "qcow2", "raw"];
+
+/// Backups are config only: VM and disk images are left out.
+fn is_vm_image(rel: &Path) -> bool {
+    if rel == Path::new(DISKS_DIR) {
+        return true;
+    }
+    let parts: Vec<_> = rel.components().map(|c| c.as_os_str()).collect();
+    if let [lima, _, name] = parts.as_slice()
+        && *lima == "_lima"
+        && name.to_str().is_some_and(|n| INSTANCE_DISKS.contains(&n))
+    {
+        return true;
+    }
+    rel.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| IMAGE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+}
+
 /// Roots a backup may be written to or restored from: the daemon's
 /// [`BACKUP_ROOTS_ENV`], else `/mnt/backups`.
 pub fn backup_roots() -> Vec<String> {
@@ -79,6 +104,12 @@ fn walk(
         let shown = member.to_string_lossy().into_owned();
         if EXCLUDED.contains(&shown.as_str()) {
             excluded.push(format!("{shown}: lima's VM ssh key, regenerated on start"));
+            continue;
+        }
+        if is_vm_image(&member) {
+            excluded.push(format!(
+                "{shown}: VM or disk image; backups are config only"
+            ));
             continue;
         }
         let kind = fs::symlink_metadata(root.join(&member))?.file_type();
@@ -307,6 +338,54 @@ mod tests {
                 .any(|n| n.ends_with("user") || n.ends_with("user.pub"))
         );
         assert!(!names.contains(&"absolute".to_string()));
+    }
+
+    #[test]
+    fn vm_and_disk_images_are_left_out() {
+        for p in [
+            "_lima/_disks",
+            "_lima/colima/basedisk",
+            "_lima/colima/diffdisk",
+            "_lima/colima/disk",
+            "_lima/colima/cidata.iso",
+            "default/vm.qcow2",
+            "x.IMG",
+        ] {
+            assert!(is_vm_image(Path::new(p)), "{p}");
+        }
+        for p in [
+            "_lima/colima/colima.yaml",
+            "_lima/colima/vz-efi",
+            "_lima/_config/networks.yaml",
+            "default/disk",
+            "_lima/_disks.yaml",
+        ] {
+            assert!(!is_vm_image(Path::new(p)), "{p}");
+        }
+    }
+
+    #[test]
+    fn pack_leaves_out_lima_disks() {
+        let state = tree();
+        let s = state.path();
+        fs::create_dir_all(s.join("_lima/_disks/colima")).unwrap();
+        fs::create_dir_all(s.join("_lima/colima")).unwrap();
+        fs::write(s.join("_lima/_disks/colima/datadisk"), b"disk").unwrap();
+        fs::write(s.join("_lima/colima/diffdisk"), b"disk").unwrap();
+        fs::write(s.join("_lima/colima/lima.yaml"), b"cfg").unwrap();
+        let (members, excluded) = members(s).unwrap();
+        assert!(members.contains(&PathBuf::from("_lima/colima/lima.yaml")));
+        assert!(
+            !members
+                .iter()
+                .any(|m| m.starts_with("_lima/_disks") || m.ends_with("diffdisk"))
+        );
+        assert!(excluded.iter().any(|e| e.starts_with("_lima/_disks:")));
+        assert!(
+            excluded
+                .iter()
+                .any(|e| e.starts_with("_lima/colima/diffdisk:"))
+        );
     }
 
     #[test]
