@@ -372,10 +372,11 @@ async fn backup(
     if !state.is_dir() {
         bail!("state path '{}' is not a directory", state.display());
     }
+    let root = state_dir(None, home)?;
     let destination = in_backup_root(&args.destination, roots)?;
     let state_path = state.to_string_lossy().into_owned();
     if !args.execute {
-        let (_, excluded) = engine_state::members(&state)?;
+        let (_, excluded) = engine_state::members(&state, &root)?;
         return Ok(DockerBackupOutput {
             dry_run: true,
             destination: destination.to_string_lossy().into_owned(),
@@ -398,7 +399,7 @@ async fn backup(
         );
     }
     let stamp = plugin_toolkit::time::now().compact();
-    let (archive, excluded) = engine_state::pack(&state, &destination, &stamp)?;
+    let (archive, excluded) = engine_state::pack(&state, &root, &destination, &stamp)?;
     Ok(DockerBackupOutput {
         dry_run: false,
         destination: destination.to_string_lossy().into_owned(),
@@ -441,6 +442,9 @@ pub struct DockerRestoreOutput {
     pub restored: bool,
     /// Resolved host path the state is (or would be) restored into.
     pub state_path: String,
+    /// The replaced state dir, when it could not be removed after the swap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leftover: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub how_to_execute: Option<String>,
 }
@@ -469,22 +473,27 @@ async fn restore(
     roots: &[String],
     ctx: &ToolCtx,
 ) -> Result<DockerRestoreOutput> {
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
     execute::require_admin(RESTORE_TOOL, ctx)?;
     let archive = in_backup_root(&args.archive, roots)?;
-    let mut file = std::fs::File::open(&archive)
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&archive)
         .with_context(|| format!("archive '{}' cannot be opened", args.archive))?;
     let opened = file.metadata()?;
     if !opened.is_file() {
         bail!("archive '{}' is not a file", args.archive);
     }
-    // The file read from here on is this descriptor; make sure it is the one
-    // that was resolved inside the root, not a symlink swapped in since.
-    let at_path = std::fs::metadata(&archive)?;
+    // The file read from here on is this descriptor: it must be the file that
+    // was resolved inside the root, and still lie inside it by its own path.
+    let at_path = std::fs::symlink_metadata(&archive)?;
     if (opened.dev(), opened.ino()) != (at_path.dev(), at_path.ino()) {
         bail!("archive '{}' changed while it was opened", args.archive);
     }
+    let real = engine_state::fd_path(&file)?;
+    in_backup_root(&real.to_string_lossy(), roots)?;
     let state = state_dir(args.state_path.as_deref(), home)?;
     let outward = engine_state::outward_links(&state)?;
     if !outward.is_empty() {
@@ -501,19 +510,23 @@ async fn restore(
             dry_run: true,
             restored: false,
             state_path,
+            leftover: None,
             how_to_execute: Some(format!("re-invoke {RESTORE_TOOL} with `execute: true`")),
         });
     }
-    std::fs::create_dir_all(&state)
-        .with_context(|| format!("failed to create '{}'", state.display()))?;
+    if let Some(parent) = state.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create '{}'", parent.display()))?;
+    }
     if state_dir(args.state_path.as_deref(), home)? != state {
         bail!("state dir '{}' moved while it was created", state.display());
     }
-    engine_state::unpack(&mut file, &state)?;
+    let leftover = engine_state::restore_into(&mut file, &state)?;
     Ok(DockerRestoreOutput {
         dry_run: false,
         restored: true,
         state_path,
+        leftover: leftover.map(|p| p.to_string_lossy().into_owned()),
         how_to_execute: None,
     })
 }

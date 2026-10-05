@@ -54,6 +54,9 @@ bollard = { version = "0.21", default-features = false, features = ["pipe"] }
 # entry is checked from the same open file it is extracted from.
 tar = { version = "0.4", default-features = false }
 flate2 = "1"
+# The path an open descriptor refers to (F_GETPATH / /proc/self/fd), to
+# confirm the archive read is the one inside the backup root.
+libc = "0.2"
 
 [dev-dependencies]
 # Dev-only: in-crate tests reach the toolkit's seams (serde, `reactor::block_on`)

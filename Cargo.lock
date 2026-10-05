@@ -647,6 +647,7 @@ version = "0.1.0"
 dependencies = [
  "bollard",
  "flate2",
+ "libc",
  "plugin-toolkit",
  "tar",
  "tempfile",

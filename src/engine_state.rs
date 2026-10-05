@@ -4,9 +4,9 @@
 //! entry from the same reader it extracts from, so neither a swapped path nor
 //! a crafted listing can slip an entry past the check.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use flate2::Compression;
@@ -33,9 +33,10 @@ const DISKS_DIR: &str = "_lima/_disks";
 const INSTANCE_DISKS: &[&str] = &["basedisk", "diffdisk", "disk"];
 const IMAGE_EXTENSIONS: &[&str] = &["iso", "img", "qcow2", "raw"];
 
-/// Backups are config only: VM and disk images are left out.
+/// Backups are config only: VM and disk images are left out. `rel` is
+/// relative to the colima root, whatever subdir is being backed up.
 fn is_vm_image(rel: &Path) -> bool {
-    if rel == Path::new(DISKS_DIR) {
+    if rel.starts_with(DISKS_DIR) {
         return true;
     }
     let parts: Vec<_> = rel.components().map(|c| c.as_os_str()).collect();
@@ -79,16 +80,22 @@ fn leaves_root(p: &Path) -> bool {
 }
 
 /// What a backup of `state` holds, as paths relative to it, and what it
-/// leaves out with the reason.
-pub fn members(state: &Path) -> Result<(Vec<PathBuf>, Vec<String>)> {
+/// leaves out with the reason. Exclusions match paths relative to `root`
+/// (the resolved `$HOME/.colima`), so backing up a subdir of it cannot pick up
+/// the key or the disks.
+pub fn members(state: &Path, root: &Path) -> Result<(Vec<PathBuf>, Vec<String>)> {
+    let scope = state
+        .strip_prefix(root)
+        .with_context(|| format!("'{}' is not inside '{}'", state.display(), root.display()))?;
     let mut members = Vec::new();
     let mut excluded = Vec::new();
-    walk(state, Path::new(""), &mut members, &mut excluded)?;
+    walk(state, scope, Path::new(""), &mut members, &mut excluded)?;
     Ok((members, excluded))
 }
 
 fn walk(
     root: &Path,
+    scope: &Path,
     rel: &Path,
     members: &mut Vec<PathBuf>,
     excluded: &mut Vec<String>,
@@ -101,12 +108,13 @@ fn walk(
     names.sort();
     for name in names {
         let member = rel.join(&name);
+        let in_root = scope.join(&member);
         let shown = member.to_string_lossy().into_owned();
-        if EXCLUDED.contains(&shown.as_str()) {
+        if EXCLUDED.iter().any(|e| in_root == Path::new(e)) {
             excluded.push(format!("{shown}: lima's VM ssh key, regenerated on start"));
             continue;
         }
-        if is_vm_image(&member) {
+        if is_vm_image(&in_root) {
             excluded.push(format!(
                 "{shown}: VM or disk image; backups are config only"
             ));
@@ -115,7 +123,7 @@ fn walk(
         let kind = fs::symlink_metadata(root.join(&member))?.file_type();
         if kind.is_dir() {
             members.push(member.clone());
-            walk(root, &member, members, excluded)?;
+            walk(root, scope, &member, members, excluded)?;
         } else if kind.is_file() {
             members.push(member);
         } else if kind.is_symlink() {
@@ -138,8 +146,8 @@ fn walk(
 /// Write `state` to `docker-engine-state-<stamp>.tar.gz` in `dest`, mode 0600
 /// since it can hold VM credentials. Built under a temporary name and renamed
 /// into place, so a failed run never leaves a truncated archive behind.
-pub fn pack(state: &Path, dest: &Path, stamp: &str) -> Result<(PathBuf, Vec<String>)> {
-    let (members, excluded) = members(state)?;
+pub fn pack(state: &Path, root: &Path, dest: &Path, stamp: &str) -> Result<(PathBuf, Vec<String>)> {
+    let (members, excluded) = members(state, root)?;
     let name = format!("docker-engine-state-{stamp}.tar.gz");
     let archive = dest.join(&name);
     if archive.symlink_metadata().is_ok() {
@@ -205,36 +213,95 @@ fn admit<R: Read>(entry: &Entry<'_, R>) -> Result<bool> {
     }
 }
 
-fn archive(file: &mut File) -> Result<Archive<GzDecoder<&mut File>>> {
+/// Ceilings on what one archive may expand to, so a gzip bomb fails the
+/// check instead of filling the disk.
+#[derive(Clone, Copy)]
+pub struct Limits {
+    pub bytes: u64,
+    pub entries: usize,
+}
+
+pub const LIMITS: Limits = Limits {
+    bytes: 4 << 30,
+    entries: 100_000,
+};
+
+/// A reader that errors once more than `limit` bytes have come through.
+struct Capped<R> {
+    inner: R,
+    left: u64,
+    limit: u64,
+}
+
+impl<R: Read> Read for Capped<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.left = self.left.checked_sub(n as u64).ok_or_else(|| {
+            io::Error::other(format!(
+                "archive expands past {} bytes; refusing it",
+                self.limit
+            ))
+        })?;
+        Ok(n)
+    }
+}
+
+fn archive(file: &mut File, limits: Limits) -> Result<Archive<Capped<GzDecoder<&mut File>>>> {
     file.seek(SeekFrom::Start(0))?;
-    let mut archive = Archive::new(GzDecoder::new(file));
+    let mut archive = Archive::new(Capped {
+        inner: GzDecoder::new(file),
+        left: limits.bytes,
+        limit: limits.bytes,
+    });
     archive.set_preserve_permissions(false);
     archive.set_preserve_ownerships(false);
     archive.set_unpack_xattrs(false);
+    // Without it the archive's mode bits land verbatim (an explicit chmod
+    // that bypasses the umask), so a 0777 entry would be world-writable.
+    archive.set_mask(0o077);
     Ok(archive)
+}
+
+fn count(seen: &mut usize, limits: Limits) -> Result<()> {
+    *seen += 1;
+    if *seen > limits.entries {
+        bail!(
+            "archive has more than {} entries; refusing it",
+            limits.entries
+        );
+    }
+    Ok(())
 }
 
 /// Check every entry of the archive open as `file`.
 pub fn validate(file: &mut File) -> Result<()> {
-    for entry in archive(file)?.entries()? {
+    validate_within(file, LIMITS)
+}
+
+fn validate_within(file: &mut File, limits: Limits) -> Result<()> {
+    let mut seen = 0;
+    for entry in archive(file, limits)?.entries()? {
+        count(&mut seen, limits)?;
         admit(&entry?)?;
     }
     Ok(())
 }
 
-/// Extract the archive open as `file` into `state`, checking each entry again
-/// as it is read: [`validate`] keeps a bad archive from half-restoring, this
-/// keeps the extraction safe even if the file changed in between.
-/// `unpack_in` also refuses to write through a symlink that leaves `state`.
-/// Permissions drop setuid/setgid/sticky; ownership is never restored.
-pub fn unpack(file: &mut File, state: &Path) -> Result<()> {
-    for entry in archive(file)?.entries()? {
+/// Extract `file` into `dir`, checking each entry again as it is read:
+/// [`validate`] keeps a bad archive from getting this far, this keeps the
+/// extraction safe even if the file changed in between. `unpack_in` also
+/// refuses to write through a symlink that leaves `dir`. Mode bits are masked
+/// to owner-only with no setuid/setgid/sticky; ownership is never restored.
+fn extract(file: &mut File, dir: &Path, limits: Limits) -> Result<()> {
+    let mut seen = 0;
+    for entry in archive(file, limits)?.entries()? {
+        count(&mut seen, limits)?;
         let mut entry = entry?;
         if !admit(&entry)? {
             continue;
         }
         let path = entry.path()?.into_owned();
-        if !entry.unpack_in(state)? {
+        if !entry.unpack_in(dir)? {
             bail!(
                 "archive entry '{}' was refused by the extractor",
                 path.display()
@@ -242,6 +309,144 @@ pub fn unpack(file: &mut File, state: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Restore the archive open as `file` into `state` without ever leaving it
+/// half-restored. The archive is extracted into a fresh sibling dir; whatever
+/// the old `state` holds that the archive does not (the VM disks a
+/// config-only backup leaves out) is moved across, as extracting over it
+/// would have kept it; then the dirs are swapped by rename. Any failure
+/// before the swap completes puts everything back. Returns the old dir when
+/// it could not be removed afterwards.
+pub fn restore_into(file: &mut File, state: &Path) -> Result<Option<PathBuf>> {
+    restore_within(file, state, LIMITS)
+}
+
+fn restore_within(file: &mut File, state: &Path, limits: Limits) -> Result<Option<PathBuf>> {
+    let (Some(parent), Some(name)) = (state.parent(), state.file_name()) else {
+        bail!("state dir '{}' has no parent", state.display());
+    };
+    let name = name.to_string_lossy();
+    let pid = std::process::id();
+    let staging = parent.join(format!(".{name}.restore-{pid}"));
+    DirBuilder::new()
+        .mode(0o700)
+        .create(&staging)
+        .with_context(|| format!("failed to create '{}'", staging.display()))?;
+    let discard = |e: plugin_toolkit::anyhow::Error| {
+        let _removed = fs::remove_dir_all(&staging);
+        e
+    };
+    extract(file, &staging, limits).map_err(discard)?;
+    if state.symlink_metadata().is_err() {
+        fs::rename(&staging, state)
+            .with_context(|| format!("failed to move the restore into '{}'", state.display()))
+            .map_err(discard)?;
+        return Ok(None);
+    }
+    let mut moved = Vec::new();
+    if let Err(e) = carry_over(state, &staging, Path::new(""), &mut moved) {
+        return Err(discard(undo(e, &moved, &staging, state)));
+    }
+    let aside = parent.join(format!(".{name}.old-{pid}"));
+    if let Err(e) = fs::rename(state, &aside) {
+        let e = anyhow!(e).context(format!("failed to move '{}' aside", state.display()));
+        return Err(discard(undo(e, &moved, &staging, state)));
+    }
+    if let Err(e) = fs::rename(&staging, state) {
+        let mut e = anyhow!(e).context(format!(
+            "failed to move the restore into '{}'",
+            state.display()
+        ));
+        if let Err(back) = fs::rename(&aside, state) {
+            e = e.context(format!(
+                "and failed to put the previous state back from '{}' (kept entries are in '{}'): {back}",
+                aside.display(),
+                staging.display()
+            ));
+            return Err(e);
+        }
+        return Err(discard(undo(e, &moved, &staging, state)));
+    }
+    Ok(fs::remove_dir_all(&aside).err().map(|_| aside))
+}
+
+/// Move everything under `old` that has no counterpart under `new` across,
+/// recording each move relative to the roots.
+fn carry_over(old: &Path, new: &Path, rel: &Path, moved: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(old.join(rel))? {
+        let r = rel.join(entry?.file_name());
+        let (from, to) = (old.join(&r), new.join(&r));
+        match to.symlink_metadata() {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                fs::rename(&from, &to)
+                    .with_context(|| format!("failed to keep '{}'", from.display()))?;
+                moved.push(r);
+            }
+            Err(e) => return Err(e.into()),
+            Ok(m) if m.is_dir() && fs::symlink_metadata(&from)?.is_dir() => {
+                carry_over(old, new, &r, moved)?;
+            }
+            // The archive's copy wins, as it would extracting over it.
+            Ok(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Move carried-over entries back from `staging` to `state`, newest first.
+fn undo(
+    e: plugin_toolkit::anyhow::Error,
+    moved: &[PathBuf],
+    staging: &Path,
+    state: &Path,
+) -> plugin_toolkit::anyhow::Error {
+    let stuck: Vec<String> = moved
+        .iter()
+        .rev()
+        .filter(|r| fs::rename(staging.join(r), state.join(r)).is_err())
+        .map(|r| r.to_string_lossy().into_owned())
+        .collect();
+    if stuck.is_empty() {
+        e
+    } else {
+        e.context(format!(
+            "and could not move back into '{}': {}",
+            state.display(),
+            stuck.join(", ")
+        ))
+    }
+}
+
+/// The path the open `file` actually refers to, from the descriptor itself.
+#[cfg(target_os = "macos")]
+pub fn fd_path(file: &File) -> Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: F_GETPATH writes at most PATH_MAX bytes into `buf`, which is
+    // exactly that long and outlives the call.
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) };
+    if rc == -1 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..len])))
+}
+
+/// The path the open `file` actually refers to, from the descriptor itself.
+#[cfg(target_os = "linux")]
+pub fn fd_path(file: &File) -> Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    Ok(fs::read_link(format!(
+        "/proc/self/fd/{}",
+        file.as_raw_fd()
+    ))?)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn fd_path(_file: &File) -> Result<PathBuf> {
+    bail!("cannot read an open file's path on this platform")
 }
 
 /// Symlinks already under `state` that resolve outside it. Extraction would
@@ -314,7 +519,7 @@ mod tests {
     fn pack_writes_0600_and_leaves_out_the_key_and_absolute_links() {
         let state = tree();
         let dest = tempfile::tempdir().unwrap();
-        let (archive, excluded) = pack(state.path(), dest.path(), "stamp").unwrap();
+        let (archive, excluded) = pack(state.path(), state.path(), dest.path(), "stamp").unwrap();
         let mode = fs::metadata(&archive).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
         assert!(
@@ -373,7 +578,7 @@ mod tests {
         fs::write(s.join("_lima/_disks/colima/datadisk"), b"disk").unwrap();
         fs::write(s.join("_lima/colima/diffdisk"), b"disk").unwrap();
         fs::write(s.join("_lima/colima/lima.yaml"), b"cfg").unwrap();
-        let (members, excluded) = members(s).unwrap();
+        let (members, excluded) = members(s, s).unwrap();
         assert!(members.contains(&PathBuf::from("_lima/colima/lima.yaml")));
         assert!(
             !members
@@ -392,47 +597,185 @@ mod tests {
     fn pack_refuses_to_overwrite_an_archive() {
         let state = tree();
         let dest = tempfile::tempdir().unwrap();
-        pack(state.path(), dest.path(), "stamp").unwrap();
-        let err = pack(state.path(), dest.path(), "stamp").unwrap_err();
+        pack(state.path(), state.path(), dest.path(), "stamp").unwrap();
+        let err = pack(state.path(), state.path(), dest.path(), "stamp").unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
     }
 
     #[test]
-    fn pack_then_unpack_round_trips() {
+    fn a_subdir_backup_still_leaves_out_the_key_and_disks() {
         let state = tree();
-        let dest = tempfile::tempdir().unwrap();
-        let (archive, _) = pack(state.path(), dest.path(), "stamp").unwrap();
-        let target = tempfile::tempdir().unwrap();
-        let mut file = File::open(archive).unwrap();
-        validate(&mut file).unwrap();
-        unpack(&mut file, target.path()).unwrap();
-        let t = target.path();
-        assert_eq!(fs::read(t.join("default/current")).unwrap(), b"cpu: 2");
-        assert!(!t.join("_lima/_config/user").exists());
+        let s = state.path();
+        fs::create_dir_all(s.join("_lima/_disks/colima")).unwrap();
+        fs::write(s.join("_lima/_disks/colima/datadisk"), b"disk").unwrap();
+        fs::write(s.join("_lima/_config/networks.yaml"), b"cfg").unwrap();
+        let (members, excluded) = members(&s.join("_lima"), s).unwrap();
+        assert_eq!(
+            members,
+            [
+                PathBuf::from("_config"),
+                PathBuf::from("_config/networks.yaml")
+            ]
+        );
+        assert_eq!(excluded.len(), 3, "{excluded:?}");
+        let (disks, _) = super::members(&s.join("_lima/_disks"), s).unwrap();
+        assert!(disks.is_empty(), "{disks:?}");
     }
 
-    #[test]
-    fn unpack_drops_setuid() {
-        let work = tempfile::tempdir().unwrap();
-        let path = work.path().join("a.tar.gz");
+    /// A `.tar.gz` of `entries` as `(name, mode, body)`; a `None` body is a
+    /// directory.
+    fn built(dir: &Path, entries: &[(&str, u32, Option<&[u8]>)]) -> PathBuf {
+        let path = dir.join("built.tar.gz");
         let mut builder = Builder::new(GzEncoder::new(
             File::create(&path).unwrap(),
             Compression::default(),
         ));
-        let mut header = tar::Header::new_gnu();
-        header.set_entry_type(EntryType::Regular);
-        header.set_size(1);
-        header.set_mode(0o4755);
-        header.set_cksum();
-        builder.append_data(&mut header, "suid", &b"x"[..]).unwrap();
+        for (name, mode, body) in entries {
+            let mut h = tar::Header::new_gnu();
+            h.set_mode(*mode);
+            match body {
+                Some(b) => {
+                    h.set_entry_type(EntryType::Regular);
+                    h.set_size(b.len() as u64);
+                    h.set_cksum();
+                    builder.append_data(&mut h, name, *b).unwrap();
+                }
+                None => {
+                    h.set_entry_type(EntryType::Directory);
+                    h.set_size(0);
+                    h.set_cksum();
+                    builder.append_data(&mut h, name, io::empty()).unwrap();
+                }
+            }
+        }
         builder.into_inner().unwrap().finish().unwrap();
-        let target = tempfile::tempdir().unwrap();
-        unpack(&mut File::open(&path).unwrap(), target.path()).unwrap();
-        let mode = fs::metadata(target.path().join("suid"))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o7000, 0);
+        path
+    }
+
+    fn mode(p: &Path) -> u32 {
+        fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[test]
+    fn pack_then_restore_round_trips() {
+        let state = tree();
+        let dest = tempfile::tempdir().unwrap();
+        let (archive, _) = pack(state.path(), state.path(), dest.path(), "stamp").unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join(".colima");
+        let mut file = File::open(archive).unwrap();
+        validate(&mut file).unwrap();
+        assert_eq!(restore_into(&mut file, &target).unwrap(), None);
+        assert_eq!(fs::read(target.join("default/current")).unwrap(), b"cpu: 2");
+        assert!(!target.join("_lima/_config/user").exists());
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn restore_masks_modes_to_the_owner() {
+        let work = tempfile::tempdir().unwrap();
+        let archive = built(
+            work.path(),
+            &[
+                ("open", 0o777, None),
+                ("open/shared", 0o666, Some(b"x")),
+                ("suid", 0o4755, Some(b"x")),
+            ],
+        );
+        let target = work.path().join("state");
+        restore_into(&mut File::open(&archive).unwrap(), &target).unwrap();
+        assert_eq!(mode(&target.join("open")) & 0o077, 0);
+        assert_eq!(mode(&target.join("open/shared")) & 0o077, 0);
+        assert_eq!(mode(&target.join("suid")) & 0o7077, 0);
+    }
+
+    #[test]
+    fn restore_replaces_config_and_keeps_what_the_archive_lacks() {
+        let work = tempfile::tempdir().unwrap();
+        let state = work.path().join("state");
+        fs::create_dir_all(state.join("_lima/_disks/colima")).unwrap();
+        fs::create_dir_all(state.join("default")).unwrap();
+        fs::write(state.join("_lima/_disks/colima/datadisk"), b"disk").unwrap();
+        fs::write(state.join("default/colima.yaml"), b"old").unwrap();
+        fs::write(state.join("default/extra"), b"kept").unwrap();
+        let archive = built(
+            work.path(),
+            &[
+                ("default", 0o755, None),
+                ("default/colima.yaml", 0o644, Some(b"new")),
+            ],
+        );
+        assert_eq!(
+            restore_into(&mut File::open(&archive).unwrap(), &state).unwrap(),
+            None
+        );
+        assert_eq!(fs::read(state.join("default/colima.yaml")).unwrap(), b"new");
+        assert_eq!(fs::read(state.join("default/extra")).unwrap(), b"kept");
+        assert_eq!(
+            fs::read(state.join("_lima/_disks/colima/datadisk")).unwrap(),
+            b"disk"
+        );
+        let left: Vec<_> = fs::read_dir(work.path()).unwrap().collect();
+        assert_eq!(left.len(), 2, "staging or the old dir was left behind");
+    }
+
+    #[test]
+    fn a_failing_restore_leaves_the_state_dir_untouched() {
+        let work = tempfile::tempdir().unwrap();
+        let state = work.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(state.join("colima.yaml"), b"old").unwrap();
+        let big = vec![b'x'; 64 * 1024];
+        let archive = built(
+            work.path(),
+            &[
+                ("colima.yaml", 0o644, Some(b"new")),
+                ("big", 0o644, Some(&big)),
+            ],
+        );
+        let limits = Limits {
+            bytes: 16 * 1024,
+            entries: 10,
+        };
+        let err = restore_within(&mut File::open(&archive).unwrap(), &state, limits).unwrap_err();
+        assert!(format!("{err:#}").contains("expands past"), "{err:#}");
+        assert_eq!(fs::read(state.join("colima.yaml")).unwrap(), b"old");
+        assert_eq!(fs::read_dir(&state).unwrap().count(), 1);
+        let left: Vec<_> = fs::read_dir(work.path()).unwrap().collect();
+        assert_eq!(left.len(), 2, "staging was left behind");
+    }
+
+    #[test]
+    fn validate_caps_bytes_and_entries() {
+        let work = tempfile::tempdir().unwrap();
+        let big = vec![0u8; 1 << 20];
+        let archive = built(
+            work.path(),
+            &[("a", 0o644, Some(&big)), ("b", 0o644, Some(b"x"))],
+        );
+        let mut file = File::open(&archive).unwrap();
+        validate(&mut file).unwrap();
+        let bytes = Limits {
+            bytes: 64 * 1024,
+            entries: 10,
+        };
+        let err = validate_within(&mut file, bytes).unwrap_err();
+        assert!(format!("{err:#}").contains("expands past"), "{err:#}");
+        let entries = Limits {
+            bytes: 1 << 30,
+            entries: 1,
+        };
+        let err = validate_within(&mut file, entries).unwrap_err();
+        assert!(err.to_string().contains("more than 1 entries"), "{err}");
+    }
+
+    #[test]
+    fn fd_path_names_the_opened_file() {
+        let work = tempfile::tempdir().unwrap();
+        let path = work.path().join("f");
+        fs::write(&path, b"x").unwrap();
+        let file = File::open(&path).unwrap();
+        assert_eq!(fd_path(&file).unwrap(), path.canonicalize().unwrap());
     }
 
     #[test]
