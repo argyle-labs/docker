@@ -346,12 +346,12 @@ fn restore_within(file: &mut File, state: &Path, limits: Limits) -> Result<Optio
     }
     let mut moved = Vec::new();
     if let Err(e) = carry_over(state, &staging, Path::new(""), &mut moved) {
-        return Err(discard(undo(e, &moved, &staging, state)));
+        return Err(abandon(e, &moved, &staging, state));
     }
     let aside = parent.join(format!(".{name}.old-{pid}"));
     if let Err(e) = fs::rename(state, &aside) {
         let e = anyhow!(e).context(format!("failed to move '{}' aside", state.display()));
-        return Err(discard(undo(e, &moved, &staging, state)));
+        return Err(abandon(e, &moved, &staging, state));
     }
     if let Err(e) = fs::rename(&staging, state) {
         let mut e = anyhow!(e).context(format!(
@@ -366,16 +366,22 @@ fn restore_within(file: &mut File, state: &Path, limits: Limits) -> Result<Optio
             ));
             return Err(e);
         }
-        return Err(discard(undo(e, &moved, &staging, state)));
+        return Err(abandon(e, &moved, &staging, state));
     }
     Ok(fs::remove_dir_all(&aside).err().map(|_| aside))
 }
 
 /// Move everything under `old` that has no counterpart under `new` across,
-/// recording each move relative to the roots.
+/// recording each move relative to the roots. A path that is a directory on
+/// one side and not on the other is refused: either way the swap would drop
+/// the old subtree.
 fn carry_over(old: &Path, new: &Path, rel: &Path, moved: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in fs::read_dir(old.join(rel))? {
-        let r = rel.join(entry?.file_name());
+    let mut names: Vec<_> = fs::read_dir(old.join(rel))?
+        .map(|e| e.map(|e| e.file_name()))
+        .collect::<io::Result<_>>()?;
+    names.sort();
+    for name in names {
+        let r = rel.join(name);
         let (from, to) = (old.join(&r), new.join(&r));
         match to.symlink_metadata() {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -384,18 +390,34 @@ fn carry_over(old: &Path, new: &Path, rel: &Path, moved: &mut Vec<PathBuf>) -> R
                 moved.push(r);
             }
             Err(e) => return Err(e.into()),
-            Ok(m) if m.is_dir() && fs::symlink_metadata(&from)?.is_dir() => {
-                carry_over(old, new, &r, moved)?;
-            }
-            // The archive's copy wins, as it would extracting over it.
-            Ok(_) => {}
+            Ok(m) => match (m.is_dir(), fs::symlink_metadata(&from)?.is_dir()) {
+                (true, true) => carry_over(old, new, &r, moved)?,
+                // The archive's file wins, as it would extracting over it.
+                (false, false) => {}
+                (in_archive, _) => bail!(
+                    "'{}' is a {} in the archive but a {} in the state dir; refusing to replace it",
+                    r.display(),
+                    if in_archive {
+                        "directory"
+                    } else {
+                        "non-directory"
+                    },
+                    if in_archive {
+                        "non-directory"
+                    } else {
+                        "directory"
+                    },
+                ),
+            },
         }
     }
     Ok(())
 }
 
-/// Move carried-over entries back from `staging` to `state`, newest first.
-fn undo(
+/// Undo a failed swap: move carried-over entries back from `staging` to
+/// `state`, newest first, and remove `staging` only if every one made it back;
+/// otherwise keep it and name it, since it still holds them.
+fn abandon(
     e: plugin_toolkit::anyhow::Error,
     moved: &[PathBuf],
     staging: &Path,
@@ -408,14 +430,15 @@ fn undo(
         .map(|r| r.to_string_lossy().into_owned())
         .collect();
     if stuck.is_empty() {
-        e
-    } else {
-        e.context(format!(
-            "and could not move back into '{}': {}",
-            state.display(),
-            stuck.join(", ")
-        ))
+        let _removed = fs::remove_dir_all(staging);
+        return e;
     }
+    e.context(format!(
+        "and could not move back into '{}': {}; they remain in '{}'",
+        state.display(),
+        stuck.join(", "),
+        staging.display()
+    ))
 }
 
 /// The path the open `file` actually refers to, from the descriptor itself.
@@ -743,6 +766,65 @@ mod tests {
         assert_eq!(fs::read_dir(&state).unwrap().count(), 1);
         let left: Vec<_> = fs::read_dir(work.path()).unwrap().collect();
         assert_eq!(left.len(), 2, "staging was left behind");
+    }
+
+    #[test]
+    fn restore_refuses_a_file_over_a_directory_and_keeps_the_old_state() {
+        let work = tempfile::tempdir().unwrap();
+        let state = work.path().join("state");
+        fs::create_dir_all(state.join("_lima/_disks/colima")).unwrap();
+        fs::write(state.join("_lima/_disks/colima/datadisk"), b"disk").unwrap();
+        fs::write(state.join("a-kept"), b"kept").unwrap();
+        let archive = built(work.path(), &[("_lima", 0o644, Some(b"file"))]);
+        let err = restore_into(&mut File::open(&archive).unwrap(), &state).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("'_lima' is a non-directory in the archive"),
+            "{err:#}"
+        );
+        assert_eq!(
+            fs::read(state.join("_lima/_disks/colima/datadisk")).unwrap(),
+            b"disk"
+        );
+        assert_eq!(fs::read(state.join("a-kept")).unwrap(), b"kept");
+        assert_eq!(fs::read_dir(work.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn restore_refuses_a_directory_over_a_file() {
+        let work = tempfile::tempdir().unwrap();
+        let state = work.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(state.join("colima.yaml"), b"old").unwrap();
+        let archive = built(work.path(), &[("colima.yaml", 0o755, None)]);
+        let err = restore_into(&mut File::open(&archive).unwrap(), &state).unwrap_err();
+        assert!(
+            err.to_string().contains("is a directory in the archive"),
+            "{err:#}"
+        );
+        assert_eq!(fs::read(state.join("colima.yaml")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn abandon_keeps_staging_when_an_entry_cannot_move_back() {
+        let work = tempfile::tempdir().unwrap();
+        let (staging, state) = (work.path().join("staging"), work.path().join("state"));
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("back"), b"b").unwrap();
+        fs::write(staging.join("stuck"), b"s").unwrap();
+        // A non-empty directory where `stuck` must return blocks the rename.
+        fs::create_dir_all(state.join("stuck/occupied")).unwrap();
+        let moved = [PathBuf::from("back"), PathBuf::from("stuck")];
+        let err = abandon(anyhow!("boom"), &moved, &staging, &state);
+        let msg = format!("{err:#}");
+        assert!(msg.contains("stuck") && msg.contains("remain in"), "{msg}");
+        assert_eq!(fs::read(state.join("back")).unwrap(), b"b");
+        assert_eq!(fs::read(staging.join("stuck")).unwrap(), b"s");
+
+        fs::remove_dir_all(state.join("stuck")).unwrap();
+        abandon(anyhow!("boom"), &[PathBuf::from("stuck")], &staging, &state);
+        assert_eq!(fs::read(state.join("stuck")).unwrap(), b"s");
+        assert!(!staging.exists());
     }
 
     #[test]
