@@ -18,7 +18,7 @@ A first-party orca plugin (containers backend). This is a **backend/adapter**: i
 Everything here works **two ways, and both are supported and documented**:
 
 - **With orca** — orca fully manages it: call the `docker.*` tools and orca runs the right thing on the host.
-- **Without orca (standalone)** — run the shipped `scripts/*.sh` directly. These are the *same* scripts orca invokes, so the two paths never diverge.
+- **Without orca (standalone)** — run the shipped `scripts/*.sh` directly. Install and update run the *same* scripts orca invokes; backup and restore are done in-process by orca (with entry checks the scripts cannot do), and the scripts produce and read the same archive format.
 
 ---
 
@@ -28,15 +28,15 @@ Once orca is on the host you never touch the scripts — drive the tools. Payloa
 
 | tool | what it does | key args |
 | --- | --- | --- |
-| `docker.install` | provision + start a runtime (`scripts/install.sh`) | `runtime`: `docker`\|`colima`\|`podman` |
-| `docker.engine_update` | upgrade the runtime (`scripts/update.sh`) | `runtime` |
+| `docker.install` | provision + start a runtime (the embedded `scripts/install.sh`; no other script can be run). Admin, dry run included; dry run by default | `runtime`: `docker`\|`colima`\|`podman`; `execute` |
+| `docker.engine_update` | upgrade the runtime (the embedded `scripts/update.sh`). Admin, dry run included; dry run by default | `runtime`; `execute` |
 | `docker.update` | run a Compose lifecycle action against a stack | `path`, `action`, optional `service` |
 | `docker.list` | host docker resources: engine status + registered runtimes; plus compose services (`path`) or a project scan (`root`) | optional `path` \| `root` |
 | `docker.detail` | inspect one Compose project: services, logs, stats | `path`, optional `service`, `tail` |
 | `docker.create` | register a docker runtime | `runtime_name`, one of `socket_path`\|`host`\|`url` |
 | `docker.delete` | remove a registered docker runtime | `runtime` |
-| `docker.backup` | archive engine state to a `.tar.gz` | `destination`, optional `state_path` |
-| `docker.restore` | restore engine state from an archive | `archive`, optional `state_path` |
+| `docker.backup` | archive engine state to a mode-0600 `.tar.gz` (written under a temporary name, then renamed). Config only: VM and disk images (`_lima/_disks/`, which is colima's data disk holding container images and volumes; `_lima/<instance>/{basedisk,diffdisk,disk}`; any `*.iso`/`*.img`/`*.qcow2`/`*.raw`), lima's VM ssh keypair (`_lima/_config/user{,.pub}`, regenerated on start), sockets and links pointing outside the state dir are left out and listed in `excluded`. `destination` must be absolute and resolve, symlinks included, inside one of the daemon's backup roots (`ORCA_DOCKER_BACKUP_ROOTS`, comma-separated, else `/mnt/backups`; set it on macOS); `state_path` inside `$HOME/.colima` (the default). Admin, dry run included; dry run by default validates the paths and returns the resolved ones | `destination`, optional `state_path`; `execute` |
+| `docker.restore` | restore engine state from a `docker.backup` archive, in-process: the archive is opened once and every entry is checked from that same file before it is extracted. `archive` must be absolute and inside a backup root; `state_path` must resolve inside `$HOME/.colima` (the default). Refused: absolute or `..` entries, links whose target is absolute or contains `..`, anything but files, directories and links, and a state dir already holding a symlink that leads outside it. Ownership is never restored and modes are masked to owner-only (no setuid/setgid). Archives over 4 GiB uncompressed or 100k entries are refused. The archive is extracted into a sibling temp dir, entries the archive lacks (the VM disks) are moved across, and the dirs are swapped by rename, so a failed restore leaves the state dir as it was. Restores config only: the VM disk is recreated on the next `colima start`, and container images and volumes are not in this backup (back up volumes through the stack backup). Admin, dry run included; dry run by default validates everything and returns the resolved target | `archive`, optional `state_path`; `execute` |
 | `docker.prune` | remove dangling images (untagged, including digest-only pulls), dangling anonymous volumes and compose networks no container (running or stopped) uses; never named volumes, never a network a managed stack declares `external`. `stack` scope attributes a volume by `orca.stack`, else `com.docker.compose.project`, else a container mounting it (compose labels anonymous volumes with neither, so only orca-labeled ones are found). Dry run by default | optional `stack`; `execute` + `items` from the dry run |
 | `docker.label_audit` | every container, volume and network without `orca.managed`, grouped by inferred owner (`orca.stack` or the compose project label, else the container that mounts or attaches it). Read-only; admin | none |
 | `docker.host_update` | upgrade the confirmed upgradable OS packages (apk/apt, engine packages flagged: they restart every container), then `compose pull -q` + `up -d` for every running stack, first removing, by id, each confirmed orphan container that is still an orphan at that moment (orphans as compose defines them: services from every profile count as declared), then prune dangling images; behind the pre-update backup gate. Stacks whose compose can't be read are reported as skipped. Dry run by default | `execute` + `items` (`package:*`, `stack:*`, `orphan:*`, `image:*`) from the dry run; `skip_backup_gate` until orca#767 |
@@ -44,8 +44,9 @@ Once orca is on the host you never touch the scripts — drive the tools. Payloa
 > Individual **containers** and managed **Compose stacks** are not `docker.*` tools — they are surfaced on orca's generic five-verb **unit** surface (`docker.__unit.*`). The `docker.*` tools above manage the runtime, its registered engines, and one-off Compose projects by path. See **[Managing Compose stacks](#managing-compose-stacks-orca-as-config-manager)** below.
 
 ```jsonc
-// docker.install — provision colima (default), Docker Engine, or podman
-{ "runtime": "docker" }
+// docker.install — provision colima (default), Docker Engine, or podman.
+// Without execute it returns the plan; install, engine_update, backup and restore need an admin caller, dry run included.
+{ "runtime": "docker", "execute": true }
 
 // docker.update — bring a Compose stack up
 { "path": "/srv/stacks/myapp", "action": "up" }
@@ -57,8 +58,8 @@ Once orca is on the host you never touch the scripts — drive the tools. Payloa
 { "runtimeName": "remote-host", "host": "tcp://10.0.0.5:2375" }
 
 // docker.backup / docker.restore
-{ "destination": "/srv/backups" }
-{ "archive": "/srv/backups/docker-engine-state-20260702-120000.tar.gz" }
+{ "destination": "/mnt/backups/docker", "execute": true }
+{ "archive": "/mnt/backups/docker/docker-engine-state-20260702-120000.tar.gz", "execute": true }
 
 // docker.prune — dry run lists candidates; execute removes only confirmed ones still orphaned
 { "stack": "media" }
@@ -253,10 +254,12 @@ Upgrades the runtime via the host package manager (or `rpm-ostree upgrade` on at
 ### 4. Back up / restore engine state
 
 ```sh
-# archive the colima/lima profile (or a supplied state dir) to a timestamped tarball
-./scripts/backup.sh /srv/backups            # prints the archive path
-# restore it (pair with install.sh to rebuild a host)
-./scripts/restore.sh /srv/backups/docker-engine-state-YYYYmmdd-HHMMSS.tar.gz
+# archive the colima/lima profile (or a supplied state dir) to a timestamped,
+# owner-only, config-only tarball: no VM/disk images (so no container images or
+# volumes) and no lima VM ssh keypair; the VM disk is recreated on next start
+./scripts/backup.sh /mnt/backups/docker     # prints the archive path
+# restore it (pair with install.sh to rebuild a host); never restores owners or setuid bits
+./scripts/restore.sh /mnt/backups/docker/docker-engine-state-YYYYmmdd-HHMMSS.tar.gz
 ```
 
 > **What's backed up:** the *engine's* state (the colima/lima VM profile + config), so a reprovisioned host can be rebuilt. **Container data** lives in named volumes / bind mounts and is backed up per-stack (e.g. `docker run --rm -v <vol>:/data -v $PWD:/out alpine tar czf /out/<vol>.tgz -C /data .`).
@@ -274,6 +277,6 @@ podman info      # if using podman
 ## Layout
 
 - `src/` — the plugin (pure Rust): the containers/compose/engine adapters, the five-verb `docker.*` surface, and the `docker.{install,engine_update,backup,restore}` lifecycle tools.
-- `scripts/` — the install / update / backup / restore helpers orca drives (and you can run standalone).
+- `scripts/` — the install / update helpers orca drives, plus standalone backup / restore equivalents of the in-process `docker.backup` / `docker.restore`.
 - `examples/` — sample tool payloads.
 - `assets/` — plugin icon.
