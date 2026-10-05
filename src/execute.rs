@@ -12,15 +12,25 @@ use plugin_toolkit::prelude::*;
 
 /// Fail closed: applying changes needs an identified admin caller.
 pub fn authorize_execute(tool: &str, caller: Option<&CallerIdentity>) -> Result<()> {
+    check_admin(&format!("{tool}: execute"), caller)
+}
+
+/// Admin for the dry run too, on tools whose plan alone probes host paths or
+/// decompresses caller-chosen input.
+pub fn require_admin(tool: &str, ctx: &ToolCtx) -> Result<()> {
+    check_admin(tool, ctx.caller().as_ref())
+}
+
+fn check_admin(subject: &str, caller: Option<&CallerIdentity>) -> Result<()> {
     match caller {
         Some(c) if c.role == "admin" => Ok(()),
         Some(c) => bail!(
-            "{tool}: execute requires role 'admin'; caller '{}' has '{}'",
+            "{subject} requires role 'admin'; caller '{}' has '{}'",
             c.username,
             c.role
         ),
         None => bail!(
-            "{tool}: execute refused: the call carries no caller identity, so admin cannot be verified"
+            "{subject} refused: the call carries no caller identity, so admin cannot be verified"
         ),
     }
 }

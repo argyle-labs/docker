@@ -1,4 +1,4 @@
 {
-  "_comment": "docker.backup — archive engine state to a .tar.gz in destination. Dry run unless execute is true (admin only); destination must resolve inside a managed root (ORCA_DOCKER_MANAGED_ROOTS, else /mnt/data, /mnt/backups, /mnt/downloads, /opt/appdata), state_path inside $HOME/.colima.",
+  "_comment": "docker.backup — archive engine state to a 0600 .tar.gz in destination. Admin only; dry run unless execute is true. destination must resolve inside a backup root (ORCA_DOCKER_BACKUP_ROOTS, else /mnt/backups), state_path inside $HOME/.colima.",
   "destination": "/mnt/backups/docker"
 }

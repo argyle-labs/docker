@@ -50,6 +50,11 @@ plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main",
 # generic.
 bollard = { version = "0.21", default-features = false, features = ["pipe"] }
 
+# Engine-state backup/restore reads and writes the archive in-process, so each
+# entry is checked from the same open file it is extracted from.
+tar = { version = "0.4", default-features = false }
+flate2 = "1"
+
 [dev-dependencies]
 # Dev-only: in-crate tests reach the toolkit's seams (serde, `reactor::block_on`)
 # the same way the lib does. Not a runtime dep.
