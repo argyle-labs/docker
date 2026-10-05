@@ -1,4 +1,4 @@
 {
-  "_comment": "docker.restore — restore engine state from a docker.backup archive.",
+  "_comment": "docker.restore — restore engine state from a docker.backup archive. Dry run unless execute is true (admin only); state_path must resolve inside $HOME/.colima.",
   "archive": "/srv/backups/docker-engine-state-20260702-120000.tar.gz"
 }

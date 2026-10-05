@@ -28,15 +28,15 @@ Once orca is on the host you never touch the scripts — drive the tools. Payloa
 
 | tool | what it does | key args |
 | --- | --- | --- |
-| `docker.install` | provision + start a runtime (`scripts/install.sh`) | `runtime`: `docker`\|`colima`\|`podman` |
-| `docker.engine_update` | upgrade the runtime (`scripts/update.sh`) | `runtime` |
+| `docker.install` | provision + start a runtime (the embedded `scripts/install.sh`; no other script can be run). Admin; dry run by default | `runtime`: `docker`\|`colima`\|`podman`; `execute` |
+| `docker.engine_update` | upgrade the runtime (the embedded `scripts/update.sh`). Admin; dry run by default | `runtime`; `execute` |
 | `docker.update` | run a Compose lifecycle action against a stack | `path`, `action`, optional `service` |
 | `docker.list` | host docker resources: engine status + registered runtimes; plus compose services (`path`) or a project scan (`root`) | optional `path` \| `root` |
 | `docker.detail` | inspect one Compose project: services, logs, stats | `path`, optional `service`, `tail` |
 | `docker.create` | register a docker runtime | `runtime_name`, one of `socket_path`\|`host`\|`url` |
 | `docker.delete` | remove a registered docker runtime | `runtime` |
 | `docker.backup` | archive engine state to a `.tar.gz` | `destination`, optional `state_path` |
-| `docker.restore` | restore engine state from an archive | `archive`, optional `state_path` |
+| `docker.restore` | restore engine state from an archive (the embedded `scripts/restore.sh`). `state_path` must be absolute and resolve, symlinks included, inside `$HOME/.colima` (the default). Admin; dry run by default validates the paths and returns the resolved target | `archive`, optional `state_path`; `execute` |
 | `docker.prune` | remove dangling images (untagged, including digest-only pulls), dangling anonymous volumes and compose networks no container (running or stopped) uses; never named volumes, never a network a managed stack declares `external`. `stack` scope attributes a volume by `orca.stack`, else `com.docker.compose.project`, else a container mounting it (compose labels anonymous volumes with neither, so only orca-labeled ones are found). Dry run by default | optional `stack`; `execute` + `items` from the dry run |
 | `docker.label_audit` | every container, volume and network without `orca.managed`, grouped by inferred owner (`orca.stack` or the compose project label, else the container that mounts or attaches it). Read-only; admin | none |
 | `docker.host_update` | upgrade the confirmed upgradable OS packages (apk/apt, engine packages flagged: they restart every container), then `compose pull -q` + `up -d` for every running stack, first removing, by id, each confirmed orphan container that is still an orphan at that moment (orphans as compose defines them: services from every profile count as declared), then prune dangling images; behind the pre-update backup gate. Stacks whose compose can't be read are reported as skipped. Dry run by default | `execute` + `items` (`package:*`, `stack:*`, `orphan:*`, `image:*`) from the dry run; `skip_backup_gate` until orca#767 |
@@ -44,8 +44,9 @@ Once orca is on the host you never touch the scripts — drive the tools. Payloa
 > Individual **containers** and managed **Compose stacks** are not `docker.*` tools — they are surfaced on orca's generic five-verb **unit** surface (`docker.__unit.*`). The `docker.*` tools above manage the runtime, its registered engines, and one-off Compose projects by path. See **[Managing Compose stacks](#managing-compose-stacks-orca-as-config-manager)** below.
 
 ```jsonc
-// docker.install — provision colima (default), Docker Engine, or podman
-{ "runtime": "docker" }
+// docker.install — provision colima (default), Docker Engine, or podman.
+// Without execute it returns the plan; install, engine_update and restore all need an admin caller to execute.
+{ "runtime": "docker", "execute": true }
 
 // docker.update — bring a Compose stack up
 { "path": "/srv/stacks/myapp", "action": "up" }
@@ -58,7 +59,7 @@ Once orca is on the host you never touch the scripts — drive the tools. Payloa
 
 // docker.backup / docker.restore
 { "destination": "/srv/backups" }
-{ "archive": "/srv/backups/docker-engine-state-20260702-120000.tar.gz" }
+{ "archive": "/srv/backups/docker-engine-state-20260702-120000.tar.gz", "execute": true }
 
 // docker.prune — dry run lists candidates; execute removes only confirmed ones still orphaned
 { "stack": "media" }

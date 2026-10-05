@@ -1,4 +1,4 @@
 {
-  "_comment": "docker.install — provision + start a runtime on this host. runtime ∈ docker|colima|podman.",
+  "_comment": "docker.install — provision + start a runtime on this host. runtime ∈ docker|colima|podman. Dry run unless execute is true (admin only).",
   "runtime": "colima"
 }
