@@ -19,12 +19,15 @@ pub mod labels;
 pub mod lifecycle;
 pub mod lint;
 pub mod ownership;
+pub mod policy;
 pub mod prune;
 pub mod registration;
 pub mod runtime_adapter;
 pub mod stacks;
 #[cfg(test)]
 mod test_engine;
+#[cfg(test)]
+mod test_support;
 pub mod tools;
 pub mod topology;
 pub mod unit_provider;

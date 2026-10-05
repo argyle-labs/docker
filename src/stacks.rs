@@ -22,6 +22,8 @@ use plugin_toolkit::runtime::{db_op, field_from_row};
 use plugin_toolkit::serde::{Deserialize, Serialize};
 
 use crate::Compose;
+use crate::compose_config::ComposeConfig;
+use crate::policy;
 
 /// The docker-owned stacks table. Declared in the Hello handshake schema (see
 /// [`crate::registration::schema_json`]) and applied by the daemon against its
@@ -50,6 +52,10 @@ pub struct StackRow {
     /// stacks in bulk operations; direct verbs still work.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Compose policy exceptions an admin granted this stack (see
+    /// [`crate::policy`]).
+    #[serde(default)]
+    pub allow: Vec<String>,
 }
 
 fn default_compose_file() -> String {
@@ -125,6 +131,69 @@ impl StackRow {
         std::fs::write(&p, env).with_context(|| format!("writing env file {}", p.display()))
     }
 
+    /// Write the compose file and/or `.env` for `deploy`, `set` and `edit`:
+    /// both are staged, the resolved config they produce is checked against
+    /// [`crate::policy`], and nothing is replaced unless it passes. `current`
+    /// is the registered stack before this write; settings it already ran
+    /// with stay allowed. With no compose file to write or on disk there is
+    /// nothing to check.
+    pub async fn write_checked(
+        &self,
+        yaml: Option<&str>,
+        env: Option<&str>,
+        current: Option<&StackRow>,
+        stacks_roots: &[String],
+    ) -> Result<()> {
+        let env = env.filter(|e| !e.is_empty());
+        if yaml.is_some() || env.is_some() {
+            std::fs::create_dir_all(&self.dir)
+                .with_context(|| format!("creating stack dir {}", self.dir))?;
+        }
+        let compose_path = self.compose_path();
+        let env_path = self.env_path();
+        ensure_within(&compose_path, &self.dir)?;
+        ensure_within(&env_path, &self.dir)?;
+        let compose = yaml
+            .map(|y| StagedWrite::new(&compose_path, y))
+            .transpose()?;
+        let env = env.map(|e| StagedWrite::new(&env_path, e)).transpose()?;
+        let file = match &compose {
+            Some(staged) => staged.temp_path().to_path_buf(),
+            None if compose_path.is_file() => compose_path,
+            None => {
+                if let Some(staged) = env {
+                    staged.commit()?;
+                }
+                return Ok(());
+            }
+        };
+        let raw = config_json(&self.dir, &file, env.as_ref().map(StagedWrite::temp_path)).await?;
+        let new = ComposeConfig::parse(&raw)?;
+        let before = match current.map(StackRow::compose) {
+            Some(Ok(c)) => c
+                .config_json()
+                .await
+                .ok()
+                .and_then(|raw| ComposeConfig::parse(&raw).ok()),
+            _ => None,
+        };
+        let roots = policy::bind_roots(&self.dir, stacks_roots);
+        policy::check(
+            &new,
+            before.as_ref(),
+            &self.allow,
+            &roots,
+            &policy::resolve_host_path,
+        )?;
+        if let Some(staged) = compose {
+            staged.commit()?;
+        }
+        if let Some(staged) = env {
+            staged.commit()?;
+        }
+        Ok(())
+    }
+
     /// The [`Compose`] project of [`compose_path`](Self::compose_path).
     /// Errors when that file does not exist.
     pub fn compose(&self) -> Result<Compose, crate::ComposeError> {
@@ -145,6 +214,14 @@ async fn validate_compose(dir: &str, file: &Path) -> Result<()> {
 }
 
 fn validate_args(dir: &str, file: &Path) -> Vec<String> {
+    let mut args = project_args(dir, file);
+    args.extend(["config".into(), "-q".into()]);
+    args
+}
+
+/// `compose` with `file` as the project's compose file, plus the override
+/// compose would load from `dir`.
+fn project_args(dir: &str, file: &Path) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "compose".into(),
         "--project-directory".into(),
@@ -157,8 +234,63 @@ fn validate_args(dir: &str, file: &Path) -> Vec<String> {
     {
         args.extend(["-f".into(), o.to_string_lossy().into_owned()]);
     }
-    args.extend(["config".into(), "-q".into()]);
     args
+}
+
+/// The resolved config `compose up` would run with `file` as the compose file
+/// and, when given, `env_file` in place of the stack's `.env`.
+pub async fn config_json(dir: &str, file: &Path, env_file: Option<&Path>) -> Result<String> {
+    let mut args = project_args(dir, file);
+    if let Some(env) = env_file {
+        args.extend(["--env-file".into(), env.to_string_lossy().into_owned()]);
+    }
+    args.extend(["config".into(), "--format".into(), "json".into()]);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    crate::run(&argv, None)
+        .await
+        .context("compose rejects the stack's config; nothing was written")
+}
+
+/// `dir` resolved, symlinks included, and refused unless it lies strictly
+/// inside one of `roots`.
+pub fn stack_dir_in_roots(dir: &str, roots: &[String]) -> Result<PathBuf> {
+    let resolved = crate::lifecycle::resolve(Path::new(dir))?;
+    let inside = roots
+        .iter()
+        .filter_map(|r| crate::lifecycle::resolve(Path::new(r)).ok())
+        .any(|root| resolved.starts_with(&root) && resolved != root);
+    if !inside {
+        anyhow::bail!(
+            "stack dir '{dir}' resolves to '{}', outside the stacks roots ({}); set stacks_root with docker.update to allow another root",
+            resolved.display(),
+            roots.join(", ")
+        );
+    }
+    Ok(resolved)
+}
+
+/// A compose filename: one plain path component.
+pub fn check_file_name(file: &str) -> Result<()> {
+    let mut parts = Path::new(file).components();
+    match (parts.next(), parts.next()) {
+        (Some(std::path::Component::Normal(_)), None) => Ok(()),
+        _ => anyhow::bail!("compose file '{file}' must be a plain file name inside the stack dir"),
+    }
+}
+
+/// Refuse `path` when it resolves, through a symlink, outside `dir`.
+pub fn ensure_within(path: &Path, dir: &str) -> Result<()> {
+    let resolved = crate::lifecycle::resolve(path)?;
+    let dir = crate::lifecycle::resolve(Path::new(dir))?;
+    if !resolved.starts_with(&dir) {
+        anyhow::bail!(
+            "'{}' resolves to '{}', outside the stack dir '{}'",
+            path.display(),
+            resolved.display(),
+            dir.display()
+        );
+    }
+    Ok(())
 }
 
 /// A file replacement staged next to its target. The target is resolved
@@ -279,6 +411,10 @@ fn to_dbrow(row: &StackRow) -> DbRow {
     m.insert("dir".to_string(), DbValue::Text(row.dir.clone()));
     m.insert("file".to_string(), DbValue::Text(row.file.clone()));
     m.insert("enabled".to_string(), DbValue::Bool(row.enabled));
+    m.insert(
+        "allow".to_string(),
+        DbValue::Text(plugin_toolkit::serde_json::to_string(&row.allow).unwrap_or_default()),
+    );
     m
 }
 
@@ -288,6 +424,9 @@ fn from_dbrow(m: &DbRow) -> Result<StackRow> {
         dir: field_from_row(m, "dir")?,
         file: field_from_row(m, "file")?,
         enabled: field_from_row::<bool>(m, "enabled")?,
+        allow: field_from_row::<Option<String>>(m, "allow")?
+            .and_then(|raw| plugin_toolkit::serde_json::from_str(&raw).ok())
+            .unwrap_or_default(),
     })
 }
 
@@ -357,6 +496,7 @@ mod tests {
             dir: dir.to_string_lossy().into_owned(),
             file: DEFAULT_COMPOSE_FILE.into(),
             enabled: true,
+            allow: Vec::new(),
         }
     }
 
@@ -367,6 +507,7 @@ mod tests {
             dir: "/srv/x".into(),
             file: "compose.yaml".into(),
             enabled: true,
+            allow: Vec::new(),
         };
         assert_eq!(r.compose_path(), Path::new("/srv/x/compose.yaml"));
         assert_eq!(r.env_path(), Path::new("/srv/x/.env"));
@@ -542,5 +683,66 @@ mod tests {
             plugin_toolkit::serde_json::from_str(r#"{"name":"a","dir":"/srv/a"}"#).unwrap();
         assert_eq!(r.file, DEFAULT_COMPOSE_FILE);
         assert!(r.enabled);
+    }
+
+    fn s(p: &Path) -> String {
+        p.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn stack_dir_must_resolve_strictly_inside_a_root() {
+        let root = tempdir().unwrap();
+        let roots = [s(root.path())];
+        let inside = root.path().join("web");
+        assert_eq!(
+            stack_dir_in_roots(&s(&inside), &roots).unwrap(),
+            root.path().canonicalize().unwrap().join("web")
+        );
+        let outside = tempdir().unwrap();
+        for bad in [
+            s(outside.path()),
+            "/etc".to_string(),
+            s(root.path()),
+            format!("{}/web/../../etc", s(root.path())),
+            "relative/web".to_string(),
+        ] {
+            assert!(stack_dir_in_roots(&bad, &roots).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn stack_dir_refuses_a_symlink_out_of_the_root() {
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("escape")).unwrap();
+        let roots = [s(root.path())];
+        for dir in ["escape", "escape/web"] {
+            let err = stack_dir_in_roots(&s(&root.path().join(dir)), &roots).unwrap_err();
+            assert!(
+                err.to_string().contains("outside the stacks roots"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn compose_file_is_a_plain_name() {
+        check_file_name("docker-compose.yml").unwrap();
+        for bad in ["../x.yml", "/etc/x.yml", "sub/x.yml", "..", ""] {
+            assert!(check_file_name(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn files_linked_out_of_the_stack_dir_are_refused() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("x.yml"),
+            dir.path().join("compose.yaml"),
+        )
+        .unwrap();
+        assert!(ensure_within(&dir.path().join("compose.yaml"), &s(dir.path())).is_err());
+        ensure_within(&dir.path().join(".env"), &s(dir.path())).unwrap();
     }
 }

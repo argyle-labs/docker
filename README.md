@@ -30,32 +30,33 @@ Once orca is on the host you never touch the scripts — drive the tools. Payloa
 | --- | --- | --- |
 | `docker.install` | provision + start a runtime (the embedded `scripts/install.sh`; no other script can be run). Admin, dry run included; dry run by default | `runtime`: `docker`\|`colima`\|`podman`; `execute` |
 | `docker.engine_update` | upgrade the runtime (the embedded `scripts/update.sh`). Admin, dry run included; dry run by default | `runtime`; `execute` |
-| `docker.update` | run a Compose lifecycle action against a stack | `path`, `action`, optional `service` |
-| `docker.list` | host docker resources: engine status + registered runtimes; plus compose services (`path`) or a project scan (`root`) | optional `path` \| `root` |
-| `docker.detail` | inspect one Compose project: services, logs, stats | `path`, optional `service`, `tail` |
-| `docker.create` | register a docker runtime | `runtime_name`, one of `socket_path`\|`host`\|`url` |
-| `docker.delete` | remove a registered docker runtime | `runtime` |
+| `docker.list` | registered docker runtimes | optional `limit`, `cursor` |
+| `docker.detail` | one registered docker runtime | `name` |
+| `docker.create` | register a docker runtime, with the `stacks_root` its managed stacks must live under (absolute; default `/opt/stacks`). Admin, dry run included; dry run by default | `name`, one of `socketPath`\|`host`\|`url`, optional `stacksRoot`, `route`; `execute` |
+| `docker.update` | patch a registered docker runtime. Admin, dry run included; dry run by default | `name`, any of `socketPath`, `host`, `url`, `stacksRoot`, `route`, `enabled`; `execute` |
+| `docker.delete` | remove a registered docker runtime. Admin, dry run included; dry run by default | `name`; `execute` |
+| `docker.stack_allow` | set a managed stack's compose policy grants (see [Compose policy](#compose-policy)), replacing the current set. Admin, dry run included; dry run by default | `name`, `allow` (repeatable); `execute` |
 | `docker.backup` | archive engine state to a mode-0600 `.tar.gz` (written under a temporary name, then renamed). Config only: VM and disk images (`_lima/_disks/`, which is colima's data disk holding container images and volumes; `_lima/<instance>/{basedisk,diffdisk,disk}`; any `*.iso`/`*.img`/`*.qcow2`/`*.raw`), lima's VM ssh keypair (`_lima/_config/user{,.pub}`, regenerated on start), sockets and links pointing outside the state dir are left out and listed in `excluded`. `destination` must be absolute and resolve, symlinks included, inside one of the daemon's backup roots (`ORCA_DOCKER_BACKUP_ROOTS`, comma-separated, else `/mnt/backups`; set it on macOS); `state_path` inside `$HOME/.colima` (the default). Admin, dry run included; dry run by default validates the paths and returns the resolved ones | `destination`, optional `state_path`; `execute` |
 | `docker.restore` | restore engine state from a `docker.backup` archive, in-process: the archive is opened once and every entry is checked from that same file before it is extracted. `archive` must be absolute and inside a backup root; `state_path` must resolve inside `$HOME/.colima` (the default). Refused: absolute or `..` entries, links whose target is absolute or contains `..`, anything but files, directories and links, and a state dir already holding a symlink that leads outside it. Ownership is never restored and modes are masked to owner-only (no setuid/setgid). Archives over 4 GiB uncompressed or 100k entries are refused. The archive is extracted into a sibling temp dir, entries the archive lacks (the VM disks) are moved across, and the dirs are swapped by rename, so a failed restore leaves the state dir as it was. Restores config only: the VM disk is recreated on the next `colima start`, and container images and volumes are not in this backup (back up volumes through the stack backup). Admin, dry run included; dry run by default validates everything and returns the resolved target | `archive`, optional `state_path`; `execute` |
 | `docker.prune` | remove dangling images (untagged, including digest-only pulls), dangling anonymous volumes and compose networks no container (running or stopped) uses; never named volumes, never a network a managed stack declares `external`. `stack` scope attributes a volume by `orca.stack`, else `com.docker.compose.project`, else a container mounting it (compose labels anonymous volumes with neither, so only orca-labeled ones are found). Dry run by default | optional `stack`; `execute` + `items` from the dry run |
 | `docker.label_audit` | every container, volume and network without `orca.managed`, grouped by inferred owner (`orca.stack` or the compose project label, else the container that mounts or attaches it). Read-only; admin | none |
 | `docker.host_update` | upgrade the confirmed upgradable OS packages (apk/apt, engine packages flagged: they restart every container), then `compose pull -q` + `up -d` for every running stack, first removing, by id, each confirmed orphan container that is still an orphan at that moment (orphans as compose defines them: services from every profile count as declared), then prune dangling images; behind the pre-update backup gate. Stacks whose compose can't be read are reported as skipped. Dry run by default | `execute` + `items` (`package:*`, `stack:*`, `orphan:*`, `image:*`) from the dry run; `skip_backup_gate` until orca#767 |
 
-> Individual **containers** and managed **Compose stacks** are not `docker.*` tools — they are surfaced on orca's generic five-verb **unit** surface (`docker.__unit.*`). The `docker.*` tools above manage the runtime, its registered engines, and one-off Compose projects by path. See **[Managing Compose stacks](#managing-compose-stacks-orca-as-config-manager)** below.
+> Individual **containers** and managed **Compose stacks** are not `docker.*` tools — they are surfaced on orca's generic five-verb **unit** surface (`docker.__unit.*`). The `docker.*` tools above manage the runtime and its registered engines. See **[Managing Compose stacks](#managing-compose-stacks-orca-as-config-manager)** below.
 
 ```jsonc
 // docker.install — provision colima (default), Docker Engine, or podman.
 // Without execute it returns the plan; install, engine_update, backup and restore need an admin caller, dry run included.
 { "runtime": "docker", "execute": true }
 
-// docker.update — bring a Compose stack up
-{ "path": "/srv/stacks/myapp", "action": "up" }
-
-// docker.detail — inspect a Compose project (services + logs + stats)
-{ "path": "/srv/stacks/myapp", "tail": 200 }
-
 // docker.create — register a docker runtime (needs socketPath | host | url)
-{ "runtimeName": "remote-host", "host": "tcp://10.0.0.5:2375" }
+{ "name": "remote-host", "host": "tcp://10.0.0.5:2375", "stacksRoot": "/srv/stacks", "execute": true }
+
+// docker.update — move where this host's managed stacks may live
+{ "name": "remote-host", "stacksRoot": "/opt/stacks", "execute": true }
+
+// docker.stack_allow — let homeassistant keep host networking and the dbus socket
+{ "name": "homeassistant", "allow": ["network_mode:host", "bind:/run/dbus"], "execute": true }
 
 // docker.backup / docker.restore
 { "destination": "/mnt/backups/docker", "execute": true }
@@ -96,6 +97,22 @@ vocabulary spans both). Every operation is available through `unit` list / detai
 | **register + deploy** (add-only) | `create` | `action = "deploy"`, deploy payload |
 | **register-or-replace + deploy** | `upsert` | `action = "set"`, deploy payload |
 | **deregister** (leaves containers running) | `delete` | `id.kind = "stack"`, `id.id = <name>` |
+
+**Where stacks live.** `deploy` and `set` refuse a `dir` that does not resolve, symlinks included, strictly inside a stacks root: the `stacksRoot` of each enabled registered runtime, else `/opt/stacks`. `..` and relative paths are refused, and `file` must be a plain file name. A stack backup's `dest` must resolve inside the daemon's backup roots (`ORCA_DOCKER_BACKUP_ROOTS`, else `/mnt/backups`); a restore archive must be inside them or in the stack's own `.orca-backups` sibling dir, where a backup without `dest` puts it.
+
+#### Compose policy
+
+The stack unit verbs reach the plugin without a caller identity, so the plugin cannot require admin on them. Instead `deploy`, `set` and `edit` check the resolved config (`compose config`, with the new `.env`) before anything is written, and refuse a service that uses:
+
+| setting | grant |
+| --- | --- |
+| `privileged: true` | `privileged` |
+| `pid: host` | `pid:host` |
+| `network_mode: host` | `network_mode:host` |
+| `cap_add: SYS_ADMIN` (or `ALL`) | `cap_add:SYS_ADMIN` |
+| a bind (or a `local` volume with `o: bind`) of a host path, resolved through symlinks, outside the stack dir, the stacks roots, `/mnt/*`, `/opt/appdata` and the managed roots | `bind:<path>` |
+
+A setting the registered stack already ran with stays allowed for the same service, so editing an existing stack does not break it. Anything new needs an admin to grant it with `docker.stack_allow`; `bind:/` cannot be granted. To deploy a new stack that needs a grant, register it first with `deploy: false` and no `compose_yaml` (with no compose file there is nothing to check), grant, then `set` the compose file.
 
 **Ownership labels.** Every `up`, deploy and restore regenerates `compose.orca.yaml` next to the compose file and passes it last (`-f`). Orca's other compose calls on the stack pass only the user's files, so a stale `compose.orca.yaml` never breaks them; coverage regenerates it before reading. The user's compose file is never edited.
 
@@ -241,7 +258,7 @@ services:
     restart: unless-stopped
 ```
 
-Lifecycle actions mirror the `docker.update` tool: `up`, `down`, `restart`, `start`, `stop`, `build`, `pull`, `logs`.
+Lifecycle actions are the stack unit's `update` actions: `up`, `down`, `restart`, `start`, `stop`, `build`, `pull`.
 
 ### 3. Update the runtime
 

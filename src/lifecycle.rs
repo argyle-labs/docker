@@ -81,7 +81,7 @@ fn script_command(name: &str, embedded: &str, args: &[&str]) -> Command {
 
 /// `path` with every existing prefix canonicalized and the not-yet-created tail
 /// appended, so a symlink anywhere along it is resolved before the root check.
-fn resolve(path: &Path) -> Result<PathBuf> {
+pub(crate) fn resolve(path: &Path) -> Result<PathBuf> {
     if !path.is_absolute() {
         bail!("'{}' is not an absolute path", path.display());
     }
@@ -130,7 +130,7 @@ fn state_dir(requested: Option<&str>, home: &str) -> Result<PathBuf> {
 
 /// `requested` resolved, refused unless it lies inside one of `roots`: the
 /// daemon's backup roots, which a caller cannot widen.
-fn in_backup_root(requested: &str, roots: &[String]) -> Result<PathBuf> {
+pub(crate) fn in_backup_root(requested: &str, roots: &[String]) -> Result<PathBuf> {
     let dest = resolve(Path::new(requested))?;
     let allowed: Vec<PathBuf> = roots
         .iter()
@@ -266,8 +266,8 @@ pub struct DockerEngineUpdateOutput {
 /// **Upgrade a container runtime** on this host. Runs `scripts/update.sh`, which
 /// bumps the runtime (docker engine, colima/lima, or podman) to the latest
 /// available release and restarts the daemon. Distinct from `docker.update`,
-/// which runs compose lifecycle actions against deployed stacks. Without
-/// `execute`, returns what would run and changes nothing.
+/// which patches a registered runtime. Without `execute`, returns what would
+/// run and changes nothing.
 #[orca_tool(
     domain = "docker",
     verb = "engine_update",

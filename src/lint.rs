@@ -95,7 +95,7 @@ pub struct Finding {
     pub fixable: bool,
 }
 
-fn under(path: &str, root: &str) -> bool {
+pub(crate) fn under(path: &str, root: &str) -> bool {
     let root = root.trim_end_matches('/');
     path == root || path.starts_with(&format!("{root}/"))
 }

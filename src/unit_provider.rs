@@ -43,6 +43,7 @@ use plugin_toolkit::serde_json;
 
 use crate::compose::ORCA_FILE;
 use crate::compose_config::ComposeConfig;
+use crate::engine_state;
 use crate::lint::{self, Finding, NotFixed};
 use crate::ownership::{self, Migrated, Migrator};
 use crate::runtime_adapter::DockerAdapter;
@@ -236,12 +237,13 @@ impl DockerUnitProvider {
                         "edit payload must set compose_yaml and/or compose_env"
                     ));
                 }
-                if let Some(yaml) = &p.compose_yaml {
-                    row.write_compose(yaml)?;
-                }
-                if let Some(env) = &p.compose_env {
-                    row.write_env(env)?;
-                }
+                row.write_checked(
+                    p.compose_yaml.as_deref(),
+                    p.compose_env.as_deref(),
+                    Some(&row),
+                    &crate::tools::stacks_roots()?,
+                )
+                .await?;
                 // A stale orca override naming a removed service breaks every
                 // compose command, so regenerate the one that exists.
                 let mut message = format!("edited stack '{}'", row.name);
@@ -438,11 +440,9 @@ impl DockerUnitProvider {
                 row.dir
             ));
         }
-        // Default destination is a `.orca-backups` sibling of the stack dir, so
-        // the archive is never written inside the directory being archived.
         let dest = match &p.dest {
-            Some(d) => std::path::PathBuf::from(d),
-            None => dir.parent().unwrap_or(dir).join(".orca-backups"),
+            Some(d) => crate::lifecycle::in_backup_root(d, &engine_state::backup_roots())?,
+            None => default_backup_dir(dir),
         };
         std::fs::create_dir_all(&dest)
             .map_err(|e| anyhow::anyhow!("create backup dir {}: {e}", dest.display()))?;
@@ -513,6 +513,7 @@ impl DockerUnitProvider {
         if archive.is_empty() {
             return Err(anyhow::anyhow!("restore backup ref has an empty locator"));
         }
+        restore_source(&archive, &row.dir, &engine_state::backup_roots())?;
         if !std::path::Path::new(&archive).is_file() {
             return Err(anyhow::anyhow!("restore archive {archive} not found"));
         }
@@ -536,7 +537,15 @@ impl DockerUnitProvider {
         let raw = payload.ok_or_else(|| anyhow::anyhow!("deploy requires a payload"))?;
         let p: StackDeployPayload =
             serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("deploy payload: {e}"))?;
-        let existed = stacks::exists(&p.name)?;
+        let file = p
+            .file
+            .clone()
+            .unwrap_or_else(|| stacks::DEFAULT_COMPOSE_FILE.to_string());
+        stacks::check_file_name(&file)?;
+        let roots = crate::tools::stacks_roots()?;
+        let dir = stacks::stack_dir_in_roots(&p.dir, &roots)?;
+        let current = stacks::get(&p.name)?;
+        let existed = current.is_some();
         if add_only && existed {
             return Err(anyhow::anyhow!(
                 "stack '{}' already exists; use upsert (action=set) to redeploy",
@@ -545,19 +554,22 @@ impl DockerUnitProvider {
         }
         let row = StackRow {
             name: p.name.clone(),
-            dir: p.dir.clone(),
-            file: p
-                .file
-                .clone()
-                .unwrap_or_else(|| stacks::DEFAULT_COMPOSE_FILE.to_string()),
+            dir: dir.to_string_lossy().into_owned(),
+            file,
             enabled: true,
+            // Grants are set only through the admin-only `docker.stack_allow`.
+            allow: current
+                .as_ref()
+                .map(|r| r.allow.clone())
+                .unwrap_or_default(),
         };
-        if let Some(yaml) = &p.compose_yaml {
-            row.write_compose(yaml)?;
-        }
-        if let Some(env) = &p.compose_env {
-            row.write_env(env)?;
-        }
+        row.write_checked(
+            p.compose_yaml.as_deref(),
+            p.compose_env.as_deref(),
+            current.as_ref(),
+            &roots,
+        )
+        .await?;
         stacks::put(&row)?;
         if p.deploy {
             ownership::up(&row, &[]).await?;
@@ -791,7 +803,9 @@ pub struct StackLogs {
 #[serde(crate = "plugin_toolkit::serde")]
 #[schemars(crate = "plugin_toolkit::schemars")]
 pub struct StackEditPayload {
-    /// New compose file contents.
+    /// New compose file contents. Privileged, host-namespace, `SYS_ADMIN` and
+    /// out-of-root bind settings the stack did not already have are refused
+    /// unless granted with `docker.stack_allow`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compose_yaml: Option<String>,
     /// New `.env` contents.
@@ -1025,9 +1039,11 @@ pub struct StackFixResult {
 #[serde(crate = "plugin_toolkit::serde")]
 #[schemars(crate = "plugin_toolkit::schemars")]
 pub struct StackBackupPayload {
-    /// Directory the archive is written to. `None` → a `.orca-backups` sibling of
-    /// the stack's project directory (a system-owned WHERE, until the backup
-    /// target/storage layer resolves it centrally).
+    /// Directory the archive is written to; must resolve inside the daemon's
+    /// backup roots (`ORCA_DOCKER_BACKUP_ROOTS`, else `/mnt/backups`). `None`
+    /// → a `.orca-backups` sibling of the stack's project directory (a
+    /// system-owned WHERE, until the backup target/storage layer resolves it
+    /// centrally).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dest: Option<String>,
 }
@@ -1040,13 +1056,15 @@ pub struct StackBackupPayload {
 pub struct StackDeployPayload {
     /// Unique stack name.
     pub name: String,
-    /// Project directory on the host holding the compose file.
+    /// Project directory on the host holding the compose file. Must resolve
+    /// strictly inside a runtime's `stacks_root` (default `/opt/stacks`).
     pub dir: String,
-    /// Compose filename within `dir` (default `docker-compose.yml`).
+    /// Compose filename within `dir` (default `docker-compose.yml`); a plain
+    /// file name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
     /// Compose file contents to write. Omit to register/redeploy an existing
-    /// on-disk file unchanged.
+    /// on-disk file unchanged. Either way the config is checked like `edit`'s.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compose_yaml: Option<String>,
     /// Optional `.env` contents to write alongside.
@@ -1262,6 +1280,22 @@ fn fix_result(
         how_to_execute: None,
     };
     Ok((result, write))
+}
+
+/// Where a stack backup goes when the caller names no destination: a
+/// `.orca-backups` sibling of the stack dir, so the archive is never written
+/// inside the directory being archived.
+fn default_backup_dir(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.parent().unwrap_or(dir).join(".orca-backups")
+}
+
+/// Refuse a restore archive outside the backup roots and outside the stack's
+/// own default backup dir, where an un-targeted backup put it.
+fn restore_source(archive: &str, stack_dir: &str, roots: &[String]) -> Result<()> {
+    let default = default_backup_dir(std::path::Path::new(stack_dir));
+    let mut allowed = roots.to_vec();
+    allowed.push(default.to_string_lossy().into_owned());
+    crate::lifecycle::in_backup_root(archive, &allowed).map(|_| ())
 }
 
 /// `tar` arguments for a stack archive: the stack dir (without any stale
@@ -1867,5 +1901,91 @@ mod tests {
             .find(|a| a.action == "label_volumes")
             .unwrap();
         assert!(a.payload_schema.is_some() && a.response_schema.is_some());
+    }
+
+    fn path(p: &std::path::Path) -> String {
+        p.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn restore_reads_only_from_the_backup_roots_or_the_stacks_own_backups() {
+        let roots_dir = tempfile::tempdir().unwrap();
+        let stacks = tempfile::tempdir().unwrap();
+        let stack = stacks.path().join("web");
+        std::fs::create_dir_all(stacks.path().join(".orca-backups")).unwrap();
+        let roots = [path(roots_dir.path())];
+        let own = path(&stacks.path().join(".orca-backups/web-1.tar.gz"));
+        restore_source(&own, &path(&stack), &roots).unwrap();
+        restore_source(
+            &path(&roots_dir.path().join("web.tar.gz")),
+            &path(&stack),
+            &roots,
+        )
+        .unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), roots_dir.path().join("escape")).unwrap();
+        for bad in [
+            path(&outside.path().join("web.tar.gz")),
+            format!("{}/../x.tar.gz", path(roots_dir.path())),
+            path(&roots_dir.path().join("escape/web.tar.gz")),
+            "web.tar.gz".to_string(),
+        ] {
+            assert!(
+                restore_source(&bad, &path(&stack), &roots).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    fn deploy(payload: plugin_toolkit::serde_json::Value) -> String {
+        let provider = DockerUnitProvider::new(crate::registration::adapter());
+        plugin_toolkit::reactor::block_on(provider.stack_deploy(Some(payload.to_string()), true))
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn deploy_refuses_dirs_and_files_outside_the_stacks_root_before_writing() {
+        use crate::test_support::{admin, with_db};
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("escape")).unwrap();
+        let root_s = path(root.path());
+        let ((), tables) = with_db(|| {
+            let args = crate::tools::DockerCreateArgs {
+                name: "local".into(),
+                socket_path: None,
+                host: None,
+                url: None,
+                stacks_root: Some(root_s.clone()),
+                routes: Vec::new(),
+                execute: true,
+            };
+            plugin_toolkit::reactor::block_on(crate::tools::docker_create(args, &admin())).unwrap();
+            let yaml = "services: {}\n";
+            for dir in [
+                path(outside.path()),
+                format!("{root_s}/web/../../x"),
+                path(&root.path().join("escape/web")),
+                root_s.clone(),
+            ] {
+                let err = deploy(plugin_toolkit::serde_json::json!({
+                    "name": "web", "dir": dir, "compose_yaml": yaml
+                }));
+                assert!(
+                    err.contains("outside the stacks roots") || err.contains("contains '..'"),
+                    "{dir}: {err}"
+                );
+            }
+            let err = deploy(plugin_toolkit::serde_json::json!({
+                "name": "web", "dir": format!("{root_s}/web"), "file": "../x.yml",
+                "compose_yaml": yaml
+            }));
+            assert!(err.contains("plain file name"), "{err}");
+        });
+        assert!(tables.contains_key(&("docker".into(), "runtime_settings".into())));
+        assert!(!tables.contains_key(&("docker".into(), "stacks".into())));
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+        assert!(!root.path().join("web").exists());
     }
 }

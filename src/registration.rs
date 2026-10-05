@@ -72,17 +72,19 @@ impl EnvProvider for DockerEnv {
 
 /// The plugin-scoped SQL schema orca declares in the Hello handshake: the
 /// `docker.stacks` table (physical `plug__docker__stacks`), mirroring
-/// [`crate::stacks::StackRow`] with `name` as the natural key, and
+/// [`crate::stacks::StackRow`] with `name` as the natural key,
 /// `docker.volume_policies`, mirroring
-/// [`crate::volume_coverage::VolumePolicy`] keyed `<stack>/<volume>`.
+/// [`crate::volume_coverage::VolumePolicy`] keyed `<stack>/<volume>`, and
+/// `docker.runtime_settings`, each runtime's `stacks_root` keyed by runtime
+/// name.
 pub fn schema_json() -> String {
-    r#"{"namespace":"docker","tables":[{"table":"stacks","columns":[{"name":"name","sql_type":"TEXT","not_null":true,"primary_key":true},{"name":"dir","sql_type":"TEXT","not_null":true},{"name":"file","sql_type":"TEXT","not_null":true},{"name":"enabled","sql_type":"INTEGER","not_null":true,"default":"1"}]},{"table":"volume_policies","columns":[{"name":"id","sql_type":"TEXT","not_null":true,"primary_key":true},{"name":"stack","sql_type":"TEXT","not_null":true},{"name":"volume","sql_type":"TEXT","not_null":true},{"name":"strategy","sql_type":"TEXT","not_null":true},{"name":"service","sql_type":"TEXT"},{"name":"command","sql_type":"TEXT"}]}]}"#.to_string()
+    r#"{"namespace":"docker","tables":[{"table":"stacks","columns":[{"name":"name","sql_type":"TEXT","not_null":true,"primary_key":true},{"name":"dir","sql_type":"TEXT","not_null":true},{"name":"file","sql_type":"TEXT","not_null":true},{"name":"enabled","sql_type":"INTEGER","not_null":true,"default":"1"},{"name":"allow","sql_type":"TEXT"}]},{"table":"volume_policies","columns":[{"name":"id","sql_type":"TEXT","not_null":true,"primary_key":true},{"name":"stack","sql_type":"TEXT","not_null":true},{"name":"volume","sql_type":"TEXT","not_null":true},{"name":"strategy","sql_type":"TEXT","not_null":true},{"name":"service","sql_type":"TEXT"},{"name":"command","sql_type":"TEXT"}]},{"table":"runtime_settings","columns":[{"name":"name","sql_type":"TEXT","not_null":true,"primary_key":true},{"name":"stacks_root","sql_type":"TEXT"}]}]}"#.to_string()
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn schema_declares_both_tables() {
+    fn schema_declares_every_table() {
         let v: plugin_toolkit::serde_json::Value =
             plugin_toolkit::serde_json::from_str(&super::schema_json()).unwrap();
         let tables: Vec<_> = v["tables"]
@@ -91,6 +93,9 @@ mod tests {
             .iter()
             .map(|t| t["table"].as_str().unwrap())
             .collect();
-        assert_eq!(tables, vec!["stacks", "volume_policies"]);
+        assert_eq!(
+            tables,
+            vec!["stacks", "volume_policies", "runtime_settings"]
+        );
     }
 }

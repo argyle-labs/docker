@@ -901,6 +901,7 @@ mod tests {
             dir: format!("/srv/{name}"),
             file: "docker-compose.yml".into(),
             enabled: true,
+            allow: Vec::new(),
         }
     }
 
