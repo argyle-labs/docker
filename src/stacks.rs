@@ -34,7 +34,7 @@ const TABLE: &str = "stacks";
 
 /// Compose filename written when the caller doesn't name one.
 pub const DEFAULT_COMPOSE_FILE: &str = "docker-compose.yml";
-const ENV_FILE: &str = ".env";
+pub const ENV_FILE: &str = ".env";
 
 /// A registered managed stack: a name bound to an on-disk compose project.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,7 +159,7 @@ impl StackRow {
         };
         let env_file = env.as_ref().map(StagedWrite::temp_path);
         let raw = config_json(dir.path(), &file, env_file.as_deref()).await?;
-        policy::check_stack(&raw, self, dir.path(), stacks_roots)?;
+        policy::check_stack(&raw, &raw, self, dir.path(), stacks_roots)?;
         if let Some(staged) = compose {
             staged.commit()?;
         }
@@ -191,7 +191,7 @@ impl StackRow {
         }
         let staged = StagedWrite::new(&dir, &name, yaml)?;
         let raw = config_json(dir.path(), &staged.temp_path(), None).await?;
-        policy::check_stack(&raw, self, dir.path(), stacks_roots)?;
+        policy::check_stack(&raw, &raw, self, dir.path(), stacks_roots)?;
         staged.commit()
     }
 
@@ -235,11 +235,21 @@ pub fn env_values(env: &str) -> Vec<String> {
     env_pairs(env).into_iter().map(|(_, v)| v).collect()
 }
 
-/// `text` with each of `values` replaced by `***`. Compose interpolates
-/// `.env` values into the config it prints and echoes them in its errors.
+/// `text` with each of `values`, as written or JSON-escaped, replaced by
+/// `***`. Compose interpolates `.env` values into the config it prints and
+/// echoes them in its errors.
 pub fn redact(text: &str, values: &[String]) -> String {
+    let escaped: Vec<String> = values
+        .iter()
+        .filter_map(|v| {
+            let quoted = plugin_toolkit::serde_json::to_string(v).ok()?;
+            let inner = &quoted[1..quoted.len() - 1];
+            (inner != v).then(|| inner.to_string())
+        })
+        .collect();
     let mut values: Vec<&str> = values
         .iter()
+        .chain(&escaped)
         .map(String::as_str)
         .filter(|v| v.chars().count() >= MIN_REDACTED_LEN)
         .collect();
@@ -1066,6 +1076,14 @@ mod tests {
             &env_values(env),
         );
         assert_eq!(out, "volume ***, pw ***, ***, ***, ***, 1 replica");
+    }
+
+    #[test]
+    fn json_escaped_env_values_are_scrubbed_too() {
+        let values = env_values("PW='pa\"ss\\word'\n");
+        assert_eq!(values, [r#"pa"ss\word"#]);
+        let json = plugin_toolkit::serde_json::json!({"error": "bad pa\"ss\\word"}).to_string();
+        assert_eq!(redact(&json, &values), r#"{"error":"bad ***"}"#);
     }
 
     #[test]

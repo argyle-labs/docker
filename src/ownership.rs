@@ -487,13 +487,15 @@ pub async fn refresh(row: &StackRow) -> Result<Compose> {
     Ok(write_with(row, client()?, None).await?.0)
 }
 
-/// `compose up -d` (for `services`, or all) with a fresh [`ORCA_FILE`], once
-/// the files it runs pass [`crate::policy::gate`]. The output leads with
+/// `compose up -d` (for `services`, or all) with a fresh [`ORCA_FILE`], run
+/// from the config [`crate::policy::gate`] checked. The output leads with
 /// what was left unlabeled.
 pub async fn up(row: &StackRow, services: &[&str]) -> Result<String> {
     let (compose, notes) = write_with(row, client()?, None).await?;
-    crate::policy::gate(row, &compose).await?;
-    let out = compose.up(services).await?;
+    let out = crate::policy::gate(row, &compose)
+        .await?
+        .up(services)
+        .await?;
     Ok(notes
         .iter()
         .map(|n| format!("note: {n}\n"))
@@ -1036,11 +1038,11 @@ pub fn manifest_args(volume: &str) -> Vec<String> {
 }
 
 async fn docker_checked(args: &[String], what: &str) -> Result<String> {
-    let mut cmd = plugin_toolkit::process::Command::new(crate::resolve_docker_bin()).args(args);
-    if let Some(host) = crate::docker_host().await {
-        cmd = cmd.env("DOCKER_HOST", host);
-    }
-    let out = cmd.output().await?;
+    let out = crate::clean_command(crate::resolve_docker_bin())
+        .await
+        .args(args)
+        .output()
+        .await?;
     if !out.status.success {
         anyhow::bail!("{what}: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
@@ -1120,11 +1122,11 @@ impl Migrator for ComposeMigrator<'_> {
             } else {
                 compose
             };
-            crate::policy::gate(self.row, &compose).await?;
+            let checked = crate::policy::gate(self.row, &compose).await?;
             if start {
-                compose.up(&[service]).await?;
+                checked.up(&[service]).await?;
             } else {
-                compose.create(&[service]).await?;
+                checked.create(&[service]).await?;
             }
             Ok(())
         })

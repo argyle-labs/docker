@@ -271,14 +271,21 @@ impl DockerUnitProvider {
             }
             action if STACK_LIFECYCLE.contains(&action) => {
                 let compose = row.compose().map_err(anyhow::Error::from)?;
-                // Only stopping and removing containers needs no check.
-                if !matches!(action, "down" | "stop") {
-                    policy::gate(&row, &compose).await?;
-                }
-                let out = compose
-                    .run_action(action, None, None)
-                    .await
-                    .map_err(anyhow::Error::from)?;
+                // Only stopping and removing containers needs no check. Build
+                // and pull read the config, so they run from the checked one;
+                // start and restart act on containers that already exist.
+                let checked = match action {
+                    "down" | "stop" => None,
+                    _ => Some(policy::gate(&row, &compose).await?),
+                };
+                let out = match (action, checked) {
+                    ("build", Some(checked)) => checked.build().await?,
+                    ("pull", Some(checked)) => checked.pull().await?,
+                    _ => compose
+                        .run_action(action, None, None)
+                        .await
+                        .map_err(anyhow::Error::from)?,
+                };
                 Ok(VerbOutcome::Action(ActionOutcome {
                     changed: true,
                     message: format!("stack '{}' {action}: {}", row.name, out.trim()),
@@ -529,9 +536,15 @@ impl DockerUnitProvider {
             .map(|e| stacks::env_values(&e))
             .unwrap_or_default();
         let checked = async {
-            for files in staged.compose_sets(row) {
-                let raw = stacks::resolved_config(&live, &files, env.as_deref()).await?;
-                policy::check_stack(&raw, row, &live, &roots)?;
+            let sets = staged.compose_sets(row);
+            let Some(plain) = sets.first() else {
+                return Ok(());
+            };
+            // Definition digests come from the user's files alone, the first set.
+            let user_raw = stacks::resolved_config(&live, plain, env.as_deref()).await?;
+            for files in &sets {
+                let raw = stacks::resolved_config(&live, files, env.as_deref()).await?;
+                policy::check_stack(&raw, &user_raw, row, &live, &roots)?;
             }
             Ok::<_, anyhow::Error>(())
         }
@@ -634,6 +647,10 @@ impl DockerUnitProvider {
     }
 
     async fn do_update(&self, args: UpdateArgs) -> Result<VerbOutcome> {
+        crate::execute::refuse_non_admin(
+            &format!("docker {} update", args.id.kind),
+            args.caller.as_ref(),
+        )?;
         if args.id.kind == STACK_KIND {
             let name = args.id.id.clone();
             let secrets = stack_secrets(&name, args.payload.as_deref());
@@ -706,6 +723,10 @@ impl DockerUnitProvider {
     }
 
     async fn do_delete(&self, args: DeleteArgs) -> Result<VerbOutcome> {
+        crate::execute::refuse_non_admin(
+            &format!("docker {} delete", args.id.kind),
+            args.caller.as_ref(),
+        )?;
         if args.id.kind == STACK_KIND {
             // Delete is one command: tear the stack down (`compose down`), then
             // deregister it. No separate `action=down` step first.
@@ -738,6 +759,10 @@ impl DockerUnitProvider {
     }
 
     async fn do_upsert(&self, args: UpsertArgs) -> Result<VerbOutcome> {
+        crate::execute::refuse_non_admin(
+            &format!("docker {} upsert", args.id.kind),
+            args.caller.as_ref(),
+        )?;
         if args.id.kind == STACK_KIND {
             return match args.action.as_str() {
                 "set" => {
@@ -2277,6 +2302,66 @@ mod tests {
             Ok(_) => panic!("expected a refusal"),
             Err(e) => format!("{e:#}"),
         }
+    }
+
+    #[test]
+    fn a_present_non_admin_caller_is_refused_on_every_mutating_verb() {
+        use crate::test_support::caller;
+        let provider = DockerUnitProvider::new(crate::registration::adapter());
+        let id = |kind: &str| UnitId {
+            manager: "docker@test".into(),
+            kind: kind.into(),
+            id: "web".into(),
+            name: "web".into(),
+        };
+        let ((), _) = crate::test_support::with_db(|| {
+            for role in ["member", "user"] {
+                let who = Some(caller(role));
+                for (kind, action) in [
+                    (STACK_KIND, "restart"),
+                    (STACK_KIND, "volume_policy"),
+                    (STACK_KIND, ACTION_RESTORE),
+                    (KIND, "start"),
+                ] {
+                    let err = err_of(plugin_toolkit::reactor::block_on(provider.do_update(
+                        UpdateArgs {
+                            id: id(kind),
+                            action: action.into(),
+                            payload: None,
+                            caller: who.clone(),
+                        },
+                    )));
+                    crate::test_support::assert_admin_refusal(&err);
+                }
+                let err = err_of(plugin_toolkit::reactor::block_on(provider.do_delete(
+                    DeleteArgs {
+                        id: id(STACK_KIND),
+                        caller: who.clone(),
+                    },
+                )));
+                crate::test_support::assert_admin_refusal(&err);
+                let err = err_of(plugin_toolkit::reactor::block_on(provider.do_upsert(
+                    UpsertArgs {
+                        id: id(STACK_KIND),
+                        action: "set".into(),
+                        payload: None,
+                        caller: who.clone(),
+                    },
+                )));
+                crate::test_support::assert_admin_refusal(&err);
+            }
+            for who in [None, Some(caller("admin"))] {
+                let err = err_of(plugin_toolkit::reactor::block_on(provider.do_update(
+                    UpdateArgs {
+                        id: id(STACK_KIND),
+                        action: "restart".into(),
+                        payload: None,
+                        caller: who,
+                    },
+                )));
+                assert!(err.contains("no managed stack named 'web'"), "{err}");
+            }
+        });
     }
 
     #[test]

@@ -7,16 +7,24 @@
 //! verb. The policy is an allowlist over the resolved config (`compose
 //! config`, every profile enabled): a key it does not know is refused, and
 //! every setting that reaches the host (privileged, host or shared
-//! namespaces, extra capabilities, devices, binds outside the data roots,
-//! external volumes, the host network) needs a grant. Grants are
-//! recorded per `(service, image)` by an admin through `docker.stack_allow`,
-//! either one by one or by approving what the stack runs now; swapping a
-//! service's image drops its grants.
+//! namespaces, extra capabilities, devices, binds outside the stack dir,
+//! other projects' volumes and networks, the host network) needs a grant.
+//! Grants are recorded by an admin through `docker.stack_allow`, either one
+//! by one or by approving what the stack runs now. Each is bound to a digest
+//! of its service's whole resolved definition, so any change to the service
+//! (command, environment, image, mounts, ...) voids its grants until an admin
+//! approves again.
 //!
 //! A few things are refused outright, with no grant: a path with a `..`
 //! component or that cannot be resolved, a bind that contains the stack dir,
-//! its parent, a stacks root or a backup root, an env file, build context or
-//! Dockerfile outside the stack dir, and keys the policy does not know.
+//! its parent, a stacks root, a backup root or another stack's dir, a bind
+//! inside another stack's dir or of one of the stack's own compose or `.env`
+//! files, binds that nest inside one another, an env file, build context or
+//! Dockerfile outside the stack dir, a grant on a service that builds its
+//! image, and keys the policy does not know.
+//!
+//! [`gate`] returns the exact config it checked, and compose runs from that
+//! ([`Checked`]), so a compose file changed after the check is never used.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -24,9 +32,9 @@ use std::path::{Component, Path, PathBuf};
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::serde_json::{self, Value};
 
-use crate::compose::Compose;
+use crate::compose::{self, Compose};
 use crate::stacks::{self, StackDir, StackRow};
-use crate::{engine_state, execute, lint};
+use crate::{engine_state, execute, fsat};
 
 pub const ALLOW_PRIVILEGED: &str = "privileged";
 pub const ALLOW_PID_HOST: &str = "pid:host";
@@ -47,8 +55,14 @@ pub const ALLOW_CAP: &str = "cap_add:";
 /// Prefix of a per-path bind grant: `bind:/var/run/docker.sock`. Secret and
 /// config `file:` sources are bind mounts too and use the same grant.
 pub const ALLOW_BIND: &str = "bind:";
-/// Prefix of an external volume grant: `external_volume:<engine name>`.
+/// Prefix of a grant for a volume the project does not own, external or
+/// named outside the project: `external_volume:<engine name>`.
 pub const ALLOW_EXTERNAL_VOLUME: &str = "external_volume:";
+/// Prefix of a grant for a network the project does not own, external or
+/// named outside the project: `network:<engine name>`.
+pub const ALLOW_NETWORK: &str = "network:";
+/// Prefix of a network driver grant: `network_driver:macvlan`.
+pub const ALLOW_NETWORK_DRIVER: &str = "network_driver:";
 
 const FIXED_GRANTS: &[&str] = &[
     ALLOW_PRIVILEGED,
@@ -184,6 +198,13 @@ const NETWORK_KEYS: &[&str] = &[
     "internal",
     "labels",
 ];
+/// Network drivers that need no grant. `host` needs the host network grant;
+/// `macvlan` and `ipvlan` put the container on the host's LAN and need a
+/// driver grant; any other is refused.
+const PLAIN_NETWORK_DRIVERS: &[&str] = &["", "bridge", "overlay"];
+const GRANTED_NETWORK_DRIVERS: &[&str] = &["macvlan", "ipvlan"];
+/// `network_mode` values that join no named network.
+const PLAIN_NETWORK_MODES: &[&str] = &["", "bridge", "default", "none"];
 const VOLUME_KEYS: &[&str] = &["name", "driver", "driver_opts", "external", "labels"];
 const SECRET_KEYS: &[&str] = &[
     "name",
@@ -210,44 +231,51 @@ const BUILD_KEYS: &[&str] = &[
 ];
 /// `local` volume mount types that do not take a host path as `device`.
 const REMOTE_VOLUME_TYPES: &[&str] = &["nfs", "nfs4", "cifs", "tmpfs"];
+const DIGEST_PREFIX: &str = "sha256:";
 
-/// One exception an admin recorded: `allow` for `service` while it runs
-/// `image`.
+/// One exception an admin recorded: `allow` for `service` while its resolved
+/// definition hashes to `definition`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(crate = "plugin_toolkit::serde")]
 #[schemars(crate = "plugin_toolkit::schemars")]
 pub struct Grant {
     pub service: String,
-    /// The service's `image` as compose resolves it; empty for a service
-    /// that only builds.
-    pub image: String,
+    /// `sha256:<hex>` of the service's definition (see [`digests`]).
+    pub definition: String,
     pub allow: String,
 }
 
 impl std::fmt::Display for Grant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}|{}|{}", self.service, self.image, self.allow)
+        write!(f, "{}|{}|{}", self.service, self.definition, self.allow)
     }
 }
 
 impl std::str::FromStr for Grant {
     type Err = plugin_toolkit::anyhow::Error;
 
-    /// `<service>|<image>|<grant>`. Neither service names nor image
-    /// references can hold a `|`; the grant may.
+    /// `<service>|<definition>|<grant>`. Neither service names nor digests
+    /// can hold a `|`; the grant may.
     fn from_str(s: &str) -> Result<Self> {
         let mut parts = s.splitn(3, '|');
-        let (Some(service), Some(image), Some(allow)) = (parts.next(), parts.next(), parts.next())
+        let (Some(service), Some(definition), Some(allow)) =
+            (parts.next(), parts.next(), parts.next())
         else {
-            bail!("grant '{s}' must be '<service>|<image>|<grant>'");
+            bail!("grant '{s}' must be '<service>|<definition>|<grant>'");
         };
         if service.is_empty() {
             bail!("grant '{s}' names no service");
         }
+        let hex = definition.strip_prefix(DIGEST_PREFIX).unwrap_or("");
+        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!(
+                "grant '{s}' needs the service's definition digest ({DIGEST_PREFIX}<hex>) from the dry run"
+            );
+        }
         validate_grant(allow)?;
         Ok(Grant {
             service: service.to_string(),
-            image: image.to_string(),
+            definition: definition.to_string(),
             allow: allow.to_string(),
         })
     }
@@ -258,6 +286,8 @@ pub struct Violation {
     /// Empty for a project-level setting no service uses.
     pub service: String,
     pub image: String,
+    /// The service's definition digest; empty with no service.
+    pub definition: String,
     /// The grant that admits it; `None` when nothing can.
     pub allow: Option<String>,
     pub detail: String,
@@ -267,7 +297,7 @@ impl Violation {
     fn grant(&self) -> Option<Grant> {
         self.allow.as_ref().map(|allow| Grant {
             service: self.service.clone(),
-            image: self.image.clone(),
+            definition: self.definition.clone(),
             allow: allow.clone(),
         })
     }
@@ -278,12 +308,15 @@ pub type Resolver<'a> = &'a dyn Fn(&Path) -> Result<PathBuf>;
 /// The host paths the policy judges sources against, all resolved.
 pub struct Roots {
     stack_dir: PathBuf,
-    /// Configured data roots: binds inside them need no grant.
-    data: Vec<PathBuf>,
     /// A source that is or contains one of these is refused outright.
     protected: Vec<PathBuf>,
-    /// A source inside one of these needs a grant, data root or not.
-    backups: Vec<PathBuf>,
+    /// Other registered stacks' dirs: a source inside one is refused.
+    other_dirs: Vec<PathBuf>,
+    /// Other registered stacks' granted bind paths: a source may equal one,
+    /// never nest with one.
+    other_binds: Vec<PathBuf>,
+    /// File names in the stack dir that orca reads or writes, never bindable.
+    own_files: BTreeSet<String>,
 }
 
 impl Roots {
@@ -291,25 +324,53 @@ impl Roots {
         stack_dir: &Path,
         stacks_roots: &[String],
         backup_roots: &[String],
-        data_roots: &[String],
         resolve: Resolver<'_>,
     ) -> Result<Roots> {
         let stack_dir = resolve(stack_dir)?;
-        // Admin-configured, absolute without `..`: an unresolvable one is
-        // still judged as written.
-        let configured = |r: &String| resolve(Path::new(r)).unwrap_or_else(|_| PathBuf::from(r));
-        let backups: Vec<PathBuf> = backup_roots.iter().map(configured).collect();
         let mut protected = vec![stack_dir.clone()];
         protected.extend(stack_dir.parent().map(Path::to_path_buf));
-        protected.extend(stacks_roots.iter().map(configured));
-        protected.extend(backups.iter().cloned());
+        protected.extend(stacks_roots.iter().map(|r| configured(r, resolve)));
+        protected.extend(backup_roots.iter().map(|r| configured(r, resolve)));
+        let mut own_files = BTreeSet::new();
+        for name in compose::COMPOSE_FILES
+            .iter()
+            .chain(compose::OVERRIDE_FILES)
+            .chain(&[compose::ORCA_FILE, stacks::ENV_FILE])
+        {
+            own_files.insert(name.to_string());
+            own_files.insert(format!("{name}.bak"));
+        }
         Ok(Roots {
-            data: data_roots.iter().map(configured).collect(),
             stack_dir,
             protected,
-            backups,
+            other_dirs: Vec::new(),
+            other_binds: Vec::new(),
+            own_files,
         })
     }
+
+    /// With the other registered stacks' `dirs` and granted bind paths.
+    pub fn with_others(mut self, dirs: &[String], binds: &[String], resolve: Resolver<'_>) -> Self {
+        let dirs: Vec<PathBuf> = dirs.iter().map(|d| configured(d, resolve)).collect();
+        self.protected.extend(dirs.iter().cloned());
+        self.other_dirs = dirs;
+        self.other_binds = binds.iter().map(|b| configured(b, resolve)).collect();
+        self
+    }
+
+    /// With the stack's own compose file name, when it is not a conventional
+    /// one.
+    pub fn with_compose_file(mut self, file: &str) -> Self {
+        self.own_files.insert(file.to_string());
+        self.own_files.insert(format!("{file}.bak"));
+        self
+    }
+}
+
+/// An admin-configured path, absolute without `..`: one that cannot be
+/// resolved is still judged as written.
+fn configured(r: &str, resolve: Resolver<'_>) -> PathBuf {
+    resolve(Path::new(r)).unwrap_or_else(|_| PathBuf::from(r))
 }
 
 enum Judgment {
@@ -341,25 +402,36 @@ fn in_stack_dir(raw: &str, roots: &Roots, or_equal: bool, resolve: Resolver<'_>)
         .is_ok_and(|p| p.starts_with(&roots.stack_dir) && (or_equal || p != roots.stack_dir))
 }
 
-fn judge_source(raw: &str, roots: &Roots, resolve: Resolver<'_>) -> Judgment {
-    let p = match host_path(raw, resolve) {
-        Ok(p) => p,
-        Err(why) => return Judgment::Refuse(why),
-    };
-    if let Some(r) = roots.protected.iter().find(|r| r.starts_with(&p)) {
+/// A bind source: free strictly inside the stack dir, but for orca's own
+/// files there; a grant anywhere else. Sources are resolved now and docker
+/// resolves them again at mount time, so a writable parent could redirect a
+/// bind: data roots are not exempt, and [`Collector::nesting`] refuses binds
+/// that nest.
+fn judge_source(p: &Path, raw: &str, roots: &Roots) -> Judgment {
+    if let Some(r) = roots.protected.iter().find(|r| r.starts_with(p)) {
         return Judgment::Refuse(format!(
-            "'{raw}' contains {}, the stack dir, its parent, a stacks root or a backup root",
+            "'{raw}' contains {}, the stack dir, its parent, a stacks root, a backup root or another stack's dir",
             r.display()
         ));
     }
-    let grant = Judgment::Grant(format!("{ALLOW_BIND}{}", p.display()));
-    if roots.backups.iter().any(|b| p.starts_with(b)) {
-        return grant;
+    if let Some(d) = roots.other_dirs.iter().find(|d| p.starts_with(d)) {
+        return Judgment::Refuse(format!(
+            "'{raw}' is inside another stack's dir {}",
+            d.display()
+        ));
     }
-    if p.starts_with(&roots.stack_dir) || roots.data.iter().any(|d| p.starts_with(d)) {
+    if p.parent() == Some(roots.stack_dir.as_path())
+        && p.file_name()
+            .is_some_and(|n| roots.own_files.contains(&*n.to_string_lossy()))
+    {
+        return Judgment::Refuse(format!(
+            "'{raw}' is one of the stack's own compose or .env files"
+        ));
+    }
+    if p.starts_with(&roots.stack_dir) {
         return Judgment::Ok;
     }
-    grant
+    Judgment::Grant(format!("{ALLOW_BIND}{}", p.display()))
 }
 
 fn norm_cap(cap: &str) -> String {
@@ -429,7 +501,7 @@ const MODES: &[Mode] = &[
     },
     Mode {
         key: "network_mode",
-        ok: &[],
+        ok: PLAIN_NETWORK_MODES,
         host: ALLOW_NETWORK_HOST,
         shared: Some(ALLOW_NETWORK_SHARED),
     },
@@ -452,7 +524,15 @@ fn namespace(value: &str, mode: &Mode) -> Judgment {
 
 struct Collector<'a> {
     out: BTreeSet<Violation>,
-    services: &'a BTreeMap<String, String>,
+    /// Each service's image, for messages.
+    images: &'a BTreeMap<String, String>,
+    digests: &'a BTreeMap<String, String>,
+    /// Services with a `build` section.
+    builders: BTreeSet<String>,
+    /// Every resolved bind source and the services that use it.
+    binds: Vec<(PathBuf, Vec<String>)>,
+    /// The project's own prefix for volume and network names.
+    prefix: String,
 }
 
 impl Collector<'_> {
@@ -469,6 +549,62 @@ impl Collector<'_> {
         self.add(users, allow, detail.to_string());
     }
 
+    /// Judge the bind source `raw` and remember it for [`nesting`](Self::nesting).
+    fn bind(
+        &mut self,
+        users: &[&str],
+        raw: &str,
+        detail: &str,
+        roots: &Roots,
+        resolve: Resolver<'_>,
+    ) {
+        match host_path(raw, resolve) {
+            Ok(p) => {
+                let judgment = judge_source(&p, raw, roots);
+                self.binds
+                    .push((p, users.iter().map(|u| u.to_string()).collect()));
+                self.push(users, judgment, detail);
+            }
+            Err(why) => self.push(users, Judgment::Refuse(why), detail),
+        }
+    }
+
+    /// Refuse a bind that contains another bind of this stack, or nests with
+    /// one another stack holds a grant for: a container that can write the
+    /// outer one could swap a symlink in for the inner one before it is
+    /// mounted again. Equal sources are fine: a mount root cannot be replaced
+    /// from inside.
+    fn nesting(&mut self, roots: &Roots) {
+        let binds = std::mem::take(&mut self.binds);
+        for (p, users) in &binds {
+            let users: Vec<&str> = users.iter().map(String::as_str).collect();
+            if let Some((q, _)) = binds.iter().find(|(q, _)| q != p && q.starts_with(p)) {
+                self.push(
+                    &users,
+                    Judgment::Refuse(format!(
+                        "it contains {}, another bind of this stack",
+                        q.display()
+                    )),
+                    &format!("bind {}", p.display()),
+                );
+            }
+            if let Some(o) = roots
+                .other_binds
+                .iter()
+                .find(|o| *o != p && (o.starts_with(p) || p.starts_with(o)))
+            {
+                self.push(
+                    &users,
+                    Judgment::Refuse(format!(
+                        "it nests with {}, a bind another stack holds a grant for",
+                        o.display()
+                    )),
+                    &format!("bind {}", p.display()),
+                );
+            }
+        }
+    }
+
     fn add(&mut self, users: &[&str], allow: Option<String>, detail: String) {
         if users.is_empty() {
             // A grant is per service, so a setting no service uses cannot
@@ -480,17 +616,28 @@ impl Collector<'_> {
             self.out.insert(Violation {
                 service: String::new(),
                 image: String::new(),
+                definition: String::new(),
                 allow: None,
                 detail,
             });
             return;
         }
         for svc in users {
+            // A built image is not pinned by the service's definition: the
+            // context and Dockerfile can change under an unchanged digest.
+            let (allow, detail) = match allow.clone() {
+                Some(_) if self.builders.contains(*svc) => (
+                    None,
+                    format!("{detail} (a service that builds its image cannot hold a grant)"),
+                ),
+                other => (other, detail.clone()),
+            };
             self.out.insert(Violation {
                 service: svc.to_string(),
-                image: self.services.get(*svc).cloned().unwrap_or_default(),
-                allow: allow.clone(),
-                detail: detail.clone(),
+                image: self.images.get(*svc).cloned().unwrap_or_default(),
+                definition: self.digests.get(*svc).cloned().unwrap_or_default(),
+                allow,
+                detail,
             });
         }
     }
@@ -515,21 +662,101 @@ fn users_of<'a>(cfg: &'a Value, field: &str, name: &str) -> Vec<&'a str> {
         .collect()
 }
 
-/// Every setting in the resolved config `cfg` that needs a grant or is
-/// refused outright.
-pub fn violations(cfg: &Value, roots: &Roots, resolve: Resolver<'_>) -> Vec<Violation> {
-    let services: BTreeMap<String, String> = cfg
-        .get("services")
-        .and_then(Value::as_object)
-        .map(|m| {
-            m.iter()
-                .map(|(k, s)| (k.clone(), str_of(s.get("image")).to_string()))
-                .collect()
+/// `v` serialized with object keys sorted at every level, so the digest does
+/// not depend on key order.
+fn canonical(v: &Value, out: &mut String) {
+    match v {
+        Value::Object(o) => {
+            let mut keys: Vec<&String> = o.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (i, k) in keys.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&Value::String(k.clone()).to_string());
+                out.push(':');
+                canonical(&o[k], out);
+            }
+            out.push('}');
+        }
+        Value::Array(a) => {
+            out.push('[');
+            for (i, e) in a.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                canonical(e, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&other.to_string()),
+    }
+}
+
+/// Each service's definition digest over the user's own compose files'
+/// resolved config: the service with every key, the project name, and the
+/// top-level volumes, networks, secrets and configs it refers to.
+pub fn digests(cfg: &Value) -> BTreeMap<String, String> {
+    let Some(services) = cfg.get("services").and_then(Value::as_object) else {
+        return BTreeMap::new();
+    };
+    services
+        .iter()
+        .map(|(name, svc)| {
+            let mut refs = serde_json::Map::new();
+            for kind in ["volumes", "networks", "secrets", "configs"] {
+                let used: serde_json::Map<String, Value> = cfg
+                    .get(kind)
+                    .and_then(Value::as_object)
+                    .into_iter()
+                    .flatten()
+                    .filter(|(key, _)| users_of(cfg, kind, key).contains(&name.as_str()))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                refs.insert(kind.to_string(), Value::Object(used));
+            }
+            let mut text = String::new();
+            canonical(
+                &serde_json::json!({
+                    "project": cfg.get("name"),
+                    "service": svc,
+                    "refs": refs,
+                }),
+                &mut text,
+            );
+            let hex = plugin_toolkit::hash::sha256_hex(text.as_bytes());
+            (name.clone(), format!("{DIGEST_PREFIX}{hex}"))
         })
-        .unwrap_or_default();
+        .collect()
+}
+
+/// Every setting in the resolved config `cfg` that needs a grant or is
+/// refused outright, with grants bound to `digests`.
+pub fn violations(
+    cfg: &Value,
+    digests: &BTreeMap<String, String>,
+    roots: &Roots,
+    resolve: Resolver<'_>,
+) -> Vec<Violation> {
+    let all = cfg.get("services").and_then(Value::as_object);
+    let images: BTreeMap<String, String> = all
+        .into_iter()
+        .flatten()
+        .map(|(k, s)| (k.clone(), str_of(s.get("image")).to_string()))
+        .collect();
     let mut c = Collector {
         out: BTreeSet::new(),
-        services: &services,
+        images: &images,
+        digests,
+        builders: all
+            .into_iter()
+            .flatten()
+            .filter(|(_, s)| non_empty(s.get("build")))
+            .map(|(k, _)| k.clone())
+            .collect(),
+        binds: Vec::new(),
+        prefix: format!("{}_", str_of(cfg.get("name"))),
     };
     for key in keys_outside(cfg, &[TOP_KEYS]) {
         c.push(
@@ -539,11 +766,10 @@ pub fn violations(cfg: &Value, roots: &Roots, resolve: Resolver<'_>) -> Vec<Viol
         );
     }
     project_entries(cfg, &mut c, roots, resolve);
-    if let Some(all) = cfg.get("services").and_then(Value::as_object) {
-        for (name, svc) in all {
-            service(name, svc, &mut c, roots, resolve);
-        }
+    for (name, svc) in all.into_iter().flatten() {
+        service(name, svc, &mut c, roots, resolve);
     }
+    c.nesting(roots);
     c.out.into_iter().collect()
 }
 
@@ -556,20 +782,7 @@ fn project_entries(cfg: &Value, c: &mut Collector<'_>, roots: &Roots, resolve: R
     };
     for (key, net) in section("networks") {
         let users = users_of(cfg, "networks", key);
-        for k in keys_outside(net, &[NETWORK_KEYS]) {
-            c.push(
-                &users,
-                Judgment::Refuse("not supported".into()),
-                &format!("network {key}: key '{k}'"),
-            );
-        }
-        if str_of(net.get("name")) == "host" || str_of(net.get("driver")) == "host" {
-            c.push(
-                &users,
-                Judgment::Grant(ALLOW_NETWORK_HOST.into()),
-                &format!("network {key} is the host network"),
-            );
-        }
+        network(key, net, &users, c);
     }
     for (key, vol) in section("volumes") {
         let users = users_of(cfg, "volumes", key);
@@ -586,13 +799,64 @@ fn project_entries(cfg: &Value, c: &mut Collector<'_>, roots: &Roots, resolve: R
                 );
             }
             if let Some(file) = entry.get("file").and_then(Value::as_str) {
-                c.push(
+                c.bind(
                     &users,
-                    judge_source(file, roots, resolve),
+                    file,
                     &format!("{kind} {key} mounts host file {file}"),
+                    roots,
+                    resolve,
                 );
             }
         }
+    }
+}
+
+fn network(key: &str, net: &Value, users: &[&str], c: &mut Collector<'_>) {
+    for k in keys_outside(net, &[NETWORK_KEYS]) {
+        c.push(
+            users,
+            Judgment::Refuse("not supported".into()),
+            &format!("network {key}: key '{k}'"),
+        );
+    }
+    let name = net.get("name").and_then(Value::as_str).unwrap_or(key);
+    let driver = str_of(net.get("driver"));
+    if name == "host" || driver == "host" {
+        c.push(
+            users,
+            Judgment::Grant(ALLOW_NETWORK_HOST.into()),
+            &format!("network {key} is the host network"),
+        );
+        return;
+    }
+    let external = net.get("external").and_then(Value::as_bool) == Some(true);
+    if external || !name.starts_with(&c.prefix) {
+        let prefix = c.prefix.clone();
+        c.push(
+            users,
+            Judgment::Grant(format!("{ALLOW_NETWORK}{name}")),
+            &format!(
+                "network {key} joins {name}, {}",
+                if external {
+                    "an external network".to_string()
+                } else {
+                    format!("named outside the project's '{prefix}' prefix")
+                }
+            ),
+        );
+    }
+    if GRANTED_NETWORK_DRIVERS.contains(&driver) {
+        c.push(
+            users,
+            Judgment::Grant(format!("{ALLOW_NETWORK_DRIVER}{driver}")),
+            &format!("network {key} uses the {driver} driver"),
+        );
+    } else if !PLAIN_NETWORK_DRIVERS.contains(&driver) {
+        c.push(
+            users,
+            Judgment::Refuse(format!("driver '{driver}' is not supported")),
+            &format!("network {key}"),
+        );
     }
 }
 
@@ -611,12 +875,19 @@ fn volume(
             &format!("volume {key}: key '{k}'"),
         );
     }
+    let name = vol.get("name").and_then(Value::as_str).unwrap_or(key);
     if vol.get("external").and_then(Value::as_bool) == Some(true) {
-        let name = vol.get("name").and_then(Value::as_str).unwrap_or(key);
         c.push(
             users,
             Judgment::Grant(format!("{ALLOW_EXTERNAL_VOLUME}{name}")),
             &format!("volume {key} is the external volume {name}"),
+        );
+    } else if !name.starts_with(&c.prefix) {
+        let prefix = c.prefix.clone();
+        c.push(
+            users,
+            Judgment::Grant(format!("{ALLOW_EXTERNAL_VOLUME}{name}")),
+            &format!("volume {key} is {name}, named outside the project's '{prefix}' prefix"),
         );
     }
     let driver = str_of(vol.get("driver"));
@@ -637,10 +908,12 @@ fn volume(
         .split(',')
         .any(|o| matches!(o.trim(), "bind" | "rbind"));
     if binds {
-        c.push(
+        c.bind(
             users,
-            judge_source(device, roots, resolve),
+            device,
             &format!("volume {key} binds host path {device}"),
+            roots,
+            resolve,
         );
     } else if !REMOTE_VOLUME_TYPES.contains(&kind) {
         c.push(
@@ -671,13 +944,20 @@ fn service(name: &str, svc: &Value, c: &mut Collector<'_>, roots: &Roots, resolv
     }
     for mode in MODES {
         let value = str_of(svc.get(mode.key));
-        // Any other network_mode names a network, which `networks` judges.
+        // Any other network_mode joins the network it names directly.
         if mode.key == "network_mode"
-            && !value.is_empty()
+            && !PLAIN_NETWORK_MODES.contains(&value)
             && value != "host"
             && !value.starts_with("container:")
             && !value.starts_with("service:")
         {
+            if !value.starts_with(&c.prefix) {
+                c.push(
+                    &me,
+                    Judgment::Grant(format!("{ALLOW_NETWORK}{value}")),
+                    &format!("network_mode: {value} joins a network outside the project"),
+                );
+            }
             continue;
         }
         c.push(
@@ -749,10 +1029,12 @@ fn service(name: &str, svc: &Value, c: &mut Collector<'_>, roots: &Roots, resolv
         let source = str_of(m.get("source"));
         let target = str_of(m.get("target"));
         match str_of(m.get("type")) {
-            "bind" => c.push(
+            "bind" => c.bind(
                 &me,
-                judge_source(source, roots, resolve),
+                source,
                 &format!("binds host path {source} into {target}"),
+                roots,
+                resolve,
             ),
             "volume" | "tmpfs" | "image" => {}
             other => c.push(
@@ -830,11 +1112,11 @@ fn build_section(
     }
 }
 
-/// Whether `grant` admits `allow` for `v`'s service and image. Bind grants
-/// match by resolved path, so a grant written through a symlink still
+/// Whether `grant` admits `allow` for `v`'s service and definition. Bind
+/// grants match by resolved path, so a grant written through a symlink still
 /// matches.
 fn admits(g: &Grant, v: &Violation, allow: &str, resolve: Resolver<'_>) -> bool {
-    if g.service != v.service || g.image != v.image {
+    if g.service != v.service || v.definition.is_empty() || g.definition != v.definition {
         return false;
     }
     if g.allow == allow {
@@ -851,9 +1133,16 @@ fn admits(g: &Grant, v: &Violation, allow: &str, resolve: Resolver<'_>) -> bool 
     }
 }
 
-/// Refuse `cfg` unless every violation is granted to its service and image.
-pub fn check(cfg: &Value, grants: &[Grant], roots: &Roots, resolve: Resolver<'_>) -> Result<()> {
-    let refused: Vec<Violation> = violations(cfg, roots, resolve)
+/// Refuse `cfg` unless every violation is granted to its service and
+/// definition.
+pub fn check(
+    cfg: &Value,
+    digests: &BTreeMap<String, String>,
+    grants: &[Grant],
+    roots: &Roots,
+    resolve: Resolver<'_>,
+) -> Result<()> {
+    let refused: Vec<Violation> = violations(cfg, digests, roots, resolve)
         .into_iter()
         .filter(|v| match &v.allow {
             Some(allow) => !grants.iter().any(|g| admits(g, v, allow, resolve)),
@@ -887,62 +1176,161 @@ fn parse(raw: &str) -> Result<Value> {
     serde_json::from_str(raw).context("parsing `compose config --format json`")
 }
 
-fn live_roots(stack_dir: &Path, stacks_roots: &[String]) -> Result<Roots> {
-    Roots::new(
+/// The roots `row`, whose dir is `stack_dir`, is judged against, with every
+/// other registered stack's dir and bind grants.
+fn live_roots(row: &StackRow, stack_dir: &Path, stacks_roots: &[String]) -> Result<Roots> {
+    let others: Vec<StackRow> = stacks::list()?
+        .into_iter()
+        .filter(|r| r.name != row.name)
+        .collect();
+    let dirs: Vec<String> = others.iter().map(|r| r.dir.clone()).collect();
+    let binds: Vec<String> = others
+        .iter()
+        .flat_map(|r| &r.allow)
+        .filter_map(|g| g.allow.strip_prefix(ALLOW_BIND).map(String::from))
+        .collect();
+    let resolve = &crate::lifecycle::resolve;
+    Ok(Roots::new(
         stack_dir,
         stacks_roots,
         &engine_state::backup_roots(),
-        &lint::managed_roots(None),
-        &crate::lifecycle::resolve,
-    )
+        resolve,
+    )?
+    .with_others(&dirs, &binds, resolve)
+    .with_compose_file(&row.file))
 }
 
 /// Check the resolved config `raw` of `row`, whose dir is `stack_dir`,
-/// against the row's grants, the configured data roots and the backup roots.
+/// against the row's grants. `user_raw` is the resolved config of the user's
+/// own files (without [`compose::ORCA_FILE`]), which the definition digests
+/// are taken from.
 pub fn check_stack(
     raw: &str,
+    user_raw: &str,
     row: &StackRow,
     stack_dir: &Path,
     stacks_roots: &[String],
 ) -> Result<()> {
-    let roots = live_roots(stack_dir, stacks_roots)?;
-    check(&parse(raw)?, &row.allow, &roots, &crate::lifecycle::resolve)
+    let roots = live_roots(row, stack_dir, stacks_roots)?;
+    check(
+        &parse(raw)?,
+        &digests(&parse(user_raw)?),
+        &row.allow,
+        &roots,
+        &crate::lifecycle::resolve,
+    )
 }
 
 /// The stack dir, opened under a stacks root, and the resolved config of
-/// exactly `compose`'s files.
-async fn resolved(row: &StackRow, compose: &Compose) -> Result<(StackDir, Vec<String>, String)> {
+/// exactly `compose`'s files and of the user's own files among them.
+async fn resolved(
+    row: &StackRow,
+    compose: &Compose,
+) -> Result<(StackDir, Vec<String>, String, String)> {
     let roots = crate::tools::stacks_roots()?;
     let dir = StackDir::open(&row.dir, &roots, false)?
         .ok_or_else(|| anyhow!("stack dir {} does not exist", row.dir))?;
-    let files: Vec<PathBuf> = compose.files().into_iter().map(Path::to_path_buf).collect();
-    let raw = stacks::resolved_config(dir.path(), &files, None).await?;
-    Ok((dir, roots, raw))
+    let files =
+        |c: &Compose| -> Vec<PathBuf> { c.files().into_iter().map(Path::to_path_buf).collect() };
+    let raw = stacks::resolved_config(dir.path(), &files(compose), None).await?;
+    let user = compose.without_orca();
+    let user_raw = if user.files() == compose.files() {
+        raw.clone()
+    } else {
+        stacks::resolved_config(dir.path(), &files(&user), None).await?
+    };
+    Ok((dir, roots, raw, user_raw))
+}
+
+/// The config [`gate`] checked, which compose runs from.
+#[derive(Debug)]
+pub struct Checked {
+    dir: PathBuf,
+    project: String,
+    config: String,
+}
+
+impl Checked {
+    pub async fn up(&self, services: &[&str]) -> Result<String> {
+        self.run(&[&["up", "-d"], services].concat()).await
+    }
+
+    /// `up --no-start`.
+    pub async fn create(&self, services: &[&str]) -> Result<String> {
+        self.run(&[&["up", "--no-start"], services].concat()).await
+    }
+
+    pub async fn build(&self) -> Result<String> {
+        self.run(&["build", "--no-cache"]).await
+    }
+
+    pub async fn pull(&self) -> Result<String> {
+        self.run(&["pull", "-q"]).await
+    }
+
+    /// `compose <sub>` over the checked config, written into a fresh 0700
+    /// dir no one else can write. The config is already interpolated, so
+    /// the stack's `.env` is not read again.
+    pub async fn run(&self, sub: &[&str]) -> Result<String> {
+        let tmp = fsat::PrivateDir::new("orca-compose-")?;
+        let file = tmp.write("config.json", self.config.as_bytes())?;
+        let args = checked_args(&self.project, &self.dir, &file, sub);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        crate::run(&argv, None).await
+    }
+}
+
+fn checked_args(project: &str, dir: &Path, file: &Path, sub: &[&str]) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "compose",
+        "-p",
+        project,
+        "--project-directory",
+        &dir.to_string_lossy(),
+        "--env-file",
+        "/dev/null",
+        "-f",
+        &file.to_string_lossy(),
+    ]
+    .map(String::from)
+    .to_vec();
+    args.extend(sub.iter().map(|s| s.to_string()));
+    args
 }
 
 /// Refuse to run `compose` for `row` unless its stack dir is inside a stacks
 /// root and the config of exactly `compose`'s files passes [`check_stack`].
-pub async fn gate(row: &StackRow, compose: &Compose) -> Result<()> {
-    let (dir, roots, raw) = resolved(row, compose).await?;
-    check_stack(&raw, row, dir.path(), &roots)
+/// Returns that config to run compose from.
+pub async fn gate(row: &StackRow, compose: &Compose) -> Result<Checked> {
+    let (dir, roots, raw, user_raw) = resolved(row, compose).await?;
+    check_stack(&raw, &user_raw, row, dir.path(), &roots)?;
+    let project = compose::parse_project_name(&raw).ok_or_else(|| {
+        anyhow!(
+            "compose config for stack '{}' has no project name",
+            row.name
+        )
+    })?;
+    Ok(Checked {
+        dir: dir.path().to_path_buf(),
+        project,
+        config: raw,
+    })
 }
 
 /// What `row` runs now that needs a grant, for an admin to approve. Fails on
 /// anything no grant can admit.
 async fn current_grants(row: &StackRow) -> Result<Vec<Grant>> {
     let compose = row.compose()?;
-    let compose = if Path::new(&row.dir)
-        .join(crate::compose::ORCA_FILE)
-        .is_file()
-    {
+    let compose = if Path::new(&row.dir).join(compose::ORCA_FILE).is_file() {
         compose.with_orca()
     } else {
         compose
     };
-    let (dir, roots, raw) = resolved(row, &compose).await?;
+    let (dir, roots, raw, user_raw) = resolved(row, &compose).await?;
     let found = violations(
         &parse(&raw)?,
-        &live_roots(dir.path(), &roots)?,
+        &digests(&parse(&user_raw)?),
+        &live_roots(row, dir.path(), &roots)?,
         &crate::lifecycle::resolve,
     );
     let refused: Vec<String> = found
@@ -971,15 +1359,26 @@ fn validate_grant(grant: &str) -> Result<()> {
         }
         return Ok(());
     }
-    if let Some(name) = grant.strip_prefix(ALLOW_EXTERNAL_VOLUME) {
-        if name.is_empty() || name.contains('/') {
-            bail!("grant '{grant}' needs a volume name");
+    for prefix in [ALLOW_EXTERNAL_VOLUME, ALLOW_NETWORK] {
+        if let Some(name) = grant.strip_prefix(prefix) {
+            if name.is_empty() || name.contains('/') {
+                bail!("grant '{grant}' needs an engine name");
+            }
+            return Ok(());
+        }
+    }
+    if let Some(driver) = grant.strip_prefix(ALLOW_NETWORK_DRIVER) {
+        if !GRANTED_NETWORK_DRIVERS.contains(&driver) {
+            bail!(
+                "grant '{grant}' needs one of the drivers {}",
+                GRANTED_NETWORK_DRIVERS.join(", ")
+            );
         }
         return Ok(());
     }
     let Some(path) = grant.strip_prefix(ALLOW_BIND) else {
         bail!(
-            "unknown grant '{grant}'; expected one of {}, {ALLOW_CAP}<CAP>, {ALLOW_EXTERNAL_VOLUME}<name> or {ALLOW_BIND}<absolute path>",
+            "unknown grant '{grant}'; expected one of {}, {ALLOW_CAP}<CAP>, {ALLOW_EXTERNAL_VOLUME}<name>, {ALLOW_NETWORK}<name>, {ALLOW_NETWORK_DRIVER}<driver> or {ALLOW_BIND}<absolute path>",
             FIXED_GRANTS.join(", ")
         );
     };
@@ -1003,20 +1402,27 @@ pub struct DockerStackAllowArgs {
     #[arg(long)]
     pub name: String,
     /// The full grant set, replacing the current one, each
-    /// `<service>|<image>|<grant>`. A grant is `privileged`, `pid:host`,
-    /// `pid:shared`, `ipc:host`, `ipc:shared`, `network_mode:host`,
-    /// `network_mode:shared`, `userns_mode:host`, `cgroup:host`,
-    /// `security_opt`, `devices`, `volumes_from`, `cap_add:<CAP>`,
-    /// `external_volume:<name>` or `bind:<absolute host path>`. Repeatable;
-    /// empty clears every grant.
+    /// `<service>|<definition>|<grant>`, the definition digest as the
+    /// policy refusal or an `approve_current` dry run shows it. A grant is
+    /// `privileged`, `pid:host`, `pid:shared`, `ipc:host`, `ipc:shared`,
+    /// `network_mode:host`, `network_mode:shared`, `userns_mode:host`,
+    /// `cgroup:host`, `security_opt`, `devices`, `volumes_from`,
+    /// `cap_add:<CAP>`, `external_volume:<name>`, `network:<name>`,
+    /// `network_driver:macvlan|ipvlan` or `bind:<absolute host path>`.
+    /// Repeatable; empty clears every grant.
     #[arg(long = "allow")]
     #[serde(default)]
     pub allow: Vec<String>,
     /// Add a grant for everything the stack's compose files on disk use now
-    /// that needs one, each bound to its service's current image.
+    /// that needs one, each bound to its service's current definition.
     #[arg(long)]
     #[serde(default)]
     pub approve_current: bool,
+    /// With `approve_current`, execute needs the dry run's `after` list
+    /// echoed here, and is refused when the grants would differ from it.
+    #[arg(long = "item")]
+    #[serde(default)]
+    pub items: Vec<String>,
     /// Record the grants. Omitted, returns them and changes nothing.
     #[arg(long)]
     #[serde(default)]
@@ -1037,8 +1443,8 @@ pub struct DockerStackAllowOutput {
 }
 
 /// [MUTATES STATE] Set the compose policy grants of a managed stack, each
-/// bound to a service and the image it runs. Without `execute`, returns the
-/// grants and changes nothing.
+/// bound to a service and its resolved definition. Without `execute`,
+/// returns the grants and changes nothing.
 #[orca_tool(
     domain = "docker",
     verb = "stack_allow",
@@ -1064,13 +1470,32 @@ async fn docker_stack_allow(
     let show = |g: &[Grant]| g.iter().map(Grant::to_string).collect::<Vec<_>>();
     let before = show(&row.allow);
     if !args.execute {
+        let how = if args.approve_current {
+            format!("re-invoke {ALLOW_TOOL} with `execute: true` and `items` set to `after`")
+        } else {
+            format!("re-invoke {ALLOW_TOOL} with `execute: true`")
+        };
         return Ok(DockerStackAllowOutput {
             dry_run: true,
             name: args.name,
             before,
             after: show(&after),
-            how_to_execute: Some(format!("re-invoke {ALLOW_TOOL} with `execute: true`")),
+            how_to_execute: Some(how),
         });
+    }
+    if args.approve_current {
+        let planned = show(&after);
+        execute::require_confirmed(ALLOW_TOOL, &args.items, &planned)?;
+        let mut confirmed = args.items.clone();
+        confirmed.sort();
+        confirmed.dedup();
+        let mut planned = planned;
+        planned.sort();
+        if confirmed != planned {
+            bail!(
+                "{ALLOW_TOOL}: the grants to record differ from the confirmed items (the stack changed since the dry run?); re-run the dry run"
+            );
+        }
     }
     row.allow = after;
     stacks::put(&row)?;
@@ -1104,7 +1529,6 @@ mod tests {
             Path::new(STACK),
             &["/opt/stacks".to_string()],
             &["/mnt/backups".to_string()],
-            &["/opt/appdata".to_string(), "/mnt/data".to_string()],
             &lexical,
         )
         .unwrap()
@@ -1130,9 +1554,21 @@ mod tests {
         service(json!({"volumes": [{"type": "bind", "source": source, "target": "/x"}]}))
     }
 
+    /// `app|<app's digest in c>|<allow>`.
+    fn grant_for(c: &Value, allow: &str) -> String {
+        format!("app|{}|{allow}", digests(c)["app"])
+    }
+
+    fn check_with(c: &Value, allow: &[&str], roots: &Roots) -> Result<()> {
+        let g: Vec<Grant> = allow
+            .iter()
+            .map(|a| grant_for(c, a).parse().unwrap())
+            .collect();
+        check(c, &digests(c), &g, roots, &lexical)
+    }
+
     fn grants(c: &Value, allow: &[&str]) -> Result<()> {
-        let g: Vec<Grant> = allow.iter().map(|a| a.parse().unwrap()).collect();
-        check(c, &g, &roots(), &lexical)
+        check_with(c, allow, &roots())
     }
 
     fn refused(c: &Value) -> String {
@@ -1143,6 +1579,10 @@ mod tests {
         let err = refused(c);
         assert!(err.contains("cannot be granted"), "{err}");
         err
+    }
+
+    fn found(c: &Value) -> Vec<Violation> {
+        violations(c, &digests(c), &roots(), &lexical)
     }
 
     #[test]
@@ -1158,12 +1598,10 @@ mod tests {
                 "x-note": 1,
                 "environment": {"A": "1"},
                 "env_file": [{"path": "/opt/stacks/web/app.env"}],
-                "build": {"context": "/opt/stacks/web", "dockerfile": "Dockerfile"},
                 "networks": {"default": null},
                 "volumes": [
                     {"type": "bind", "source": "/opt/stacks/web/config", "target": "/config"},
-                    {"type": "bind", "source": "/mnt/data/media", "target": "/media"},
-                    {"type": "bind", "source": "/opt/appdata/web", "target": "/data"},
+                    {"type": "bind", "source": "/opt/stacks/web/config.yml", "target": "/c.yml"},
                     {"type": "volume", "source": "db", "target": "/db"},
                     {"type": "tmpfs", "target": "/tmp"}
                 ],
@@ -1173,11 +1611,7 @@ mod tests {
             "networks": {"default": {"name": "web_default", "ipam": {}}},
             "secrets": {"token": {"name": "web_token", "file": "/opt/stacks/web/token"}}
         });
-        assert!(
-            violations(&c, &roots(), &lexical).is_empty(),
-            "{:?}",
-            violations(&c, &roots(), &lexical)
-        );
+        assert!(found(&c).is_empty(), "{:?}", found(&c));
     }
 
     #[test]
@@ -1193,7 +1627,7 @@ mod tests {
         }
         let vol = cfg_with(json!({
             "services": {"app": {"image": "x:1", "volumes": [{"type": "volume", "source": "v", "target": "/v"}]}},
-            "volumes": {"v": {"driver_opts": {"type": "none", "o": "bind", "device": "/mnt/data/../../"}}}
+            "volumes": {"v": {"name": "web_v", "driver_opts": {"type": "none", "o": "bind", "device": "/mnt/data/../../"}}}
         }));
         assert!(ungrantable(&vol).contains("'..'"));
         let secret = cfg_with(json!({
@@ -1206,7 +1640,8 @@ mod tests {
     #[test]
     fn an_unresolvable_source_is_refused_not_judged_as_written() {
         let failing = |_: &Path| -> Result<PathBuf> { bail!("permission denied") };
-        let err = check(&bind("/mnt/data/x"), &[], &roots(), &failing)
+        let c = bind("/mnt/data/x");
+        let err = check(&c, &digests(&c), &[], &roots(), &failing)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1222,9 +1657,13 @@ mod tests {
             "/opt/appdata-other/x",
             "/opt/stacks/webapp/x",
         ] {
-            let err = refused(&bind(src));
+            let c = bind(src);
+            let err = refused(&c);
             assert!(
-                err.contains(&format!("grant 'app|x:1|bind:{src}'")),
+                err.contains(&format!(
+                    "grant '{}'",
+                    grant_for(&c, &format!("bind:{src}"))
+                )),
                 "{src}: {err}"
             );
         }
@@ -1236,30 +1675,103 @@ mod tests {
             let err = ungrantable(&bind(src));
             assert!(err.contains("contains"), "{src}: {err}");
         }
-        assert!(grants(&bind("/opt/stacks"), &["app|x:1|bind:/opt/stacks"]).is_err());
+        assert!(grants(&bind("/opt/stacks"), &["bind:/opt/stacks"]).is_err());
     }
 
     #[test]
-    fn binds_outside_the_data_roots_need_a_grant() {
+    fn every_bind_outside_the_stack_dir_needs_a_grant_data_roots_included() {
         for src in [
             "/etc",
             "/var/run/docker.sock",
             "/root/.ssh",
-            "/mnt/willow/media",
+            "/mnt/data/media",
+            "/opt/appdata/web",
             "/opt/stacks/other/data",
             "/mnt/backups/web",
         ] {
-            let err = refused(&bind(src));
+            let c = bind(src);
+            let err = refused(&c);
             assert!(
-                err.contains(&format!("grant 'app|x:1|bind:{src}'")),
+                err.contains(&format!(
+                    "grant '{}'",
+                    grant_for(&c, &format!("bind:{src}"))
+                )),
                 "{src}: {err}"
             );
+            grants(&c, &[&format!("bind:{src}")]).unwrap();
         }
-        grants(
-            &bind("/mnt/backups/web"),
-            &["app|x:1|bind:/mnt/backups/web"],
-        )
-        .unwrap();
+    }
+
+    #[test]
+    fn binds_that_nest_within_the_stack_are_refused_even_granted() {
+        let two = |a: &str, b: &str| {
+            json!({"name": "web", "services": {
+                "app": {"image": "x:1", "volumes": [{"type": "bind", "source": a, "target": "/a"}]},
+                "db": {"image": "y:1", "volumes": [{"type": "bind", "source": b, "target": "/b"}]}
+            }})
+        };
+        let inside = two("/opt/stacks/web/data", "/opt/stacks/web/data/db");
+        let err = ungrantable(&inside);
+        assert!(err.contains("another bind of this stack"), "{err}");
+        let granted = two("/srv/x", "/srv/x/y");
+        let g: Vec<Grant> = [("app", "bind:/srv/x"), ("db", "bind:/srv/x/y")]
+            .iter()
+            .map(|(svc, a)| {
+                format!("{svc}|{}|{a}", digests(&granted)[*svc])
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        let err = check(&granted, &digests(&granted), &g, &roots(), &lexical)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("contains /srv/x/y"), "{err}");
+        let shared = two("/opt/stacks/web/media", "/opt/stacks/web/media");
+        assert!(found(&shared).is_empty(), "equal sources are fine");
+    }
+
+    #[test]
+    fn binds_into_another_stack_or_nesting_its_grants_are_refused() {
+        let others = || {
+            roots().with_others(
+                &["/opt/stacks/other".to_string()],
+                &["/srv/media".to_string()],
+                &lexical,
+            )
+        };
+        for src in [
+            "/opt/stacks/other/data",
+            "/opt/stacks/other",
+            "/srv",
+            "/srv/media/tv",
+        ] {
+            let c = bind(src);
+            let err = check_with(&c, &[&format!("bind:{src}")], &others())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("cannot be granted"), "{src}: {err}");
+        }
+        check_with(&bind("/srv/media"), &["bind:/srv/media"], &others()).unwrap();
+    }
+
+    #[test]
+    fn the_stacks_own_compose_and_env_files_cannot_be_bound() {
+        for name in [
+            "compose.yaml",
+            "docker-compose.yml",
+            "compose.override.yaml",
+            "compose.orca.yaml",
+            ".env",
+            ".env.bak",
+            "compose.yaml.bak",
+        ] {
+            let err = ungrantable(&bind(&format!("{STACK}/{name}")));
+            assert!(err.contains("own compose or .env"), "{name}: {err}");
+        }
+        let custom = roots().with_compose_file("prod.yml");
+        let c = bind(&format!("{STACK}/prod.yml"));
+        assert!(check(&c, &digests(&c), &[], &custom, &lexical).is_err());
+        assert!(found(&bind(&format!("{STACK}/sub/compose.yaml"))).is_empty());
     }
 
     #[test]
@@ -1270,12 +1782,13 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), stack.join("escape")).unwrap();
         let resolve = &crate::lifecycle::resolve;
-        let roots = Roots::new(&stack, &[], &[], &[], resolve).unwrap();
+        let roots = Roots::new(&stack, &[], &[], resolve).unwrap();
         let src = stack.join("escape/data").to_string_lossy().into_owned();
-        let found = violations(&bind(&src), &roots, resolve);
+        let c = bind(&src);
+        let found = violations(&c, &digests(&c), &roots, resolve);
         assert_eq!(found.len(), 1, "{found:?}");
-        let inside = stack.join("data").to_string_lossy().into_owned();
-        assert!(violations(&bind(&inside), &roots, resolve).is_empty());
+        let inside = bind(&stack.join("data").to_string_lossy());
+        assert!(violations(&inside, &digests(&inside), &roots, resolve).is_empty());
     }
 
     #[test]
@@ -1360,10 +1873,10 @@ mod tests {
             let c = service(extra.clone());
             let err = refused(&c);
             assert!(
-                err.contains(&format!("grant 'app|x:1|{grant}'")),
+                err.contains(&format!("grant '{}'", grant_for(&c, &grant))),
                 "{extra}: {err}"
             );
-            grants(&c, &[&format!("app|x:1|{grant}")]).unwrap();
+            grants(&c, &[&grant]).unwrap();
         }
     }
 
@@ -1386,8 +1899,56 @@ mod tests {
         }));
         let err = refused(&c);
         assert!(err.contains("network hn is the host network"), "{err}");
-        assert!(err.contains("grant 'app|x:1|network_mode:host'"), "{err}");
-        grants(&c, &["app|x:1|network_mode:host"]).unwrap();
+        assert!(err.contains(&grant_for(&c, "network_mode:host")), "{err}");
+        grants(&c, &["network_mode:host"]).unwrap();
+    }
+
+    #[test]
+    fn networks_and_volumes_the_project_does_not_own_need_a_grant() {
+        let net = |net: Value| {
+            cfg_with(json!({
+                "services": {"app": {"image": "x:1", "networks": {"n": null}}},
+                "networks": {"n": net}
+            }))
+        };
+        let vol = |name: &str| {
+            cfg_with(json!({
+                "services": {"app": {"image": "x:1", "volumes": [{"type": "volume", "source": "v", "target": "/v"}]}},
+                "volumes": {"v": {"name": name}}
+            }))
+        };
+        for (c, grant) in [
+            (
+                service(json!({"network_mode": "proxy_net"})),
+                "network:proxy_net",
+            ),
+            (
+                net(json!({"name": "proxy", "external": true})),
+                "network:proxy",
+            ),
+            (
+                net(json!({"name": "web_proxy", "external": true})),
+                "network:web_proxy",
+            ),
+            (net(json!({"name": "shared"})), "network:shared"),
+            (
+                net(json!({"name": "web_lan", "driver": "macvlan"})),
+                "network_driver:macvlan",
+            ),
+            (
+                net(json!({"name": "web_lan", "driver": "ipvlan"})),
+                "network_driver:ipvlan",
+            ),
+            (vol("other_data"), "external_volume:other_data"),
+        ] {
+            let err = refused(&c);
+            assert!(err.contains(&grant_for(&c, grant)), "{grant}: {err}");
+            grants(&c, &[grant]).unwrap();
+        }
+        assert!(found(&service(json!({"network_mode": "web_backend"}))).is_empty());
+        assert!(found(&net(json!({"name": "web_n", "driver": "bridge"}))).is_empty());
+        assert!(found(&vol("web_v")).is_empty());
+        ungrantable(&net(json!({"name": "web_n", "driver": "weird"})));
     }
 
     #[test]
@@ -1399,7 +1960,7 @@ mod tests {
             }));
             let err = refused(&c);
             assert!(
-                err.contains("grant 'app|x:1|bind:/etc/shadow'"),
+                err.contains(&grant_for(&c, "bind:/etc/shadow")),
                 "{kind}: {err}"
             );
         }
@@ -1431,64 +1992,137 @@ mod tests {
         }));
         let err = refused(&ext);
         assert!(
-            err.contains("grant 'app|x:1|external_volume:other_data'"),
+            err.contains(&grant_for(&ext, "external_volume:other_data")),
             "{err}"
         );
-        grants(&ext, &["app|x:1|external_volume:other_data"]).unwrap();
+        grants(&ext, &["external_volume:other_data"]).unwrap();
         for opts in [
             json!({"type": "none", "o": "bind", "device": "/"}),
             json!({"type": "ext4", "device": "/dev/sda1"}),
         ] {
             let c = cfg_with(json!({
                 "services": {"app": {"image": "x:1", "volumes": [{"type": "volume", "source": "v", "target": "/v"}]}},
-                "volumes": {"v": {"driver_opts": opts}}
+                "volumes": {"v": {"name": "web_v", "driver_opts": opts}}
             }));
             ungrantable(&c);
         }
         let nfs = cfg_with(json!({
             "services": {"app": {"image": "x:1", "volumes": [{"type": "volume", "source": "v", "target": "/v"}]}},
-            "volumes": {"v": {"driver_opts": {"type": "nfs", "o": "addr=10.0.0.2", "device": ":/export"}}}
+            "volumes": {"v": {"name": "web_v", "driver_opts": {"type": "nfs", "o": "addr=10.0.0.2", "device": ":/export"}}}
         }));
         grants(&nfs, &[]).unwrap();
     }
 
     #[test]
-    fn grants_bind_to_service_and_image() {
-        let c = service(json!({"privileged": true}));
-        grants(&c, &["app|x:1|privileged"]).unwrap();
-        let swapped =
-            json!({"name": "web", "services": {"app": {"image": "evil:1", "privileged": true}}});
-        let err = grants(&swapped, &["app|x:1|privileged"])
+    fn a_grant_is_void_once_anything_in_its_service_changes() {
+        let c = service(json!({"privileged": true, "command": ["sleep", "inf"]}));
+        let g: Grant = grant_for(&c, "privileged").parse().unwrap();
+        check(
+            &c,
+            &digests(&c),
+            std::slice::from_ref(&g),
+            &roots(),
+            &lexical,
+        )
+        .unwrap();
+        let changed = [
+            service(json!({"privileged": true, "command": ["sh", "-c", "evil"]})),
+            service(json!({"privileged": true, "command": ["sleep", "inf"], "entrypoint": ["sh"]})),
+            service(
+                json!({"privileged": true, "command": ["sleep", "inf"], "environment": {"LD_PRELOAD": "/x"}}),
+            ),
+            service(json!({"privileged": true, "command": ["sleep", "inf"], "user": "0"})),
+            service(
+                json!({"privileged": true, "command": ["sleep", "inf"], "working_dir": "/tmp"}),
+            ),
+            service(json!({"privileged": true, "command": ["sleep", "inf"], "image": "evil:1"})),
+            json!({"name": "other", "services": {"app": {"image": "x:1", "privileged": true, "command": ["sleep", "inf"]}}}),
+        ];
+        for c in changed {
+            let err = check(
+                &c,
+                &digests(&c),
+                std::slice::from_ref(&g),
+                &roots(),
+                &lexical,
+            )
             .unwrap_err()
             .to_string();
-        assert!(err.contains("grant 'app|evil:1|privileged'"), "{err}");
-        let moved =
-            json!({"name": "web", "services": {"other": {"image": "x:1", "privileged": true}}});
-        assert!(grants(&moved, &["app|x:1|privileged"]).is_err());
+            assert!(err.contains("privileged: true"), "{c}: {err}");
+        }
+        let vol = |opts: Value| {
+            cfg_with(json!({
+                "services": {"app": {"image": "x:1", "privileged": true, "volumes": [{"type": "volume", "source": "v", "target": "/v"}]}},
+                "volumes": {"v": {"name": "web_v", "driver_opts": opts}}
+            }))
+        };
+        let before = vol(json!({"type": "nfs", "device": ":/a"}));
+        let after = vol(json!({"type": "nfs", "device": ":/b"}));
+        assert_ne!(
+            digests(&before)["app"],
+            digests(&after)["app"],
+            "a referenced top-level entry is part of the definition"
+        );
+        let moved = json!({"name": "web", "services": {"other": {"image": "x:1", "privileged": true, "command": ["sleep", "inf"]}}});
+        assert!(check(&moved, &digests(&moved), &[g], &roots(), &lexical).is_err());
+    }
+
+    #[test]
+    fn digests_ignore_key_order() {
+        let a: Value =
+            serde_json::from_str(r#"{"name":"web","services":{"app":{"image":"x:1","user":"1"}}}"#)
+                .unwrap();
+        let b: Value =
+            serde_json::from_str(r#"{"services":{"app":{"user":"1","image":"x:1"}},"name":"web"}"#)
+                .unwrap();
+        assert_eq!(digests(&a), digests(&b));
+    }
+
+    #[test]
+    fn a_service_that_builds_cannot_hold_a_grant() {
+        for c in [
+            service(json!({"privileged": true, "build": {"context": STACK}})),
+            json!({"name": "web", "services": {"app": {"privileged": true, "build": {"context": STACK, "dockerfile_inline": "FROM x"}}}}),
+        ] {
+            let err = grants(&c, &["privileged"]).unwrap_err().to_string();
+            assert!(
+                err.contains("builds its image") && err.contains("cannot be granted"),
+                "{err}"
+            );
+        }
+        assert!(found(&service(json!({"build": {"context": STACK}}))).is_empty());
     }
 
     #[test]
     fn grant_strings_are_validated() {
-        for ok in [
-            "app|x:1|privileged",
-            "app|ghcr.io/a/b:2|pid:shared",
-            "app||cap_add:SYS_ADMIN",
-            "app|x|bind:/var/run/docker.sock",
-            "app|x|external_volume:shared",
+        let d = format!("sha256:{}", "a".repeat(64));
+        for allow in [
+            "privileged",
+            "pid:shared",
+            "cap_add:SYS_ADMIN",
+            "bind:/var/run/docker.sock",
+            "external_volume:shared",
+            "network:proxy",
+            "network_driver:macvlan",
         ] {
-            ok.parse::<Grant>().unwrap();
+            format!("app|{d}|{allow}").parse::<Grant>().unwrap();
         }
         for bad in [
-            "privileged",
-            "app|x",
-            "|x|privileged",
-            "app|x|root",
-            "app|x|bind:/",
-            "app|x|bind:relative",
-            "app|x|bind:/mnt/../etc",
-            "app|x|cap_add:",
-            "app|x|cap_add:sys admin",
-            "app|x|pid:container",
+            "privileged".to_string(),
+            "app|x".to_string(),
+            format!("|{d}|privileged"),
+            "app|x:1|privileged".to_string(),
+            "app||privileged".to_string(),
+            format!("app|sha256:{}|privileged", "a".repeat(63)),
+            format!("app|{d}|root"),
+            format!("app|{d}|bind:/"),
+            format!("app|{d}|bind:relative"),
+            format!("app|{d}|bind:/mnt/../etc"),
+            format!("app|{d}|cap_add:"),
+            format!("app|{d}|cap_add:sys admin"),
+            format!("app|{d}|pid:container"),
+            format!("app|{d}|network:"),
+            format!("app|{d}|network_driver:bridge"),
         ] {
             assert!(bad.parse::<Grant>().is_err(), "{bad}");
         }
@@ -1525,6 +2159,21 @@ mod tests {
         row
     }
 
+    fn allow(
+        approve_current: bool,
+        items: Vec<String>,
+        execute: bool,
+    ) -> Result<DockerStackAllowOutput> {
+        let args = DockerStackAllowArgs {
+            name: "web".into(),
+            allow: Vec::new(),
+            approve_current,
+            items,
+            execute,
+        };
+        plugin_toolkit::reactor::block_on(docker_stack_allow(args, &crate::test_support::admin()))
+    }
+
     #[test]
     fn real_compose_config_feeds_profiles_env_files_and_dotdot_binds_to_the_policy() {
         if !crate::test_support::have_compose() {
@@ -1548,6 +2197,10 @@ mod tests {
                     "services:\n  app:\n    image: x:1\n    env_file: [/etc/hosts]\n",
                     "env_file /etc/hosts",
                 ),
+                (
+                    "services:\n  app:\n    image: x:1\n    volumes: [\"./compose.yaml:/c.yaml\"]\n",
+                    "own compose or .env",
+                ),
             ] {
                 let err =
                     plugin_toolkit::reactor::block_on(row.write_checked(Some(yaml), None, &roots))
@@ -1563,7 +2216,7 @@ mod tests {
     }
 
     #[test]
-    fn on_disk_settings_run_only_once_approved_and_only_for_their_image() {
+    fn on_disk_settings_run_only_once_approved_and_only_while_unchanged() {
         if !crate::test_support::have_compose() {
             return;
         }
@@ -1574,39 +2227,98 @@ mod tests {
             let row = registered(&root, host);
             let compose = row.compose().unwrap();
             let err = plugin_toolkit::reactor::block_on(gate(&row, &compose)).unwrap_err();
-            assert!(
-                err.to_string()
-                    .contains("grant 'app|x:1|network_mode:host'"),
-                "{err}"
-            );
+            assert!(err.to_string().contains("|network_mode:host'"), "{err}");
 
-            let args = DockerStackAllowArgs {
-                name: "web".into(),
-                allow: Vec::new(),
-                approve_current: true,
-                execute: true,
-            };
-            let out = plugin_toolkit::reactor::block_on(docker_stack_allow(
-                args,
-                &crate::test_support::admin(),
-            ))
-            .unwrap();
-            assert_eq!(out.after, ["app|x:1|network_mode:host"]);
+            let plan = allow(true, Vec::new(), false).unwrap();
+            assert_eq!(plan.after.len(), 1);
+            assert!(
+                plan.after[0].ends_with("|network_mode:host"),
+                "{:?}",
+                plan.after
+            );
+            let err = allow(true, Vec::new(), true).unwrap_err().to_string();
+            assert!(err.contains("needs the items from the dry run"), "{err}");
+            let wrong = vec![plan.after[0].replace("network_mode:host", "privileged")];
+            let err = allow(true, wrong, true).unwrap_err().to_string();
+            assert!(err.contains("differ from the confirmed items"), "{err}");
+            assert!(stacks::require("web").unwrap().allow.is_empty());
+            allow(true, plan.after.clone(), true).unwrap();
             let row = stacks::require("web").unwrap();
             plugin_toolkit::reactor::block_on(gate(&row, &compose)).unwrap();
 
             let roots = crate::tools::stacks_roots().unwrap();
-            let swapped = host.replace("x:1", "evil:1");
-            let err =
-                plugin_toolkit::reactor::block_on(row.write_checked(Some(&swapped), None, &roots))
-                    .unwrap_err();
-            assert!(
-                err.to_string().contains("app (evil:1): network_mode: host"),
-                "{err}"
-            );
-            std::fs::write(root.join("web/compose.yaml"), &swapped).unwrap();
+            for changed in [
+                host.replace("x:1", "evil:1"),
+                format!("{host}    command: [sh, -c, evil]\n"),
+            ] {
+                let err = plugin_toolkit::reactor::block_on(row.write_checked(
+                    Some(&changed),
+                    None,
+                    &roots,
+                ))
+                .unwrap_err();
+                assert!(err.to_string().contains("network_mode: host"), "{err}");
+            }
+            std::fs::write(
+                root.join("web/compose.yaml"),
+                format!("{host}    command: [sh, -c, evil]\n"),
+            )
+            .unwrap();
             assert!(plugin_toolkit::reactor::block_on(gate(&row, &compose)).is_err());
         });
+    }
+
+    #[test]
+    fn compose_runs_the_config_that_was_checked_not_the_file_on_disk_now() {
+        if !crate::test_support::have_compose() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        crate::test_support::with_db(|| {
+            let row = registered(&root, "services:\n  app:\n    image: x:1\n");
+            std::fs::write(root.join("web/.env"), "IMG=y:2\n").unwrap();
+            let compose = row.compose().unwrap();
+            let checked = plugin_toolkit::reactor::block_on(gate(&row, &compose)).unwrap();
+            std::fs::write(
+                root.join("web/compose.yaml"),
+                "services:\n  app:\n    image: ${IMG}\n    privileged: true\n",
+            )
+            .unwrap();
+            let ran =
+                plugin_toolkit::reactor::block_on(checked.run(&["config", "--format", "json"]))
+                    .unwrap();
+            let cfg: Value = serde_json::from_str(&ran).unwrap();
+            assert_eq!(cfg["services"]["app"]["image"], "x:1", "{ran}");
+            assert!(cfg["services"]["app"].get("privileged").is_none(), "{ran}");
+            assert_eq!(cfg["name"], "web");
+        });
+    }
+
+    #[test]
+    fn checked_runs_name_no_user_file_and_read_no_env_file() {
+        let a = checked_args(
+            "web",
+            Path::new("/s/web"),
+            Path::new("/tmp/orca-compose-x/config.json"),
+            &["up", "-d"],
+        );
+        assert_eq!(
+            a,
+            [
+                "compose",
+                "-p",
+                "web",
+                "--project-directory",
+                "/s/web",
+                "--env-file",
+                "/dev/null",
+                "-f",
+                "/tmp/orca-compose-x/config.json",
+                "up",
+                "-d"
+            ]
+        );
     }
 
     #[test]
@@ -1620,8 +2332,9 @@ mod tests {
             for execute in [false, true] {
                 let args = DockerStackAllowArgs {
                     name: "web".into(),
-                    allow: vec!["app|x|privileged".into()],
+                    allow: vec![format!("app|sha256:{}|privileged", "a".repeat(64))],
                     approve_current: false,
+                    items: Vec::new(),
                     execute,
                 };
                 let err = plugin_toolkit::reactor::block_on(docker_stack_allow(args, &ctx))

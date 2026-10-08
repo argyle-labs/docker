@@ -512,11 +512,12 @@ pub async fn mark_existing(docker: &Docker, volumes: &mut [StackVolume]) -> Resu
 }
 
 async fn run_checked(program: &str, args: &[String], what: &str) -> Result<()> {
-    let mut cmd = plugin_toolkit::process::Command::new(program).args(args);
-    if let Some(host) = crate::docker_host().await {
-        cmd = cmd.env("DOCKER_HOST", host);
-    }
-    let out = cmd.output().await?;
+    // The dump runs `docker compose` through `sh`, which interpolates.
+    let out = crate::clean_command(program)
+        .await
+        .args(args)
+        .output()
+        .await?;
     if !out.status.success {
         anyhow::bail!("{what}: {}", String::from_utf8_lossy(&out.stderr).trim());
     }

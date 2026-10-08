@@ -70,11 +70,20 @@ pub struct ServiceSummary {
 /// Override files compose would auto-load next to the compose file, in its
 /// order. Passing `-f` turns auto-loading off, so the first one present must
 /// be passed explicitly.
-const OVERRIDE_FILES: &[&str] = &[
+pub const OVERRIDE_FILES: &[&str] = &[
     "compose.override.yml",
     "compose.override.yaml",
     "docker-compose.override.yml",
     "docker-compose.override.yaml",
+];
+
+/// The conventional compose file names, in the order [`Compose::find`] tries
+/// them.
+pub const COMPOSE_FILES: &[&str] = &[
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    "compose.yml",
+    "compose.yaml",
 ];
 
 /// orca's generated override (ownership labels, converted volumes), passed
@@ -101,12 +110,7 @@ impl Compose {
     /// Search `project_path` for the conventional compose filenames. Returns
     /// `None` when none are present (use [`Compose::open`] to error out).
     pub fn find(project_path: &Path) -> Option<Compose> {
-        for name in &[
-            "docker-compose.yml",
-            "docker-compose.yaml",
-            "compose.yml",
-            "compose.yaml",
-        ] {
+        for name in COMPOSE_FILES {
             if let Some(c) = Compose::at(&project_path.join(name)) {
                 return Some(c);
             }

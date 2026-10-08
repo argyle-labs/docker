@@ -8,8 +8,8 @@ use std::ffi::CString;
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::ffi::OsStrExt;
-use std::path::{Component, Path};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -178,6 +178,54 @@ pub fn set_owner(file: &File, uid: u32, gid: u32) -> io::Result<()> {
     }
 }
 
+/// A fresh 0700 dir under the system temp dir, removed with its contents on
+/// drop. Only its owner can write in it, and the temp dir's sticky bit keeps
+/// anyone else from renaming it away.
+pub struct PrivateDir {
+    path: PathBuf,
+    fd: File,
+}
+
+impl PrivateDir {
+    pub fn new(prefix: &str) -> io::Result<Self> {
+        let template = std::env::temp_dir().join(format!("{prefix}XXXXXX"));
+        let mut buf = cpath(&template)?.into_bytes_with_nul();
+        // SAFETY: `buf` is a writable NUL-terminated template; mkdtemp
+        // rewrites the trailing Xs in place.
+        if unsafe { libc::mkdtemp(buf.as_mut_ptr().cast()) }.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        buf.pop();
+        let path = PathBuf::from(std::ffi::OsString::from_vec(buf));
+        let fd = open_dir(&path)?;
+        Ok(PrivateDir { path, fd })
+    }
+
+    /// Create `name` (0600) in the dir with `contents`; its path.
+    pub fn write(&self, name: &str, contents: &[u8]) -> io::Result<PathBuf> {
+        use std::io::Write;
+        let mut f = open_at(
+            &self.fd,
+            name,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        )?;
+        f.write_all(contents)?;
+        Ok(self.path.join(name))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for PrivateDir {
+    fn drop(&mut self) {
+        // Best effort: a leftover dir is private to its owner.
+        let _removed = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,5 +254,19 @@ mod tests {
         assert_eq!(stat_at(&d, "link").unwrap().unwrap().kind, Kind::Symlink);
         assert!(stat_at(&d, "missing").unwrap().is_none());
         assert!(open_dir(&dir.path().join("dlink")).is_err());
+    }
+
+    #[test]
+    fn a_private_dir_is_owner_only_and_removed_on_drop() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = PrivateDir::new("orca-test-").unwrap();
+        let mode = std::fs::metadata(d.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        let f = d.write("c.json", b"{}").unwrap();
+        assert_eq!(std::fs::read(&f).unwrap(), b"{}");
+        assert!(d.write("c.json", b"x").is_err(), "never overwrites");
+        let path = d.path().to_path_buf();
+        drop(d);
+        assert!(!path.exists());
     }
 }
