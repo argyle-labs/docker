@@ -643,7 +643,8 @@ impl Collector<'_> {
         roots: &Roots,
         resolve: Resolver<'_>,
     ) {
-        match host_path(raw, resolve) {
+        // compose prints a literal `$` as `$$`; the mount uses the literal.
+        match host_path(&raw.replace("$$", "$"), resolve) {
             Ok(p) => {
                 let judgment = judge_source(&p, raw, roots);
                 self.binds
@@ -1412,10 +1413,16 @@ pub fn prepare(raw: &str, base: &Path, dir: &StackDir) -> Result<Value> {
                 None if !required => continue,
                 None => bail!("service {name}: env_file {path} does not exist"),
             };
-            for (k, v) in stacks::env_pairs(&text) {
+            for e in stacks::parse_env(&text) {
+                if e.expands {
+                    bail!(
+                        "service {name}: env_file {path} sets {} from a variable (`$VAR` or `${{VAR}}`), which orca does not expand; put the value in single quotes or escape the `$` as `\\$` in double quotes",
+                        e.key
+                    );
+                }
                 // Escaped as compose prints `environment`, so a rerun reads
                 // it back verbatim.
-                env.insert(k, Value::String(v.replace('$', "$$")));
+                env.insert(e.key, Value::String(e.value.replace('$', "$$")));
             }
         }
         if let Some(Value::Object(own)) = svc.get("environment") {
@@ -2722,6 +2729,55 @@ mod tests {
     }
 
     #[test]
+    fn literal_dollars_stay_literal_through_the_checked_run() {
+        if !crate::test_support::have_compose() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let fake = engine(&[]);
+        let docker = fake.client();
+        crate::test_support::with_db(|| {
+            let row = registered(
+                &root,
+                "services:\n  app:\n    image: x:1\n    command: [echo, \"a$$b\"]\n    labels:\n      l: \"c$$d\"\n    environment:\n      E: \"e$$f\"\n    volumes: [\"./d$$x:/x\"]\n",
+            );
+            let compose = row.compose().unwrap();
+            let (_, _, cfg, _) =
+                plugin_toolkit::reactor::block_on(resolved(&row, &compose)).unwrap();
+            let checked =
+                plugin_toolkit::reactor::block_on(gate(Some(&docker), &row, &compose)).unwrap();
+            let ran =
+                plugin_toolkit::reactor::block_on(checked.run(&["config", "--format", "json"]))
+                    .unwrap();
+            let ran: Value = serde_json::from_str(&ran).unwrap();
+            for (path, want) in [
+                ("/services/app/command/1", "a$$b"),
+                ("/services/app/labels/l", "c$$d"),
+                ("/services/app/environment/E", "e$$f"),
+            ] {
+                assert_eq!(ran.pointer(path), cfg.pointer(path), "{path}");
+                assert_eq!(
+                    ran.pointer(path).and_then(Value::as_str),
+                    Some(want),
+                    "{path}"
+                );
+            }
+            let source = |c: &Value| c.pointer("/services/app/volumes/0/source").cloned();
+            assert_eq!(source(&ran), source(&cfg));
+            assert!(source(&ran).unwrap().as_str().unwrap().ends_with("/d$$x"));
+        });
+    }
+
+    #[test]
+    fn a_bind_source_is_judged_as_the_literal_path_compose_mounts() {
+        let c = bind("/srv/a$$b");
+        let err = refused(&c);
+        assert!(err.contains("|bind:/srv/a$b'"), "{err}");
+        grants(&c, &["bind:/srv/a$b"]).unwrap();
+    }
+
+    #[test]
     fn env_files_are_read_into_the_checked_config_and_its_digest() {
         if !crate::test_support::have_compose() {
             return;
@@ -2735,7 +2791,7 @@ mod tests {
                 &root,
                 "services:\n  app:\n    image: x:1\n    env_file: [app.env]\n    environment:\n      B: own\n",
             );
-            std::fs::write(root.join("web/app.env"), "A=pa$s\nB=file\n").unwrap();
+            std::fs::write(root.join("web/app.env"), "A='pa$s'\nB=file\n").unwrap();
             let compose = row.compose().unwrap();
             let (dir, _, cfg, _) =
                 plugin_toolkit::reactor::block_on(resolved(&row, &compose)).unwrap();
@@ -2773,6 +2829,14 @@ mod tests {
                 prepare(&raw, dir.path(), &dir).is_err(),
                 "a symlink is not followed"
             );
+            std::fs::remove_file(root.join("web/app.env")).unwrap();
+            std::fs::write(root.join("web/app.env"), "OK='${HOME}'\nBAD=${HOME}/x\n").unwrap();
+            let raw = format!(
+                r#"{{"name":"web","services":{{"app":{{"image":"x:1","env_file":[{{"path":"{}/app.env"}}]}}}}}}"#,
+                dir.path().display()
+            );
+            let err = prepare(&raw, dir.path(), &dir).unwrap_err().to_string();
+            assert!(err.contains("sets BAD from a variable"), "{err}");
             let raw =
                 r#"{"name":"web","services":{"app":{"image":"x:1","env_file":["/etc/hosts"]}}}"#;
             let err = prepare(raw, dir.path(), &dir).unwrap_err().to_string();

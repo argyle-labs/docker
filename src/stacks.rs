@@ -207,26 +207,136 @@ impl StackRow {
     }
 }
 
-/// The `(key, value)` pairs an `.env` text sets, in file order, values
-/// unquoted.
+/// One assignment in an env file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvEntry {
+    pub key: String,
+    /// Unquoted, escapes in double quotes applied.
+    pub value: String,
+    /// The value names a variable (`$VAR` or `${VAR}`, unquoted or in double
+    /// quotes) that compose would expand.
+    pub expands: bool,
+}
+
+/// Whether `$` at `chars[i]` starts a variable compose would expand.
+fn starts_var(chars: &[char], i: usize) -> bool {
+    chars
+        .get(i + 1)
+        .is_some_and(|c| *c == '{' || *c == '_' || c.is_ascii_alphabetic())
+}
+
+/// The assignments an env file sets, in file order, read as compose reads
+/// them: `KEY=value` or `KEY: value`, an optional `export ` prefix, `#`
+/// comments (inline ones after whitespace in unquoted values), single quotes
+/// literal, double quotes with `\n`, `\r`, `\t`, `\\`, `\"` and `\$`
+/// escapes, and quoted values that span lines.
+pub fn parse_env(text: &str) -> Vec<EnvEntry> {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+    let mut out = Vec::new();
+    let skip_line = |i: &mut usize| {
+        while *i < n && chars[*i] != '\n' {
+            *i += 1;
+        }
+    };
+    while i < n {
+        while i < n && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+        if chars[i] == '#' {
+            skip_line(&mut i);
+            continue;
+        }
+        let rest: String = chars[i..n.min(i + 7)].iter().collect();
+        if rest.starts_with("export") && rest[6..].starts_with([' ', '\t']) {
+            i += 7;
+        }
+        let key_start = i;
+        while i < n && !matches!(chars[i], '=' | ':' | '\n') {
+            i += 1;
+        }
+        let key: String = chars[key_start..i]
+            .iter()
+            .collect::<String>()
+            .trim()
+            .to_string();
+        if i >= n || chars[i] == '\n' || key.is_empty() {
+            skip_line(&mut i);
+            continue;
+        }
+        i += 1;
+        while i < n && matches!(chars[i], ' ' | '\t') {
+            i += 1;
+        }
+        let mut value = String::new();
+        let mut expands = false;
+        match chars.get(i) {
+            Some('\'') => {
+                i += 1;
+                while i < n && chars[i] != '\'' {
+                    value.push(chars[i]);
+                    i += 1;
+                }
+                i += 1;
+                skip_line(&mut i);
+            }
+            Some('"') => {
+                i += 1;
+                while i < n && chars[i] != '"' {
+                    match (chars[i], chars.get(i + 1)) {
+                        ('\\', Some(&e)) => {
+                            match e {
+                                'n' => value.push('\n'),
+                                'r' => value.push('\r'),
+                                't' => value.push('\t'),
+                                '\\' | '"' | '$' => value.push(e),
+                                other => {
+                                    value.push('\\');
+                                    value.push(other);
+                                }
+                            }
+                            i += 2;
+                            continue;
+                        }
+                        ('$', _) if starts_var(&chars, i) => expands = true,
+                        _ => {}
+                    }
+                    value.push(chars[i]);
+                    i += 1;
+                }
+                i += 1;
+                skip_line(&mut i);
+            }
+            _ => {
+                let start = i;
+                skip_line(&mut i);
+                let line = &chars[start..i];
+                let end = (0..line.len())
+                    .find(|&j| line[j] == '#' && j > 0 && line[j - 1].is_whitespace())
+                    .unwrap_or(line.len());
+                let line = &line[..end];
+                expands = (0..line.len()).any(|j| line[j] == '$' && starts_var(line, j));
+                value = line.iter().collect::<String>().trim().to_string();
+            }
+        }
+        out.push(EnvEntry {
+            key,
+            value,
+            expands,
+        });
+    }
+    out
+}
+
+/// The `(key, value)` pairs an env text sets (see [`parse_env`]).
 pub fn env_pairs(env: &str) -> Vec<(String, String)> {
-    env.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .filter_map(|l| {
-            let l = l.strip_prefix("export ").unwrap_or(l);
-            let (k, v) = l.split_once('=')?;
-            let v = v.trim();
-            let quoted = v.len() >= 2
-                && (v.starts_with('"') && v.ends_with('"')
-                    || v.starts_with('\'') && v.ends_with('\''));
-            let v = if quoted {
-                &v[1..v.len() - 1]
-            } else {
-                v.split_once(" #").map_or(v, |(v, _)| v.trim_end())
-            };
-            Some((k.trim().to_string(), v.to_string()))
-        })
+    parse_env(env)
+        .into_iter()
+        .map(|e| (e.key, e.value))
         .collect()
 }
 
@@ -1131,6 +1241,82 @@ mod tests {
             &env_values(env),
         );
         assert_eq!(out, "volume ***, pw ***, ***, ***, ***, 1 replica");
+    }
+
+    fn entries_of(text: &str) -> Vec<(String, String, bool)> {
+        parse_env(text)
+            .into_iter()
+            .map(|e| (e.key, e.value, e.expands))
+            .collect()
+    }
+
+    fn entry(k: &str, v: &str, expands: bool) -> (String, String, bool) {
+        (k.to_string(), v.to_string(), expands)
+    }
+
+    #[test]
+    fn env_files_parse_keys_comments_and_export_as_compose_does() {
+        let text = "# top\n  export A=1\nexport\tB=2\nC: 3\nexporter=4\nno pair here\n=empty key\nD=a#b # comment\nE=\r\n";
+        assert_eq!(
+            entries_of(text),
+            [
+                entry("A", "1", false),
+                entry("B", "2", false),
+                entry("C", "3", false),
+                entry("exporter", "4", false),
+                entry("D", "a#b", false),
+                entry("E", "", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn single_quotes_are_literal_and_may_span_lines() {
+        let text = "A='x\\ny $B ${C} # not a comment'\nM='one\ntwo' # after\nN=1\n";
+        assert_eq!(
+            entries_of(text),
+            [
+                entry("A", "x\\ny $B ${C} # not a comment", false),
+                entry("M", "one\ntwo", false),
+                entry("N", "1", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn double_quotes_take_escapes_and_may_span_lines() {
+        let text = "A=\"l1\\nl2\\t\\\"q\\\" back\\\\slash \\$LIT \\x\" # c\nM=\"one\ntwo\"\nN=1\n";
+        assert_eq!(
+            entries_of(text),
+            [
+                entry("A", "l1\nl2\t\"q\" back\\slash $LIT \\x", false),
+                entry("M", "one\ntwo", false),
+                entry("N", "1", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn variables_compose_would_expand_are_flagged() {
+        let text =
+            "A=$HOME\nB=${HOME}/x\nC=\"pre ${X}\"\nD='${X}'\nE=\"\\${X}\"\nF=cost $5\nG=a$\n";
+        let flags: Vec<(String, bool)> = parse_env(text)
+            .into_iter()
+            .map(|e| (e.key, e.expands))
+            .collect();
+        assert_eq!(
+            flags,
+            [
+                ("A", true),
+                ("B", true),
+                ("C", true),
+                ("D", false),
+                ("E", false),
+                ("F", false),
+                ("G", false),
+            ]
+            .map(|(k, f)| (k.to_string(), f))
+        );
     }
 
     #[test]
