@@ -13,6 +13,7 @@ pub mod containers;
 pub mod engine;
 pub mod engine_state;
 pub mod execute;
+pub mod fsat;
 pub mod host_update;
 pub mod label_audit;
 pub mod labels;

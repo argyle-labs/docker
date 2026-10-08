@@ -467,33 +467,40 @@ async fn docker_restore(args: DockerRestoreArgs, ctx: &ToolCtx) -> Result<Docker
     restore(args, &home, &engine_state::backup_roots(), ctx).await
 }
 
+/// Open the archive at `requested`, refused unless it resolves inside one of
+/// `roots`. The file read from then on is the returned descriptor: it must be
+/// the file that was resolved inside a root, and still lie inside one by its
+/// own path.
+pub(crate) fn open_archive(requested: &str, roots: &[String]) -> Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let archive = in_backup_root(requested, roots)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&archive)
+        .with_context(|| format!("archive '{requested}' cannot be opened"))?;
+    let opened = file.metadata()?;
+    if !opened.is_file() {
+        bail!("archive '{requested}' is not a file");
+    }
+    let at_path = std::fs::symlink_metadata(&archive)?;
+    if (opened.dev(), opened.ino()) != (at_path.dev(), at_path.ino()) {
+        bail!("archive '{requested}' changed while it was opened");
+    }
+    let real = engine_state::fd_path(&file)?;
+    in_backup_root(&real.to_string_lossy(), roots)?;
+    Ok(file)
+}
+
 async fn restore(
     args: DockerRestoreArgs,
     home: &str,
     roots: &[String],
     ctx: &ToolCtx,
 ) -> Result<DockerRestoreOutput> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-
     execute::require_admin(RESTORE_TOOL, ctx)?;
-    let archive = in_backup_root(&args.archive, roots)?;
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&archive)
-        .with_context(|| format!("archive '{}' cannot be opened", args.archive))?;
-    let opened = file.metadata()?;
-    if !opened.is_file() {
-        bail!("archive '{}' is not a file", args.archive);
-    }
-    // The file read from here on is this descriptor: it must be the file that
-    // was resolved inside the root, and still lie inside it by its own path.
-    let at_path = std::fs::symlink_metadata(&archive)?;
-    if (opened.dev(), opened.ino()) != (at_path.dev(), at_path.ino()) {
-        bail!("archive '{}' changed while it was opened", args.archive);
-    }
-    let real = engine_state::fd_path(&file)?;
-    in_backup_root(&real.to_string_lossy(), roots)?;
+    let mut file = open_archive(&args.archive, roots)?;
     let state = state_dir(args.state_path.as_deref(), home)?;
     let outward = engine_state::outward_links(&state)?;
     if !outward.is_empty() {

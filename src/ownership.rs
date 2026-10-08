@@ -345,13 +345,20 @@ pub fn read_conversions(dir: &Path) -> Result<Vec<Conversion>> {
     })
 }
 
-/// Write `text` to `path` through a fsynced temp file and a rename;
-/// unchanged content is not rewritten.
-fn write_atomic(path: &Path, text: &str) -> Result<()> {
-    if std::fs::read_to_string(path).is_ok_and(|old| old == text) {
+/// `row`'s dir, opened under a stacks root without following symlinks.
+fn stack_dir(row: &StackRow) -> Result<crate::stacks::StackDir> {
+    crate::stacks::StackDir::open(&row.dir, &crate::tools::stacks_roots()?, false)?
+        .ok_or_else(|| anyhow::anyhow!("stack dir {} does not exist", row.dir))
+}
+
+/// Write `text` as [`ORCA_FILE`] in `row`'s dir through a fsynced temp file
+/// and a rename; unchanged content is not rewritten.
+fn write_orca(row: &StackRow, text: &str) -> Result<()> {
+    let dir = stack_dir(row)?;
+    if dir.read(ORCA_FILE).is_ok_and(|old| old == text) {
         return Ok(());
     }
-    crate::stacks::StagedWrite::new(path, text)?.replace()
+    crate::stacks::StagedWrite::new(&dir, ORCA_FILE, text)?.replace()
 }
 
 pub async fn engine_volumes(docker: &Docker) -> Result<EngineVolumes> {
@@ -465,7 +472,7 @@ pub async fn write_with(
     let engine = engine_volumes(docker).await?;
     let networks = engine_networks(docker, &cfg).await?;
     let rendered = render(&cfg, &row.name, conversions, &engine, &networks);
-    write_atomic(&Path::new(&row.dir).join(ORCA_FILE), &rendered.text)?;
+    write_orca(row, &rendered.text)?;
     Ok((compose.with_orca(), rendered.notes))
 }
 
@@ -480,10 +487,12 @@ pub async fn refresh(row: &StackRow) -> Result<Compose> {
     Ok(write_with(row, client()?, None).await?.0)
 }
 
-/// `compose up -d` (for `services`, or all) with a fresh [`ORCA_FILE`]. The
-/// output leads with what was left unlabeled.
+/// `compose up -d` (for `services`, or all) with a fresh [`ORCA_FILE`], once
+/// the files it runs pass [`crate::policy::gate`]. The output leads with
+/// what was left unlabeled.
 pub async fn up(row: &StackRow, services: &[&str]) -> Result<String> {
     let (compose, notes) = write_with(row, client()?, None).await?;
+    crate::policy::gate(row, &compose).await?;
     let out = compose.up(services).await?;
     Ok(notes
         .iter()
@@ -1089,13 +1098,16 @@ impl Migrator for ComposeMigrator<'_> {
         })
     }
     fn restore_override(&self, previous: Option<&str>) -> Result<()> {
-        let path = Path::new(&self.row.dir).join(ORCA_FILE);
         match previous {
-            Some(text) => write_atomic(&path, text),
-            None if path.exists() => {
-                std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))
+            Some(text) => write_orca(self.row, text),
+            None => {
+                let dir = stack_dir(self.row)?;
+                if dir.stat(ORCA_FILE)?.is_some() {
+                    crate::fsat::unlink_at(dir.fd(), ORCA_FILE)
+                        .with_context(|| format!("remove {ORCA_FILE} in {}", self.row.dir))?;
+                }
+                Ok(())
             }
-            None => Ok(()),
         }
     }
     fn up<'a>(&'a self, service: &'a str, start: bool) -> BoxFuture<'a, Result<()>> {
@@ -1108,6 +1120,7 @@ impl Migrator for ComposeMigrator<'_> {
             } else {
                 compose
             };
+            crate::policy::gate(self.row, &compose).await?;
             if start {
                 compose.up(&[service]).await?;
             } else {

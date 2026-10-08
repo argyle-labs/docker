@@ -46,8 +46,9 @@ use crate::compose_config::ComposeConfig;
 use crate::engine_state;
 use crate::lint::{self, Finding, NotFixed};
 use crate::ownership::{self, Migrated, Migrator};
+use crate::policy;
 use crate::runtime_adapter::DockerAdapter;
-use crate::stacks::{self, StackRow};
+use crate::stacks::{self, StackRow, StagedRestore};
 use crate::volume_coverage::{self, Strategy, VolumePolicy};
 
 const KIND: &str = "container";
@@ -209,7 +210,7 @@ impl DockerUnitProvider {
         }
         let detail = StackDetail {
             compose_yaml: row.read_compose().unwrap_or_default(),
-            compose_env: row.read_env(),
+            env_keys: env_keys(row.read_env().as_deref().unwrap_or("")),
             services: Self::stack_services(&row).await,
             name: row.name.clone(),
             dir: row.dir.clone(),
@@ -240,7 +241,6 @@ impl DockerUnitProvider {
                 row.write_checked(
                     p.compose_yaml.as_deref(),
                     p.compose_env.as_deref(),
-                    Some(&row),
                     &crate::tools::stacks_roots()?,
                 )
                 .await?;
@@ -270,9 +270,12 @@ impl DockerUnitProvider {
                 }))
             }
             action if STACK_LIFECYCLE.contains(&action) => {
-                let out = row
-                    .compose()
-                    .map_err(anyhow::Error::from)?
+                let compose = row.compose().map_err(anyhow::Error::from)?;
+                // Only stopping and removing containers needs no check.
+                if !matches!(action, "down" | "stop") {
+                    policy::gate(&row, &compose).await?;
+                }
+                let out = compose
                     .run_action(action, None, None)
                     .await
                     .map_err(anyhow::Error::from)?;
@@ -301,7 +304,7 @@ impl DockerUnitProvider {
             }
             None => StackFixPayload::default(),
         };
-        let roots = lint::managed_roots(p.managed_roots.as_deref());
+        let roots = lint::managed_roots(None);
         let findings = stack_findings(row, &roots).await?;
         let yaml = row.read_compose()?;
         let override_yaml = row
@@ -312,7 +315,8 @@ impl DockerUnitProvider {
             .transpose()?;
         let (result, new_yaml) = fix_result(&yaml, override_yaml.as_deref(), &findings, &p)?;
         if let Some(new_yaml) = new_yaml {
-            row.write_compose_if_unchanged(&new_yaml, &yaml).await?;
+            row.write_compose_if_unchanged(&new_yaml, &yaml, &crate::tools::stacks_roots()?)
+                .await?;
         }
         Ok(VerbOutcome::Item(ItemOutcome::new(
             id.clone(),
@@ -513,19 +517,41 @@ impl DockerUnitProvider {
         if archive.is_empty() {
             return Err(anyhow::anyhow!("restore backup ref has an empty locator"));
         }
-        restore_source(&archive, &row.dir, &engine_state::backup_roots())?;
-        if !std::path::Path::new(&archive).is_file() {
-            return Err(anyhow::anyhow!("restore archive {archive} not found"));
+        let mut file = restore_source(&archive, &row.dir, &engine_state::backup_roots())?;
+        engine_state::validate(&mut file)?;
+        let roots = crate::tools::stacks_roots()?;
+        let mut staged = StagedRestore::stage(row, &mut file, &roots)?;
+        let live = stacks::stack_dir_in_roots(&row.dir, &roots)?;
+        let env = staged.env_file();
+        let staged_secrets = env
+            .as_deref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|e| stacks::env_values(&e))
+            .unwrap_or_default();
+        let checked = async {
+            for files in staged.compose_sets(row) {
+                let raw = stacks::resolved_config(&live, &files, env.as_deref()).await?;
+                policy::check_stack(&raw, row, &live, &roots)?;
+            }
+            Ok::<_, anyhow::Error>(())
         }
-        std::fs::create_dir_all(&row.dir)
-            .map_err(|e| anyhow::anyhow!("create stack dir {}: {e}", row.dir))?;
-        run_tar(&["xzf", &archive, "-C", &row.dir]).await?;
+        .await;
+        if let Err(e) = checked {
+            // The staged `.env` is discarded with the staging dir, so the
+            // caller's scrub of the live one would miss its values.
+            let e = anyhow::anyhow!(stacks::redact(&format!("{e:#}"), &staged_secrets));
+            return Err(staged.fail(e.context("restore refused; the stack dir is unchanged")));
+        }
+        let leftover = staged.swap()?;
         let out = ownership::up(row, &[]).await?;
         Ok(VerbOutcome::Action(ActionOutcome {
             changed: true,
             message: format!(
-                "restored stack '{}' from {archive}; up: {}",
+                "restored stack '{}' from {archive}{}; up: {}",
                 row.name,
+                leftover
+                    .map(|p| format!(" (the previous dir is left at {})", p.display()))
+                    .unwrap_or_default(),
                 out.trim()
             ),
         }))
@@ -557,19 +583,15 @@ impl DockerUnitProvider {
             dir: dir.to_string_lossy().into_owned(),
             file,
             enabled: true,
-            // Grants are set only through the admin-only `docker.stack_allow`.
+            // Grants are set only through the admin-only `docker.stack_allow`,
+            // and stay bound to the services and images they name.
             allow: current
                 .as_ref()
                 .map(|r| r.allow.clone())
                 .unwrap_or_default(),
         };
-        row.write_checked(
-            p.compose_yaml.as_deref(),
-            p.compose_env.as_deref(),
-            current.as_ref(),
-            &roots,
-        )
-        .await?;
+        row.write_checked(p.compose_yaml.as_deref(), p.compose_env.as_deref(), &roots)
+            .await?;
         stacks::put(&row)?;
         if p.deploy {
             ownership::up(&row, &[]).await?;
@@ -587,7 +609,9 @@ impl DockerUnitProvider {
 
     async fn do_detail(&self, args: DetailArgs) -> Result<VerbOutcome> {
         if args.id.kind == STACK_KIND {
-            return self.stack_detail(args).await;
+            let name = args.id.id.clone();
+            let secrets = stack_secrets(&name, None);
+            return scrub_outcome(&name, secrets, self.stack_detail(args).await);
         }
         let id = &args.id.id;
         if args.query.kind.as_deref() == Some("logs") {
@@ -611,7 +635,9 @@ impl DockerUnitProvider {
 
     async fn do_update(&self, args: UpdateArgs) -> Result<VerbOutcome> {
         if args.id.kind == STACK_KIND {
-            return self.stack_update(args).await;
+            let name = args.id.id.clone();
+            let secrets = stack_secrets(&name, args.payload.as_deref());
+            return scrub_outcome(&name, secrets, self.stack_update(args).await);
         }
         let id = &args.id.id;
         match args.action.as_str() {
@@ -642,11 +668,24 @@ impl DockerUnitProvider {
 
     async fn do_create(&self, args: CreateArgs) -> Result<VerbOutcome> {
         match args.action.as_str() {
-            "deploy" => self.stack_deploy(args.payload, true).await,
+            "deploy" => {
+                let name = payload_name(args.payload.as_deref());
+                let secrets = stack_secrets(&name, args.payload.as_deref());
+                scrub_outcome(&name, secrets, self.stack_deploy(args.payload, true).await)
+            }
             "exec" => {
                 let raw = args.payload.unwrap_or_default();
                 let exec: ExecPayload =
                     serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("exec payload: {e}"))?;
+                let docker = self.adapter.client().map_err(adapter_err)?;
+                let info = docker
+                    .inspect_container(&exec.id, None)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("inspect {}: {e}", exec.id))?;
+                let dirs: Vec<String> = stacks::list()?.into_iter().map(|r| r.dir).collect();
+                if let Some(why) = exec_refusal(&info, &dirs) {
+                    return Err(anyhow::anyhow!("exec in {} refused: {why}", exec.id));
+                }
                 let result = self
                     .adapter
                     .exec(&exec.id, &exec.cmd, exec.stdin)
@@ -671,6 +710,7 @@ impl DockerUnitProvider {
             // Delete is one command: tear the stack down (`compose down`), then
             // deregister it. No separate `action=down` step first.
             let row = stacks::require(&args.id.id)?;
+            let secrets = stack_secrets(&row.name, None);
             let teardown = match row.compose() {
                 Ok(c) => match c.run_action("down", None, None).await {
                     Ok(out) => {
@@ -685,6 +725,7 @@ impl DockerUnitProvider {
                 },
                 Err(e) => format!("teardown skipped: {e}"),
             };
+            let teardown = stacks::redact(&teardown, &secrets);
             stacks::remove(&args.id.id)?;
             return Ok(VerbOutcome::Action(ActionOutcome {
                 changed: true,
@@ -699,7 +740,11 @@ impl DockerUnitProvider {
     async fn do_upsert(&self, args: UpsertArgs) -> Result<VerbOutcome> {
         if args.id.kind == STACK_KIND {
             return match args.action.as_str() {
-                "set" => self.stack_deploy(args.payload, false).await,
+                "set" => {
+                    let name = payload_name(args.payload.as_deref());
+                    let secrets = stack_secrets(&name, args.payload.as_deref());
+                    scrub_outcome(&name, secrets, self.stack_deploy(args.payload, false).await)
+                }
                 other => Err(anyhow::anyhow!("unknown stack upsert action: {other}")),
             };
         }
@@ -783,9 +828,8 @@ pub struct StackDetail {
     pub enabled: bool,
     /// Full compose file contents (empty if the file isn't on disk yet).
     pub compose_yaml: String,
-    /// `.env` contents when present.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub compose_env: Option<String>,
+    /// The keys `.env` sets. Its values are secrets and are never returned.
+    pub env_keys: Vec<String>,
     pub services: Vec<StackService>,
 }
 
@@ -803,9 +847,9 @@ pub struct StackLogs {
 #[serde(crate = "plugin_toolkit::serde")]
 #[schemars(crate = "plugin_toolkit::schemars")]
 pub struct StackEditPayload {
-    /// New compose file contents. Privileged, host-namespace, `SYS_ADMIN` and
-    /// out-of-root bind settings the stack did not already have are refused
-    /// unless granted with `docker.stack_allow`.
+    /// New compose file contents, checked against the compose policy (see
+    /// [`crate::policy`]): settings that reach the host need a grant from
+    /// `docker.stack_allow` for their service and image.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compose_yaml: Option<String>,
     /// New `.env` contents.
@@ -998,8 +1042,11 @@ pub struct StackAudit {
 
 /// Payload for `Update{action:"fix"}`. Every field defaults: no payload is a
 /// dry run.
+/// Bind proposals use the daemon's configured managed roots only, so a
+/// caller cannot steer a rewrite to a path of its choosing: unknown fields
+/// (`managed_roots` included) are refused.
 #[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
-#[serde(crate = "plugin_toolkit::serde")]
+#[serde(crate = "plugin_toolkit::serde", deny_unknown_fields)]
 #[schemars(crate = "plugin_toolkit::schemars")]
 pub struct StackFixPayload {
     /// Write the file. Omitted, returns the changes and diff only.
@@ -1008,9 +1055,6 @@ pub struct StackFixPayload {
     /// The dry run's change targets (finding ids) to apply.
     #[serde(default)]
     pub items: Vec<String>,
-    /// As for the audit.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub managed_roots: Option<Vec<String>>,
 }
 
 /// Response for `Update{action:"fix"}`.
@@ -1289,13 +1333,152 @@ fn default_backup_dir(dir: &std::path::Path) -> std::path::PathBuf {
     dir.parent().unwrap_or(dir).join(".orca-backups")
 }
 
-/// Refuse a restore archive outside the backup roots and outside the stack's
-/// own default backup dir, where an un-targeted backup put it.
-fn restore_source(archive: &str, stack_dir: &str, roots: &[String]) -> Result<()> {
+/// Open a restore archive, refused outside the backup roots and outside the
+/// stack's own default backup dir, where an un-targeted backup put it.
+fn restore_source(archive: &str, stack_dir: &str, roots: &[String]) -> Result<std::fs::File> {
     let default = default_backup_dir(std::path::Path::new(stack_dir));
     let mut allowed = roots.to_vec();
     allowed.push(default.to_string_lossy().into_owned());
-    crate::lifecycle::in_backup_root(archive, &allowed).map(|_| ())
+    crate::lifecycle::open_archive(archive, &allowed)
+}
+
+/// The keys an `.env` file sets, in file order.
+fn env_keys(env: &str) -> Vec<String> {
+    stacks::env_pairs(env).into_iter().map(|(k, _)| k).collect()
+}
+
+/// The `.env` values a stack verb could echo: stack `name`'s now, plus a
+/// `compose_env` in `payload`.
+fn stack_secrets(name: &str, payload: Option<&str>) -> Vec<String> {
+    let mut envs: Vec<String> = stacks::get(name)
+        .ok()
+        .flatten()
+        .and_then(|r| r.read_env())
+        .into_iter()
+        .collect();
+    envs.extend(
+        payload
+            .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+            .and_then(|v| v.get("compose_env")?.as_str().map(String::from)),
+    );
+    envs.iter().flat_map(|e| stacks::env_values(e)).collect()
+}
+
+fn redact_json(v: &mut serde_json::Value, secrets: &[String]) {
+    match v {
+        serde_json::Value::String(s) => *s = stacks::redact(s, secrets),
+        serde_json::Value::Array(a) => a.iter_mut().for_each(|v| redact_json(v, secrets)),
+        serde_json::Value::Object(o) => o.values_mut().for_each(|v| redact_json(v, secrets)),
+        _ => {}
+    }
+}
+
+/// `out` with `secrets`, and the values of stack `name`'s `.env` as it is
+/// afterwards, scrubbed from its message, payload or error.
+fn scrub_outcome(
+    name: &str,
+    mut secrets: Vec<String>,
+    out: Result<VerbOutcome>,
+) -> Result<VerbOutcome> {
+    secrets.extend(stack_secrets(name, None));
+    match out {
+        Ok(VerbOutcome::Action(mut a)) => {
+            a.message = stacks::redact(&a.message, &secrets);
+            Ok(VerbOutcome::Action(a))
+        }
+        Ok(VerbOutcome::Item(mut item)) => {
+            item.payload = match serde_json::from_str::<serde_json::Value>(&item.payload) {
+                Ok(mut v) => {
+                    redact_json(&mut v, &secrets);
+                    serde_json::to_string(&v).unwrap_or_default()
+                }
+                Err(_) => stacks::redact(&item.payload, &secrets),
+            };
+            Ok(VerbOutcome::Item(item))
+        }
+        Ok(other) => Ok(other),
+        Err(e) => Err(anyhow::anyhow!(stacks::redact(&format!("{e:#}"), &secrets))),
+    }
+}
+
+/// The stack `name` a deploy payload names.
+fn payload_name(payload: Option<&str>) -> String {
+    payload
+        .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+        .and_then(|v| v.get("name")?.as_str().map(String::from))
+        .unwrap_or_default()
+}
+
+const COMPOSE_WORKING_DIR_LABEL: &str = "com.docker.compose.project.working_dir";
+
+/// Why `exec` into the inspected container is refused, if it is. The unit
+/// verbs carry no caller identity (orca#788), so exec is limited to
+/// containers of registered stacks, which the compose policy has checked,
+/// and refused in any that holds the host: privileged, a host namespace,
+/// the docker socket or `SYS_ADMIN`. The gap that remains until the verb
+/// carries the caller: any caller can exec in any such container, reading
+/// its secrets and data.
+fn exec_refusal(
+    info: &bollard::models::ContainerInspectResponse,
+    stack_dirs: &[String],
+) -> Option<String> {
+    use bollard::models::HostConfigCgroupnsModeEnum;
+    let working_dir = info
+        .config
+        .as_ref()
+        .and_then(|c| c.labels.as_ref())
+        .and_then(|l| l.get(COMPOSE_WORKING_DIR_LABEL));
+    let registered = working_dir.is_some_and(|wd| {
+        let wd = std::path::Path::new(wd);
+        stack_dirs.iter().any(|d| {
+            wd == std::path::Path::new(d)
+                || crate::lifecycle::resolve(std::path::Path::new(d)).is_ok_and(|r| r == wd)
+        })
+    });
+    if !registered {
+        return Some("the container is not part of a registered stack".into());
+    }
+    let hc = info.host_config.clone().unwrap_or_default();
+    if hc.privileged == Some(true) {
+        return Some("the container is privileged".into());
+    }
+    for (key, mode) in [
+        ("pid", &hc.pid_mode),
+        ("ipc", &hc.ipc_mode),
+        ("network", &hc.network_mode),
+        ("userns", &hc.userns_mode),
+        ("uts", &hc.uts_mode),
+    ] {
+        if mode.as_deref() == Some("host") {
+            return Some(format!("the container uses the host {key} namespace"));
+        }
+    }
+    if hc.cgroupns_mode == Some(HostConfigCgroupnsModeEnum::HOST) {
+        return Some("the container uses the host cgroup namespace".into());
+    }
+    if hc.cap_add.iter().flatten().any(|c| {
+        let c = c.to_ascii_uppercase();
+        matches!(c.strip_prefix("CAP_").unwrap_or(&c), "SYS_ADMIN" | "ALL")
+    }) {
+        return Some("the container has CAP_SYS_ADMIN".into());
+    }
+    let sources = info
+        .mounts
+        .iter()
+        .flatten()
+        .filter_map(|m| m.source.clone())
+        .chain(hc.binds.iter().flatten().cloned());
+    for source in sources {
+        if source
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .ends_with("docker.sock")
+        {
+            return Some("the container mounts the docker socket".into());
+        }
+    }
+    None
 }
 
 /// `tar` arguments for a stack archive: the stack dir (without any stale
@@ -1671,7 +1854,6 @@ mod tests {
         let p = StackFixPayload {
             execute: true,
             items: vec!["restart:app".into(), "restart:gone".into()],
-            managed_roots: None,
         };
         let (result, write) = fix_result(FIX_YAML, None, &fix_findings(), &p).unwrap();
         assert!(!result.dry_run);
@@ -1681,6 +1863,88 @@ mod tests {
         assert!(written.contains("restart: unless-stopped"));
         // worker was fixable but not confirmed.
         assert!(!written.contains("worker:\n    restart"), "{written}");
+    }
+
+    #[test]
+    fn fix_refuses_caller_supplied_roots() {
+        let err = serde_json::from_str::<StackFixPayload>(
+            r#"{"execute":true,"items":["bind:app:/x"],"managed_roots":["/"]}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("managed_roots"), "{err}");
+    }
+
+    #[test]
+    fn stack_detail_returns_env_keys_never_values() {
+        let env = "# comment\nDB_PASSWORD=hunter2\n\nexport TOKEN = abc\nnot a pair\n";
+        assert_eq!(env_keys(env), vec!["DB_PASSWORD", "TOKEN"]);
+        let schema = serde_json::to_string(&schema_for!(StackDetail)).unwrap();
+        assert!(
+            schema.contains("env_keys") && !schema.contains("compose_env"),
+            "{schema}"
+        );
+    }
+
+    fn inspected(
+        dir: &str,
+        host_config: serde_json::Value,
+    ) -> bollard::models::ContainerInspectResponse {
+        serde_json::from_value(serde_json::json!({
+            "Config": {"Labels": {COMPOSE_WORKING_DIR_LABEL: dir}},
+            "HostConfig": host_config,
+            "Mounts": []
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn exec_is_limited_to_unprivileged_containers_of_registered_stacks() {
+        let dirs = vec!["/opt/stacks/web".to_string()];
+        assert_eq!(
+            exec_refusal(&inspected("/opt/stacks/web", serde_json::json!({})), &dirs),
+            None
+        );
+        let why = exec_refusal(
+            &inspected("/opt/stacks/other", serde_json::json!({})),
+            &dirs,
+        )
+        .unwrap();
+        assert!(why.contains("not part of a registered stack"), "{why}");
+        let unlabeled: bollard::models::ContainerInspectResponse =
+            serde_json::from_value(serde_json::json!({"HostConfig": {}})).unwrap();
+        assert!(exec_refusal(&unlabeled, &dirs).is_some());
+        for (hc, want) in [
+            (serde_json::json!({"Privileged": true}), "privileged"),
+            (serde_json::json!({"PidMode": "host"}), "host pid"),
+            (serde_json::json!({"IpcMode": "host"}), "host ipc"),
+            (serde_json::json!({"NetworkMode": "host"}), "host network"),
+            (serde_json::json!({"UsernsMode": "host"}), "host userns"),
+            (serde_json::json!({"UTSMode": "host"}), "host uts"),
+            (serde_json::json!({"CgroupnsMode": "host"}), "host cgroup"),
+            (
+                serde_json::json!({"CapAdd": ["CAP_SYS_ADMIN"]}),
+                "CAP_SYS_ADMIN",
+            ),
+            (serde_json::json!({"CapAdd": ["ALL"]}), "CAP_SYS_ADMIN"),
+            (
+                serde_json::json!({"Binds": ["/var/run/docker.sock:/var/run/docker.sock"]}),
+                "docker socket",
+            ),
+        ] {
+            let why = exec_refusal(&inspected("/opt/stacks/web", hc.clone()), &dirs)
+                .unwrap_or_else(|| panic!("{hc} was allowed"));
+            assert!(why.contains(want), "{hc}: {why}");
+        }
+        let mut sock = inspected("/opt/stacks/web", serde_json::json!({}));
+        sock.mounts = Some(vec![bollard::models::MountPoint {
+            source: Some("/run/docker.sock".into()),
+            ..Default::default()
+        }]);
+        assert!(
+            exec_refusal(&sock, &dirs)
+                .unwrap()
+                .contains("docker socket")
+        );
     }
 
     #[test]
@@ -1914,15 +2178,14 @@ mod tests {
         let stack = stacks.path().join("web");
         std::fs::create_dir_all(stacks.path().join(".orca-backups")).unwrap();
         let roots = [path(roots_dir.path())];
-        let own = path(&stacks.path().join(".orca-backups/web-1.tar.gz"));
-        restore_source(&own, &path(&stack), &roots).unwrap();
-        restore_source(
-            &path(&roots_dir.path().join("web.tar.gz")),
-            &path(&stack),
-            &roots,
-        )
-        .unwrap();
+        let own = stacks.path().join(".orca-backups/web-1.tar.gz");
+        let rooted = roots_dir.path().join("web.tar.gz");
+        for archive in [&own, &rooted] {
+            std::fs::write(archive, b"x").unwrap();
+            restore_source(&path(archive), &path(&stack), &roots).unwrap();
+        }
         let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("web.tar.gz"), b"x").unwrap();
         std::os::unix::fs::symlink(outside.path(), roots_dir.path().join("escape")).unwrap();
         for bad in [
             path(&outside.path().join("web.tar.gz")),
@@ -1935,6 +2198,209 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    fn register_root(root: &std::path::Path) {
+        let args = crate::tools::DockerCreateArgs {
+            name: "local".into(),
+            socket_path: None,
+            host: None,
+            url: None,
+            stacks_root: Some(path(root)),
+            routes: Vec::new(),
+            execute: true,
+        };
+        plugin_toolkit::reactor::block_on(crate::tools::docker_create(
+            args,
+            &crate::test_support::admin(),
+        ))
+        .unwrap();
+    }
+
+    /// The stack `web` registered at `dir`, with `yaml` and `env` on disk.
+    fn registered_stack(dir: &std::path::Path, yaml: &str, env: Option<&str>) -> StackRow {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("compose.yaml"), yaml).unwrap();
+        if let Some(env) = env {
+            std::fs::write(dir.join(".env"), env).unwrap();
+        }
+        let row = StackRow {
+            name: "web".into(),
+            dir: path(dir),
+            file: "compose.yaml".into(),
+            enabled: true,
+            allow: Vec::new(),
+        };
+        stacks::put(&row).unwrap();
+        row
+    }
+
+    fn stack_update(action: &str, payload: Option<serde_json::Value>) -> Result<VerbOutcome> {
+        let provider = DockerUnitProvider::new(crate::registration::adapter());
+        plugin_toolkit::reactor::block_on(provider.do_update(UpdateArgs {
+            id: UnitId {
+                manager: "docker@test".into(),
+                kind: STACK_KIND.into(),
+                id: "web".into(),
+                name: "web".into(),
+            },
+            action: action.into(),
+            payload: payload.map(|p| p.to_string()),
+            caller: None,
+        }))
+    }
+
+    /// A stack archive in `<dir>/.orca-backups`, where a backup without
+    /// `dest` puts it, holding `files`.
+    fn stack_archive(dir: &std::path::Path, files: &[(&str, &str)]) -> serde_json::Value {
+        let backups = dir.join(".orca-backups");
+        std::fs::create_dir_all(&backups).unwrap();
+        let archive = backups.join("web-1.tar.gz");
+        let gz = flate2::write::GzEncoder::new(
+            std::fs::File::create(&archive).unwrap(),
+            flate2::Compression::default(),
+        );
+        let mut b = tar::Builder::new(gz);
+        for (name, body) in files {
+            let mut h = tar::Header::new_gnu();
+            h.set_mode(0o644);
+            h.set_size(body.len() as u64);
+            h.set_cksum();
+            b.append_data(&mut h, name, body.as_bytes()).unwrap();
+        }
+        b.into_inner().unwrap().finish().unwrap();
+        serde_json::json!({"from": {"locator": path(&archive), "manager": "docker@test", "timestamp": 0}})
+    }
+
+    fn err_of(r: Result<VerbOutcome>) -> String {
+        match r {
+            Ok(_) => panic!("expected a refusal"),
+            Err(e) => format!("{e:#}"),
+        }
+    }
+
+    #[test]
+    fn up_lifecycle_edit_and_restore_refuse_a_stack_outside_the_stacks_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let yaml = "services:\n  app:\n    image: x:1\n";
+        let dir = outside.path().join("web");
+        let ((), _) = crate::test_support::with_db(|| {
+            register_root(root.path());
+            let row = registered_stack(&dir, yaml, None);
+            let compose = row.compose().unwrap();
+            let err = plugin_toolkit::reactor::block_on(policy::gate(&row, &compose))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("outside the stacks roots"), "gate: {err}");
+            for action in ["start", "restart", "build", "pull"] {
+                let err = err_of(stack_update(action, None));
+                assert!(err.contains("outside the stacks roots"), "{action}: {err}");
+            }
+            let edit = serde_json::json!({"compose_yaml": "services: {}\n"});
+            let err = err_of(stack_update("edit", Some(edit)));
+            assert!(err.contains("outside the stacks roots"), "edit: {err}");
+            let restore = stack_archive(outside.path(), &[("compose.yaml", "services: {}\n")]);
+            let err = err_of(stack_update(ACTION_RESTORE, Some(restore)));
+            assert!(err.contains("outside the stacks roots"), "restore: {err}");
+            assert!(stack_update("up", None).is_err());
+        });
+        let mut left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            ["compose.yaml"],
+            "nothing was written in the stack dir"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("compose.yaml")).unwrap(),
+            yaml
+        );
+    }
+
+    #[test]
+    fn restore_refuses_an_archive_the_policy_refuses_and_scrubs_its_env_values() {
+        if !crate::test_support::have_compose() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let yaml = "services:\n  app:\n    image: x:1\n";
+        let dir = root.join("web");
+        let ((), _) = crate::test_support::with_db(|| {
+            register_root(&root);
+            registered_stack(&dir, yaml, None);
+            let restore = stack_archive(
+                &root,
+                &[
+                    (
+                        "compose.yaml",
+                        "services:\n  app:\n    image: x:1\n    privileged: true\n    volumes: [\"${V}:/x\"]\n",
+                    ),
+                    (".env", "V=/nonexistent/s3cr3tvalue\n"),
+                ],
+            );
+            let err = err_of(stack_update(ACTION_RESTORE, Some(restore)));
+            assert!(
+                err.contains("restore refused") && err.contains("privileged: true"),
+                "{err}"
+            );
+            assert!(!err.contains("s3cr3tvalue") && err.contains("***"), "{err}");
+        });
+        let mut left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["compose.yaml"]);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("compose.yaml")).unwrap(),
+            yaml
+        );
+        let mut siblings: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        siblings.sort();
+        assert_eq!(siblings, [".orca-backups", "web"], "no staging dir is left");
+    }
+
+    #[test]
+    fn stack_verb_errors_never_carry_env_values() {
+        if !crate::test_support::have_compose() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let dir = root.join("web");
+        let ((), _) = crate::test_support::with_db(|| {
+            register_root(&root);
+            // Compose names the undefined volume, interpolated from `.env`,
+            // in its error.
+            registered_stack(
+                &dir,
+                "services:\n  app:\n    image: x:1\n    volumes: [\"${VOL}:/x\"]\n",
+                Some("VOL=hunter2vol\n"),
+            );
+            let err = err_of(stack_update("restart", None));
+            assert!(!err.contains("hunter2vol") && err.contains("***"), "{err}");
+
+            let edit = serde_json::json!({
+                "compose_yaml": "services:\n  app:\n    image: x:1\n    volumes: [\"${DIR}:/x\"]\n",
+                "compose_env": "DIR=/nonexistent/hunter2dir\n",
+            });
+            let err = err_of(stack_update("edit", Some(edit)));
+            assert!(err.contains("binds host path"), "{err}");
+            assert!(!err.contains("hunter2dir") && err.contains("***"), "{err}");
+        });
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".env")).unwrap(),
+            "VOL=hunter2vol\n",
+            "a refused edit writes nothing"
+        );
     }
 
     fn deploy(payload: plugin_toolkit::serde_json::Value) -> String {

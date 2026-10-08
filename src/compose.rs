@@ -81,6 +81,14 @@ const OVERRIDE_FILES: &[&str] = &[
 /// last so it applies over the user's files. See [`crate::ownership`].
 pub const ORCA_FILE: &str = "compose.orca.yaml";
 
+/// The override compose auto-loads from `dir`, if any.
+pub fn override_in(dir: &Path) -> Option<PathBuf> {
+    OVERRIDE_FILES
+        .iter()
+        .map(|o| dir.join(o))
+        .find(|o| o.exists())
+}
+
 /// A located compose project.
 #[derive(Debug, Clone)]
 pub struct Compose {
@@ -114,11 +122,7 @@ impl Compose {
         if !file.is_file() {
             return None;
         }
-        let dir = file.parent()?;
-        let override_file = OVERRIDE_FILES
-            .iter()
-            .map(|o| dir.join(o))
-            .find(|o| o.exists());
+        let override_file = override_in(file.parent()?);
         Some(Compose {
             file: file.to_path_buf(),
             override_file,

@@ -56,6 +56,19 @@ pub fn assert_admin_refusal(err: &str) {
     );
 }
 
+/// Whether the docker CLI with compose is here; tests that run the real
+/// `compose config` are skipped without it.
+pub fn have_compose() -> bool {
+    let ok = std::process::Command::new(crate::resolve_docker_bin())
+        .args(["compose", "version"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !ok {
+        eprintln!("skipped: no docker compose CLI");
+    }
+    ok
+}
+
 type Tables = BTreeMap<(String, String), Vec<DbRow>>;
 
 fn text(row: &DbRow, col: &str) -> Option<String> {
