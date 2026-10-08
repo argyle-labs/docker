@@ -522,33 +522,41 @@ impl StackDir {
         Ok(fsat::stat_at(&self.fd, name)?)
     }
 
-    /// Read the file at `rel` below this dir, crossing no symlink. `None`
-    /// when it does not exist.
-    pub fn read_rel(&self, rel: &Path) -> Result<Option<String>> {
-        let mut names: Vec<String> = rel
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect();
-        let Some(file) = names.pop() else {
-            anyhow::bail!("no file named in {}", rel.display());
-        };
+    /// The dir at `rel` below this one (this one for an empty `rel`), crossing
+    /// no symlink. `None` when it does not exist.
+    pub fn open_rel(&self, rel: &Path) -> Result<Option<StackDir>> {
         let mut dir = StackDir {
             fd: self.fd.try_clone()?,
             path: self.path.clone(),
         };
-        for name in &names {
-            dir = match fsat::open_dir_at(&dir.fd, name) {
+        for c in rel.components() {
+            let name = c.as_os_str().to_string_lossy().into_owned();
+            dir = match fsat::open_dir_at(&dir.fd, &name) {
                 Ok(fd) => StackDir {
                     fd,
-                    path: dir.path.join(name),
+                    path: dir.path.join(&name),
                 },
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(e) => {
-                    return Err(anyhow::anyhow!(e)
-                        .context(format!("opening '{name}' in {}", dir.path.display())));
+                    return Err(anyhow::anyhow!(e).context(format!(
+                        "opening '{name}' in {} (a symlink or not a directory)",
+                        dir.path.display()
+                    )));
                 }
             };
         }
+        Ok(Some(dir))
+    }
+
+    /// Read the file at `rel` below this dir, crossing no symlink. `None`
+    /// when it does not exist.
+    pub fn read_rel(&self, rel: &Path) -> Result<Option<String>> {
+        let Some(file) = rel.file_name().map(|f| f.to_string_lossy().into_owned()) else {
+            anyhow::bail!("no file named in {}", rel.display());
+        };
+        let Some(dir) = self.open_rel(rel.parent().unwrap_or(Path::new("")))? else {
+            return Ok(None);
+        };
         match dir.stat(&file)? {
             None => Ok(None),
             Some(_) => dir.read(&file).map(Some),

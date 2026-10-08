@@ -475,8 +475,15 @@ fn host_path(raw: &str, resolve: Resolver<'_>) -> std::result::Result<PathBuf, S
 
 /// Whether `raw` resolves inside the stack dir (`or_equal`: or is it).
 fn in_stack_dir(raw: &str, roots: &Roots, or_equal: bool, resolve: Resolver<'_>) -> bool {
-    host_path(raw, resolve)
-        .is_ok_and(|p| p.starts_with(&roots.stack_dir) && (or_equal || p != roots.stack_dir))
+    stack_path(raw, roots, or_equal, resolve).is_some()
+}
+
+/// `raw` resolved, when it lies inside the stack dir (`or_equal`: or is it).
+/// compose prints a literal `$` as `$$`.
+fn stack_path(raw: &str, roots: &Roots, or_equal: bool, resolve: Resolver<'_>) -> Option<PathBuf> {
+    host_path(&raw.replace("$$", "$"), resolve)
+        .ok()
+        .filter(|p| p.starts_with(&roots.stack_dir) && (or_equal || *p != roots.stack_dir))
 }
 
 /// A bind source: free strictly inside the stack dir, but for orca's own
@@ -616,6 +623,9 @@ struct Collector<'a> {
     pins: &'a Pins,
     /// Every resolved bind source and the services that use it.
     binds: Vec<(PathBuf, Vec<String>)>,
+    /// Every resolved build context and Dockerfile, with what it is and the
+    /// service that builds from it.
+    builds: Vec<(PathBuf, String, String)>,
     /// The project's own prefix for volume and network names.
     prefix: String,
 }
@@ -662,6 +672,30 @@ impl Collector<'_> {
     /// from inside.
     fn nesting(&mut self, roots: &Roots) {
         let binds = std::mem::take(&mut self.binds);
+        // A build reads its context and Dockerfile from the host: if a
+        // container can write a bind that holds either, or one inside the
+        // context, it can swap in a symlink and the next build reads host
+        // files into the image.
+        for (b, what, svc) in std::mem::take(&mut self.builds) {
+            let nests = |p: &PathBuf| b.starts_with(p) || p.starts_with(&b);
+            let hit = binds
+                .iter()
+                .map(|(p, _)| (p, "a bind of this stack"))
+                .chain(
+                    roots
+                        .other_binds
+                        .iter()
+                        .map(|o| (o, "a bind another stack holds a grant for")),
+                )
+                .find(|(p, _)| nests(p));
+            if let Some((p, whose)) = hit {
+                self.push(
+                    &[svc.as_str()],
+                    Judgment::Refuse(format!("it nests with {}, {whose}", p.display())),
+                    &format!("build {what} {}", b.display()),
+                );
+            }
+        }
         for (p, users) in &binds {
             let users: Vec<&str> = users.iter().map(String::as_str).collect();
             if let Some((q, _)) = binds.iter().find(|(q, _)| q != p && q.starts_with(p)) {
@@ -883,6 +917,7 @@ fn raw_violations(
         images: &images,
         pins,
         binds: Vec::new(),
+        builds: Vec::new(),
         prefix: format!("{}_", str_of(cfg.get("name"))),
     };
     for key in keys_outside(cfg, &[TOP_KEYS]) {
@@ -1265,14 +1300,16 @@ fn build_section(
         );
     }
     let context = str_of(build.get("context"));
-    if !in_stack_dir(context, roots, true, resolve) {
+    let Some(context_path) = stack_path(context, roots, true, resolve) else {
         c.push(
             me,
             Judgment::Refuse("only the stack dir or a path inside it is allowed".into()),
             &format!("build context {context}"),
         );
         return;
-    }
+    };
+    c.builds
+        .push((context_path, "context".into(), me[0].to_string()));
     let dockerfile = str_of(build.get("dockerfile"));
     if !dockerfile.is_empty() {
         let full = if Path::new(dockerfile).is_absolute() {
@@ -1280,12 +1317,13 @@ fn build_section(
         } else {
             format!("{}/{dockerfile}", context.trim_end_matches('/'))
         };
-        if !in_stack_dir(&full, roots, false, resolve) {
-            c.push(
+        match stack_path(&full, roots, false, resolve) {
+            Some(p) => c.builds.push((p, "dockerfile".into(), me[0].to_string())),
+            None => c.push(
                 me,
                 Judgment::Refuse("only a file inside the stack dir is allowed".into()),
                 &format!("build dockerfile {dockerfile}"),
-            );
+            ),
         }
     }
     let network = str_of(build.get("network"));
@@ -1391,12 +1429,19 @@ pub fn prepare(raw: &str, base: &Path, dir: &StackDir) -> Result<Value> {
         let Some(svc) = svc.as_object_mut() else {
             continue;
         };
+        if let Some(build) = svc.get("build") {
+            build_paths_unlinked(name, build, base, dir)?;
+        }
         let Some(files) = svc.remove("env_file") else {
             continue;
         };
         let mut env = serde_json::Map::new();
         for f in files.as_array().into_iter().flatten() {
-            let path = f.as_str().unwrap_or_else(|| str_of(f.get("path")));
+            let path = f
+                .as_str()
+                .unwrap_or_else(|| str_of(f.get("path")))
+                .replace("$$", "$");
+            let path = path.as_str();
             let required = f.get("required").and_then(Value::as_bool).unwrap_or(true);
             let rel = Path::new(path)
                 .strip_prefix(base)
@@ -1431,6 +1476,35 @@ pub fn prepare(raw: &str, base: &Path, dir: &StackDir) -> Result<Value> {
         svc.insert("environment".into(), Value::Object(env));
     }
     Ok(cfg)
+}
+
+/// Refuse a build context, or a Dockerfile in the stack dir, reached
+/// through a symlink: each is opened component by component from the stack
+/// dir without following one. A context outside the stack dir is left to the
+/// policy, which refuses it.
+fn build_paths_unlinked(name: &str, build: &Value, base: &Path, dir: &StackDir) -> Result<()> {
+    let context = str_of(build.get("context")).replace("$$", "$");
+    let Ok(rel) = Path::new(&context).strip_prefix(base) else {
+        return Ok(());
+    };
+    let ctx = dir
+        .open_rel(rel)
+        .with_context(|| format!("service {name}: build context {context}"))?
+        .ok_or_else(|| anyhow!("service {name}: build context {context} does not exist"))?;
+    let dockerfile = str_of(build.get("dockerfile")).replace("$$", "$");
+    if dockerfile.is_empty() || build.get("dockerfile_inline").is_some() {
+        return Ok(());
+    }
+    let full = if Path::new(&dockerfile).is_absolute() {
+        PathBuf::from(&dockerfile)
+    } else {
+        ctx.path().join(&dockerfile)
+    };
+    if let Ok(rel) = full.strip_prefix(base) {
+        dir.read_rel(rel)
+            .with_context(|| format!("service {name}: build dockerfile {dockerfile}"))?;
+    }
+    Ok(())
 }
 
 /// The registry identity of each of `services`' images, where it has one.
@@ -2767,6 +2841,100 @@ mod tests {
             assert_eq!(source(&ran), source(&cfg));
             assert!(source(&ran).unwrap().as_str().unwrap().ends_with("/d$$x"));
         });
+    }
+
+    #[test]
+    fn a_build_cannot_read_through_a_bind_or_a_grant() {
+        let stack = |svcs: Value| json!({"name": "web", "services": svcs});
+        let binder = |src: &str| json!({"image": "x:1", "volumes": [{"type": "bind", "source": src, "target": "/d"}]});
+        for (cfg, want) in [
+            (
+                stack(json!({
+                    "a": binder("/opt/stacks/web/data"),
+                    "b": {"image": "y:1", "build": {"context": "/opt/stacks/web/data/src"}}
+                })),
+                "build context /opt/stacks/web/data/src",
+            ),
+            (
+                stack(json!({
+                    "a": binder("/opt/stacks/web/config"),
+                    "b": {"image": "y:1", "build": {"context": STACK}}
+                })),
+                "build context /opt/stacks/web",
+            ),
+            (
+                stack(json!({
+                    "a": binder("/opt/stacks/web/df"),
+                    "b": {"image": "y:1", "build": {"context": "/opt/stacks/web/src", "dockerfile": "/opt/stacks/web/df/Dockerfile"}}
+                })),
+                "build dockerfile /opt/stacks/web/df/Dockerfile",
+            ),
+            (
+                stack(json!({
+                    "a": binder("/opt/stacks/web/a$b"),
+                    "b": {"image": "y:1", "build": {"context": "/opt/stacks/web/a$$b"}}
+                })),
+                "build context /opt/stacks/web/a$b",
+            ),
+        ] {
+            let err = ungrantable(&cfg);
+            assert!(
+                err.contains(want) && err.contains("a bind of this stack"),
+                "{err}"
+            );
+        }
+        let granted = roots().with_others(&[], &["/opt/stacks/web/shared".to_string()], &lexical);
+        let c = stack(
+            json!({"b": {"image": "y:1", "build": {"context": "/opt/stacks/web/shared/src"}}}),
+        );
+        let err = check(&c, &pins(&c), &[], &granted, &lexical)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("another stack holds a grant for"), "{err}");
+        let apart = stack(json!({
+            "a": binder("/opt/stacks/web/data"),
+            "b": {"image": "y:1", "build": {"context": "/opt/stacks/web/src"}}
+        }));
+        assert!(found(&apart).is_empty(), "{:?}", found(&apart));
+    }
+
+    #[test]
+    fn build_paths_unescape_dollars() {
+        let roots = Roots::new(Path::new("/opt/stacks/w$b"), &[], &[], &lexical).unwrap();
+        let c = json!({"name": "web", "services": {"b": {"image": "y:1", "build": {
+            "context": "/opt/stacks/w$$b", "dockerfile": "Dockerfile"
+        }}}});
+        assert!(violations(&c, &pins(&c), &roots, &lexical).is_empty());
+    }
+
+    #[test]
+    fn prepare_opens_build_paths_without_following_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let web = root.join("web");
+        std::fs::create_dir_all(web.join("src")).unwrap();
+        std::fs::write(web.join("src/Dockerfile"), "FROM x\n").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("Dockerfile"), "FROM x\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), web.join("ctx")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("Dockerfile"), web.join("src/Linked"))
+            .unwrap();
+        let roots = vec![root.to_string_lossy().into_owned()];
+        let dir = StackDir::open(&web.to_string_lossy(), &roots, false)
+            .unwrap()
+            .unwrap();
+        let raw = |context: &str, dockerfile: &str| {
+            json!({"name": "web", "services": {"b": {"image": "y:1", "build": {
+                "context": format!("{}/{context}", web.display()), "dockerfile": dockerfile
+            }}}})
+            .to_string()
+        };
+        prepare(&raw("src", "Dockerfile"), &web, &dir).unwrap();
+        assert!(prepare(&raw("ctx", "Dockerfile"), &web, &dir).is_err());
+        assert!(prepare(&raw("src", "Linked"), &web, &dir).is_err());
+        std::fs::create_dir(web.join("a$b")).unwrap();
+        std::fs::write(web.join("a$b/Dockerfile"), "FROM x\n").unwrap();
+        prepare(&raw("a$$b", "Dockerfile"), &web, &dir).unwrap();
     }
 
     #[test]
