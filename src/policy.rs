@@ -1478,17 +1478,24 @@ pub fn prepare(raw: &str, base: &Path, dir: &StackDir) -> Result<Value> {
     Ok(cfg)
 }
 
-/// Refuse a build context, or a Dockerfile in the stack dir, reached
-/// through a symlink: each is opened component by component from the stack
-/// dir without following one. A context outside the stack dir is left to the
-/// policy, which refuses it.
+/// Refuse a build context or Dockerfile reached through a symlink: each is
+/// opened component by component from the stack dir without following one.
+/// A path not lexically inside `base` is refused too, as the policy judges
+/// paths canonicalised and would accept an alias (`/proc/self/root/...`)
+/// this walk never opens.
 fn build_paths_unlinked(name: &str, build: &Value, base: &Path, dir: &StackDir) -> Result<()> {
-    let context = str_of(build.get("context")).replace("$$", "$");
-    let Ok(rel) = Path::new(&context).strip_prefix(base) else {
-        return Ok(());
+    let inside = |p: &Path| {
+        p.strip_prefix(base)
+            .ok()
+            .filter(|r| r.components().all(|c| matches!(c, Component::Normal(_))))
+            .map(Path::to_path_buf)
     };
+    let context = str_of(build.get("context")).replace("$$", "$");
+    let rel = inside(Path::new(&context)).ok_or_else(|| {
+        anyhow!("service {name}: build context {context} is not inside the stack dir")
+    })?;
     let ctx = dir
-        .open_rel(rel)
+        .open_rel(&rel)
         .with_context(|| format!("service {name}: build context {context}"))?
         .ok_or_else(|| anyhow!("service {name}: build context {context} does not exist"))?;
     let dockerfile = str_of(build.get("dockerfile")).replace("$$", "$");
@@ -1500,10 +1507,14 @@ fn build_paths_unlinked(name: &str, build: &Value, base: &Path, dir: &StackDir) 
     } else {
         ctx.path().join(&dockerfile)
     };
-    if let Ok(rel) = full.strip_prefix(base) {
-        dir.read_rel(rel)
-            .with_context(|| format!("service {name}: build dockerfile {dockerfile}"))?;
-    }
+    let rel = inside(&full)
+        .filter(|r| r.components().next().is_some())
+        .ok_or_else(|| {
+            anyhow!("service {name}: build dockerfile {dockerfile} is not inside the stack dir")
+        })?;
+    dir.read_rel(&rel)
+        .with_context(|| format!("service {name}: build dockerfile {dockerfile}"))?
+        .ok_or_else(|| anyhow!("service {name}: build dockerfile {dockerfile} does not exist"))?;
     Ok(())
 }
 
@@ -2935,6 +2946,97 @@ mod tests {
         std::fs::create_dir(web.join("a$b")).unwrap();
         std::fs::write(web.join("a$b/Dockerfile"), "FROM x\n").unwrap();
         prepare(&raw("a$$b", "Dockerfile"), &web, &dir).unwrap();
+    }
+
+    #[test]
+    fn prepare_refuses_build_paths_reached_through_an_alias_of_the_stack_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let web = root.join("web");
+        std::fs::create_dir_all(web.join("src")).unwrap();
+        std::fs::write(web.join("src/Dockerfile"), "FROM x\n").unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let alias = elsewhere.path().join("alias");
+        std::os::unix::fs::symlink(&web, &alias).unwrap();
+        let roots = vec![root.to_string_lossy().into_owned()];
+        let dir = StackDir::open(&web.to_string_lossy(), &roots, false)
+            .unwrap()
+            .unwrap();
+        let raw = |context: &Path, dockerfile: &Path| {
+            json!({"name": "web", "services": {"b": {"image": "y:1", "build": {
+                "context": context, "dockerfile": dockerfile
+            }}}})
+            .to_string()
+        };
+        prepare(
+            &raw(&web.join("src"), &web.join("src/Dockerfile")),
+            &web,
+            &dir,
+        )
+        .unwrap();
+        let err = prepare(
+            &raw(&alias.join("src"), Path::new("Dockerfile")),
+            &web,
+            &dir,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not inside the stack dir"), "{err}");
+        let err = prepare(
+            &raw(&web.join("src"), &alias.join("src/Dockerfile")),
+            &web,
+            &dir,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not inside the stack dir"), "{err}");
+    }
+
+    #[test]
+    fn prepare_unescapes_dollars_in_dockerfiles_and_refuses_a_missing_one() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let web = root.join("web");
+        std::fs::create_dir_all(web.join("src")).unwrap();
+        std::fs::write(web.join("src/ok$x"), "FROM x\n").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("Dockerfile"), "FROM x\n").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("Dockerfile"), web.join("src/a$b")).unwrap();
+        let roots = vec![root.to_string_lossy().into_owned()];
+        let dir = StackDir::open(&web.to_string_lossy(), &roots, false)
+            .unwrap()
+            .unwrap();
+        let raw = |dockerfile: &str| {
+            json!({"name": "web", "services": {"b": {"image": "y:1", "build": {
+                "context": web.join("src"), "dockerfile": dockerfile
+            }}}})
+            .to_string()
+        };
+        prepare(&raw("ok$$x"), &web, &dir).unwrap();
+        assert!(prepare(&raw("a$$b"), &web, &dir).is_err());
+        let err = prepare(&raw("Missing"), &web, &dir)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not exist"), "{err}");
+    }
+
+    #[test]
+    fn prepare_unescapes_dollars_in_env_file_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let web = root.join("web");
+        std::fs::create_dir_all(&web).unwrap();
+        std::fs::write(web.join("e$v.env"), "A=1\n").unwrap();
+        let roots = vec![root.to_string_lossy().into_owned()];
+        let dir = StackDir::open(&web.to_string_lossy(), &roots, false)
+            .unwrap()
+            .unwrap();
+        let raw = json!({"name": "web", "services": {"app": {
+            "image": "x:1", "env_file": [format!("{}/e$$v.env", web.display())]
+        }}})
+        .to_string();
+        let cfg = prepare(&raw, &web, &dir).unwrap();
+        assert_eq!(cfg["services"]["app"]["environment"]["A"], "1");
     }
 
     #[test]
