@@ -492,7 +492,7 @@ pub async fn refresh(row: &StackRow) -> Result<Compose> {
 /// what was left unlabeled.
 pub async fn up(row: &StackRow, services: &[&str]) -> Result<String> {
     let (compose, notes) = write_with(row, client()?, None).await?;
-    let out = crate::policy::gate(row, &compose)
+    let out = crate::policy::gate(Some(client()?), row, &compose)
         .await?
         .up(services)
         .await?;
@@ -1122,7 +1122,7 @@ impl Migrator for ComposeMigrator<'_> {
             } else {
                 compose
             };
-            let checked = crate::policy::gate(self.row, &compose).await?;
+            let checked = crate::policy::gate(Some(self.docker), self.row, &compose).await?;
             if start {
                 checked.up(&[service]).await?;
             } else {

@@ -129,6 +129,7 @@ impl StackRow {
         yaml: Option<&str>,
         env: Option<&str>,
         stacks_roots: &[String],
+        docker: Option<&bollard::Docker>,
     ) -> Result<()> {
         check_file_name(&self.file)?;
         let env = env.filter(|e| !e.is_empty());
@@ -159,7 +160,8 @@ impl StackRow {
         };
         let env_file = env.as_ref().map(StagedWrite::temp_path);
         let raw = config_json(dir.path(), &file, env_file.as_deref()).await?;
-        policy::check_stack(&raw, &raw, self, dir.path(), stacks_roots)?;
+        let cfg = policy::prepare(&raw, dir.path(), &dir)?;
+        policy::check_stack(docker, &cfg, &cfg, self, dir.path(), stacks_roots).await?;
         if let Some(staged) = compose {
             staged.commit()?;
         }
@@ -178,6 +180,7 @@ impl StackRow {
         yaml: &str,
         read_before: &str,
         stacks_roots: &[String],
+        docker: Option<&bollard::Docker>,
     ) -> Result<()> {
         let dir = StackDir::open(&self.dir, stacks_roots, false)?
             .ok_or_else(|| anyhow::anyhow!("stack dir {} does not exist", self.dir))?;
@@ -191,7 +194,8 @@ impl StackRow {
         }
         let staged = StagedWrite::new(&dir, &name, yaml)?;
         let raw = config_json(dir.path(), &staged.temp_path(), None).await?;
-        policy::check_stack(&raw, &raw, self, dir.path(), stacks_roots)?;
+        let cfg = policy::prepare(&raw, dir.path(), &dir)?;
+        policy::check_stack(docker, &cfg, &cfg, self, dir.path(), stacks_roots).await?;
         staged.commit()
     }
 
@@ -408,6 +412,39 @@ impl StackDir {
         Ok(fsat::stat_at(&self.fd, name)?)
     }
 
+    /// Read the file at `rel` below this dir, crossing no symlink. `None`
+    /// when it does not exist.
+    pub fn read_rel(&self, rel: &Path) -> Result<Option<String>> {
+        let mut names: Vec<String> = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        let Some(file) = names.pop() else {
+            anyhow::bail!("no file named in {}", rel.display());
+        };
+        let mut dir = StackDir {
+            fd: self.fd.try_clone()?,
+            path: self.path.clone(),
+        };
+        for name in &names {
+            dir = match fsat::open_dir_at(&dir.fd, name) {
+                Ok(fd) => StackDir {
+                    fd,
+                    path: dir.path.join(name),
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => {
+                    return Err(anyhow::anyhow!(e)
+                        .context(format!("opening '{name}' in {}", dir.path.display())));
+                }
+            };
+        }
+        match dir.stat(&file)? {
+            None => Ok(None),
+            Some(_) => dir.read(&file).map(Some),
+        }
+    }
+
     /// Read `name`, refusing a symlink.
     pub fn read(&self, name: &str) -> Result<String> {
         use std::io::Read;
@@ -503,6 +540,11 @@ impl StagedRestore {
     /// The staged dir, as it will be once swapped in.
     pub fn path(&self) -> &Path {
         &self.staged
+    }
+
+    /// The staged dir, opened from its parent without following a symlink.
+    pub fn dir(&self) -> Result<StackDir> {
+        self.parent.child(&self.staging)
     }
 
     /// The compose files in the staged dir that `row` would run, in `-f`
@@ -819,6 +861,11 @@ mod tests {
         }
     }
 
+    /// A client whose engine is gone, so every image lookup fails.
+    fn no_engine() -> bollard::Docker {
+        crate::test_engine::FakeEngine::routed(Vec::new()).client()
+    }
+
     fn row(dir: &Path) -> StackRow {
         StackRow {
             name: "web".into(),
@@ -956,9 +1003,12 @@ mod tests {
         let f = Fixture::new();
         let r = f.row();
         std::fs::write(r.compose_path(), "a: 2\n").unwrap();
-        let err = plugin_toolkit::reactor::block_on(
-            r.write_compose_if_unchanged("a: 3\n", "a: 1\n", &f.roots),
-        )
+        let err = plugin_toolkit::reactor::block_on(r.write_compose_if_unchanged(
+            "a: 3\n",
+            "a: 1\n",
+            &f.roots,
+            Some(&no_engine()),
+        ))
         .unwrap_err();
         assert!(
             err.to_string().contains("changed since it was read"),
@@ -976,12 +1026,17 @@ mod tests {
             Some("services: {}\n"),
             None,
             &f.roots,
+            Some(&no_engine()),
         ))
         .unwrap_err();
         assert!(err.to_string().contains("set stacksRoot"), "{err}");
-        let err =
-            plugin_toolkit::reactor::block_on(r.write_compose_if_unchanged("x", "", &f.roots))
-                .unwrap_err();
+        let err = plugin_toolkit::reactor::block_on(r.write_compose_if_unchanged(
+            "x",
+            "",
+            &f.roots,
+            Some(&no_engine()),
+        ))
+        .unwrap_err();
         assert!(err.to_string().contains("set stacksRoot"), "{err}");
         assert_eq!(std::fs::read_dir(elsewhere.path()).unwrap().count(), 0);
     }

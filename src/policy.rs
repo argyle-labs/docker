@@ -11,9 +11,9 @@
 //! other projects' volumes and networks, the host network) needs a grant.
 //! Grants are recorded by an admin through `docker.stack_allow`, either one
 //! by one or by approving what the stack runs now. Each is bound to a digest
-//! of its service's whole resolved definition, so any change to the service
-//! (command, environment, image, mounts, ...) voids its grants until an admin
-//! approves again.
+//! of its service's whole resolved definition (env files included) and to
+//! its image's registry content digest, so any change to the service or to
+//! what its image tag holds voids its grants until an admin approves again.
 //!
 //! A few things are refused outright, with no grant: a path with a `..`
 //! component or that cannot be resolved, a bind that contains the stack dir,
@@ -233,49 +233,69 @@ const BUILD_KEYS: &[&str] = &[
 const REMOTE_VOLUME_TYPES: &[&str] = &["nfs", "nfs4", "cifs", "tmpfs"];
 const DIGEST_PREFIX: &str = "sha256:";
 
-/// One exception an admin recorded: `allow` for `service` while its resolved
-/// definition hashes to `definition`.
+fn is_digest(d: &str) -> bool {
+    d.strip_prefix(DIGEST_PREFIX)
+        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// One exception an admin recorded: `allow` for `service` while it runs
+/// `image` with registry content `image_digest` and its resolved definition
+/// hashes to `definition`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(crate = "plugin_toolkit::serde")]
 #[schemars(crate = "plugin_toolkit::schemars")]
 pub struct Grant {
     pub service: String,
+    /// The service's `image` as compose resolves it.
+    pub image: String,
     /// `sha256:<hex>` of the service's definition (see [`digests`]).
     pub definition: String,
+    /// The image's registry content digest(s), `sha256:<hex>[,...]` (see
+    /// [`ImagePin`]).
+    pub image_digest: String,
     pub allow: String,
 }
 
 impl std::fmt::Display for Grant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}|{}|{}", self.service, self.definition, self.allow)
+        write!(
+            f,
+            "{}|{}|{}|{}|{}",
+            self.service, self.image, self.definition, self.image_digest, self.allow
+        )
     }
 }
 
 impl std::str::FromStr for Grant {
     type Err = plugin_toolkit::anyhow::Error;
 
-    /// `<service>|<definition>|<grant>`. Neither service names nor digests
-    /// can hold a `|`; the grant may.
+    /// `<service>|<image>|<definition>|<image digest>|<grant>`. None of the
+    /// first four can hold a `|`; the grant may.
     fn from_str(s: &str) -> Result<Self> {
-        let mut parts = s.splitn(3, '|');
-        let (Some(service), Some(definition), Some(allow)) =
-            (parts.next(), parts.next(), parts.next())
-        else {
-            bail!("grant '{s}' must be '<service>|<definition>|<grant>'");
+        let mut parts = s.splitn(5, '|');
+        let (Some(service), Some(image), Some(definition), Some(image_digest), Some(allow)) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) else {
+            bail!("grant '{s}' must be '<service>|<image>|<definition>|<image digest>|<grant>'");
         };
-        if service.is_empty() {
-            bail!("grant '{s}' names no service");
+        if service.is_empty() || image.is_empty() {
+            bail!("grant '{s}' names no service or no image");
         }
-        let hex = definition.strip_prefix(DIGEST_PREFIX).unwrap_or("");
-        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if !is_digest(definition) || !image_digest.split(',').all(is_digest) {
             bail!(
-                "grant '{s}' needs the service's definition digest ({DIGEST_PREFIX}<hex>) from the dry run"
+                "grant '{s}' needs the definition and image digests ({DIGEST_PREFIX}<hex>) from the dry run"
             );
         }
         validate_grant(allow)?;
         Ok(Grant {
             service: service.to_string(),
+            image: image.to_string(),
             definition: definition.to_string(),
+            image_digest: image_digest.to_string(),
             allow: allow.to_string(),
         })
     }
@@ -288,6 +308,8 @@ pub struct Violation {
     pub image: String,
     /// The service's definition digest; empty with no service.
     pub definition: String,
+    /// The image's registry content digest; empty when it has none.
+    pub image_digest: String,
     /// The grant that admits it; `None` when nothing can.
     pub allow: Option<String>,
     pub detail: String,
@@ -297,10 +319,32 @@ impl Violation {
     fn grant(&self) -> Option<Grant> {
         self.allow.as_ref().map(|allow| Grant {
             service: self.service.clone(),
+            image: self.image.clone(),
             definition: self.definition.clone(),
+            image_digest: self.image_digest.clone(),
             allow: allow.clone(),
         })
     }
+}
+
+/// An image's registry identity, from `docker image inspect`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImagePin {
+    /// The content digests of its `RepoDigests`, sorted and joined by `,`.
+    pub digest: String,
+    /// One of its `RepoDigests` (`repo@sha256:...`), which compose runs so
+    /// a tag retagged after the check is never used.
+    pub reference: String,
+}
+
+/// What each service's grants are bound to.
+#[derive(Debug, Default)]
+pub struct Pins {
+    /// [`digests`] of the user's own files.
+    pub definitions: BTreeMap<String, String>,
+    /// Each service's image, where it has a registry digest. A built or
+    /// unpulled image has none and cannot hold a grant.
+    pub images: BTreeMap<String, ImagePin>,
 }
 
 pub type Resolver<'a> = &'a dyn Fn(&Path) -> Result<PathBuf>;
@@ -317,6 +361,22 @@ pub struct Roots {
     other_binds: Vec<PathBuf>,
     /// File names in the stack dir that orca reads or writes, never bindable.
     own_files: BTreeSet<String>,
+    /// The daemon's home and docker config dirs: no bind may be, contain or
+    /// sit inside one.
+    daemon_dirs: Vec<PathBuf>,
+    /// The stack being judged.
+    stack: String,
+    /// Every image a granted service of any registered stack runs.
+    granted_images: Vec<GrantedImage>,
+}
+
+/// An image a granted service runs: `stack`'s `service` holds a grant while
+/// running `image` (normalized, see [`norm_image`]).
+#[derive(Debug, Clone)]
+pub struct GrantedImage {
+    pub image: String,
+    pub stack: String,
+    pub service: String,
 }
 
 impl Roots {
@@ -346,7 +406,24 @@ impl Roots {
             other_dirs: Vec::new(),
             other_binds: Vec::new(),
             own_files,
+            daemon_dirs: Vec::new(),
+            stack: String::new(),
+            granted_images: Vec::new(),
         })
+    }
+
+    /// With the daemon's home and docker config dirs.
+    pub fn with_daemon_dirs(mut self, dirs: &[String], resolve: Resolver<'_>) -> Self {
+        self.daemon_dirs = dirs.iter().map(|d| configured(d, resolve)).collect();
+        self
+    }
+
+    /// Judging stack `stack`, against the images granted services of every
+    /// registered stack run.
+    pub fn with_granted_images(mut self, stack: &str, images: Vec<GrantedImage>) -> Self {
+        self.stack = stack.to_string();
+        self.granted_images = images;
+        self
     }
 
     /// With the other registered stacks' `dirs` and granted bind paths.
@@ -412,6 +489,16 @@ fn judge_source(p: &Path, raw: &str, roots: &Roots) -> Judgment {
         return Judgment::Refuse(format!(
             "'{raw}' contains {}, the stack dir, its parent, a stacks root, a backup root or another stack's dir",
             r.display()
+        ));
+    }
+    if let Some(d) = roots
+        .daemon_dirs
+        .iter()
+        .find(|d| p.starts_with(d) || d.starts_with(p))
+    {
+        return Judgment::Refuse(format!(
+            "'{raw}' reaches {}, the daemon's home or docker config",
+            d.display()
         ));
     }
     if let Some(d) = roots.other_dirs.iter().find(|d| p.starts_with(d)) {
@@ -526,9 +613,7 @@ struct Collector<'a> {
     out: BTreeSet<Violation>,
     /// Each service's image, for messages.
     images: &'a BTreeMap<String, String>,
-    digests: &'a BTreeMap<String, String>,
-    /// Services with a `build` section.
-    builders: BTreeSet<String>,
+    pins: &'a Pins,
     /// Every resolved bind source and the services that use it.
     binds: Vec<(PathBuf, Vec<String>)>,
     /// The project's own prefix for volume and network names.
@@ -617,27 +702,25 @@ impl Collector<'_> {
                 service: String::new(),
                 image: String::new(),
                 definition: String::new(),
+                image_digest: String::new(),
                 allow: None,
                 detail,
             });
             return;
         }
         for svc in users {
-            // A built image is not pinned by the service's definition: the
-            // context and Dockerfile can change under an unchanged digest.
-            let (allow, detail) = match allow.clone() {
-                Some(_) if self.builders.contains(*svc) => (
-                    None,
-                    format!("{detail} (a service that builds its image cannot hold a grant)"),
-                ),
-                other => (other, detail.clone()),
-            };
             self.out.insert(Violation {
                 service: svc.to_string(),
                 image: self.images.get(*svc).cloned().unwrap_or_default(),
-                definition: self.digests.get(*svc).cloned().unwrap_or_default(),
-                allow,
-                detail,
+                definition: self.pins.definitions.get(*svc).cloned().unwrap_or_default(),
+                image_digest: self
+                    .pins
+                    .images
+                    .get(*svc)
+                    .map(|p| p.digest.clone())
+                    .unwrap_or_default(),
+                allow: allow.clone(),
+                detail: detail.clone(),
             });
         }
     }
@@ -732,10 +815,59 @@ pub fn digests(cfg: &Value) -> BTreeMap<String, String> {
 }
 
 /// Every setting in the resolved config `cfg` that needs a grant or is
-/// refused outright, with grants bound to `digests`.
+/// refused outright, with grants bound to `pins`. A grantable setting of a
+/// service that builds its image, or whose image has no registry digest, is
+/// refused: nothing pins what that image holds.
 pub fn violations(
     cfg: &Value,
-    digests: &BTreeMap<String, String>,
+    pins: &Pins,
+    roots: &Roots,
+    resolve: Resolver<'_>,
+) -> Vec<Violation> {
+    let builders: BTreeSet<&str> = cfg
+        .get("services")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(_, s)| non_empty(s.get("build")))
+        .map(|(k, _)| k.as_str())
+        .collect();
+    raw_violations(cfg, pins, roots, resolve)
+        .into_iter()
+        .map(|mut v| {
+            if v.allow.is_some() {
+                let why = if builders.contains(v.service.as_str()) {
+                    Some("a service that builds its image cannot hold a grant")
+                } else if !pins.images.contains_key(&v.service) {
+                    Some(
+                        "its image has no registry digest (built locally or not pulled), so it cannot hold a grant",
+                    )
+                } else {
+                    None
+                };
+                if let Some(why) = why {
+                    v.allow = None;
+                    v.detail = format!("{} ({why})", v.detail);
+                }
+            }
+            v
+        })
+        .collect()
+}
+
+/// The services with a setting a grant could admit, whose images
+/// [`image_pins`] must look up.
+pub fn needing_grants(cfg: &Value, roots: &Roots, resolve: Resolver<'_>) -> BTreeSet<String> {
+    raw_violations(cfg, &Pins::default(), roots, resolve)
+        .into_iter()
+        .filter(|v| v.allow.is_some() && !v.service.is_empty())
+        .map(|v| v.service)
+        .collect()
+}
+
+fn raw_violations(
+    cfg: &Value,
+    pins: &Pins,
     roots: &Roots,
     resolve: Resolver<'_>,
 ) -> Vec<Violation> {
@@ -748,13 +880,7 @@ pub fn violations(
     let mut c = Collector {
         out: BTreeSet::new(),
         images: &images,
-        digests,
-        builders: all
-            .into_iter()
-            .flatten()
-            .filter(|(_, s)| non_empty(s.get("build")))
-            .map(|(k, _)| k.clone())
-            .collect(),
+        pins,
         binds: Vec::new(),
         prefix: format!("{}_", str_of(cfg.get("name"))),
     };
@@ -1059,8 +1185,67 @@ fn service(name: &str, svc: &Value, c: &mut Collector<'_>, roots: &Roots, resolv
             );
         }
     }
+    image_names(name, svc, c, roots);
     if let Some(build) = svc.get("build") {
         build_section(build, &me, c, roots, resolve);
+    }
+}
+
+/// `image` in one spelling: no `docker.io/` or `library/` prefix, and
+/// `:latest` when it names no tag or digest.
+pub fn norm_image(image: &str) -> String {
+    let i = image
+        .strip_prefix("docker.io/")
+        .or_else(|| image.strip_prefix("index.docker.io/"))
+        .unwrap_or(image);
+    let i = i.strip_prefix("library/").unwrap_or(i);
+    let last = i.rsplit('/').next().unwrap_or(i);
+    if last.contains(':') || i.contains('@') {
+        i.to_string()
+    } else {
+        format!("{i}:latest")
+    }
+}
+
+/// Refuse a build that would tag an image a granted service runs, and any
+/// other stack naming one: building or pulling it under that name would
+/// change what the granted service runs.
+fn image_names(name: &str, svc: &Value, c: &mut Collector<'_>, roots: &Roots) {
+    let builds = non_empty(svc.get("build"));
+    let named: Vec<String> = std::iter::once(str_of(svc.get("image")))
+        .chain(
+            svc.pointer("/build/tags")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|t| t.as_str().unwrap_or("")),
+        )
+        .filter(|n| !n.is_empty())
+        .map(norm_image)
+        .collect();
+    for n in named {
+        let why = roots
+            .granted_images
+            .iter()
+            .filter(|g| g.image == n)
+            .find_map(|g| {
+                if builds {
+                    Some(format!(
+                        "a build would tag {n}, which granted service {}/{} runs",
+                        g.stack, g.service
+                    ))
+                } else if g.stack != roots.stack {
+                    Some(format!(
+                        "{n} is the image granted service {}/{} runs",
+                        g.stack, g.service
+                    ))
+                } else {
+                    None
+                }
+            });
+        if let Some(why) = why {
+            c.push(&[name], Judgment::Refuse(why), &format!("image {n}"));
+        }
     }
 }
 
@@ -1112,11 +1297,16 @@ fn build_section(
     }
 }
 
-/// Whether `grant` admits `allow` for `v`'s service and definition. Bind
-/// grants match by resolved path, so a grant written through a symlink still
-/// matches.
+/// Whether `grant` admits `allow` for `v`'s service, definition and image.
+/// Bind grants match by resolved path, so a grant written through a symlink
+/// still matches.
 fn admits(g: &Grant, v: &Violation, allow: &str, resolve: Resolver<'_>) -> bool {
-    if g.service != v.service || v.definition.is_empty() || g.definition != v.definition {
+    if g.service != v.service
+        || v.definition.is_empty()
+        || g.definition != v.definition
+        || v.image_digest.is_empty()
+        || g.image_digest != v.image_digest
+    {
         return false;
     }
     if g.allow == allow {
@@ -1133,16 +1323,16 @@ fn admits(g: &Grant, v: &Violation, allow: &str, resolve: Resolver<'_>) -> bool 
     }
 }
 
-/// Refuse `cfg` unless every violation is granted to its service and
-/// definition.
+/// Refuse `cfg` unless every violation is granted to its service,
+/// definition and image.
 pub fn check(
     cfg: &Value,
-    digests: &BTreeMap<String, String>,
+    pins: &Pins,
     grants: &[Grant],
     roots: &Roots,
     resolve: Resolver<'_>,
 ) -> Result<()> {
-    let refused: Vec<Violation> = violations(cfg, digests, roots, resolve)
+    let refused: Vec<Violation> = violations(cfg, pins, roots, resolve)
         .into_iter()
         .filter(|v| match &v.allow {
             Some(allow) => !grants.iter().any(|g| admits(g, v, allow, resolve)),
@@ -1160,7 +1350,16 @@ pub fn check(
             } else {
                 format!("{} ({})", v.service, v.image)
             };
+            let upstream = grants.iter().any(|g| {
+                g.service == v.service
+                    && g.definition == v.definition
+                    && g.image_digest != v.image_digest
+            });
             match v.grant() {
+                Some(_) if upstream => format!(
+                    "{who}: {} (image changed upstream; re-approve with {ALLOW_TOOL} approveCurrent)",
+                    v.detail
+                ),
                 Some(g) => format!("{who}: {} (grant '{g}')", v.detail),
                 None => format!("{who}: {} (cannot be granted)", v.detail),
             }
@@ -1176,8 +1375,129 @@ fn parse(raw: &str) -> Result<Value> {
     serde_json::from_str(raw).context("parsing `compose config --format json`")
 }
 
+/// `raw`, the resolved config of the stack dir `base`, with each service's
+/// env files read into its `environment` and `env_file` dropped, so the
+/// definition digest covers them and compose runs exactly what was checked.
+/// The files must lie inside `base` and are read from `dir` (the stack dir,
+/// or a restore's staging dir) without following symlinks. As in compose,
+/// `environment` wins over env files and later files over earlier ones.
+pub fn prepare(raw: &str, base: &Path, dir: &StackDir) -> Result<Value> {
+    let mut cfg = parse(raw)?;
+    let Some(services) = cfg.get_mut("services").and_then(Value::as_object_mut) else {
+        return Ok(cfg);
+    };
+    for (name, svc) in services.iter_mut() {
+        let Some(svc) = svc.as_object_mut() else {
+            continue;
+        };
+        let Some(files) = svc.remove("env_file") else {
+            continue;
+        };
+        let mut env = serde_json::Map::new();
+        for f in files.as_array().into_iter().flatten() {
+            let path = f.as_str().unwrap_or_else(|| str_of(f.get("path")));
+            let required = f.get("required").and_then(Value::as_bool).unwrap_or(true);
+            let rel = Path::new(path)
+                .strip_prefix(base)
+                .ok()
+                .filter(|r| {
+                    r.components().next().is_some()
+                        && r.components().all(|c| matches!(c, Component::Normal(_)))
+                })
+                .ok_or_else(|| {
+                    anyhow!("service {name}: env_file {path} is not inside the stack dir")
+                })?;
+            let text = match dir.read_rel(rel)? {
+                Some(text) => text,
+                None if !required => continue,
+                None => bail!("service {name}: env_file {path} does not exist"),
+            };
+            for (k, v) in stacks::env_pairs(&text) {
+                // Escaped as compose prints `environment`, so a rerun reads
+                // it back verbatim.
+                env.insert(k, Value::String(v.replace('$', "$$")));
+            }
+        }
+        if let Some(Value::Object(own)) = svc.get("environment") {
+            env.extend(own.clone());
+        }
+        svc.insert("environment".into(), Value::Object(env));
+    }
+    Ok(cfg)
+}
+
+/// The registry identity of each of `services`' images, where it has one.
+/// With no engine, none has one.
+pub async fn image_pins(
+    docker: Option<&bollard::Docker>,
+    cfg: &Value,
+    services: &BTreeSet<String>,
+) -> BTreeMap<String, ImagePin> {
+    let mut pins = BTreeMap::new();
+    let Some(docker) = docker else {
+        return pins;
+    };
+    for name in services {
+        let image = str_of(cfg.pointer(&format!("/services/{name}/image"))).to_string();
+        if image.is_empty() {
+            continue;
+        }
+        // An image the engine cannot inspect has no digest to bind to.
+        let Ok(info) = docker.inspect_image(&image).await else {
+            continue;
+        };
+        let mut refs = info.repo_digests.unwrap_or_default();
+        refs.sort();
+        let mut digests: Vec<&str> = refs
+            .iter()
+            .filter_map(|r| r.split_once('@').map(|(_, d)| d))
+            .filter(|d| is_digest(d))
+            .collect();
+        digests.sort();
+        digests.dedup();
+        let Some(reference) = refs.iter().find(|r| r.contains('@')) else {
+            continue;
+        };
+        pins.insert(
+            name.clone(),
+            ImagePin {
+                digest: digests.join(","),
+                reference: reference.clone(),
+            },
+        );
+    }
+    pins
+}
+
+/// Every image a granted service of a registered stack runs, `row`'s own
+/// grants as they are now included.
+fn granted_images(row: &StackRow, others: &[StackRow]) -> Vec<GrantedImage> {
+    others
+        .iter()
+        .chain(std::iter::once(row))
+        .flat_map(|r| {
+            r.allow.iter().map(|g| GrantedImage {
+                image: norm_image(&g.image),
+                stack: r.name.clone(),
+                service: g.service.clone(),
+            })
+        })
+        .collect()
+}
+
+/// The daemon's home, `$DOCKER_CONFIG` and `~/.docker`. A home of `/` (a
+/// service with no real home) is left out: it would refuse every bind.
+fn daemon_dirs() -> Vec<String> {
+    let below_root = |d: &String| Path::new(d).is_absolute() && Path::new(d).parent().is_some();
+    let home = std::env::var("HOME").ok().filter(below_root);
+    home.iter()
+        .flat_map(|h| [h.clone(), format!("{}/.docker", h.trim_end_matches('/'))])
+        .chain(std::env::var("DOCKER_CONFIG").ok().filter(below_root))
+        .collect()
+}
+
 /// The roots `row`, whose dir is `stack_dir`, is judged against, with every
-/// other registered stack's dir and bind grants.
+/// other registered stack's dir, bind grants and granted images.
 fn live_roots(row: &StackRow, stack_dir: &Path, stacks_roots: &[String]) -> Result<Roots> {
     let others: Vec<StackRow> = stacks::list()?
         .into_iter()
@@ -1197,49 +1517,54 @@ fn live_roots(row: &StackRow, stack_dir: &Path, stacks_roots: &[String]) -> Resu
         resolve,
     )?
     .with_others(&dirs, &binds, resolve)
-    .with_compose_file(&row.file))
+    .with_compose_file(&row.file)
+    .with_daemon_dirs(&daemon_dirs(), resolve)
+    .with_granted_images(&row.name, granted_images(row, &others)))
 }
 
-/// Check the resolved config `raw` of `row`, whose dir is `stack_dir`,
-/// against the row's grants. `user_raw` is the resolved config of the user's
-/// own files (without [`compose::ORCA_FILE`]), which the definition digests
-/// are taken from.
-pub fn check_stack(
-    raw: &str,
-    user_raw: &str,
+/// Check `cfg`, the [`prepare`]d config of `row` whose dir is `stack_dir`,
+/// against the row's grants. `user_cfg` is that of the user's own files
+/// (without [`compose::ORCA_FILE`]), which definition digests come from.
+/// Returns what the grants were bound to.
+pub async fn check_stack(
+    docker: Option<&bollard::Docker>,
+    cfg: &Value,
+    user_cfg: &Value,
     row: &StackRow,
     stack_dir: &Path,
     stacks_roots: &[String],
-) -> Result<()> {
+) -> Result<Pins> {
     let roots = live_roots(row, stack_dir, stacks_roots)?;
-    check(
-        &parse(raw)?,
-        &digests(&parse(user_raw)?),
-        &row.allow,
-        &roots,
-        &crate::lifecycle::resolve,
-    )
+    let resolve = &crate::lifecycle::resolve;
+    let pins = Pins {
+        definitions: digests(user_cfg),
+        images: image_pins(docker, cfg, &needing_grants(cfg, &roots, resolve)).await,
+    };
+    check(cfg, &pins, &row.allow, &roots, resolve)?;
+    Ok(pins)
 }
 
-/// The stack dir, opened under a stacks root, and the resolved config of
+/// The stack dir, opened under a stacks root, and the [`prepare`]d config of
 /// exactly `compose`'s files and of the user's own files among them.
 async fn resolved(
     row: &StackRow,
     compose: &Compose,
-) -> Result<(StackDir, Vec<String>, String, String)> {
+) -> Result<(StackDir, Vec<String>, Value, Value)> {
     let roots = crate::tools::stacks_roots()?;
     let dir = StackDir::open(&row.dir, &roots, false)?
         .ok_or_else(|| anyhow!("stack dir {} does not exist", row.dir))?;
     let files =
         |c: &Compose| -> Vec<PathBuf> { c.files().into_iter().map(Path::to_path_buf).collect() };
     let raw = stacks::resolved_config(dir.path(), &files(compose), None).await?;
+    let cfg = prepare(&raw, dir.path(), &dir)?;
     let user = compose.without_orca();
-    let user_raw = if user.files() == compose.files() {
-        raw.clone()
+    let user_cfg = if user.files() == compose.files() {
+        cfg.clone()
     } else {
-        stacks::resolved_config(dir.path(), &files(&user), None).await?
+        let raw = stacks::resolved_config(dir.path(), &files(&user), None).await?;
+        prepare(&raw, dir.path(), &dir)?
     };
-    Ok((dir, roots, raw, user_raw))
+    Ok((dir, roots, cfg, user_cfg))
 }
 
 /// The config [`gate`] checked, which compose runs from.
@@ -1298,41 +1623,60 @@ fn checked_args(project: &str, dir: &Path, file: &Path, sub: &[&str]) -> Vec<Str
     args
 }
 
+/// `cfg` as compose runs it: each service holding a grant runs its image by
+/// registry digest, so a tag moved after the check is never used.
+fn run_config(mut cfg: Value, grants: &[Grant], pins: &Pins) -> Value {
+    for (name, pin) in &pins.images {
+        if grants.iter().any(|g| &g.service == name)
+            && let Some(svc) = cfg.pointer_mut(&format!("/services/{name}"))
+        {
+            svc["image"] = Value::String(pin.reference.clone());
+        }
+    }
+    cfg
+}
+
 /// Refuse to run `compose` for `row` unless its stack dir is inside a stacks
 /// root and the config of exactly `compose`'s files passes [`check_stack`].
 /// Returns that config to run compose from.
-pub async fn gate(row: &StackRow, compose: &Compose) -> Result<Checked> {
-    let (dir, roots, raw, user_raw) = resolved(row, compose).await?;
-    check_stack(&raw, &user_raw, row, dir.path(), &roots)?;
-    let project = compose::parse_project_name(&raw).ok_or_else(|| {
-        anyhow!(
+pub async fn gate(
+    docker: Option<&bollard::Docker>,
+    row: &StackRow,
+    compose: &Compose,
+) -> Result<Checked> {
+    let (dir, roots, cfg, user_cfg) = resolved(row, compose).await?;
+    let pins = check_stack(docker, &cfg, &user_cfg, row, dir.path(), &roots).await?;
+    let project = str_of(cfg.get("name")).to_string();
+    if project.is_empty() {
+        bail!(
             "compose config for stack '{}' has no project name",
             row.name
-        )
-    })?;
+        );
+    }
     Ok(Checked {
         dir: dir.path().to_path_buf(),
         project,
-        config: raw,
+        config: run_config(cfg, &row.allow, &pins).to_string(),
     })
 }
 
 /// What `row` runs now that needs a grant, for an admin to approve. Fails on
 /// anything no grant can admit.
-async fn current_grants(row: &StackRow) -> Result<Vec<Grant>> {
+async fn current_grants(docker: Option<&bollard::Docker>, row: &StackRow) -> Result<Vec<Grant>> {
     let compose = row.compose()?;
     let compose = if Path::new(&row.dir).join(compose::ORCA_FILE).is_file() {
         compose.with_orca()
     } else {
         compose
     };
-    let (dir, roots, raw, user_raw) = resolved(row, &compose).await?;
-    let found = violations(
-        &parse(&raw)?,
-        &digests(&parse(&user_raw)?),
-        &live_roots(row, dir.path(), &roots)?,
-        &crate::lifecycle::resolve,
-    );
+    let (dir, roots, cfg, user_cfg) = resolved(row, &compose).await?;
+    let roots = live_roots(row, dir.path(), &roots)?;
+    let resolve = &crate::lifecycle::resolve;
+    let pins = Pins {
+        definitions: digests(&user_cfg),
+        images: image_pins(docker, &cfg, &needing_grants(&cfg, &roots, resolve)).await,
+    };
+    let found = violations(&cfg, &pins, &roots, resolve);
     let refused: Vec<String> = found
         .iter()
         .filter(|v| v.allow.is_none())
@@ -1456,6 +1800,18 @@ async fn docker_stack_allow(
     ctx: &ToolCtx,
 ) -> Result<DockerStackAllowOutput> {
     execute::require_admin(ALLOW_TOOL, ctx)?;
+    let docker = crate::registration::adapter()
+        .client()
+        .map_err(|e| anyhow!("{e}"))?;
+    stack_allow(args, docker).await
+}
+
+/// [`docker_stack_allow`] past the admin check, looking images up on
+/// `docker`.
+async fn stack_allow(
+    args: DockerStackAllowArgs,
+    docker: &bollard::Docker,
+) -> Result<DockerStackAllowOutput> {
     let mut after = args
         .allow
         .iter()
@@ -1463,7 +1819,7 @@ async fn docker_stack_allow(
         .collect::<Result<Vec<_>>>()?;
     let mut row = stacks::require(&args.name)?;
     if args.approve_current {
-        after.extend(current_grants(&row).await?);
+        after.extend(current_grants(Some(docker), &row).await?);
     }
     after.sort();
     after.dedup();
@@ -1554,9 +1910,39 @@ mod tests {
         service(json!({"volumes": [{"type": "bind", "source": source, "target": "/x"}]}))
     }
 
-    /// `app|<app's digest in c>|<allow>`.
+    const IMAGE_DIGEST: &str =
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// `c`'s definitions, with every service's image pulled from a registry.
+    fn pins(c: &Value) -> Pins {
+        Pins {
+            definitions: digests(c),
+            images: c["services"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter_map(|(k, s)| {
+                    let image = s["image"].as_str()?;
+                    Some((
+                        k.clone(),
+                        ImagePin {
+                            digest: IMAGE_DIGEST.into(),
+                            reference: format!("{image}@{IMAGE_DIGEST}"),
+                        },
+                    ))
+                })
+                .collect(),
+        }
+    }
+
+    /// The grant of `allow` to `svc` as it is in `c`.
+    fn grant_of(c: &Value, svc: &str, allow: &str) -> String {
+        let image = c["services"][svc]["image"].as_str().unwrap_or("none");
+        format!("{svc}|{image}|{}|{IMAGE_DIGEST}|{allow}", digests(c)[svc])
+    }
+
     fn grant_for(c: &Value, allow: &str) -> String {
-        format!("app|{}|{allow}", digests(c)["app"])
+        grant_of(c, "app", allow)
     }
 
     fn check_with(c: &Value, allow: &[&str], roots: &Roots) -> Result<()> {
@@ -1564,7 +1950,7 @@ mod tests {
             .iter()
             .map(|a| grant_for(c, a).parse().unwrap())
             .collect();
-        check(c, &digests(c), &g, roots, &lexical)
+        check(c, &pins(c), &g, roots, &lexical)
     }
 
     fn grants(c: &Value, allow: &[&str]) -> Result<()> {
@@ -1582,7 +1968,7 @@ mod tests {
     }
 
     fn found(c: &Value) -> Vec<Violation> {
-        violations(c, &digests(c), &roots(), &lexical)
+        violations(c, &pins(c), &roots(), &lexical)
     }
 
     #[test]
@@ -1641,7 +2027,7 @@ mod tests {
     fn an_unresolvable_source_is_refused_not_judged_as_written() {
         let failing = |_: &Path| -> Result<PathBuf> { bail!("permission denied") };
         let c = bind("/mnt/data/x");
-        let err = check(&c, &digests(&c), &[], &roots(), &failing)
+        let err = check(&c, &pins(&c), &[], &roots(), &failing)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1716,13 +2102,9 @@ mod tests {
         let granted = two("/srv/x", "/srv/x/y");
         let g: Vec<Grant> = [("app", "bind:/srv/x"), ("db", "bind:/srv/x/y")]
             .iter()
-            .map(|(svc, a)| {
-                format!("{svc}|{}|{a}", digests(&granted)[*svc])
-                    .parse()
-                    .unwrap()
-            })
+            .map(|(svc, a)| grant_of(&granted, svc, a).parse().unwrap())
             .collect();
-        let err = check(&granted, &digests(&granted), &g, &roots(), &lexical)
+        let err = check(&granted, &pins(&granted), &g, &roots(), &lexical)
             .unwrap_err()
             .to_string();
         assert!(err.contains("contains /srv/x/y"), "{err}");
@@ -1770,7 +2152,7 @@ mod tests {
         }
         let custom = roots().with_compose_file("prod.yml");
         let c = bind(&format!("{STACK}/prod.yml"));
-        assert!(check(&c, &digests(&c), &[], &custom, &lexical).is_err());
+        assert!(check(&c, &pins(&c), &[], &custom, &lexical).is_err());
         assert!(found(&bind(&format!("{STACK}/sub/compose.yaml"))).is_empty());
     }
 
@@ -1785,10 +2167,10 @@ mod tests {
         let roots = Roots::new(&stack, &[], &[], resolve).unwrap();
         let src = stack.join("escape/data").to_string_lossy().into_owned();
         let c = bind(&src);
-        let found = violations(&c, &digests(&c), &roots, resolve);
+        let found = violations(&c, &pins(&c), &roots, resolve);
         assert_eq!(found.len(), 1, "{found:?}");
         let inside = bind(&stack.join("data").to_string_lossy());
-        assert!(violations(&inside, &digests(&inside), &roots, resolve).is_empty());
+        assert!(violations(&inside, &pins(&inside), &roots, resolve).is_empty());
     }
 
     #[test]
@@ -2017,14 +2399,7 @@ mod tests {
     fn a_grant_is_void_once_anything_in_its_service_changes() {
         let c = service(json!({"privileged": true, "command": ["sleep", "inf"]}));
         let g: Grant = grant_for(&c, "privileged").parse().unwrap();
-        check(
-            &c,
-            &digests(&c),
-            std::slice::from_ref(&g),
-            &roots(),
-            &lexical,
-        )
-        .unwrap();
+        check(&c, &pins(&c), std::slice::from_ref(&g), &roots(), &lexical).unwrap();
         let changed = [
             service(json!({"privileged": true, "command": ["sh", "-c", "evil"]})),
             service(json!({"privileged": true, "command": ["sleep", "inf"], "entrypoint": ["sh"]})),
@@ -2039,15 +2414,9 @@ mod tests {
             json!({"name": "other", "services": {"app": {"image": "x:1", "privileged": true, "command": ["sleep", "inf"]}}}),
         ];
         for c in changed {
-            let err = check(
-                &c,
-                &digests(&c),
-                std::slice::from_ref(&g),
-                &roots(),
-                &lexical,
-            )
-            .unwrap_err()
-            .to_string();
+            let err = check(&c, &pins(&c), std::slice::from_ref(&g), &roots(), &lexical)
+                .unwrap_err()
+                .to_string();
             assert!(err.contains("privileged: true"), "{c}: {err}");
         }
         let vol = |opts: Value| {
@@ -2064,7 +2433,7 @@ mod tests {
             "a referenced top-level entry is part of the definition"
         );
         let moved = json!({"name": "web", "services": {"other": {"image": "x:1", "privileged": true, "command": ["sleep", "inf"]}}});
-        assert!(check(&moved, &digests(&moved), &[g], &roots(), &lexical).is_err());
+        assert!(check(&moved, &pins(&moved), &[g], &roots(), &lexical).is_err());
     }
 
     #[test]
@@ -2096,6 +2465,7 @@ mod tests {
     #[test]
     fn grant_strings_are_validated() {
         let d = format!("sha256:{}", "a".repeat(64));
+        let pre = format!("app|x:1|{d}|{IMAGE_DIGEST}");
         for allow in [
             "privileged",
             "pid:shared",
@@ -2105,24 +2475,32 @@ mod tests {
             "network:proxy",
             "network_driver:macvlan",
         ] {
-            format!("app|{d}|{allow}").parse::<Grant>().unwrap();
+            format!("{pre}|{allow}").parse::<Grant>().unwrap();
         }
+        format!("app|x:1|{d}|{IMAGE_DIGEST},{d}|privileged")
+            .parse::<Grant>()
+            .unwrap();
         for bad in [
             "privileged".to_string(),
             "app|x".to_string(),
-            format!("|{d}|privileged"),
-            "app|x:1|privileged".to_string(),
-            "app||privileged".to_string(),
-            format!("app|sha256:{}|privileged", "a".repeat(63)),
-            format!("app|{d}|root"),
-            format!("app|{d}|bind:/"),
-            format!("app|{d}|bind:relative"),
-            format!("app|{d}|bind:/mnt/../etc"),
-            format!("app|{d}|cap_add:"),
-            format!("app|{d}|cap_add:sys admin"),
-            format!("app|{d}|pid:container"),
-            format!("app|{d}|network:"),
-            format!("app|{d}|network_driver:bridge"),
+            format!("|x:1|{d}|{IMAGE_DIGEST}|privileged"),
+            format!("app||{d}|{IMAGE_DIGEST}|privileged"),
+            format!("app|x:1|{d}|privileged"),
+            format!("app|x:1|{d}||privileged"),
+            format!("app|x:1|x:1|{IMAGE_DIGEST}|privileged"),
+            format!(
+                "app|x:1|sha256:{}|{IMAGE_DIGEST}|privileged",
+                "a".repeat(63)
+            ),
+            format!("{pre}|root"),
+            format!("{pre}|bind:/"),
+            format!("{pre}|bind:relative"),
+            format!("{pre}|bind:/mnt/../etc"),
+            format!("{pre}|cap_add:"),
+            format!("{pre}|cap_add:sys admin"),
+            format!("{pre}|pid:container"),
+            format!("{pre}|network:"),
+            format!("{pre}|network_driver:bridge"),
         ] {
             assert!(bad.parse::<Grant>().is_err(), "{bad}");
         }
@@ -2160,6 +2538,7 @@ mod tests {
     }
 
     fn allow(
+        docker: &bollard::Docker,
         approve_current: bool,
         items: Vec<String>,
         execute: bool,
@@ -2171,8 +2550,20 @@ mod tests {
             items,
             execute,
         };
-        plugin_toolkit::reactor::block_on(docker_stack_allow(args, &crate::test_support::admin()))
+        plugin_toolkit::reactor::block_on(stack_allow(args, docker))
     }
+
+    /// An engine that knows `x:1` with `repo_digests`.
+    fn engine(repo_digests: &[&str]) -> crate::test_engine::FakeEngine {
+        let body = json!({"Id": "sha256:1", "RepoDigests": repo_digests}).to_string();
+        crate::test_engine::FakeEngine::routed(vec![
+            crate::test_engine::Route::new("GET", "/images/x:1/json", 200, body.clone()),
+            crate::test_engine::Route::new("GET", "/images/x%3A1/json", 200, body),
+        ])
+    }
+
+    const PULLED: &str = "registry.example/x@sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    const REPUSHED: &str = "registry.example/x@sha256:2222222222222222222222222222222222222222222222222222222222222222";
 
     #[test]
     fn real_compose_config_feeds_profiles_env_files_and_dotdot_binds_to_the_policy() {
@@ -2181,6 +2572,8 @@ mod tests {
         }
         let root = tempfile::tempdir().unwrap();
         let root = root.path().canonicalize().unwrap();
+        let fake = engine(&[]);
+        let docker = fake.client();
         crate::test_support::with_db(|| {
             let row = registered(&root, "services:\n  app:\n    image: x:1\n");
             let roots = crate::tools::stacks_roots().unwrap();
@@ -2202,9 +2595,13 @@ mod tests {
                     "own compose or .env",
                 ),
             ] {
-                let err =
-                    plugin_toolkit::reactor::block_on(row.write_checked(Some(yaml), None, &roots))
-                        .unwrap_err();
+                let err = plugin_toolkit::reactor::block_on(row.write_checked(
+                    Some(yaml),
+                    None,
+                    &roots,
+                    Some(&docker),
+                ))
+                .unwrap_err();
                 assert!(format!("{err:#}").contains(want), "{yaml}: {err:#}");
             }
             assert_eq!(
@@ -2222,29 +2619,41 @@ mod tests {
         }
         let root = tempfile::tempdir().unwrap();
         let root = root.path().canonicalize().unwrap();
+        let pulled = engine(&[PULLED]);
+        let docker = pulled.client();
         crate::test_support::with_db(|| {
             let host = "services:\n  app:\n    image: x:1\n    network_mode: host\n";
             let row = registered(&root, host);
             let compose = row.compose().unwrap();
-            let err = plugin_toolkit::reactor::block_on(gate(&row, &compose)).unwrap_err();
+            let err =
+                plugin_toolkit::reactor::block_on(gate(Some(&docker), &row, &compose)).unwrap_err();
             assert!(err.to_string().contains("|network_mode:host'"), "{err}");
 
-            let plan = allow(true, Vec::new(), false).unwrap();
+            let plan = allow(&docker, true, Vec::new(), false).unwrap();
             assert_eq!(plan.after.len(), 1);
             assert!(
-                plan.after[0].ends_with("|network_mode:host"),
+                plan.after[0].starts_with("app|x:1|sha256:")
+                    && plan.after[0].ends_with("|sha256:1111111111111111111111111111111111111111111111111111111111111111|network_mode:host"),
                 "{:?}",
                 plan.after
             );
-            let err = allow(true, Vec::new(), true).unwrap_err().to_string();
+            let err = allow(&docker, true, Vec::new(), true)
+                .unwrap_err()
+                .to_string();
             assert!(err.contains("needs the items from the dry run"), "{err}");
             let wrong = vec![plan.after[0].replace("network_mode:host", "privileged")];
-            let err = allow(true, wrong, true).unwrap_err().to_string();
+            let err = allow(&docker, true, wrong, true).unwrap_err().to_string();
             assert!(err.contains("differ from the confirmed items"), "{err}");
             assert!(stacks::require("web").unwrap().allow.is_empty());
-            allow(true, plan.after.clone(), true).unwrap();
+            allow(&docker, true, plan.after.clone(), true).unwrap();
             let row = stacks::require("web").unwrap();
-            plugin_toolkit::reactor::block_on(gate(&row, &compose)).unwrap();
+            let checked =
+                plugin_toolkit::reactor::block_on(gate(Some(&docker), &row, &compose)).unwrap();
+            assert!(
+                checked.config.contains(PULLED),
+                "a granted service runs its image by digest: {}",
+                checked.config
+            );
 
             let roots = crate::tools::stacks_roots().unwrap();
             for changed in [
@@ -2255,16 +2664,30 @@ mod tests {
                     Some(&changed),
                     None,
                     &roots,
+                    Some(&docker),
                 ))
                 .unwrap_err();
                 assert!(err.to_string().contains("network_mode: host"), "{err}");
             }
-            std::fs::write(
-                root.join("web/compose.yaml"),
-                format!("{host}    command: [sh, -c, evil]\n"),
-            )
-            .unwrap();
-            assert!(plugin_toolkit::reactor::block_on(gate(&row, &compose)).is_err());
+
+            let repushed = engine(&[REPUSHED]);
+            let err =
+                plugin_toolkit::reactor::block_on(gate(Some(&repushed.client()), &row, &compose))
+                    .unwrap_err();
+            assert!(
+                err.to_string().contains("image changed upstream")
+                    && err.to_string().contains("approveCurrent"),
+                "{err}"
+            );
+            let built = engine(&[]);
+            let built = built.client();
+            let err =
+                plugin_toolkit::reactor::block_on(gate(Some(&built), &row, &compose)).unwrap_err();
+            assert!(err.to_string().contains("no registry digest"), "{err}");
+            let err = allow(&built, true, Vec::new(), false)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("no registry digest"), "{err}");
         });
     }
 
@@ -2275,11 +2698,14 @@ mod tests {
         }
         let root = tempfile::tempdir().unwrap();
         let root = root.path().canonicalize().unwrap();
+        let fake = engine(&[]);
+        let docker = fake.client();
         crate::test_support::with_db(|| {
             let row = registered(&root, "services:\n  app:\n    image: x:1\n");
             std::fs::write(root.join("web/.env"), "IMG=y:2\n").unwrap();
             let compose = row.compose().unwrap();
-            let checked = plugin_toolkit::reactor::block_on(gate(&row, &compose)).unwrap();
+            let checked =
+                plugin_toolkit::reactor::block_on(gate(Some(&docker), &row, &compose)).unwrap();
             std::fs::write(
                 root.join("web/compose.yaml"),
                 "services:\n  app:\n    image: ${IMG}\n    privileged: true\n",
@@ -2293,6 +2719,147 @@ mod tests {
             assert!(cfg["services"]["app"].get("privileged").is_none(), "{ran}");
             assert_eq!(cfg["name"], "web");
         });
+    }
+
+    #[test]
+    fn env_files_are_read_into_the_checked_config_and_its_digest() {
+        if !crate::test_support::have_compose() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let fake = engine(&[]);
+        let docker = fake.client();
+        crate::test_support::with_db(|| {
+            let row = registered(
+                &root,
+                "services:\n  app:\n    image: x:1\n    env_file: [app.env]\n    environment:\n      B: own\n",
+            );
+            std::fs::write(root.join("web/app.env"), "A=pa$s\nB=file\n").unwrap();
+            let compose = row.compose().unwrap();
+            let (dir, _, cfg, _) =
+                plugin_toolkit::reactor::block_on(resolved(&row, &compose)).unwrap();
+            let app = &cfg["services"]["app"];
+            assert!(app.get("env_file").is_none(), "{app}");
+            assert_eq!(app["environment"]["A"], "pa$$s");
+            assert_eq!(app["environment"]["B"], "own", "environment wins");
+            let before = digests(&cfg)["app"].clone();
+
+            let checked =
+                plugin_toolkit::reactor::block_on(gate(Some(&docker), &row, &compose)).unwrap();
+            std::fs::write(root.join("web/app.env"), "A=changed\nB=file\n").unwrap();
+            let ran =
+                plugin_toolkit::reactor::block_on(checked.run(&["config", "--format", "json"]))
+                    .unwrap();
+            assert!(ran.contains("pa$$s") && !ran.contains("changed"), "{ran}");
+            let (_, _, cfg, _) =
+                plugin_toolkit::reactor::block_on(resolved(&row, &compose)).unwrap();
+            assert_ne!(
+                digests(&cfg)["app"],
+                before,
+                "the digest covers env file contents"
+            );
+
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("secrets"), "S=x\n").unwrap();
+            std::fs::remove_file(root.join("web/app.env")).unwrap();
+            std::os::unix::fs::symlink(outside.path().join("secrets"), root.join("web/app.env"))
+                .unwrap();
+            let raw = format!(
+                r#"{{"name":"web","services":{{"app":{{"image":"x:1","env_file":[{{"path":"{}/app.env"}}]}}}}}}"#,
+                dir.path().display()
+            );
+            assert!(
+                prepare(&raw, dir.path(), &dir).is_err(),
+                "a symlink is not followed"
+            );
+            let raw =
+                r#"{"name":"web","services":{"app":{"image":"x:1","env_file":["/etc/hosts"]}}}"#;
+            let err = prepare(raw, dir.path(), &dir).unwrap_err().to_string();
+            assert!(err.contains("not inside the stack dir"), "{err}");
+        });
+    }
+
+    #[test]
+    fn images_granted_services_run_cannot_be_named_elsewhere_or_built() {
+        let held = || {
+            roots().with_granted_images(
+                "web",
+                vec![
+                    GrantedImage {
+                        image: norm_image("x:1"),
+                        stack: "web".into(),
+                        service: "app".into(),
+                    },
+                    GrantedImage {
+                        image: norm_image("docker.io/library/ha"),
+                        stack: "home".into(),
+                        service: "ha".into(),
+                    },
+                ],
+            )
+        };
+        let refused_in = |c: Value| {
+            check(&c, &pins(&c), &[], &held(), &lexical)
+                .unwrap_err()
+                .to_string()
+        };
+        let ok = |c: Value| {
+            assert!(
+                violations(&c, &pins(&c), &held(), &lexical).is_empty(),
+                "{c}"
+            )
+        };
+        let err = refused_in(json!({"name": "web", "services": {"app": {"image": "ha"}}}));
+        assert!(err.contains("granted service home/ha"), "{err}");
+        let err = refused_in(json!({"name": "web", "services": {"b": {
+            "image": "y:1", "build": {"context": STACK, "tags": ["x:1"]}
+        }}}));
+        assert!(err.contains("a build would tag x:1"), "{err}");
+        let err = refused_in(json!({"name": "web", "services": {"b": {
+            "image": "x:1", "build": {"context": STACK}
+        }}}));
+        assert!(err.contains("a build would tag x:1"), "{err}");
+        ok(
+            json!({"name": "web", "services": {"app": {"image": "x:1"}, "worker": {"image": "x:1"}}}),
+        );
+        ok(
+            json!({"name": "web", "services": {"b": {"image": "y:1", "build": {"context": STACK}}}}),
+        );
+        assert_eq!(norm_image("docker.io/library/ha"), "ha:latest");
+        assert_eq!(norm_image("ghcr.io/a/b:2"), "ghcr.io/a/b:2");
+        assert_eq!(norm_image("localhost:5000/b"), "localhost:5000/b:latest");
+    }
+
+    #[test]
+    fn the_daemons_home_and_docker_config_cannot_be_bound_even_granted() {
+        let daemon = || {
+            roots().with_daemon_dirs(
+                &[
+                    "/root".to_string(),
+                    "/root/.docker".to_string(),
+                    "/etc/docker-cli".to_string(),
+                ],
+                &lexical,
+            )
+        };
+        for src in [
+            "/root",
+            "/root/.docker/config.json",
+            "/root/.ssh",
+            "/etc/docker-cli",
+            "/etc",
+        ] {
+            let c = bind(src);
+            let err = check_with(&c, &[&format!("bind:{src}")], &daemon())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("daemon's home or docker config"),
+                "{src}: {err}"
+            );
+        }
+        check_with(&bind("/srv/data"), &["bind:/srv/data"], &daemon()).unwrap();
     }
 
     #[test]
@@ -2332,7 +2899,10 @@ mod tests {
             for execute in [false, true] {
                 let args = DockerStackAllowArgs {
                     name: "web".into(),
-                    allow: vec![format!("app|sha256:{}|privileged", "a".repeat(64))],
+                    allow: vec![format!(
+                        "app|x:1|sha256:{}|{IMAGE_DIGEST}|privileged",
+                        "a".repeat(64)
+                    )],
                     approve_current: false,
                     items: Vec::new(),
                     execute,

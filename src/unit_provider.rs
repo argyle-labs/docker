@@ -242,6 +242,7 @@ impl DockerUnitProvider {
                     p.compose_yaml.as_deref(),
                     p.compose_env.as_deref(),
                     &crate::tools::stacks_roots()?,
+                    self.adapter.client().ok(),
                 )
                 .await?;
                 // A stale orca override naming a removed service breaks every
@@ -276,7 +277,7 @@ impl DockerUnitProvider {
                 // start and restart act on containers that already exist.
                 let checked = match action {
                     "down" | "stop" => None,
-                    _ => Some(policy::gate(&row, &compose).await?),
+                    _ => Some(policy::gate(self.adapter.client().ok(), &row, &compose).await?),
                 };
                 let out = match (action, checked) {
                     ("build", Some(checked)) => checked.build().await?,
@@ -322,8 +323,13 @@ impl DockerUnitProvider {
             .transpose()?;
         let (result, new_yaml) = fix_result(&yaml, override_yaml.as_deref(), &findings, &p)?;
         if let Some(new_yaml) = new_yaml {
-            row.write_compose_if_unchanged(&new_yaml, &yaml, &crate::tools::stacks_roots()?)
-                .await?;
+            row.write_compose_if_unchanged(
+                &new_yaml,
+                &yaml,
+                &crate::tools::stacks_roots()?,
+                self.adapter.client().ok(),
+            )
+            .await?;
         }
         Ok(VerbOutcome::Item(ItemOutcome::new(
             id.clone(),
@@ -541,10 +547,16 @@ impl DockerUnitProvider {
                 return Ok(());
             };
             // Definition digests come from the user's files alone, the first set.
+            let docker = self.adapter.client().ok();
+            // Env files are read from the staging dir, where the paths will
+            // be once it is swapped in.
+            let dir = staged.dir()?;
             let user_raw = stacks::resolved_config(&live, plain, env.as_deref()).await?;
+            let user_cfg = policy::prepare(&user_raw, &live, &dir)?;
             for files in &sets {
                 let raw = stacks::resolved_config(&live, files, env.as_deref()).await?;
-                policy::check_stack(&raw, &user_raw, row, &live, &roots)?;
+                let cfg = policy::prepare(&raw, &live, &dir)?;
+                policy::check_stack(docker, &cfg, &user_cfg, row, &live, &roots).await?;
             }
             Ok::<_, anyhow::Error>(())
         }
@@ -603,8 +615,13 @@ impl DockerUnitProvider {
                 .map(|r| r.allow.clone())
                 .unwrap_or_default(),
         };
-        row.write_checked(p.compose_yaml.as_deref(), p.compose_env.as_deref(), &roots)
-            .await?;
+        row.write_checked(
+            p.compose_yaml.as_deref(),
+            p.compose_env.as_deref(),
+            &roots,
+            self.adapter.client().ok(),
+        )
+        .await?;
         stacks::put(&row)?;
         if p.deploy {
             ownership::up(&row, &[]).await?;
@@ -2374,9 +2391,11 @@ mod tests {
             register_root(root.path());
             let row = registered_stack(&dir, yaml, None);
             let compose = row.compose().unwrap();
-            let err = plugin_toolkit::reactor::block_on(policy::gate(&row, &compose))
-                .unwrap_err()
-                .to_string();
+            let docker = crate::test_engine::FakeEngine::routed(Vec::new()).client();
+            let err =
+                plugin_toolkit::reactor::block_on(policy::gate(Some(&docker), &row, &compose))
+                    .unwrap_err()
+                    .to_string();
             assert!(err.contains("outside the stacks roots"), "gate: {err}");
             for action in ["start", "restart", "build", "pull"] {
                 let err = err_of(stack_update(action, None));
