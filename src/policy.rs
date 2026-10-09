@@ -1558,9 +1558,9 @@ fn mounts_device_as_bind(o: &str) -> bool {
 
 /// The writable bind sources of every container on the host, running or
 /// stopped, with its name, when `cfg` builds an image: its binds, its
-/// volumes' sources and the devices of `local` volumes that bind one. Any of them can swap a symlink
-/// into a build path it nests with, whoever owns it. None without an
-/// engine, which leaves nothing to build with.
+/// volumes' sources and the devices of `local` volumes that bind one. Any
+/// of them can swap a symlink into a build path it nests with, whoever owns
+/// it. None without an engine, which leaves nothing to build with.
 async fn container_binds(
     docker: Option<&bollard::Docker>,
     cfg: &Value,
