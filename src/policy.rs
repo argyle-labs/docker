@@ -1557,8 +1557,8 @@ fn mounts_device_as_bind(o: &str) -> bool {
 }
 
 /// The writable bind sources of every container on the host, running or
-/// stopped, with its name, when `cfg` builds an image: its binds and the
-/// devices of `local` volumes that bind one. Any of them can swap a symlink
+/// stopped, with its name, when `cfg` builds an image: its binds, its
+/// volumes' sources and the devices of `local` volumes that bind one. Any of them can swap a symlink
 /// into a build path it nests with, whoever owns it. None without an
 /// engine, which leaves nothing to build with.
 async fn container_binds(
@@ -1594,8 +1594,12 @@ async fn container_binds(
             .or_else(|| c.id.clone())
             .unwrap_or_default();
         for m in c.mounts.iter().flatten().filter(|m| m.rw != Some(false)) {
-            let source = match (m.typ.as_deref(), &m.name) {
-                (Some("bind"), _) => m.source.clone(),
+            // A volume's own source counts too: a driver plugin can mount a
+            // host path there, whatever it reports as its driver.
+            if matches!(m.typ.as_deref(), Some("bind" | "volume")) {
+                out.extend(m.source.clone().map(|s| (s, name.clone())));
+            }
+            let device = match (m.typ.as_deref(), &m.name) {
                 (Some("volume"), Some(vol)) => {
                     if !devices.contains_key(vol) {
                         let v = docker.inspect_volume(vol).await.map_err(|e| {
@@ -1613,7 +1617,7 @@ async fn container_binds(
                 }
                 _ => None,
             };
-            out.extend(source.map(|s| (s, name.clone())));
+            out.extend(device.map(|s| (s, name.clone())));
         }
     }
     Ok(out)
@@ -3242,6 +3246,32 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("inspecting volume gone"), "{err}");
+    }
+
+    #[test]
+    fn a_build_cannot_read_through_a_volume_a_driver_plugin_mounts_from_a_host_path() {
+        let held = |driver: &'static str, source: String| {
+            let mount = json!([{"Type": "volume", "Name": "v", "Source": source,
+                "Destination": "/v", "Driver": driver, "RW": true}]);
+            let volume = json!({"Name": "v", "Driver": driver, "Mountpoint": source,
+                "Labels": {}, "Scope": "local", "Options": {}});
+            vec![
+                containers_route(mount),
+                crate::test_engine::Route::new("GET", "/volumes/v", 200, volume.to_string()),
+            ]
+        };
+        let Some(gated) = gate_build_over_proj(|proj| held("local-persist", proj.to_string()))
+        else {
+            return;
+        };
+        let err = gated.unwrap_err().to_string();
+        assert!(
+            err.contains("a writable bind of container web-a-1"),
+            "{err}"
+        );
+        gate_build_over_proj(|_| held("local", "/var/lib/docker/volumes/v/_data".into()))
+            .unwrap()
+            .unwrap();
     }
 
     #[test]
