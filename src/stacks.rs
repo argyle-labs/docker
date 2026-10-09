@@ -928,6 +928,53 @@ pub fn put(row: &StackRow) -> Result<()> {
     Ok(())
 }
 
+/// Register a stack, failing when the name is already registered.
+pub fn insert(row: &StackRow) -> Result<()> {
+    db_op(&DbOp::Insert {
+        namespace: "docker".to_string(),
+        table: TABLE.to_string(),
+        row: to_dbrow(row),
+    })?;
+    Ok(())
+}
+
+/// Refuse `dir` (resolved) for stack `name` when it is, is inside or
+/// contains another registered stack's dir, or nests with a bind any
+/// registered stack is granted: either stack's policy would then judge the
+/// other's files as its own.
+pub fn check_dir_free(name: &str, dir: &Path) -> Result<()> {
+    let resolve =
+        |p: &str| crate::lifecycle::resolve(Path::new(p)).unwrap_or_else(|_| PathBuf::from(p));
+    let nests = |p: &Path| dir.starts_with(p) || p.starts_with(dir);
+    for row in list()?.into_iter().filter(|r| r.name != name) {
+        let other = resolve(&row.dir);
+        if nests(&other) {
+            anyhow::bail!(
+                "stack dir {} overlaps stack '{}' at {}",
+                dir.display(),
+                row.name,
+                other.display()
+            );
+        }
+        for bind in row
+            .allow
+            .iter()
+            .filter_map(|g| g.allow.strip_prefix(policy::ALLOW_BIND))
+        {
+            let bind = resolve(bind);
+            if nests(&bind) {
+                anyhow::bail!(
+                    "stack dir {} overlaps {}, a bind granted to stack '{}'",
+                    dir.display(),
+                    bind.display(),
+                    row.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Deregister a stack. Returns whether a row was removed. Does NOT tear down
 /// running containers — callers run `down` first when that's intended.
 pub fn remove(name: &str) -> Result<bool> {
@@ -948,6 +995,22 @@ mod tests {
 
     fn s(p: &Path) -> String {
         p.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn insert_fails_on_a_registered_name_and_keeps_the_row() {
+        crate::test_support::with_db(|| {
+            let row = |dir: &str| StackRow {
+                name: "web".into(),
+                dir: dir.into(),
+                file: DEFAULT_COMPOSE_FILE.into(),
+                enabled: true,
+                allow: Vec::new(),
+            };
+            insert(&row("/opt/stacks/web")).unwrap();
+            assert!(insert(&row("/opt/stacks/elsewhere")).is_err());
+            assert_eq!(require("web").unwrap().dir, "/opt/stacks/web");
+        });
     }
 
     /// A stacks root with the stack `web` in it, the dir created.

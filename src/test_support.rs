@@ -78,7 +78,7 @@ fn text(row: &DbRow, col: &str) -> Option<String> {
     }
 }
 
-fn apply(tables: &mut Tables, op: DbOp) -> DbReply {
+fn apply(tables: &mut Tables, op: DbOp) -> Result<DbReply, String> {
     let mut reply = DbReply::default();
     match op {
         DbOp::List { namespace, table } => {
@@ -102,8 +102,16 @@ fn apply(tables: &mut Tables, op: DbOp) -> DbReply {
             namespace,
             table,
             row,
+        } => {
+            let rows = tables.entry((namespace, table)).or_default();
+            let name = text(&row, "name");
+            if name.is_some() && rows.iter().any(|r| text(r, "name") == name) {
+                return Err("UNIQUE constraint failed: name".into());
+            }
+            rows.push(row);
+            reply.affected = 1;
         }
-        | DbOp::Upsert {
+        DbOp::Upsert {
             namespace,
             table,
             row,
@@ -138,7 +146,40 @@ fn apply(tables: &mut Tables, op: DbOp) -> DbReply {
             reply.affected = (before - rows.len()) as u64;
         }
     }
-    reply
+    Ok(reply)
+}
+
+/// Under `root`, an already registered stacks root: the stack `web` at
+/// `group/web`, granted a bind of `shared/data`, and a dir with a compose
+/// file for each way another stack's dir can overlap them.
+pub fn overlapping_dirs(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let web = root.join("group/web");
+    let bind = format!(
+        "app|x:1|sha256:{}|sha256:{}|bind:{}",
+        "a".repeat(64),
+        "b".repeat(64),
+        root.join("shared/data").display()
+    );
+    crate::stacks::put(&crate::stacks::StackRow {
+        name: "web".into(),
+        dir: web.to_string_lossy().into_owned(),
+        file: "compose.yaml".into(),
+        enabled: true,
+        allow: vec![bind.parse().unwrap()],
+    })
+    .unwrap();
+    let dirs = [
+        web.clone(),
+        web.join("sub"),
+        root.join("group"),
+        root.join("shared/data/app"),
+        root.join("shared"),
+    ];
+    for d in &dirs {
+        std::fs::create_dir_all(d).unwrap();
+        std::fs::write(d.join("compose.yaml"), "services: {}\n").unwrap();
+    }
+    dirs.to_vec()
 }
 
 /// Run `body` against a fresh in-memory database, returning its result and
@@ -151,7 +192,7 @@ pub fn with_db<R>(body: impl FnOnce() -> R) -> (R, Tables) {
             return Err(format!("unexpected capability {cap}"));
         }
         let op: DbOp = plugin_toolkit::serde_json::from_str(op_json).map_err(|e| e.to_string())?;
-        let reply = apply(&mut sink_tables.borrow_mut(), op);
+        let reply = apply(&mut sink_tables.borrow_mut(), op)?;
         plugin_toolkit::serde_json::to_string(&reply).map_err(|e| e.to_string())
     });
     let out = plugin_toolkit::capsink::with_cap_sink(sink, body);

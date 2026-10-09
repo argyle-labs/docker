@@ -10,7 +10,8 @@
 //! namespaces, extra capabilities, devices, binds outside the stack dir,
 //! other projects' volumes and networks, the host network) needs a grant.
 //! Grants are recorded by an admin through `docker.stack_allow`, either one
-//! by one or by approving what the stack runs now. Each is bound to a digest
+//! by one or by approving what the stack runs now; approving an unregistered
+//! compose project registers it with its grants. Each is bound to a digest
 //! of its service's whole resolved definition (env files included) and to
 //! its image's registry content digest, so any change to the service or to
 //! what its image tag holds voids its grants until an admin approves again.
@@ -80,6 +81,8 @@ const FIXED_GRANTS: &[&str] = &[
 ];
 
 const ALLOW_TOOL: &str = "docker.stack_allow";
+/// Prefix of the `after` item an adoption adds: `adopt:<dir>/<file>`.
+const ADOPT_ITEM: &str = "adopt:";
 
 /// Capabilities a service may add without a grant: Docker's default set,
 /// which every container already holds, so adding one is a no-op, plus
@@ -1940,9 +1943,20 @@ fn validate_grant(grant: &str) -> Result<()> {
 
 #[orca_struct(args)]
 pub struct DockerStackAllowArgs {
-    /// Registered stack name.
+    /// Stack name. An unregistered one is adopted: registered at `dir` with
+    /// its grants in one write, which needs `approve_current`.
     #[arg(long)]
     pub name: String,
+    /// The stack dir, inside a stacks root. Required to adopt; for a
+    /// registered stack it must match, so a stack cannot be moved here.
+    #[arg(long)]
+    #[serde(default)]
+    pub dir: Option<String>,
+    /// The compose file name in `dir`, which must exist (default
+    /// `docker-compose.yml`). For a registered stack it must match.
+    #[arg(long)]
+    #[serde(default)]
+    pub file: Option<String>,
     /// The full grant set, replacing the current one, each
     /// `<service>|<definition>|<grant>`, the definition digest as the
     /// policy refusal or an `approve_current` dry run shows it. A grant is
@@ -1978,6 +1992,9 @@ pub struct DockerStackAllowOutput {
     /// `true`: nothing was written.
     pub dry_run: bool,
     pub name: String,
+    /// `true`: the stack was not registered and is (or would be) registered
+    /// by this call.
+    pub adopted: bool,
     pub before: Vec<String>,
     pub after: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1985,8 +2002,10 @@ pub struct DockerStackAllowOutput {
 }
 
 /// [MUTATES STATE] Set the compose policy grants of a managed stack, each
-/// bound to a service and its resolved definition. Without `execute`,
-/// returns the grants and changes nothing.
+/// bound to a service and its resolved definition, or adopt an existing
+/// compose project as a stack together with its grants. Never starts or
+/// changes containers.
+/// Without `execute`, returns the grants and changes nothing.
 #[orca_tool(
     domain = "docker",
     verb = "stack_allow",
@@ -2015,7 +2034,13 @@ async fn stack_allow(
         .iter()
         .map(|g| g.parse::<Grant>())
         .collect::<Result<Vec<_>>>()?;
-    let mut row = stacks::require(&args.name)?;
+    let (mut row, adopted) = match stacks::get(&args.name)? {
+        Some(row) => {
+            refuse_move(&row, &args)?;
+            (row, false)
+        }
+        None => (adoptable(&args)?, true),
+    };
     if args.approve_current {
         after.extend(current_grants(Some(docker), &row).await?);
     }
@@ -2023,8 +2048,18 @@ async fn stack_allow(
     after.dedup();
     let show = |g: &[Grant]| g.iter().map(Grant::to_string).collect::<Vec<_>>();
     let before = show(&row.allow);
+    let mut planned = show(&after);
+    // Confirming the adopted path too stops an execute from registering a
+    // dir no dry run showed, even when it needs no grant.
+    if adopted {
+        planned.push(adopt_item(&row));
+    }
     if !args.execute {
-        let how = if args.approve_current {
+        let how = if adopted {
+            format!(
+                "re-invoke {ALLOW_TOOL} with `execute: true`, the same `dir` and `file`, and `items` set to `after`"
+            )
+        } else if args.approve_current {
             format!("re-invoke {ALLOW_TOOL} with `execute: true` and `items` set to `after`")
         } else {
             format!("re-invoke {ALLOW_TOOL} with `execute: true`")
@@ -2032,33 +2067,121 @@ async fn stack_allow(
         return Ok(DockerStackAllowOutput {
             dry_run: true,
             name: args.name,
+            adopted,
             before,
-            after: show(&after),
+            after: planned,
             how_to_execute: Some(how),
         });
     }
     if args.approve_current {
-        let planned = show(&after);
         execute::require_confirmed(ALLOW_TOOL, &args.items, &planned)?;
         let mut confirmed = args.items.clone();
         confirmed.sort();
         confirmed.dedup();
-        let mut planned = planned;
-        planned.sort();
-        if confirmed != planned {
+        let mut sorted = planned.clone();
+        sorted.sort();
+        if confirmed != sorted {
             bail!(
                 "{ALLOW_TOOL}: the grants to record differ from the confirmed items (the stack changed since the dry run?); re-run the dry run"
             );
         }
     }
     row.allow = after;
-    stacks::put(&row)?;
+    if adopted {
+        // Insert, not put: a stack registered under this name since the
+        // lookup fails the write instead of being overwritten.
+        stacks::insert(&row)?;
+    } else {
+        stacks::put(&row)?;
+    }
     Ok(DockerStackAllowOutput {
         dry_run: false,
         name: args.name,
+        adopted,
         before,
-        after: show(&row.allow),
+        after: planned,
         how_to_execute: None,
+    })
+}
+
+/// The `after` item naming the compose file an adoption registers.
+fn adopt_item(row: &StackRow) -> String {
+    format!(
+        "{ADOPT_ITEM}{}",
+        Path::new(&row.dir).join(&row.file).display()
+    )
+}
+
+/// Refuse a `dir` or `file` that differs from registered `row`'s.
+fn refuse_move(row: &StackRow, args: &DockerStackAllowArgs) -> Result<()> {
+    let resolve = |p: &str| crate::lifecycle::resolve(Path::new(p)).ok();
+    if let Some(dir) = &args.dir
+        && dir != &row.dir
+        && resolve(dir).is_none_or(|d| resolve(&row.dir) != Some(d))
+    {
+        bail!(
+            "{ALLOW_TOOL}: stack '{}' is registered at {}, not {dir}; it cannot be moved here",
+            row.name,
+            row.dir
+        );
+    }
+    if let Some(file) = &args.file
+        && file != &row.file
+    {
+        bail!(
+            "{ALLOW_TOOL}: stack '{}' is registered with compose file {}, not {file}",
+            row.name,
+            row.file
+        );
+    }
+    Ok(())
+}
+
+/// The row adopting `args.name` would register: enabled, no grants yet, at
+/// `args.dir` inside a stacks root, its compose file a regular file there.
+fn adoptable(args: &DockerStackAllowArgs) -> Result<StackRow> {
+    if !args.approve_current {
+        bail!(
+            "{ALLOW_TOOL}: stack '{}' is not registered; adopting it needs `approve_current`",
+            args.name
+        );
+    }
+    let Some(dir) = &args.dir else {
+        bail!(
+            "{ALLOW_TOOL}: stack '{}' is not registered; adopting it needs `dir`",
+            args.name
+        );
+    };
+    let file = args
+        .file
+        .clone()
+        .unwrap_or_else(|| stacks::DEFAULT_COMPOSE_FILE.to_string());
+    stacks::check_file_name(&file)?;
+    let dir = stacks::stack_dir_in_roots(dir, &crate::tools::stacks_roots()?)?;
+    stacks::check_dir_free(&args.name, &dir)?;
+    let path = dir.join(&file);
+    if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+        bail!(
+            "{ALLOW_TOOL}: compose file {} is not a regular file",
+            path.display()
+        );
+    }
+    // compose reads these by path, following symlinks out of the stack dir.
+    for name in compose::OVERRIDE_FILES
+        .iter()
+        .chain(&[compose::ORCA_FILE, stacks::ENV_FILE])
+    {
+        let p = dir.join(name);
+        if std::fs::symlink_metadata(&p).is_ok_and(|m| !m.is_file()) {
+            bail!("{ALLOW_TOOL}: {} is not a regular file", p.display());
+        }
+    }
+    Ok(StackRow {
+        name: args.name.clone(),
+        dir: dir.to_string_lossy().into_owned(),
+        file,
+        enabled: true,
+        allow: Vec::new(),
     })
 }
 
@@ -2707,6 +2830,21 @@ mod tests {
     /// A registered runtime whose stacks root is `root`, and the stack `web`
     /// in it with `yaml` on disk.
     fn registered(root: &Path, yaml: &str) -> StackRow {
+        let dir = unregistered(root, yaml);
+        let row = StackRow {
+            name: "web".into(),
+            dir: dir.to_string_lossy().into_owned(),
+            file: "compose.yaml".into(),
+            enabled: true,
+            allow: Vec::new(),
+        };
+        stacks::put(&row).unwrap();
+        row
+    }
+
+    /// A registered runtime whose stacks root is `root`, and the dir `web`
+    /// in it with `yaml` on disk as `compose.yaml`, registered as no stack.
+    fn unregistered(root: &Path, yaml: &str) -> PathBuf {
         let args = crate::tools::DockerCreateArgs {
             name: "local".into(),
             socket_path: None,
@@ -2724,15 +2862,7 @@ mod tests {
         let dir = root.join("web");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("compose.yaml"), yaml).unwrap();
-        let row = StackRow {
-            name: "web".into(),
-            dir: dir.to_string_lossy().into_owned(),
-            file: "compose.yaml".into(),
-            enabled: true,
-            allow: Vec::new(),
-        };
-        stacks::put(&row).unwrap();
-        row
+        dir
     }
 
     fn allow(
@@ -2743,6 +2873,8 @@ mod tests {
     ) -> Result<DockerStackAllowOutput> {
         let args = DockerStackAllowArgs {
             name: "web".into(),
+            dir: None,
+            file: None,
             allow: Vec::new(),
             approve_current,
             items,
@@ -2886,6 +3018,285 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("no registry digest"), "{err}");
+        });
+    }
+
+    /// Adopting `web` at `dir` by approving what it runs now.
+    fn adopt(
+        docker: &bollard::Docker,
+        dir: Option<&Path>,
+        items: Vec<String>,
+        execute: bool,
+    ) -> Result<DockerStackAllowOutput> {
+        let args = DockerStackAllowArgs {
+            name: "web".into(),
+            dir: dir.map(|d| d.to_string_lossy().into_owned()),
+            file: Some("compose.yaml".into()),
+            allow: Vec::new(),
+            approve_current: true,
+            items,
+            execute,
+        };
+        plugin_toolkit::reactor::block_on(stack_allow(args, docker))
+    }
+
+    #[test]
+    fn approving_an_unregistered_stack_registers_it_with_its_grants_on_execute() {
+        if !crate::test_support::have_compose() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let pulled = engine(&[PULLED]);
+        let docker = pulled.client();
+        crate::test_support::with_db(|| {
+            let dir = unregistered(
+                &root,
+                "services:\n  app:\n    image: x:1\n    network_mode: host\n    volumes: [\"/srv/media:/media\"]\n",
+            );
+            let plan = adopt(&docker, Some(&dir), Vec::new(), false).unwrap();
+            assert!(plan.dry_run && plan.adopted && plan.before.is_empty());
+            let adopt_item = format!("adopt:{}", dir.join("compose.yaml").display());
+            assert_eq!(plan.after.len(), 3, "{:?}", plan.after);
+            assert!(
+                plan.after.iter().any(|g| g.ends_with("|bind:/srv/media"))
+                    && plan.after.iter().any(|g| g.ends_with("|network_mode:host"))
+                    && plan.after.contains(&adopt_item),
+                "{:?}",
+                plan.after
+            );
+            assert!(
+                stacks::get("web").unwrap().is_none(),
+                "a dry run writes nothing"
+            );
+
+            let err = adopt(&docker, Some(&dir), Vec::new(), true)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("needs the items from the dry run"), "{err}");
+            assert!(stacks::get("web").unwrap().is_none());
+
+            let done = adopt(&docker, Some(&dir), plan.after.clone(), true).unwrap();
+            assert!(!done.dry_run && done.adopted);
+            let row = stacks::require("web").unwrap();
+            assert_eq!(row.dir, dir.to_string_lossy());
+            assert_eq!(row.file, "compose.yaml");
+            assert!(row.enabled);
+            let grants: Vec<String> = plan
+                .after
+                .iter()
+                .filter(|i| **i != adopt_item)
+                .cloned()
+                .collect();
+            assert_eq!(
+                row.allow.iter().map(Grant::to_string).collect::<Vec<_>>(),
+                grants
+            );
+            let compose = row.compose().unwrap();
+            plugin_toolkit::reactor::block_on(gate(Some(&docker), &row, &compose)).unwrap();
+
+            let again = adopt(&docker, Some(&dir), Vec::new(), false).unwrap();
+            assert!(!again.adopted, "a registered stack is not adopted again");
+        });
+    }
+
+    #[test]
+    fn adopting_confirms_the_dir_and_file_even_with_no_grants() {
+        if !crate::test_support::have_compose() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let fake = engine(&[PULLED]);
+        let docker = fake.client();
+        crate::test_support::with_db(|| {
+            let dir = unregistered(&root, "services:\n  app:\n    image: x:1\n");
+            let other = root.join("other");
+            std::fs::create_dir(&other).unwrap();
+            std::fs::write(
+                other.join("compose.yaml"),
+                "services:\n  app:\n    image: x:1\n",
+            )
+            .unwrap();
+            let plan = adopt(&docker, Some(&dir), Vec::new(), false).unwrap();
+            assert_eq!(
+                plan.after,
+                [format!("adopt:{}", dir.join("compose.yaml").display())]
+            );
+            let err = adopt(&docker, Some(&dir), Vec::new(), true)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("needs the items from the dry run"), "{err}");
+            let err = adopt(&docker, Some(&other), plan.after.clone(), true)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("differ from the confirmed items"), "{err}");
+            assert!(stacks::get("web").unwrap().is_none());
+            adopt(&docker, Some(&dir), plan.after, true).unwrap();
+            assert_eq!(stacks::require("web").unwrap().dir, dir.to_string_lossy());
+        });
+    }
+
+    #[test]
+    fn adopting_refuses_a_dir_overlapping_another_stack_or_its_bind_grants() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let fake = engine(&[]);
+        let docker = fake.client();
+        crate::test_support::with_db(|| {
+            unregistered(&root, "services: {}\n");
+            for dir in crate::test_support::overlapping_dirs(&root) {
+                let args = DockerStackAllowArgs {
+                    name: "other".into(),
+                    dir: Some(dir.to_string_lossy().into_owned()),
+                    file: Some("compose.yaml".into()),
+                    allow: Vec::new(),
+                    approve_current: true,
+                    items: Vec::new(),
+                    execute: false,
+                };
+                let err = plugin_toolkit::reactor::block_on(stack_allow(args, &docker))
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("overlaps"), "{}: {err}", dir.display());
+            }
+            assert!(stacks::get("other").unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn adopting_refuses_a_symlinked_override_orca_or_env_file() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("evil.yaml");
+        std::fs::write(&target, "services: {}\n").unwrap();
+        let fake = engine(&[]);
+        let docker = fake.client();
+        crate::test_support::with_db(|| {
+            let dir = unregistered(&root, "services: {}\n");
+            for name in [
+                "compose.override.yaml",
+                compose::ORCA_FILE,
+                stacks::ENV_FILE,
+            ] {
+                let link = dir.join(name);
+                std::os::unix::fs::symlink(&target, &link).unwrap();
+                let err = adopt(&docker, Some(&dir), Vec::new(), false)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    err.contains(&format!("{} is not a regular file", link.display())),
+                    "{err}"
+                );
+                std::fs::remove_file(&link).unwrap();
+            }
+            assert!(stacks::get("web").unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn an_unregistered_stack_no_grant_can_admit_is_not_adopted() {
+        if !crate::test_support::have_compose() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let fake = engine(&[PULLED]);
+        let docker = fake.client();
+        crate::test_support::with_db(|| {
+            let dir = unregistered(
+                &root,
+                "services:\n  app:\n    image: x:1\n    volumes: [\"./compose.yaml:/c.yaml\"]\n",
+            );
+            for execute in [false, true] {
+                let err = adopt(&docker, Some(&dir), Vec::new(), execute)
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("no grant can admit"), "{err}");
+            }
+            assert!(stacks::get("web").unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn adopting_needs_approve_current_a_dir_in_a_stacks_root_and_its_compose_file() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside = outside.path().canonicalize().unwrap();
+        std::fs::write(outside.join("compose.yaml"), "services: {}\n").unwrap();
+        let fake = engine(&[]);
+        let docker = fake.client();
+        crate::test_support::with_db(|| {
+            let dir = unregistered(&root, "services:\n  app:\n    image: x:1\n");
+            let err = adopt(&docker, None, Vec::new(), false)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("needs `dir`"), "{err}");
+            let err = adopt(&docker, Some(&outside), Vec::new(), false)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("outside the stacks roots"), "{err}");
+            let empty = root.join("empty");
+            std::fs::create_dir(&empty).unwrap();
+            let err = adopt(&docker, Some(&empty), Vec::new(), false)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("is not a regular file"), "{err}");
+            let args = DockerStackAllowArgs {
+                name: "web".into(),
+                dir: Some(dir.to_string_lossy().into_owned()),
+                file: Some("compose.yaml".into()),
+                allow: Vec::new(),
+                approve_current: false,
+                items: Vec::new(),
+                execute: true,
+            };
+            let err = plugin_toolkit::reactor::block_on(stack_allow(args, &docker))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("needs `approve_current`"), "{err}");
+            assert!(stacks::list().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn stack_allow_cannot_move_a_registered_stack() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let fake = engine(&[]);
+        let docker = fake.client();
+        crate::test_support::with_db(|| {
+            let row = registered(&root, "services:\n  app:\n    image: x:1\n");
+            let other = root.join("other");
+            std::fs::create_dir(&other).unwrap();
+            std::fs::write(other.join("compose.yaml"), "services: {}\n").unwrap();
+            let call = |dir: &str, file: &str| {
+                let args = DockerStackAllowArgs {
+                    name: "web".into(),
+                    dir: Some(dir.into()),
+                    file: Some(file.into()),
+                    allow: Vec::new(),
+                    approve_current: false,
+                    items: Vec::new(),
+                    execute: true,
+                };
+                plugin_toolkit::reactor::block_on(stack_allow(args, &docker))
+            };
+            let err = call(&other.to_string_lossy(), "compose.yaml")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("cannot be moved here"), "{err}");
+            let err = call(&row.dir, "docker-compose.yml")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("registered with compose file"), "{err}");
+            let row_now = stacks::require("web").unwrap();
+            assert_eq!(row_now.dir, row.dir);
+            assert_eq!(row_now.file, row.file);
+            let same = call(&format!("{}/", row.dir), "compose.yaml").unwrap();
+            assert!(!same.adopted);
         });
     }
 
@@ -3565,14 +3976,20 @@ mod tests {
         }
         admin_self_gated::<DockerStackAllow>();
         for ctx in crate::test_support::non_admins() {
-            for execute in [false, true] {
+            for (execute, dir) in [false, true].into_iter().flat_map(|e| {
+                [None, Some("/opt/stacks/web".to_string())]
+                    .into_iter()
+                    .map(move |d| (e, d))
+            }) {
                 let args = DockerStackAllowArgs {
                     name: "web".into(),
+                    approve_current: dir.is_some(),
+                    dir,
+                    file: None,
                     allow: vec![format!(
                         "app|x:1|sha256:{}|{IMAGE_DIGEST}|privileged",
                         "a".repeat(64)
                     )],
-                    approve_current: false,
                     items: Vec::new(),
                     execute,
                 };
