@@ -368,6 +368,9 @@ pub struct Roots {
     stack: String,
     /// Every image a granted service of any registered stack runs.
     granted_images: Vec<GrantedImage>,
+    /// Writable bind sources of the host's containers, and each container's
+    /// name: compose builds before it recreates or removes any of them.
+    container_binds: Vec<(PathBuf, String)>,
 }
 
 /// An image a granted service runs: `stack`'s `service` holds a grant while
@@ -409,6 +412,7 @@ impl Roots {
             daemon_dirs: Vec::new(),
             stack: String::new(),
             granted_images: Vec::new(),
+            container_binds: Vec::new(),
         })
     }
 
@@ -432,6 +436,20 @@ impl Roots {
         self.protected.extend(dirs.iter().cloned());
         self.other_dirs = dirs;
         self.other_binds = binds.iter().map(|b| configured(b, resolve)).collect();
+        self
+    }
+
+    /// With the writable bind `sources` of existing containers, each with
+    /// its container's name.
+    pub fn with_container_binds(
+        mut self,
+        sources: &[(String, String)],
+        resolve: Resolver<'_>,
+    ) -> Self {
+        self.container_binds = sources
+            .iter()
+            .map(|(s, c)| (configured(s, resolve), c.clone()))
+            .collect();
         self
     }
 
@@ -616,6 +634,9 @@ fn namespace(value: &str, mode: &Mode) -> Judgment {
     Judgment::Refuse(format!("{}: {value} is not supported", mode.key))
 }
 
+/// What compose builds from when `build` names no Dockerfile.
+const DEFAULT_DOCKERFILE: &str = "Dockerfile";
+
 struct Collector<'a> {
     out: BTreeSet<Violation>,
     /// Each service's image, for messages.
@@ -680,12 +701,18 @@ impl Collector<'_> {
             let nests = |p: &PathBuf| b.starts_with(p) || p.starts_with(&b);
             let hit = binds
                 .iter()
-                .map(|(p, _)| (p, "a bind of this stack"))
+                .map(|(p, _)| (p, "a bind of this stack".to_string()))
                 .chain(
                     roots
                         .other_binds
                         .iter()
-                        .map(|o| (o, "a bind another stack holds a grant for")),
+                        .map(|o| (o, "a bind another stack holds a grant for".into())),
+                )
+                .chain(
+                    roots
+                        .container_binds
+                        .iter()
+                        .map(|(p, c)| (p, format!("a writable bind of container {c}"))),
                 )
                 .find(|(p, _)| nests(p));
             if let Some((p, whose)) = hit {
@@ -1310,7 +1337,10 @@ fn build_section(
     };
     c.builds
         .push((context_path, "context".into(), me[0].to_string()));
-    let dockerfile = str_of(build.get("dockerfile"));
+    let dockerfile = match str_of(build.get("dockerfile")) {
+        "" if build.get("dockerfile_inline").is_none() => DEFAULT_DOCKERFILE,
+        d => d,
+    };
     if !dockerfile.is_empty() {
         let full = if Path::new(dockerfile).is_absolute() {
             dockerfile.to_string()
@@ -1494,19 +1524,19 @@ fn build_paths_unlinked(name: &str, build: &Value, base: &Path, dir: &StackDir) 
     let rel = inside(Path::new(&context)).ok_or_else(|| {
         anyhow!("service {name}: build context {context} is not inside the stack dir")
     })?;
-    let ctx = dir
-        .open_rel(&rel)
+    dir.open_rel(&rel)
         .with_context(|| format!("service {name}: build context {context}"))?
         .ok_or_else(|| anyhow!("service {name}: build context {context} does not exist"))?;
-    let dockerfile = str_of(build.get("dockerfile")).replace("$$", "$");
-    if dockerfile.is_empty() || build.get("dockerfile_inline").is_some() {
+    if build.get("dockerfile_inline").is_some() {
         return Ok(());
     }
-    let full = if Path::new(&dockerfile).is_absolute() {
-        PathBuf::from(&dockerfile)
-    } else {
-        ctx.path().join(&dockerfile)
+    let dockerfile = match str_of(build.get("dockerfile")) {
+        "" => DEFAULT_DOCKERFILE.to_string(),
+        d => d.replace("$$", "$"),
     };
+    // Joined to the context as written, not `dir`'s path: on restore `dir`
+    // is the staging dir and `base` the live one.
+    let full = Path::new(&context).join(&dockerfile);
     let rel = inside(&full)
         .filter(|r| r.components().next().is_some())
         .ok_or_else(|| {
@@ -1514,8 +1544,58 @@ fn build_paths_unlinked(name: &str, build: &Value, base: &Path, dir: &StackDir) 
         })?;
     dir.read_rel(&rel)
         .with_context(|| format!("service {name}: build dockerfile {dockerfile}"))?
-        .ok_or_else(|| anyhow!("service {name}: build dockerfile {dockerfile} does not exist"))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "service {name}: the build needs a Dockerfile at {} and there is none; add that file",
+                full.display()
+            )
+        })?;
     Ok(())
+}
+
+/// The writable bind sources of every container on the host, running or
+/// stopped, with its name, when `cfg` builds an image. Any of them can swap
+/// a symlink into a build path it nests with, whoever owns it. None without
+/// an engine, which leaves nothing to build with.
+async fn container_binds(
+    docker: Option<&bollard::Docker>,
+    cfg: &Value,
+) -> Result<Vec<(String, String)>> {
+    let builds = cfg
+        .get("services")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .any(|(_, s)| non_empty(s.get("build")));
+    let Some(docker) = docker.filter(|_| builds) else {
+        return Ok(Vec::new());
+    };
+    let containers = docker
+        .list_containers(Some(
+            bollard::query_parameters::ListContainersOptionsBuilder::new()
+                .all(true)
+                .build(),
+        ))
+        .await
+        .map_err(|e| anyhow!("listing containers to check build paths against: {e}"))?;
+    Ok(containers
+        .iter()
+        .flat_map(|c| {
+            let name = c
+                .names
+                .iter()
+                .flatten()
+                .next()
+                .map(|n| n.trim_start_matches('/').to_string())
+                .or_else(|| c.id.clone())
+                .unwrap_or_default();
+            c.mounts
+                .iter()
+                .flatten()
+                .filter(|m| m.typ.as_deref() == Some("bind") && m.rw != Some(false))
+                .filter_map(move |m| Some((m.source.clone()?, name.clone())))
+        })
+        .collect())
 }
 
 /// The registry identity of each of `services`' images, where it has one.
@@ -1626,8 +1706,9 @@ pub async fn check_stack(
     stack_dir: &Path,
     stacks_roots: &[String],
 ) -> Result<Pins> {
-    let roots = live_roots(row, stack_dir, stacks_roots)?;
     let resolve = &crate::lifecycle::resolve;
+    let roots = live_roots(row, stack_dir, stacks_roots)?
+        .with_container_binds(&container_binds(docker, cfg).await?, resolve);
     let pins = Pins {
         definitions: digests(user_cfg),
         images: image_pins(docker, cfg, &needing_grants(cfg, &roots, resolve)).await,
@@ -3017,7 +3098,11 @@ mod tests {
         let err = prepare(&raw("Missing"), &web, &dir)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("does not exist"), "{err}");
+        let want = format!(
+            "needs a Dockerfile at {}",
+            web.join("src/Missing").display()
+        );
+        assert!(err.contains(&want), "{err}");
     }
 
     #[test]
@@ -3037,6 +3122,136 @@ mod tests {
         .to_string();
         let cfg = prepare(&raw, &web, &dir).unwrap();
         assert_eq!(cfg["services"]["app"]["environment"]["A"], "1");
+    }
+
+    #[test]
+    fn a_build_cannot_read_through_a_writable_bind_an_existing_container_holds() {
+        if !crate::test_support::have_compose() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let held = |mounts: Value| {
+            let body = json!([{"Id": "abc", "Names": ["/web-a-1"], "Mounts": mounts}]);
+            crate::test_engine::FakeEngine::routed(vec![crate::test_engine::Route::new(
+                "GET",
+                "/containers/json",
+                200,
+                body.to_string(),
+            )])
+        };
+        crate::test_support::with_db(|| {
+            let row = registered(
+                &root,
+                "services:\n  b:\n    image: y:1\n    build: ./proj/src\n",
+            );
+            std::fs::create_dir_all(root.join("web/proj/src")).unwrap();
+            std::fs::write(root.join("web/proj/src/Dockerfile"), "FROM x\n").unwrap();
+            let compose = row.compose().unwrap();
+            let proj = root.join("web/proj").to_string_lossy().into_owned();
+            let gated = |fake: &crate::test_engine::FakeEngine| {
+                let docker = fake.client();
+                plugin_toolkit::reactor::block_on(gate(Some(&docker), &row, &compose))
+            };
+            let err = gated(&held(
+                json!([{"Type": "bind", "Source": proj, "Destination": "/p", "RW": true}]),
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("a writable bind of container web-a-1"),
+                "{err}"
+            );
+            gated(&held(json!([
+                {"Type": "bind", "Source": proj, "Destination": "/p", "RW": false},
+                {"Type": "volume", "Source": proj, "Destination": "/v", "RW": true}
+            ])))
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn a_build_without_a_dockerfile_key_uses_and_checks_the_default() {
+        let outside = |p: &Path| -> Result<PathBuf> {
+            if p == Path::new("/opt/stacks/web/src/Dockerfile") {
+                return Ok(PathBuf::from("/etc/Dockerfile"));
+            }
+            lexical(p)
+        };
+        for build in [
+            json!({"context": "/opt/stacks/web/src"}),
+            json!({"context": "/opt/stacks/web/src", "dockerfile": ""}),
+        ] {
+            let c = json!({"name": "web", "services": {"b": {"image": "y:1", "build": build}}});
+            let found = violations(&c, &pins(&c), &roots(), &outside);
+            assert!(
+                found
+                    .iter()
+                    .any(|v| v.detail.starts_with("build dockerfile Dockerfile")),
+                "{found:?}"
+            );
+        }
+        let c = json!({"name": "web", "services": {"b": {"image": "y:1", "build": {
+            "context": "/opt/stacks/web/src", "dockerfile_inline": "FROM x"
+        }}}});
+        assert!(violations(&c, &pins(&c), &roots(), &outside).is_empty());
+
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let web = root.join("web");
+        std::fs::create_dir_all(web.join("src")).unwrap();
+        std::fs::create_dir_all(web.join("bare")).unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::write(elsewhere.path().join("Dockerfile"), "FROM x\n").unwrap();
+        std::os::unix::fs::symlink(
+            elsewhere.path().join("Dockerfile"),
+            web.join("src/Dockerfile"),
+        )
+        .unwrap();
+        let roots = vec![root.to_string_lossy().into_owned()];
+        let dir = StackDir::open(&web.to_string_lossy(), &roots, false)
+            .unwrap()
+            .unwrap();
+        let raw = |build: Value| {
+            json!({"name": "web", "services": {"b": {"image": "y:1", "build": build}}}).to_string()
+        };
+        let src = web.join("src");
+        assert!(prepare(&raw(json!({"context": src})), &web, &dir).is_err());
+        assert!(prepare(&raw(json!({"context": src, "dockerfile": ""})), &web, &dir).is_err());
+        prepare(
+            &raw(json!({"context": src, "dockerfile_inline": "FROM x"})),
+            &web,
+            &dir,
+        )
+        .unwrap();
+        let err = prepare(&raw(json!({"context": web.join("bare")})), &web, &dir)
+            .unwrap_err()
+            .to_string();
+        let want = format!(
+            "service b: the build needs a Dockerfile at {}",
+            web.join("bare/Dockerfile").display()
+        );
+        assert!(err.contains(&want), "{err}");
+    }
+
+    #[test]
+    fn prepare_reads_a_restores_dockerfile_from_the_staging_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let live = root.join("web");
+        let staged = root.join(".web.staged");
+        std::fs::create_dir_all(live.join("src")).unwrap();
+        std::fs::create_dir_all(staged.join("src")).unwrap();
+        std::fs::write(staged.join("src/Dockerfile"), "FROM x\n").unwrap();
+        let roots = vec![root.to_string_lossy().into_owned()];
+        let dir = StackDir::open(&staged.to_string_lossy(), &roots, false)
+            .unwrap()
+            .unwrap();
+        let raw = json!({"name": "web", "services": {"b": {"image": "y:1", "build": {
+            "context": live.join("src"), "dockerfile": "Dockerfile"
+        }}}})
+        .to_string();
+        prepare(&raw, &live, &dir).unwrap();
     }
 
     #[test]
