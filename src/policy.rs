@@ -2167,7 +2167,10 @@ fn adoptable(args: &DockerStackAllowArgs) -> Result<StackRow> {
         );
     }
     // compose reads these by path, following symlinks out of the stack dir.
-    for name in compose::OVERRIDE_FILES.iter().chain(&[compose::ORCA_FILE]) {
+    for name in compose::OVERRIDE_FILES
+        .iter()
+        .chain(&[compose::ORCA_FILE, stacks::ENV_FILE])
+    {
         let p = dir.join(name);
         if std::fs::symlink_metadata(&p).is_ok_and(|m| !m.is_file()) {
             bail!("{ALLOW_TOOL}: {} is not a regular file", p.display());
@@ -3162,7 +3165,7 @@ mod tests {
     }
 
     #[test]
-    fn adopting_refuses_a_symlinked_override_or_orca_file() {
+    fn adopting_refuses_a_symlinked_override_orca_or_env_file() {
         let root = tempfile::tempdir().unwrap();
         let root = root.path().canonicalize().unwrap();
         let outside = tempfile::tempdir().unwrap();
@@ -3172,7 +3175,11 @@ mod tests {
         let docker = fake.client();
         crate::test_support::with_db(|| {
             let dir = unregistered(&root, "services: {}\n");
-            for name in ["compose.override.yaml", compose::ORCA_FILE] {
+            for name in [
+                "compose.override.yaml",
+                compose::ORCA_FILE,
+                stacks::ENV_FILE,
+            ] {
                 let link = dir.join(name);
                 std::os::unix::fs::symlink(&target, &link).unwrap();
                 let err = adopt(&docker, Some(&dir), Vec::new(), false)
