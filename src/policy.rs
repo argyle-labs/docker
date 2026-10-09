@@ -81,6 +81,8 @@ const FIXED_GRANTS: &[&str] = &[
 ];
 
 const ALLOW_TOOL: &str = "docker.stack_allow";
+/// Prefix of the `after` item an adoption adds: `adopt:<dir>/<file>`.
+const ADOPT_ITEM: &str = "adopt:";
 
 /// Capabilities a service may add without a grant: Docker's default set,
 /// which every container already holds, so adding one is a no-op, plus
@@ -2001,7 +2003,8 @@ pub struct DockerStackAllowOutput {
 
 /// [MUTATES STATE] Set the compose policy grants of a managed stack, each
 /// bound to a service and its resolved definition, or adopt an existing
-/// compose project as a stack together with its grants. Never runs compose.
+/// compose project as a stack together with its grants. Never starts or
+/// changes containers.
 /// Without `execute`, returns the grants and changes nothing.
 #[orca_tool(
     domain = "docker",
@@ -2045,6 +2048,12 @@ async fn stack_allow(
     after.dedup();
     let show = |g: &[Grant]| g.iter().map(Grant::to_string).collect::<Vec<_>>();
     let before = show(&row.allow);
+    let mut planned = show(&after);
+    // Confirming the adopted path too stops an execute from registering a
+    // dir no dry run showed, even when it needs no grant.
+    if adopted {
+        planned.push(adopt_item(&row));
+    }
     if !args.execute {
         let how = if adopted {
             format!(
@@ -2060,34 +2069,47 @@ async fn stack_allow(
             name: args.name,
             adopted,
             before,
-            after: show(&after),
+            after: planned,
             how_to_execute: Some(how),
         });
     }
     if args.approve_current {
-        let planned = show(&after);
         execute::require_confirmed(ALLOW_TOOL, &args.items, &planned)?;
         let mut confirmed = args.items.clone();
         confirmed.sort();
         confirmed.dedup();
-        let mut planned = planned;
-        planned.sort();
-        if confirmed != planned {
+        let mut sorted = planned.clone();
+        sorted.sort();
+        if confirmed != sorted {
             bail!(
                 "{ALLOW_TOOL}: the grants to record differ from the confirmed items (the stack changed since the dry run?); re-run the dry run"
             );
         }
     }
     row.allow = after;
-    stacks::put(&row)?;
+    if adopted {
+        // Insert, not put: a stack registered under this name since the
+        // lookup fails the write instead of being overwritten.
+        stacks::insert(&row)?;
+    } else {
+        stacks::put(&row)?;
+    }
     Ok(DockerStackAllowOutput {
         dry_run: false,
         name: args.name,
         adopted,
         before,
-        after: show(&row.allow),
+        after: planned,
         how_to_execute: None,
     })
+}
+
+/// The `after` item naming the compose file an adoption registers.
+fn adopt_item(row: &StackRow) -> String {
+    format!(
+        "{ADOPT_ITEM}{}",
+        Path::new(&row.dir).join(&row.file).display()
+    )
 }
 
 /// Refuse a `dir` or `file` that differs from registered `row`'s.
@@ -2136,12 +2158,20 @@ fn adoptable(args: &DockerStackAllowArgs) -> Result<StackRow> {
         .unwrap_or_else(|| stacks::DEFAULT_COMPOSE_FILE.to_string());
     stacks::check_file_name(&file)?;
     let dir = stacks::stack_dir_in_roots(dir, &crate::tools::stacks_roots()?)?;
+    stacks::check_dir_free(&args.name, &dir)?;
     let path = dir.join(&file);
     if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
         bail!(
             "{ALLOW_TOOL}: compose file {} is not a regular file",
             path.display()
         );
+    }
+    // compose reads these by path, following symlinks out of the stack dir.
+    for name in compose::OVERRIDE_FILES.iter().chain(&[compose::ORCA_FILE]) {
+        let p = dir.join(name);
+        if std::fs::symlink_metadata(&p).is_ok_and(|m| !m.is_file()) {
+            bail!("{ALLOW_TOOL}: {} is not a regular file", p.display());
+        }
     }
     Ok(StackRow {
         name: args.name.clone(),
@@ -3023,10 +3053,12 @@ mod tests {
             );
             let plan = adopt(&docker, Some(&dir), Vec::new(), false).unwrap();
             assert!(plan.dry_run && plan.adopted && plan.before.is_empty());
-            assert_eq!(plan.after.len(), 2, "{:?}", plan.after);
+            let adopt_item = format!("adopt:{}", dir.join("compose.yaml").display());
+            assert_eq!(plan.after.len(), 3, "{:?}", plan.after);
             assert!(
                 plan.after.iter().any(|g| g.ends_with("|bind:/srv/media"))
-                    && plan.after.iter().any(|g| g.ends_with("|network_mode:host")),
+                    && plan.after.iter().any(|g| g.ends_with("|network_mode:host"))
+                    && plan.after.contains(&adopt_item),
                 "{:?}",
                 plan.after
             );
@@ -3047,15 +3079,112 @@ mod tests {
             assert_eq!(row.dir, dir.to_string_lossy());
             assert_eq!(row.file, "compose.yaml");
             assert!(row.enabled);
+            let grants: Vec<String> = plan
+                .after
+                .iter()
+                .filter(|i| **i != adopt_item)
+                .cloned()
+                .collect();
             assert_eq!(
                 row.allow.iter().map(Grant::to_string).collect::<Vec<_>>(),
-                plan.after
+                grants
             );
             let compose = row.compose().unwrap();
             plugin_toolkit::reactor::block_on(gate(Some(&docker), &row, &compose)).unwrap();
 
             let again = adopt(&docker, Some(&dir), Vec::new(), false).unwrap();
             assert!(!again.adopted, "a registered stack is not adopted again");
+        });
+    }
+
+    #[test]
+    fn adopting_confirms_the_dir_and_file_even_with_no_grants() {
+        if !crate::test_support::have_compose() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let fake = engine(&[PULLED]);
+        let docker = fake.client();
+        crate::test_support::with_db(|| {
+            let dir = unregistered(&root, "services:\n  app:\n    image: x:1\n");
+            let other = root.join("other");
+            std::fs::create_dir(&other).unwrap();
+            std::fs::write(
+                other.join("compose.yaml"),
+                "services:\n  app:\n    image: x:1\n",
+            )
+            .unwrap();
+            let plan = adopt(&docker, Some(&dir), Vec::new(), false).unwrap();
+            assert_eq!(
+                plan.after,
+                [format!("adopt:{}", dir.join("compose.yaml").display())]
+            );
+            let err = adopt(&docker, Some(&dir), Vec::new(), true)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("needs the items from the dry run"), "{err}");
+            let err = adopt(&docker, Some(&other), plan.after.clone(), true)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("differ from the confirmed items"), "{err}");
+            assert!(stacks::get("web").unwrap().is_none());
+            adopt(&docker, Some(&dir), plan.after, true).unwrap();
+            assert_eq!(stacks::require("web").unwrap().dir, dir.to_string_lossy());
+        });
+    }
+
+    #[test]
+    fn adopting_refuses_a_dir_overlapping_another_stack_or_its_bind_grants() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let fake = engine(&[]);
+        let docker = fake.client();
+        crate::test_support::with_db(|| {
+            unregistered(&root, "services: {}\n");
+            for dir in crate::test_support::overlapping_dirs(&root) {
+                let args = DockerStackAllowArgs {
+                    name: "other".into(),
+                    dir: Some(dir.to_string_lossy().into_owned()),
+                    file: Some("compose.yaml".into()),
+                    allow: Vec::new(),
+                    approve_current: true,
+                    items: Vec::new(),
+                    execute: false,
+                };
+                let err = plugin_toolkit::reactor::block_on(stack_allow(args, &docker))
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("overlaps"), "{}: {err}", dir.display());
+            }
+            assert!(stacks::get("other").unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn adopting_refuses_a_symlinked_override_or_orca_file() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("evil.yaml");
+        std::fs::write(&target, "services: {}\n").unwrap();
+        let fake = engine(&[]);
+        let docker = fake.client();
+        crate::test_support::with_db(|| {
+            let dir = unregistered(&root, "services: {}\n");
+            for name in ["compose.override.yaml", compose::ORCA_FILE] {
+                let link = dir.join(name);
+                std::os::unix::fs::symlink(&target, &link).unwrap();
+                let err = adopt(&docker, Some(&dir), Vec::new(), false)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    err.contains(&format!("{} is not a regular file", link.display())),
+                    "{err}"
+                );
+                std::fs::remove_file(&link).unwrap();
+            }
+            assert!(stacks::get("web").unwrap().is_none());
         });
     }
 

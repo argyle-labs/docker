@@ -595,6 +595,7 @@ impl DockerUnitProvider {
         stacks::check_file_name(&file)?;
         let roots = crate::tools::stacks_roots()?;
         let dir = stacks::stack_dir_in_roots(&p.dir, &roots)?;
+        stacks::check_dir_free(&p.name, &dir)?;
         let current = stacks::get(&p.name)?;
         let existed = current.is_some();
         if add_only && existed {
@@ -2512,6 +2513,31 @@ mod tests {
         plugin_toolkit::reactor::block_on(provider.stack_deploy(Some(payload.to_string()), true))
             .unwrap_err()
             .to_string()
+    }
+
+    #[test]
+    fn deploy_refuses_a_dir_overlapping_another_stack_or_its_bind_grants() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let ((), _) = crate::test_support::with_db(|| {
+            register_root(&root);
+            for dir in crate::test_support::overlapping_dirs(&root) {
+                let err = deploy(serde_json::json!({
+                    "name": "other", "dir": path(&dir), "file": "compose.yaml", "deploy": false
+                }));
+                assert!(err.contains("overlaps"), "{}: {err}", dir.display());
+            }
+            assert!(stacks::get("other").unwrap().is_none());
+            let free = root.join("free");
+            std::fs::create_dir(&free).unwrap();
+            let provider = DockerUnitProvider::new(crate::registration::adapter());
+            let payload = serde_json::json!({"name": "other", "dir": path(&free), "deploy": false});
+            plugin_toolkit::reactor::block_on(
+                provider.stack_deploy(Some(payload.to_string()), true),
+            )
+            .unwrap();
+            assert!(stacks::get("other").unwrap().is_some());
+        });
     }
 
     #[test]
