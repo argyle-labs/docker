@@ -1409,6 +1409,10 @@ mod tests {
         for (name, kind) in entries {
             let mut h = tar::Header::new_gnu();
             h.set_mode(0o644);
+            // Unpacking as root reads ownership; empty numeric fields fail to parse.
+            h.set_uid(0);
+            h.set_gid(0);
+            h.set_mtime(0);
             h.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
             let body: &[u8] = match kind {
                 Kind::File(b) => {
