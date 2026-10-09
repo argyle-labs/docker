@@ -1093,10 +1093,7 @@ fn volume(
         return;
     }
     let kind = str_of(opts.and_then(|o| o.get("type")));
-    let binds = str_of(opts.and_then(|o| o.get("o")))
-        .split(',')
-        .any(|o| matches!(o.trim(), "bind" | "rbind"));
-    if binds {
+    if mounts_device_as_bind(str_of(opts.and_then(|o| o.get("o")))) {
         c.bind(
             users,
             device,
@@ -1553,10 +1550,17 @@ fn build_paths_unlinked(name: &str, build: &Value, base: &Path, dir: &StackDir) 
     Ok(())
 }
 
+/// Whether a `local` volume's mount options `o` bind its `device`, a host
+/// path.
+fn mounts_device_as_bind(o: &str) -> bool {
+    o.split(',').any(|o| matches!(o.trim(), "bind" | "rbind"))
+}
+
 /// The writable bind sources of every container on the host, running or
-/// stopped, with its name, when `cfg` builds an image. Any of them can swap
-/// a symlink into a build path it nests with, whoever owns it. None without
-/// an engine, which leaves nothing to build with.
+/// stopped, with its name, when `cfg` builds an image: its binds and the
+/// devices of `local` volumes that bind one. Any of them can swap a symlink
+/// into a build path it nests with, whoever owns it. None without an
+/// engine, which leaves nothing to build with.
 async fn container_binds(
     docker: Option<&bollard::Docker>,
     cfg: &Value,
@@ -1578,24 +1582,41 @@ async fn container_binds(
         ))
         .await
         .map_err(|e| anyhow!("listing containers to check build paths against: {e}"))?;
-    Ok(containers
-        .iter()
-        .flat_map(|c| {
-            let name = c
-                .names
-                .iter()
-                .flatten()
-                .next()
-                .map(|n| n.trim_start_matches('/').to_string())
-                .or_else(|| c.id.clone())
-                .unwrap_or_default();
-            c.mounts
-                .iter()
-                .flatten()
-                .filter(|m| m.typ.as_deref() == Some("bind") && m.rw != Some(false))
-                .filter_map(move |m| Some((m.source.clone()?, name.clone())))
-        })
-        .collect())
+    let mut devices: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let mut out = Vec::new();
+    for c in &containers {
+        let name = c
+            .names
+            .iter()
+            .flatten()
+            .next()
+            .map(|n| n.trim_start_matches('/').to_string())
+            .or_else(|| c.id.clone())
+            .unwrap_or_default();
+        for m in c.mounts.iter().flatten().filter(|m| m.rw != Some(false)) {
+            let source = match (m.typ.as_deref(), &m.name) {
+                (Some("bind"), _) => m.source.clone(),
+                (Some("volume"), Some(vol)) => {
+                    if !devices.contains_key(vol) {
+                        let v = docker.inspect_volume(vol).await.map_err(|e| {
+                            anyhow!("inspecting volume {vol} to check build paths against: {e}")
+                        })?;
+                        let device = (v.driver == "local"
+                            && mounts_device_as_bind(
+                                v.options.get("o").map(String::as_str).unwrap_or_default(),
+                            ))
+                        .then(|| v.options.get("device").cloned())
+                        .flatten();
+                        devices.insert(vol.clone(), device);
+                    }
+                    devices[vol].clone()
+                }
+                _ => None,
+            };
+            out.extend(source.map(|s| (s, name.clone())));
+        }
+    }
+    Ok(out)
 }
 
 /// The registry identity of each of `services`' images, where it has one.
@@ -3124,23 +3145,17 @@ mod tests {
         assert_eq!(cfg["services"]["app"]["environment"]["A"], "1");
     }
 
-    #[test]
-    fn a_build_cannot_read_through_a_writable_bind_an_existing_container_holds() {
+    /// Gate a stack whose `b` builds from `web/proj/src` against an engine
+    /// answering `routes`; `routes` gets the path of `web/proj`.
+    fn gate_build_over_proj(
+        routes: impl FnOnce(&str) -> Vec<crate::test_engine::Route>,
+    ) -> Option<Result<Checked>> {
         if !crate::test_support::have_compose() {
-            return;
+            return None;
         }
         let root = tempfile::tempdir().unwrap();
         let root = root.path().canonicalize().unwrap();
-        let held = |mounts: Value| {
-            let body = json!([{"Id": "abc", "Names": ["/web-a-1"], "Mounts": mounts}]);
-            crate::test_engine::FakeEngine::routed(vec![crate::test_engine::Route::new(
-                "GET",
-                "/containers/json",
-                200,
-                body.to_string(),
-            )])
-        };
-        crate::test_support::with_db(|| {
+        let (gated, _) = crate::test_support::with_db(|| {
             let row = registered(
                 &root,
                 "services:\n  b:\n    image: y:1\n    build: ./proj/src\n",
@@ -3148,26 +3163,101 @@ mod tests {
             std::fs::create_dir_all(root.join("web/proj/src")).unwrap();
             std::fs::write(root.join("web/proj/src/Dockerfile"), "FROM x\n").unwrap();
             let compose = row.compose().unwrap();
-            let proj = root.join("web/proj").to_string_lossy().into_owned();
-            let gated = |fake: &crate::test_engine::FakeEngine| {
-                let docker = fake.client();
-                plugin_toolkit::reactor::block_on(gate(Some(&docker), &row, &compose))
-            };
-            let err = gated(&held(
+            let fake = crate::test_engine::FakeEngine::routed(routes(
+                &root.join("web/proj").to_string_lossy(),
+            ));
+            let docker = fake.client();
+            plugin_toolkit::reactor::block_on(gate(Some(&docker), &row, &compose))
+        });
+        Some(gated)
+    }
+
+    fn containers_route(mounts: Value) -> crate::test_engine::Route {
+        let body = json!([{"Id": "abc", "Names": ["/web-a-1"], "Mounts": mounts}]);
+        crate::test_engine::Route::new("GET", "/containers/json", 200, body.to_string())
+    }
+
+    #[test]
+    fn a_build_cannot_read_through_a_writable_bind_an_existing_container_holds() {
+        let Some(gated) = gate_build_over_proj(|proj| {
+            vec![containers_route(
                 json!([{"Type": "bind", "Source": proj, "Destination": "/p", "RW": true}]),
-            ))
+            )]
+        }) else {
+            return;
+        };
+        let err = gated.unwrap_err().to_string();
+        assert!(
+            err.contains("a writable bind of container web-a-1"),
+            "{err}"
+        );
+        gate_build_over_proj(|proj| {
+            vec![containers_route(
+                json!([{"Type": "bind", "Source": proj, "Destination": "/p", "RW": false}]),
+            )]
+        })
+        .unwrap()
+        .unwrap();
+    }
+
+    #[test]
+    fn a_build_cannot_read_through_a_volume_an_existing_container_holds_that_binds() {
+        let volume = |name: &str, options: Value| {
+            crate::test_engine::Route::new(
+                "GET",
+                format!("/volumes/{name}"),
+                200,
+                json!({"Name": name, "Driver": "local", "Mountpoint": "/var/lib/docker/volumes/x/_data",
+                    "Labels": {}, "Scope": "local", "Options": options})
+                .to_string(),
+            )
+        };
+        let mount = |name: &str| {
+            json!([{"Type": "volume", "Name": name, "Source": "/var/lib/docker/volumes/x/_data",
+                "Destination": "/v", "Driver": "local", "RW": true}])
+        };
+        let Some(gated) = gate_build_over_proj(|proj| {
+            vec![
+                containers_route(mount("bound")),
+                volume(
+                    "bound",
+                    json!({"type": "none", "o": "rw,rbind", "device": proj}),
+                ),
+            ]
+        }) else {
+            return;
+        };
+        let err = gated.unwrap_err().to_string();
+        assert!(
+            err.contains("a writable bind of container web-a-1"),
+            "{err}"
+        );
+        gate_build_over_proj(|_| {
+            vec![containers_route(mount("plain")), volume("plain", json!({}))]
+        })
+        .unwrap()
+        .unwrap();
+        let err = gate_build_over_proj(|_| vec![containers_route(mount("gone"))])
+            .unwrap()
             .unwrap_err()
             .to_string();
-            assert!(
-                err.contains("a writable bind of container web-a-1"),
-                "{err}"
-            );
-            gated(&held(json!([
-                {"Type": "bind", "Source": proj, "Destination": "/p", "RW": false},
-                {"Type": "volume", "Source": proj, "Destination": "/v", "RW": true}
-            ])))
-            .unwrap();
-        });
+        assert!(err.contains("inspecting volume gone"), "{err}");
+    }
+
+    #[test]
+    fn a_build_is_refused_when_the_containers_cannot_be_listed() {
+        let Some(gated) = gate_build_over_proj(|_| {
+            vec![crate::test_engine::Route::new(
+                "GET",
+                "/containers/json",
+                500,
+                r#"{"message":"boom"}"#,
+            )]
+        }) else {
+            return;
+        };
+        let err = gated.unwrap_err().to_string();
+        assert!(err.contains("listing containers"), "{err}");
     }
 
     #[test]
