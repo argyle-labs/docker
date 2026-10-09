@@ -1,0 +1,6 @@
+{
+  "_comment": "docker.update — patch a registered runtime. Admin only; dry run unless execute is true. stacksRoot is the absolute dir managed stacks must live under.",
+  "name": "local",
+  "stacksRoot": "/opt/stacks",
+  "execute": true
+}

@@ -70,16 +70,33 @@ pub struct ServiceSummary {
 /// Override files compose would auto-load next to the compose file, in its
 /// order. Passing `-f` turns auto-loading off, so the first one present must
 /// be passed explicitly.
-const OVERRIDE_FILES: &[&str] = &[
+pub const OVERRIDE_FILES: &[&str] = &[
     "compose.override.yml",
     "compose.override.yaml",
     "docker-compose.override.yml",
     "docker-compose.override.yaml",
 ];
 
+/// The conventional compose file names, in the order [`Compose::find`] tries
+/// them.
+pub const COMPOSE_FILES: &[&str] = &[
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    "compose.yml",
+    "compose.yaml",
+];
+
 /// orca's generated override (ownership labels, converted volumes), passed
 /// last so it applies over the user's files. See [`crate::ownership`].
 pub const ORCA_FILE: &str = "compose.orca.yaml";
+
+/// The override compose auto-loads from `dir`, if any.
+pub fn override_in(dir: &Path) -> Option<PathBuf> {
+    OVERRIDE_FILES
+        .iter()
+        .map(|o| dir.join(o))
+        .find(|o| o.exists())
+}
 
 /// A located compose project.
 #[derive(Debug, Clone)]
@@ -93,12 +110,7 @@ impl Compose {
     /// Search `project_path` for the conventional compose filenames. Returns
     /// `None` when none are present (use [`Compose::open`] to error out).
     pub fn find(project_path: &Path) -> Option<Compose> {
-        for name in &[
-            "docker-compose.yml",
-            "docker-compose.yaml",
-            "compose.yml",
-            "compose.yaml",
-        ] {
+        for name in COMPOSE_FILES {
             if let Some(c) = Compose::at(&project_path.join(name)) {
                 return Some(c);
             }
@@ -114,11 +126,7 @@ impl Compose {
         if !file.is_file() {
             return None;
         }
-        let dir = file.parent()?;
-        let override_file = OVERRIDE_FILES
-            .iter()
-            .map(|o| dir.join(o))
-            .find(|o| o.exists());
+        let override_file = override_in(file.parent()?);
         Some(Compose {
             file: file.to_path_buf(),
             override_file,

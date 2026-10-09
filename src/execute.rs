@@ -21,6 +21,15 @@ pub fn require_admin(tool: &str, ctx: &ToolCtx) -> Result<()> {
     check_admin(tool, ctx.caller().as_ref())
 }
 
+/// Refuse a caller orca identified that is not an admin. A call with no
+/// caller is left to orca's central gate (orca#704, orca#788).
+pub fn refuse_non_admin(subject: &str, caller: Option<&CallerIdentity>) -> Result<()> {
+    match caller {
+        Some(_) => check_admin(subject, caller),
+        None => Ok(()),
+    }
+}
+
 fn check_admin(subject: &str, caller: Option<&CallerIdentity>) -> Result<()> {
     match caller {
         Some(c) if c.role == "admin" => Ok(()),
@@ -94,6 +103,16 @@ mod tests {
         assert!(err.to_string().contains("requires role 'admin'"), "{err}");
         let err = authorize_execute("t", None).unwrap_err();
         assert!(err.to_string().contains("no caller identity"), "{err}");
+    }
+
+    #[test]
+    fn a_present_non_admin_is_refused_and_no_caller_is_left_to_orca() {
+        assert!(refuse_non_admin("t", Some(&caller("admin"))).is_ok());
+        assert!(refuse_non_admin("t", None).is_ok());
+        for role in ["member", "user"] {
+            let err = refuse_non_admin("t", Some(&caller(role))).unwrap_err();
+            assert!(err.to_string().contains("requires role 'admin'"), "{err}");
+        }
     }
 
     #[test]

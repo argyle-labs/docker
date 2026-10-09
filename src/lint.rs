@@ -7,7 +7,7 @@
 //! written literally in the file (interpolated, relative) is reported as not
 //! auto-fixable rather than guessed at.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use plugin_toolkit::schemars::JsonSchema;
 use plugin_toolkit::serde::{Deserialize, Serialize};
@@ -95,9 +95,11 @@ pub struct Finding {
     pub fixable: bool,
 }
 
-fn under(path: &str, root: &str) -> bool {
-    let root = root.trim_end_matches('/');
-    path == root || path.starts_with(&format!("{root}/"))
+/// Whether `path` is `root` or below it, by whole components. A path with a
+/// `..` component is never under anything: it could climb back out.
+pub(crate) fn under(path: &str, root: &str) -> bool {
+    let p = Path::new(path);
+    !p.components().any(|c| c == Component::ParentDir) && p.starts_with(root)
 }
 
 /// Whether `candidate` is, contains or sits inside one of `bound`.
@@ -660,6 +662,15 @@ mod tests {
         let v = f.iter().find(|f| f.id == "volume:app:data").unwrap();
         assert_eq!(v.current, "media_data");
         assert!(!v.fixable);
+    }
+
+    #[test]
+    fn under_compares_whole_components_and_refuses_dotdot() {
+        assert!(under("/mnt/data", "/mnt/data"));
+        assert!(under("/mnt/data/x", "/mnt/data/"));
+        assert!(!under("/mnt/database", "/mnt/data"));
+        assert!(!under("/mnt/data/../../etc", "/mnt/data"));
+        assert!(!under("/mnt/../", "/mnt"));
     }
 
     #[test]

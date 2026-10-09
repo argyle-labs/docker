@@ -246,19 +246,40 @@ impl<R: Read> Read for Capped<R> {
     }
 }
 
-fn archive(file: &mut File, limits: Limits) -> Result<Archive<Capped<GzDecoder<&mut File>>>> {
+/// How entries land on disk.
+#[derive(Clone, Copy)]
+struct Unpack {
+    /// Mode bits cleared from every entry.
+    mask: u32,
+    /// Restore the archive's owners.
+    owners: bool,
+}
+
+/// Engine state is the owner's alone.
+const ENGINE: Unpack = Unpack {
+    mask: 0o077,
+    owners: false,
+};
+
+fn archive(
+    file: &mut File,
+    limits: Limits,
+    unpack: Unpack,
+) -> Result<Archive<Capped<GzDecoder<&mut File>>>> {
     file.seek(SeekFrom::Start(0))?;
     let mut archive = Archive::new(Capped {
         inner: GzDecoder::new(file),
         left: limits.bytes,
         limit: limits.bytes,
     });
+    // Without preserved permissions the setuid, setgid and sticky bits are
+    // dropped.
     archive.set_preserve_permissions(false);
-    archive.set_preserve_ownerships(false);
+    archive.set_preserve_ownerships(unpack.owners);
     archive.set_unpack_xattrs(false);
     // Without it the archive's mode bits land verbatim (an explicit chmod
     // that bypasses the umask), so a 0777 entry would be world-writable.
-    archive.set_mask(0o077);
+    archive.set_mask(unpack.mask);
     Ok(archive)
 }
 
@@ -280,7 +301,7 @@ pub fn validate(file: &mut File) -> Result<()> {
 
 fn validate_within(file: &mut File, limits: Limits) -> Result<()> {
     let mut seen = 0;
-    for entry in archive(file, limits)?.entries()? {
+    for entry in archive(file, limits, ENGINE)?.entries()? {
         count(&mut seen, limits)?;
         admit(&entry?)?;
     }
@@ -292,9 +313,9 @@ fn validate_within(file: &mut File, limits: Limits) -> Result<()> {
 /// extraction safe even if the file changed in between. `unpack_in` also
 /// refuses to write through a symlink that leaves `dir`. Mode bits are masked
 /// to owner-only with no setuid/setgid/sticky; ownership is never restored.
-fn extract(file: &mut File, dir: &Path, limits: Limits) -> Result<()> {
+fn extract(file: &mut File, dir: &Path, limits: Limits, unpack: Unpack) -> Result<()> {
     let mut seen = 0;
-    for entry in archive(file, limits)?.entries()? {
+    for entry in archive(file, limits, unpack)?.entries()? {
         count(&mut seen, limits)?;
         let mut entry = entry?;
         if !admit(&entry)? {
@@ -309,6 +330,23 @@ fn extract(file: &mut File, dir: &Path, limits: Limits) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Extract a stack archive into `dir`, checking every entry as
+/// [`extract`] does. Modes are kept but for the setuid, setgid and sticky
+/// bits; owners are kept when running as root, as `tar` would.
+pub(crate) fn extract_stack(file: &mut File, dir: &Path) -> Result<()> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let root = unsafe { libc::geteuid() } == 0;
+    extract(
+        file,
+        dir,
+        LIMITS,
+        Unpack {
+            mask: 0,
+            owners: root,
+        },
+    )
 }
 
 /// Restore the archive open as `file` into `state` without ever leaving it
@@ -337,7 +375,7 @@ fn restore_within(file: &mut File, state: &Path, limits: Limits) -> Result<Optio
         let _removed = fs::remove_dir_all(&staging);
         e
     };
-    extract(file, &staging, limits).map_err(discard)?;
+    extract(file, &staging, limits, ENGINE).map_err(discard)?;
     if state.symlink_metadata().is_err() {
         fs::rename(&staging, state)
             .with_context(|| format!("failed to move the restore into '{}'", state.display()))
@@ -375,7 +413,12 @@ fn restore_within(file: &mut File, state: &Path, limits: Limits) -> Result<Optio
 /// recording each move relative to the roots. A path that is a directory on
 /// one side and not on the other is refused: either way the swap would drop
 /// the old subtree.
-fn carry_over(old: &Path, new: &Path, rel: &Path, moved: &mut Vec<PathBuf>) -> Result<()> {
+pub(crate) fn carry_over(
+    old: &Path,
+    new: &Path,
+    rel: &Path,
+    moved: &mut Vec<PathBuf>,
+) -> Result<()> {
     let mut names: Vec<_> = fs::read_dir(old.join(rel))?
         .map(|e| e.map(|e| e.file_name()))
         .collect::<io::Result<_>>()?;
@@ -417,7 +460,7 @@ fn carry_over(old: &Path, new: &Path, rel: &Path, moved: &mut Vec<PathBuf>) -> R
 /// Undo a failed swap: move carried-over entries back from `staging` to
 /// `state`, newest first, and remove `staging` only if every one made it back;
 /// otherwise keep it and name it, since it still holds them.
-fn abandon(
+pub(crate) fn abandon(
     e: plugin_toolkit::anyhow::Error,
     moved: &[PathBuf],
     staging: &Path,

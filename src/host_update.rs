@@ -247,6 +247,14 @@ pub struct StepReport {
 }
 
 impl StepReport {
+    /// [`from_result`](Self::from_result) with `row`'s `.env` values
+    /// scrubbed: compose echoes them in its errors.
+    fn redacted(r: Result<String>, row: &StackRow) -> Self {
+        let mut report = Self::from_result(r);
+        report.output = row.redact(&report.output);
+        report
+    }
+
     fn from_result(r: Result<String>) -> Self {
         match r {
             Ok(out) => Self {
@@ -294,7 +302,7 @@ pub async fn update_stacks(runner: &dyn StackRunner, jobs: &[StackJob]) -> Vec<S
     for job in jobs {
         let mut report = StackReport {
             stack: job.row.name.clone(),
-            pull: StepReport::from_result(runner.pull(&job.row).await),
+            pull: StepReport::redacted(runner.pull(&job.row).await, &job.row),
             up: None,
             orphans_removed: Vec::new(),
             orphans_skipped: Vec::new(),
@@ -332,7 +340,7 @@ pub async fn update_stacks(runner: &dyn StackRunner, jobs: &[StackJob]) -> Vec<S
                     })),
             }
         }
-        report.up = Some(StepReport::from_result(runner.up(&job.row).await));
+        report.up = Some(StepReport::redacted(runner.up(&job.row).await, &job.row));
         out.push(report);
     }
     out
@@ -901,6 +909,7 @@ mod tests {
             dir: format!("/srv/{name}"),
             file: "docker-compose.yml".into(),
             enabled: true,
+            allow: Vec::new(),
         }
     }
 

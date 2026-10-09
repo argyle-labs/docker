@@ -40,6 +40,14 @@ pub struct ServiceConfig {
     pub restart: Option<String>,
     #[serde(default)]
     pub volumes: Vec<MountConfig>,
+    #[serde(default)]
+    pub privileged: bool,
+    #[serde(default)]
+    pub pid: Option<String>,
+    #[serde(default)]
+    pub network_mode: Option<String>,
+    #[serde(default)]
+    pub cap_add: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -63,6 +71,9 @@ pub struct VolumeConfig {
     pub name: Option<String>,
     #[serde(default)]
     pub external: Option<bool>,
+    /// `local` driver options; `o: bind` + `device` binds a host path.
+    #[serde(default)]
+    pub driver_opts: BTreeMap<String, String>,
 }
 
 impl ComposeConfig {
