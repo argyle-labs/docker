@@ -11,6 +11,7 @@ pub mod compose;
 pub mod compose_config;
 pub mod containers;
 pub mod engine;
+pub mod engine_resources;
 pub mod engine_state;
 pub mod execute;
 pub mod fsat;
