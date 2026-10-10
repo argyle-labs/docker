@@ -75,7 +75,6 @@ jobs:
         if: ${{ !cancelled() }}
 
   lint:
-    needs: build
     runs-on: ubuntu-latest
     container:
       image: ${{ vars.CI_REGISTRY || 'gitea.scottkey.me' }}/argyle-labs/ci-rust:1.95.0
