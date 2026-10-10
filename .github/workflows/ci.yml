@@ -1,16 +1,12 @@
 # Default ci.yml for a Rust-only plugin: copy to .github/workflows/ci.yml.
 # A crate over the default runners' memory cap sets `runs-on: ci-large` (and
-# optionally build-jobs/debuginfo) on every block job.
+# optionally rust-setup's build-jobs/debuginfo) on every job.
 
-# Required checks are exactly `build`, `test` and `lint`: plain aggregate jobs
-# (stable check names, unlike the `caller / called` names of reusable calls)
-# that fail closed on anything but success in their needs (a skipped job
-# counts as a failure, so a failed build turns test and lint red too). Tool blocks
-# stay separate jobs so each shows its own result. To add a tool, add its block
-# job and list it in the matching aggregate's `needs:`; ci-needs-check enforces
-# that. `coverage` is report-only and in no aggregate. Every block after
-# cargo-build `needs:` it; for cargo-fmt and cargo-lock-check that is ordering
-# only.
+# Required checks are exactly the jobs `build`, `test` and `lint`. Tests run
+# once, coverage-instrumented: `test` also reports coverage (report-only).
+# Each job composes tool actions as steps, so each job IS one
+# check (no reusable-workflow `caller / called` duplicates). Later lint steps
+# run `if: !cancelled()` so every linter reports even when an earlier one fails.
 name: CI
 
 on:
@@ -22,101 +18,85 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  # CI-only: link the image's system OpenSSL instead of compiling openssl-src.
+  # Release builds do not set this, so shipped binaries keep vendoring it.
+  OPENSSL_NO_VENDOR: "1"
+
 jobs:
-  cargo-build:
-    uses: argyle-labs/.github/.github/workflows/cargo-build.yml@main
-    secrets:
-      CI_REGISTRY_USER: ${{ secrets.CI_REGISTRY_USER }}
-      CI_REGISTRY_TOKEN: ${{ secrets.CI_REGISTRY_TOKEN }}
-      SCCACHE_S3_ACCESS_KEY: ${{ secrets.SCCACHE_S3_ACCESS_KEY }}
-      SCCACHE_S3_SECRET_KEY: ${{ secrets.SCCACHE_S3_SECRET_KEY }}
-
-  cargo-test:
-    needs: cargo-build
-    uses: argyle-labs/.github/.github/workflows/cargo-test.yml@main
-    secrets:
-      CI_REGISTRY_USER: ${{ secrets.CI_REGISTRY_USER }}
-      CI_REGISTRY_TOKEN: ${{ secrets.CI_REGISTRY_TOKEN }}
-      SCCACHE_S3_ACCESS_KEY: ${{ secrets.SCCACHE_S3_ACCESS_KEY }}
-      SCCACHE_S3_SECRET_KEY: ${{ secrets.SCCACHE_S3_SECRET_KEY }}
-
-  cargo-fmt:
-    needs: cargo-build
-    uses: argyle-labs/.github/.github/workflows/cargo-fmt.yml@main
-    secrets:
-      CI_REGISTRY_USER: ${{ secrets.CI_REGISTRY_USER }}
-      CI_REGISTRY_TOKEN: ${{ secrets.CI_REGISTRY_TOKEN }}
-
-  cargo-lock-check:
-    needs: cargo-build
-    uses: argyle-labs/.github/.github/workflows/cargo-lock-check.yml@main
-    secrets:
-      CI_REGISTRY_USER: ${{ secrets.CI_REGISTRY_USER }}
-      CI_REGISTRY_TOKEN: ${{ secrets.CI_REGISTRY_TOKEN }}
-
-  cargo-clippy:
-    needs: cargo-build
-    uses: argyle-labs/.github/.github/workflows/cargo-clippy.yml@main
-    secrets:
-      CI_REGISTRY_USER: ${{ secrets.CI_REGISTRY_USER }}
-      CI_REGISTRY_TOKEN: ${{ secrets.CI_REGISTRY_TOKEN }}
-      SCCACHE_S3_ACCESS_KEY: ${{ secrets.SCCACHE_S3_ACCESS_KEY }}
-      SCCACHE_S3_SECRET_KEY: ${{ secrets.SCCACHE_S3_SECRET_KEY }}
-
-  coverage:
-    needs: cargo-build
-    uses: argyle-labs/.github/.github/workflows/cargo-llvm-cov.yml@main
-    secrets:
-      CI_REGISTRY_USER: ${{ secrets.CI_REGISTRY_USER }}
-      CI_REGISTRY_TOKEN: ${{ secrets.CI_REGISTRY_TOKEN }}
-      SCCACHE_S3_ACCESS_KEY: ${{ secrets.SCCACHE_S3_ACCESS_KEY }}
-      SCCACHE_S3_SECRET_KEY: ${{ secrets.SCCACHE_S3_SECRET_KEY }}
-
-  ci-needs-check:
-    uses: argyle-labs/.github/.github/workflows/ci-needs-check.yml@main
-    secrets:
-      CI_REGISTRY_USER: ${{ secrets.CI_REGISTRY_USER }}
-      CI_REGISTRY_TOKEN: ${{ secrets.CI_REGISTRY_TOKEN }}
-
-  # ── Required checks ──
   build:
-    if: always()
-    needs: [cargo-build]
     runs-on: ubuntu-latest
+    # ci-rust bakes in the toolchain, sccache and Node; its tag tracks
+    # orca/rust-toolchain.toml.
+    container:
+      image: ${{ vars.CI_REGISTRY || 'gitea.scottkey.me' }}/argyle-labs/ci-rust:1.95.0
+      credentials:
+        username: ${{ secrets.CI_REGISTRY_USER }}
+        password: ${{ secrets.CI_REGISTRY_TOKEN }}
+    # Gitea runs `run:` in a custom container with sh (dash); force bash.
+    defaults:
+      run:
+        shell: bash
     steps:
-      - shell: bash
-        env:
-          NEEDS: ${{ toJSON(needs) }}
-        run: |
-          command -v jq >/dev/null || { apt-get update -qq && apt-get install -y -qq --no-install-recommends jq; } \
-            || { sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends jq; }
-          echo "$NEEDS"
-          jq -e 'length > 0 and all(.[]; .result == "success")' <<< "$NEEDS"
+      - uses: actions/checkout@v4
+      - uses: argyle-labs/.github/.github/actions/rust-setup@main
+        with:
+          wrap-cc: 'true'
+          sccache-endpoint: ${{ vars.SCCACHE_ENDPOINT }}
+          sccache-access-key: ${{ secrets.SCCACHE_S3_ACCESS_KEY }}
+          sccache-secret-key: ${{ secrets.SCCACHE_S3_SECRET_KEY }}
+      - uses: argyle-labs/.github/.github/actions/cargo-build@main
+      - uses: argyle-labs/.github/.github/actions/ci-summary@main
+        if: ${{ !cancelled() }}
 
   test:
-    if: always()
-    needs: [cargo-test]
+    needs: build
     runs-on: ubuntu-latest
+    container:
+      image: ${{ vars.CI_REGISTRY || 'gitea.scottkey.me' }}/argyle-labs/ci-rust:1.95.0
+      credentials:
+        username: ${{ secrets.CI_REGISTRY_USER }}
+        password: ${{ secrets.CI_REGISTRY_TOKEN }}
+    defaults:
+      run:
+        shell: bash
     steps:
-      - shell: bash
-        env:
-          NEEDS: ${{ toJSON(needs) }}
-        run: |
-          command -v jq >/dev/null || { apt-get update -qq && apt-get install -y -qq --no-install-recommends jq; } \
-            || { sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends jq; }
-          echo "$NEEDS"
-          jq -e 'length > 0 and all(.[]; .result == "success")' <<< "$NEEDS"
+      - uses: actions/checkout@v4
+      - uses: argyle-labs/.github/.github/actions/rust-setup@main
+        with:
+          wrap-cc: 'true'
+          sccache-endpoint: ${{ vars.SCCACHE_ENDPOINT }}
+          sccache-access-key: ${{ secrets.SCCACHE_S3_ACCESS_KEY }}
+          sccache-secret-key: ${{ secrets.SCCACHE_S3_SECRET_KEY }}
+      - uses: argyle-labs/.github/.github/actions/cargo-test@main
+      - uses: argyle-labs/.github/.github/actions/ci-summary@main
+        if: ${{ !cancelled() }}
 
   lint:
-    if: always()
-    needs: [ci-needs-check, cargo-fmt, cargo-clippy, cargo-lock-check]
+    needs: build
     runs-on: ubuntu-latest
+    container:
+      image: ${{ vars.CI_REGISTRY || 'gitea.scottkey.me' }}/argyle-labs/ci-rust:1.95.0
+      credentials:
+        username: ${{ secrets.CI_REGISTRY_USER }}
+        password: ${{ secrets.CI_REGISTRY_TOKEN }}
+    defaults:
+      run:
+        shell: bash
     steps:
-      - shell: bash
-        env:
-          NEEDS: ${{ toJSON(needs) }}
-        run: |
-          command -v jq >/dev/null || { apt-get update -qq && apt-get install -y -qq --no-install-recommends jq; } \
-            || { sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends jq; }
-          echo "$NEEDS"
-          jq -e 'length > 0 and all(.[]; .result == "success")' <<< "$NEEDS"
+      - uses: actions/checkout@v4
+      - uses: argyle-labs/.github/.github/actions/rust-setup@main
+        with:
+          wrap-cc: 'true'
+          sccache-endpoint: ${{ vars.SCCACHE_ENDPOINT }}
+          sccache-access-key: ${{ secrets.SCCACHE_S3_ACCESS_KEY }}
+          sccache-secret-key: ${{ secrets.SCCACHE_S3_SECRET_KEY }}
+      - uses: argyle-labs/.github/.github/actions/cargo-fmt@main
+      - uses: argyle-labs/.github/.github/actions/cargo-clippy@main
+        if: ${{ !cancelled() }}
+      - uses: argyle-labs/.github/.github/actions/cargo-lock-check@main
+        if: ${{ !cancelled() }}
+      - uses: argyle-labs/.github/.github/actions/ci-summary@main
+        if: ${{ !cancelled() }}
