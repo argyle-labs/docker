@@ -1,0 +1,31 @@
+#!/sbin/openrc-run
+# cgroup v2 forbids enabling controllers on a cgroup that holds processes.
+# In an LXC, init and getty sit in the CT's root cgroup, so the stock
+# `cgroups` service can't delegate memory/cpu and nested docker limits fail.
+# Park root-cgroup processes in /init.scope, then delegate every controller.
+
+description="Delegate cgroup v2 controllers to child cgroups (LXC)"
+
+# Runs after `cgroups`, which mounts /sys/fs/cgroup where LXC has not, so the
+# hierarchy exists; and before docker, whose cgroups must be created under an
+# already-delegated root.
+depend() {
+	need sysfs
+	after cgroups
+	before docker
+	keyword -docker -podman -systemd-nspawn -wsl
+}
+
+start() {
+	ebegin "Delegating cgroup v2 controllers"
+	local root=/sys/fs/cgroup p c rc=0
+	[ -e "$root/cgroup.subtree_control" ] || { eend 0 "not cgroup v2"; return 0; }
+	mkdir -p "$root/init.scope"
+	while read -r p; do
+		echo "$p" > "$root/init.scope/cgroup.procs" 2>/dev/null || true
+	done < "$root/cgroup.procs"
+	for c in $(cat "$root/cgroup.controllers"); do
+		echo "+$c" > "$root/cgroup.subtree_control" 2>/dev/null || { ewarn "could not delegate $c"; rc=1; }
+	done
+	eend "$rc" "subtree_control: $(cat "$root/cgroup.subtree_control")"
+}

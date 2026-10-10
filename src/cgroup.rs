@@ -241,6 +241,158 @@ async fn docker_host_probe(
     })
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// docker.host_prepare — install the delegation service and docker ulimit
+// ═══════════════════════════════════════════════════════════════════════════
+
+const PREPARE_TOOL: &str = "docker.host_prepare";
+const SERVICE: &str = "cgroup-delegate";
+const SERVICE_PATH: &str = "etc/init.d/cgroup-delegate";
+const SERVICE_SH: &str = include_str!("../scripts/cgroup-delegate.openrc");
+const DOCKER_CONF: &str = "etc/conf.d/docker";
+const RC_UPDATE: &str = "/sbin/rc-update";
+const RC_SERVICE: &str = "/sbin/rc-service";
+/// What Alpine's docker service should ask for; capped at the CT hard limit,
+/// since Alpine's default asks for more and dockerd then fails to start.
+const WANT_NOFILE: u64 = 524_288;
+
+/// `conf` with `DOCKER_ULIMIT="-n <nofile>"`, edited in place.
+pub(crate) fn set_ulimit(conf: &str, nofile: u64) -> String {
+    crate::init::set_var(conf, "DOCKER_ULIMIT", &format!("-n {nofile}"))
+}
+
+/// What prepare would change on a host with assessment `a`, whose docker
+/// conf currently reads `conf` and whose service file reads `service`.
+pub(crate) fn plan(a: &CgroupAssessment, service: Option<&str>, conf: Option<&str>) -> Vec<String> {
+    let mut steps = Vec::new();
+    if !a.needs_delegation || a.init != crate::init::Init::OpenRc.as_str() {
+        return steps;
+    }
+    if service != Some(SERVICE_SH) {
+        steps.push(format!("write /{SERVICE_PATH}"));
+    }
+    steps.push(format!("{RC_UPDATE} add {SERVICE} boot"));
+    steps.push(format!("{RC_SERVICE} {SERVICE} start"));
+    let nofile = a.nofile_hard.map_or(WANT_NOFILE, |h| h.min(WANT_NOFILE));
+    let conf = conf.unwrap_or_default();
+    if set_ulimit(conf, nofile) != conf {
+        steps.push(format!(
+            "set DOCKER_ULIMIT=\"-n {nofile}\" in /{DOCKER_CONF}"
+        ));
+    }
+    steps
+}
+
+/// Write the files `plan` calls for under `root`, each atomically.
+pub(crate) fn write_files(root: &Path, a: &CgroupAssessment) -> Result<()> {
+    let service = root.join(SERVICE_PATH);
+    if std::fs::read_to_string(&service).ok().as_deref() != Some(SERVICE_SH) {
+        crate::init::write_atomic(&service, SERVICE_SH, 0o755)?;
+    }
+    let conf_path = root.join(DOCKER_CONF);
+    let conf = std::fs::read_to_string(&conf_path).unwrap_or_default();
+    let nofile = a.nofile_hard.map_or(WANT_NOFILE, |h| h.min(WANT_NOFILE));
+    let next = set_ulimit(&conf, nofile);
+    if next != conf {
+        crate::init::write_atomic(&conf_path, &next, 0o644)?;
+    }
+    Ok(())
+}
+
+#[orca_struct(args)]
+pub struct DockerHostPrepareArgs {
+    /// Apply. Omitted, returns the plan and changes nothing.
+    #[arg(long)]
+    #[serde(default)]
+    pub execute: bool,
+}
+
+#[orca_struct]
+#[serde(rename_all = "camelCase")]
+#[derive(Debug)]
+pub struct DockerHostPrepareOutput {
+    pub dry_run: bool,
+    pub cgroup: CgroupAssessment,
+    pub plan: Vec<String>,
+    /// Why nothing is planned on a host that still needs delegation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Assessment after applying (execute only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<CgroupAssessment>,
+}
+
+/// **Prepare this docker host to enforce container limits.** Inside an LXC
+/// on cgroup v2 with OpenRC, installs and starts a boot service that moves
+/// every process in the root cgroup (init, gettys, anything else running
+/// there) into `/init.scope`, then delegates every controller,
+/// and caps docker's `DOCKER_ULIMIT` at the CT's hard open-files limit.
+/// dockerd is not restarted: the ulimit applies on its next start. Verify
+/// with `docker.host_probe`. Without `execute`, returns the plan.
+#[orca_tool(
+    domain = "docker",
+    verb = "host_prepare",
+    local_only = true,
+    role = "admin",
+    execute_gated = false
+)]
+async fn docker_host_prepare(
+    args: DockerHostPrepareArgs,
+    ctx: &ToolCtx,
+) -> Result<DockerHostPrepareOutput> {
+    crate::execute::require_admin(PREPARE_TOOL, ctx)?;
+    crate::execute::guard(PREPARE_TOOL, args.execute, ctx)?;
+    let root = Path::new("/");
+    let cgroup = assess(root);
+    let plan = plan(
+        &cgroup,
+        read(root, SERVICE_PATH).as_deref(),
+        read(root, DOCKER_CONF).as_deref(),
+    );
+    let note = (cgroup.needs_delegation && plan.is_empty()).then(|| {
+        format!(
+            "init is '{}': only OpenRC is handled; systemd delegates through \
+             Delegate=yes, verify with {PROBE_TOOL}",
+            cgroup.init
+        )
+    });
+    if !args.execute || plan.is_empty() {
+        return Ok(DockerHostPrepareOutput {
+            dry_run: !args.execute,
+            cgroup,
+            plan,
+            note,
+            after: None,
+        });
+    }
+    write_files(root, &cgroup)?;
+    let commands: [&[&str]; 2] = [
+        &[RC_UPDATE, "add", SERVICE, "boot"],
+        &[RC_SERVICE, SERVICE, "start"],
+    ];
+    for argv in commands {
+        let out = plugin_toolkit::process::Command::new(argv[0])
+            .args(argv[1..].iter().copied())
+            .output()
+            .await
+            .with_context(|| format!("failed to spawn {}", argv[0]))?;
+        if !out.status.success {
+            bail!(
+                "{} failed: {}",
+                argv.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+    }
+    Ok(DockerHostPrepareOutput {
+        dry_run: false,
+        after: Some(assess(root)),
+        cgroup,
+        plan,
+        note,
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -325,5 +477,60 @@ pub(crate) mod tests {
         assert_eq!(problems(&good, None, None).len(), 1);
         let failed = problems(&good, Some(false), Some(Err("exit Some(125): no image")));
         assert!(failed[0].contains("did not run"), "{failed:?}");
+    }
+
+    #[test]
+    fn set_ulimit_replaces_or_appends() {
+        assert_eq!(set_ulimit("", 1024), "DOCKER_ULIMIT=\"-n 1024\"\n");
+        let conf = "# opts\nDOCKER_OPTS=\"\"\nDOCKER_ULIMIT=\"-n 1048576\"\n";
+        assert_eq!(
+            set_ulimit(conf, 524288),
+            "# opts\nDOCKER_OPTS=\"\"\nDOCKER_ULIMIT=\"-n 524288\"\n"
+        );
+        let middle = "A=1\nDOCKER_ULIMIT=\"-n 1\"\nB=2\n";
+        assert_eq!(
+            set_ulimit(middle, 9),
+            "A=1\nDOCKER_ULIMIT=\"-n 9\"\nB=2\n",
+            "edited in place"
+        );
+    }
+
+    #[test]
+    fn plan_installs_service_and_caps_ulimit_at_the_hard_limit() {
+        let t = fake_lxc("", "1\n");
+        let mut a = assess(t.path());
+        a.nofile_hard = Some(65536);
+        let p = plan(&a, None, None);
+        assert_eq!(p[0], "write /etc/init.d/cgroup-delegate");
+        assert!(p.contains(&"/sbin/rc-service cgroup-delegate start".to_string()));
+        assert!(p.last().unwrap().contains("-n 65536"));
+    }
+
+    #[test]
+    fn plan_is_empty_when_delegated_or_not_openrc() {
+        let done = assess(fake_lxc("cpuset cpu io memory pids", "").path());
+        assert!(plan(&done, None, None).is_empty());
+        let mut systemd = assess(fake_lxc("", "1\n").path());
+        systemd.init = "systemd".into();
+        assert!(plan(&systemd, None, None).is_empty());
+    }
+
+    #[test]
+    fn write_files_is_idempotent() {
+        let t = fake_lxc("", "1\n");
+        let a = assess(t.path());
+        write_files(t.path(), &a).unwrap();
+        let service = read(t.path(), SERVICE_PATH);
+        let conf = read(t.path(), DOCKER_CONF);
+        assert_eq!(service.as_deref(), Some(SERVICE_SH));
+        assert!(conf.as_deref().unwrap().contains("DOCKER_ULIMIT"));
+        let remaining = plan(&a, service.as_deref(), conf.as_deref());
+        assert!(
+            !remaining
+                .iter()
+                .any(|s| s.starts_with("write") || s.starts_with("set"))
+        );
+        write_files(t.path(), &a).unwrap();
+        assert_eq!(read(t.path(), DOCKER_CONF), conf);
     }
 }
