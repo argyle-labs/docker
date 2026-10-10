@@ -22,6 +22,7 @@ pub mod label_audit;
 pub mod labels;
 pub mod lifecycle;
 pub mod lint;
+pub mod mounts;
 pub mod ownership;
 pub mod policy;
 pub mod prune;
