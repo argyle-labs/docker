@@ -119,7 +119,7 @@ vocabulary spans both). Every operation is available through `unit` list / detai
 
 #### Compose policy
 
-`deploy` is a unit create, which reaches the plugin without a caller identity (orca#788), so the plugin cannot require admin on every stack verb. Instead the resolved config (`compose config`, every profile enabled) is checked against an allowlist before a compose file or `.env` is written (`deploy`, `set`, `edit`, `fix`, `restore`) and before compose runs it (`up`, `start`, `restart`, `build`, `pull`, `docker.host_update`). A key the policy does not know is refused. A service that uses any of these needs a grant:
+`deploy` is a unit create, which reaches the plugin without a caller identity (orca#788), so the plugin cannot require admin on it. On every verb the resolved config (`compose config`, every profile enabled) is checked against an allowlist before a compose file or `.env` is written (`deploy`, `set`, `edit`, `fix`, `restore`) and before compose runs it (`up`, `start`, `restart`, `build`, `pull`, `docker.host_update`). A key the policy does not know is refused. A service that uses any of these needs a grant:
 
 | setting | grant |
 | --- | --- |
@@ -180,7 +180,8 @@ The conversions live only in `compose.orca.yaml`. A plain `docker compose down &
     "dir": "/srv/stacks/myapp",
     "compose_yaml": "services:\n  web:\n    image: nginx\n    ports: [\"8080:80\"]\n",
     "compose_env": "TZ=UTC\n",
-    "deploy": true
+    "deploy": true,
+    "execute": true
   }
 }
 
@@ -189,10 +190,10 @@ The conversions live only in `compose.orca.yaml`. A plain `docker compose down &
 
 // update (edit) — change the YAML without redeploying
 { "id": { "kind": "stack", "id": "myapp", ... }, "action": "edit",
-  "payload": { "compose_yaml": "services:\n  web:\n    image: nginx:1.27\n" } }
+  "payload": { "compose_yaml": "services:\n  web:\n    image: nginx:1.27\n", "execute": true } }
 
 // update (deploy the edit) — bring the changed stack up
-{ "id": { "kind": "stack", "id": "myapp", ... }, "action": "up" }
+{ "id": { "kind": "stack", "id": "myapp", ... }, "action": "up", "payload": { "execute": true } }
 
 // detail (audit) — flags restart `no`/unset/`on-failure[:N]` (proposes unless-stopped),
 // bind sources that are missing or outside the managed mounts (proposes the same
@@ -222,8 +223,22 @@ The conversions live only in `compose.orca.yaml`. A plain `docker compose down &
                "command": "pg_dumpall -U postgres", "execute": true } }
 ```
 
-`delete` runs `compose down` and then deregisters the stack; a failed
-teardown is reported in its message and the stack is deregistered anyway.
+Every mutating unit verb (create, update, upsert, delete) is a dry run unless
+the payload sets `"execute": true`; the dry run returns `{ "dryRun": true,
+"plan": … }` and changes nothing. `backup` is never a dry run (it only adds an archive), and core's
+pre-mutation guard may send it without a caller, with no or an empty
+payload, until it forwards one (orca#704); any other backup, and any
+caller, must be admin. `restore` needs an admin
+caller and the opt-in. `fix`, `volume_policy` and `label_volumes`
+plan themselves and take `execute` with the dry run's `items`. Update, upsert
+and delete require an admin caller and refuse a request that carries none.
+Create cannot check the caller itself (orca's `CreateArgs` carries none,
+orca#788), so it relies on the surface's admin gate.
+
+`delete` only plans: its args carry no payload for the opt-in. Apply it with
+`update` action `remove` and `{"execute": true}`, which runs `compose down`
+and then deregisters the stack; a failed teardown is reported in its message
+and the stack is deregistered anyway.
 
 ---
 
