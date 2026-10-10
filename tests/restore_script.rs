@@ -54,8 +54,15 @@ fn restores_into_a_fresh_state_dir() {
     let a = archive(tmp.path(), &[("colima.yaml", "new"), ("sub/x", "1")]);
     let state = tmp.path().join("state");
     let out = restore(&a, &state, &[]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(fs::read_to_string(state.join("colima.yaml")).unwrap(), "new");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(state.join("colima.yaml")).unwrap(),
+        "new"
+    );
     assert_eq!(fs::read_to_string(state.join("sub/x")).unwrap(), "1");
     assert!(leftovers(tmp.path()).is_empty());
 }
@@ -72,11 +79,21 @@ fn replaces_archived_entries_and_carries_over_the_rest() {
     fs::write(state.join(".hidden"), "h").unwrap();
     fs::write(state.join("_lima/_disks/disk"), "d").unwrap();
     let out = restore(&a, &state, &[]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(fs::read_to_string(state.join("colima.yaml")).unwrap(), "new");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(state.join("colima.yaml")).unwrap(),
+        "new"
+    );
     assert_eq!(fs::read_to_string(state.join("sub/kept")).unwrap(), "k");
     assert_eq!(fs::read_to_string(state.join(".hidden")).unwrap(), "h");
-    assert_eq!(fs::read_to_string(state.join("_lima/_disks/disk")).unwrap(), "d");
+    assert_eq!(
+        fs::read_to_string(state.join("_lima/_disks/disk")).unwrap(),
+        "d"
+    );
     assert!(leftovers(tmp.path()).is_empty());
 }
 
@@ -129,7 +146,10 @@ fn refuses_a_state_dir_holding_an_outward_symlink() {
     let out = restore(&a, &state, &[]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("leaves the state dir"));
-    assert_eq!(fs::read_to_string(state.join("colima.yaml")).unwrap(), "old");
+    assert_eq!(
+        fs::read_to_string(state.join("colima.yaml")).unwrap(),
+        "old"
+    );
     assert!(leftovers(tmp.path()).is_empty());
 }
 
@@ -146,7 +166,10 @@ fn refuses_an_archive_carrying_an_outward_symlink() {
     let out = restore(&a, &state, &[]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("leaves the state dir"));
-    assert_eq!(fs::read_to_string(state.join("colima.yaml")).unwrap(), "old");
+    assert_eq!(
+        fs::read_to_string(state.join("colima.yaml")).unwrap(),
+        "old"
+    );
     assert!(leftovers(tmp.path()).is_empty());
 }
 
@@ -159,7 +182,11 @@ fn keeps_an_absolute_symlink_inside_the_state_dir() {
     fs::create_dir_all(state.join("d")).unwrap();
     std::os::unix::fs::symlink(state.join("d"), state.join("abs")).unwrap();
     let out = restore(&a, &state, &[]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(fs::read_link(state.join("abs")).unwrap(), state.join("d"));
 }
 
@@ -173,7 +200,11 @@ fn a_stale_aside_dir_is_neither_reused_nor_touched() {
     fs::create_dir_all(&stale).unwrap();
     fs::write(stale.join("keep"), "x").unwrap();
     let out = restore(&a, &state, &[]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(fs::read_to_string(stale.join("keep")).unwrap(), "x");
     assert_eq!(leftovers(tmp.path()), [".state.old-1"]);
 }
@@ -191,7 +222,10 @@ fn a_failed_swap_puts_the_previous_state_back() {
     let out = restore(&a, &state, &[("BASH_FUNC_mv%%", fail)]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("previous state put back"));
-    assert_eq!(fs::read_to_string(state.join("colima.yaml")).unwrap(), "old");
+    assert_eq!(
+        fs::read_to_string(state.join("colima.yaml")).unwrap(),
+        "old"
+    );
     assert_eq!(fs::read_to_string(state.join("kept")).unwrap(), "k");
     assert!(leftovers(tmp.path()).is_empty());
 }
@@ -204,6 +238,10 @@ fn keeps_an_inward_symlink() {
     fs::create_dir_all(state.join("d")).unwrap();
     std::os::unix::fs::symlink("d", state.join("link")).unwrap();
     let out = restore(&a, &state, &[]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(fs::read_link(state.join("link")).unwrap(), Path::new("d"));
 }
