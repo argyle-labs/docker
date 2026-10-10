@@ -55,15 +55,47 @@ impl Package {
         format!("package:{}", self.name)
     }
 
-    /// Upgrading the engine restarts every container on the host.
+    /// Upgrading the engine restarts dockerd and every container on the
+    /// host, so host_update never does it.
     pub fn is_engine(&self) -> bool {
-        let n = self.name.as_str();
-        n == "docker"
-            || n == "docker.io"
-            || n.starts_with("docker-")
-            || n.starts_with("containerd")
-            || n.starts_with("moby-")
+        is_engine_name(&self.name)
     }
+}
+
+pub fn is_engine_name(n: &str) -> bool {
+    n == "docker"
+        || n == "docker.io"
+        || n.starts_with("docker-")
+        || n.starts_with("containerd")
+        || n.starts_with("moby-")
+        || n == "runc"
+}
+
+/// Why an engine package is held back.
+const ENGINE_HELD: &str = "ENGINE package: never upgraded by docker.host_update, since it restarts dockerd and every container on this host; upgrade it deliberately with docker.engine_update";
+
+/// Engine packages a dry-run upgrade (`apt-get -s` / `apk upgrade
+/// --simulate`) would install, read from its output.
+pub fn engine_in_simulation(pkg: PkgManager, out: &str) -> Vec<String> {
+    let names = out.lines().filter_map(|l| match pkg {
+        // `Inst <name>[:<arch>] …`
+        PkgManager::Apt => {
+            let name = l.strip_prefix("Inst ")?.split_whitespace().next()?;
+            Some(name.split(':').next().unwrap_or(name))
+        }
+        // `(n/m) <Installing|Upgrading|Replacing|Downgrading|…> <name> (…)`
+        PkgManager::Apk => {
+            let rest = l.trim_start().strip_prefix('(')?.split_once(") ")?.1;
+            rest.split_whitespace().nth(1)
+        }
+    });
+    let mut engine: Vec<String> = names
+        .filter(|n| is_engine_name(n))
+        .map(str::to_owned)
+        .collect();
+    engine.sort();
+    engine.dedup();
+    engine
 }
 
 impl PkgManager {
@@ -124,28 +156,61 @@ impl PkgManager {
 
     /// The commands that upgrade exactly `names`, run in order; any failure
     /// aborts the update.
-    pub fn commands(self, names: &[String]) -> Vec<Vec<String>> {
-        let owned = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    /// The upgrade of `names` as a no-op simulation, which also lists the
+    /// dependencies it would pull in.
+    pub fn simulate(self, names: &[String]) -> Vec<String> {
+        let mut cmd: Vec<String> = match self {
+            PkgManager::Apk => vec!["apk".into(), "upgrade".into(), "--simulate".into()],
+            PkgManager::Apt => ["apt-get", "-s", "install", "--only-upgrade", "--no-remove"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        };
+        cmd.extend(names.iter().cloned());
+        cmd
+    }
+
+    /// Refresh the package index.
+    pub fn refresh(self) -> Vec<String> {
         match self {
-            PkgManager::Apk => {
-                let mut upgrade = owned(&["apk", "upgrade"]);
-                upgrade.extend(names.iter().cloned());
-                vec![owned(&["apk", "update"]), upgrade]
-            }
-            PkgManager::Apt => {
-                // Keep the host's edited config files rather than prompting.
-                let mut upgrade = owned(&[
-                    "apt-get",
-                    "-y",
-                    "-o",
-                    "Dpkg::Options::=--force-confold",
-                    "install",
-                    "--only-upgrade",
-                    "--no-remove",
-                ]);
-                upgrade.extend(names.iter().cloned());
-                vec![owned(&["apt-get", "update"]), upgrade]
-            }
+            PkgManager::Apk => vec!["apk".into(), "update".into()],
+            PkgManager::Apt => vec!["apt-get".into(), "update".into()],
+        }
+    }
+
+    /// Upgrade exactly `names`.
+    pub fn upgrade(self, names: &[String]) -> Vec<String> {
+        let mut cmd: Vec<String> = match self {
+            PkgManager::Apk => vec!["apk".into(), "upgrade".into()],
+            // Keep the host's edited config files rather than prompting.
+            PkgManager::Apt => [
+                "apt-get",
+                "-y",
+                "-o",
+                "Dpkg::Options::=--force-confold",
+                "install",
+                "--only-upgrade",
+                "--no-remove",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        };
+        cmd.extend(names.iter().cloned());
+        cmd
+    }
+
+    /// Environment for refresh, simulation and upgrade. needrestart (Debian
+    /// and Ubuntu's post-upgrade hook) would otherwise restart services whose
+    /// libraries changed, docker.service among them; it is told to only list.
+    pub fn env(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            PkgManager::Apk => &[],
+            PkgManager::Apt => &[
+                ("DEBIAN_FRONTEND", "noninteractive"),
+                ("NEEDRESTART_SUSPEND", "1"),
+                ("NEEDRESTART_MODE", "l"),
+            ],
         }
     }
 }
@@ -392,7 +457,12 @@ impl HostState {
         let mut out: Vec<String> = self
             .packages
             .as_ref()
-            .map(|p| p.iter().map(Package::target).collect())
+            .map(|p| {
+                p.iter()
+                    .filter(|p| !p.is_engine())
+                    .map(Package::target)
+                    .collect()
+            })
             .unwrap_or_default();
         out.extend(self.running.iter().map(|r| stack_target(&r.name)));
         for (stack, orphans) in &self.orphans {
@@ -547,16 +617,15 @@ pub fn plan<A: Serialize>(
             .push(PlannedChange::new("host:packages-unreadable", "skip").with_detail(why.as_str())),
         (Some(_), Ok(packages)) => {
             for p in packages {
-                let detail = if p.is_engine() {
+                if p.is_engine() {
                     engine += 1;
-                    format!(
-                        "{}; ENGINE package: upgrading it restarts every container on this host",
-                        p.detail
-                    )
+                    changes.push(
+                        PlannedChange::new(format!("held:{}", p.target()), "hold")
+                            .with_detail(format!("{}; {ENGINE_HELD}", p.detail)),
+                    );
                 } else {
-                    p.detail.clone()
-                };
-                changes.push(PlannedChange::new(p.target(), "upgrade").with_detail(detail));
+                    changes.push(PlannedChange::new(p.target(), "upgrade").with_detail(&p.detail));
+                }
             }
         }
     }
@@ -584,8 +653,10 @@ pub fn plan<A: Serialize>(
     let summary = format!(
         "update host: {}, {} running stack(s), {} orphan container(s), {} unreadable stack(s) skipped, prune {} dangling image(s) plus any the pulls replace",
         match pkg {
-            Some(_) if engine > 0 =>
-                format!("{package_count} package(s) ({engine} engine: restarts every container)"),
+            Some(_) if engine > 0 => format!(
+                "{} package(s), {engine} engine package(s) held",
+                package_count - engine
+            ),
             Some(_) => format!("{package_count} package(s)"),
             None => "packages unsupported".to_string(),
         },
@@ -686,9 +757,16 @@ pub fn select(state: &HostState, items: &[String]) -> Result<Selection> {
     let (act, dropped) = execute::intersect(&others, &current);
     let mut skipped: Vec<Skipped> = dropped
         .into_iter()
-        .map(|item| Skipped {
-            item,
-            reason: "no longer valid on this host".into(),
+        .map(|item| {
+            let engine = item.strip_prefix("package:").is_some_and(is_engine_name);
+            Skipped {
+                reason: if engine {
+                    ENGINE_HELD.into()
+                } else {
+                    "no longer valid on this host".into()
+                },
+                item,
+            }
         })
         .collect();
     skipped.extend(state.unreadable.iter().cloned());
@@ -707,29 +785,58 @@ pub fn select(state: &HostState, items: &[String]) -> Result<Selection> {
     })
 }
 
-async fn run_packages(pkg: PkgManager, names: &[String]) -> Result<Vec<StepReport>> {
-    let mut out = Vec::new();
-    for cmd in pkg.commands(names) {
-        let output = Command::new(&cmd[0])
-            .args(&cmd[1..])
-            .env("DEBIAN_FRONTEND", "noninteractive")
-            .output()
-            .await
-            .with_context(|| format!("spawn {}", cmd.join(" ")))?;
-        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !output.status.success {
-            bail!(
-                "{TOOL}: `{}` failed, update aborted before touching stacks: {}",
-                cmd.join(" "),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        out.push(StepReport {
-            ok: true,
-            output: text,
-        });
+async fn run_step(pkg: PkgManager, cmd: &[String], stage: &str) -> Result<String> {
+    let mut command = Command::new(&cmd[0]).args(&cmd[1..]);
+    for (k, v) in pkg.env() {
+        command = command.env(k, v);
     }
-    Ok(out)
+    let output = command
+        .output()
+        .await
+        .with_context(|| format!("spawn {}", cmd.join(" ")))?;
+    if !output.status.success {
+        bail!(
+            "{TOOL}: `{}` failed, update aborted {stage}: {}",
+            cmd.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+async fn run_packages(pkg: PkgManager, names: &[String]) -> Result<Vec<StepReport>> {
+    run_packages_with(pkg, names, |cmd, stage| async move {
+        run_step(pkg, &cmd, stage).await
+    })
+    .await
+}
+
+/// Refresh the index, simulate the upgrade and refuse it if it would move an
+/// engine package (directly or as a dependency), then upgrade. `run` runs one
+/// command and returns its stdout.
+async fn run_packages_with<F, Fut>(
+    pkg: PkgManager,
+    names: &[String],
+    mut run: F,
+) -> Result<Vec<StepReport>>
+where
+    F: FnMut(Vec<String>, &'static str) -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
+    let refreshed = run(pkg.refresh(), "before touching packages").await?;
+    let simulated = run(pkg.simulate(names), "before touching packages").await?;
+    let engine = engine_in_simulation(pkg, &simulated);
+    if !engine.is_empty() {
+        bail!(
+            "{TOOL}: upgrading the confirmed packages would also upgrade engine package(s) {}, restarting dockerd; nothing was upgraded",
+            engine.join(", ")
+        );
+    }
+    let upgraded = run(pkg.upgrade(names), "before touching stacks").await?;
+    Ok([refreshed, upgraded]
+        .into_iter()
+        .map(|output| StepReport { ok: true, output })
+        .collect())
 }
 
 #[orca_struct(args)]
@@ -845,17 +952,15 @@ mod tests {
     #[test]
     fn package_commands_upgrade_only_the_confirmed_names() {
         let names = vec!["musl".to_string(), "docker".to_string()];
+        assert_eq!(PkgManager::Apk.refresh(), ["apk", "update"]);
         assert_eq!(
-            PkgManager::Apk.commands(&names),
-            vec![
-                vec!["apk", "update"],
-                vec!["apk", "upgrade", "musl", "docker"]
-            ]
+            PkgManager::Apk.upgrade(&names),
+            ["apk", "upgrade", "musl", "docker"]
         );
-        let apt = PkgManager::Apt.commands(&["curl".to_string()]);
-        assert_eq!(apt[0], vec!["apt-get", "update"]);
-        assert!(apt[1].contains(&"-y".to_string()));
-        assert!(apt[1].ends_with(&[
+        assert_eq!(PkgManager::Apt.refresh(), ["apt-get", "update"]);
+        let apt = PkgManager::Apt.upgrade(&["curl".to_string()]);
+        assert!(apt.contains(&"-y".to_string()));
+        assert!(apt.ends_with(&[
             "install".into(),
             "--only-upgrade".into(),
             "--no-remove".into(),
@@ -1096,7 +1201,7 @@ mod tests {
             vec![
                 "backup-gate",
                 "package:curl",
-                "package:docker-ce",
+                "held:package:docker-ce",
                 "stack:media",
                 "orphan:media/media-old-1",
                 "orphan:media/media-older-1",
@@ -1136,7 +1241,11 @@ mod tests {
     #[test]
     fn targets_cover_packages_stacks_and_orphans_but_not_unreadable_stacks() {
         let t = state().targets();
-        assert!(t.contains(&"package:docker-ce".to_string()));
+        assert!(t.contains(&"package:curl".to_string()));
+        assert!(
+            !t.contains(&"package:docker-ce".to_string()),
+            "an engine package is never a target"
+        );
         assert!(t.contains(&"orphan:media/media-old-1".to_string()));
         assert!(!t.iter().any(|x| x.contains("broken")));
     }
@@ -1147,6 +1256,7 @@ mod tests {
         let sel = select(
             &st,
             &[
+                "package:curl".to_string(),
                 "package:docker-ce".to_string(),
                 "package:gone".to_string(),
                 "stack:media".to_string(),
@@ -1156,7 +1266,17 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_eq!(sel.packages, vec!["docker-ce"], "curl was not confirmed");
+        assert_eq!(
+            sel.packages,
+            vec!["curl"],
+            "a confirmed engine package is held"
+        );
+        let held = sel
+            .skipped
+            .iter()
+            .find(|s| s.item == "package:docker-ce")
+            .unwrap();
+        assert!(held.reason.contains("restarts dockerd"), "{}", held.reason);
         assert_eq!(sel.jobs.len(), 1, "web was not confirmed");
         assert_eq!(sel.jobs[0].row.name, "media");
         assert_eq!(sel.jobs[0].remove_orphans, vec!["media-old-1"]);
@@ -1227,6 +1347,111 @@ mod tests {
             ))
             .unwrap_err();
             crate::test_support::assert_admin_refusal(&err.to_string());
+        }
+    }
+
+    #[test]
+    fn a_simulation_names_the_engine_packages_it_would_pull_in() {
+        let apt = "Reading package lists...\nInst curl [7.88.1-10] (7.88.1-10+deb12u5 Debian:12/stable [arm64])\n\
+                   Inst containerd.io [1.7.0] (1.7.1 Docker CE:bookworm [arm64])\nConf curl (7.88.1-10+deb12u5)\n";
+        assert_eq!(
+            engine_in_simulation(PkgManager::Apt, apt),
+            ["containerd.io"]
+        );
+        let apk = "(1/2) Upgrading curl (8.5.0-r0 -> 8.6.0-r0)\n(2/2) Upgrading docker (25.0.3-r0 -> 25.0.5-r0)\nOK: 0 MiB in 0 packages\n";
+        assert_eq!(engine_in_simulation(PkgManager::Apk, apk), ["docker"]);
+        assert!(engine_in_simulation(PkgManager::Apt, "Inst curl [1] (2)\n").is_empty());
+    }
+
+    #[test]
+    fn the_apt_parser_strips_the_architecture() {
+        let out = "Inst containerd.io:arm64 [1.7.0] (1.7.1 Docker CE:bookworm [arm64])\nInst libc6:amd64 [2.36] (2.37)\n";
+        assert_eq!(
+            engine_in_simulation(PkgManager::Apt, out),
+            ["containerd.io"]
+        );
+    }
+
+    #[test]
+    fn the_apk_parser_reads_every_verb() {
+        let out = "(1/5) Installing runc (1.1.12-r0)\n(2/5) Replacing containerd (1.7.13-r0 -> 1.7.14-r0)\n\
+                   (3/5) Downgrading docker-cli (26.0-r0 -> 25.0-r0)\n(4/5) Reinstalling docker-engine (25.0-r0)\n\
+                   (5/5) Upgrading curl (8.5.0-r0 -> 8.6.0-r0)\nOK: 0 MiB\n";
+        assert_eq!(
+            engine_in_simulation(PkgManager::Apk, out),
+            ["containerd", "docker-cli", "docker-engine", "runc"]
+        );
+    }
+
+    #[test]
+    fn apt_runs_with_needrestart_listing_only() {
+        let env = PkgManager::Apt.env();
+        assert!(env.contains(&("NEEDRESTART_SUSPEND", "1")));
+        assert!(env.contains(&("NEEDRESTART_MODE", "l")));
+        assert!(env.contains(&("DEBIAN_FRONTEND", "noninteractive")));
+        assert!(PkgManager::Apk.env().is_empty());
+    }
+
+    #[test]
+    fn the_simulation_is_the_upgrade_without_side_effects() {
+        let names = vec!["curl".to_string()];
+        assert_eq!(
+            PkgManager::Apt.simulate(&names),
+            [
+                "apt-get",
+                "-s",
+                "install",
+                "--only-upgrade",
+                "--no-remove",
+                "curl"
+            ]
+        );
+        assert_eq!(
+            PkgManager::Apk.simulate(&names),
+            ["apk", "upgrade", "--simulate", "curl"]
+        );
+    }
+
+    #[test]
+    fn the_simulation_runs_between_refresh_and_upgrade_and_can_stop_it() {
+        let names = vec!["curl".to_string()];
+        for (sim_out, upgrades) in [
+            ("Inst curl [1] (2)\n", true),
+            (
+                "Inst curl [1] (2)\nInst containerd.io:amd64 [1] (2)\n",
+                false,
+            ),
+        ] {
+            let ran = std::cell::RefCell::new(Vec::new());
+            let result = plugin_toolkit::reactor::block_on(run_packages_with(
+                PkgManager::Apt,
+                &names,
+                |cmd, _| {
+                    let simulation = cmd.contains(&"-s".to_string());
+                    ran.borrow_mut().push(cmd.join(" "));
+                    let out = if simulation {
+                        sim_out.to_string()
+                    } else {
+                        String::new()
+                    };
+                    async move { Ok(out) }
+                },
+            ));
+            let ran = ran.into_inner();
+            assert_eq!(ran[0], "apt-get update");
+            assert!(ran[1].starts_with("apt-get -s install"), "{ran:?}");
+            if upgrades {
+                assert!(result.is_ok());
+                assert_eq!(ran.len(), 3);
+                assert!(ran[2].starts_with("apt-get -y"), "{ran:?}");
+            } else {
+                let err = result.unwrap_err().to_string();
+                assert!(
+                    err.contains("containerd.io") && err.contains("nothing was upgraded"),
+                    "{err}"
+                );
+                assert_eq!(ran.len(), 2, "the upgrade never runs: {ran:?}");
+            }
         }
     }
 }
