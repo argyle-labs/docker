@@ -59,8 +59,9 @@ pub struct DockerEngineResourcesArgs {}
 )]
 async fn docker_engine_resources(
     _args: DockerEngineResourcesArgs,
-    _ctx: &ToolCtx,
+    ctx: &ToolCtx,
 ) -> Result<EngineResources> {
+    crate::execute::require_admin("docker.engine_resources", ctx)?;
     let docker = crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
@@ -82,5 +83,17 @@ mod tests {
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["volumes"][0], "a");
         assert_eq!(v["networks"][1], "media_default");
+    }
+
+    #[test]
+    fn refuses_a_non_admin_caller() {
+        for ctx in crate::test_support::non_admins() {
+            let err = plugin_toolkit::reactor::block_on(docker_engine_resources(
+                DockerEngineResourcesArgs {},
+                &ctx,
+            ))
+            .unwrap_err();
+            crate::test_support::assert_admin_refusal(&err.to_string());
+        }
     }
 }
