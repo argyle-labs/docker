@@ -307,7 +307,9 @@ Upgrades the runtime via the host package manager (or `rpm-ostree upgrade` on at
 # owner-only, config-only tarball: no VM/disk images (so no container images or
 # volumes) and no lima VM ssh keypair; the VM disk is recreated on next start
 ./scripts/backup.sh /mnt/backups/docker     # prints the archive path
-# restore it (pair with install.sh to rebuild a host); never restores owners or setuid bits
+# restore it (pair with install.sh to rebuild a host); never restores owners or setuid bits.
+# Refuses archives over 4 GiB uncompressed or 100k entries and links leaving the state dir;
+# extracts beside it, keeps what the archive lacks (VM disks), then swaps by rename
 ./scripts/restore.sh /mnt/backups/docker/docker-engine-state-YYYYmmdd-HHMMSS.tar.gz
 ```
 
