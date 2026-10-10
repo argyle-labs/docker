@@ -193,7 +193,8 @@ pub struct DockerLabelAuditArgs {}
     role = "admin",
     execute_gated = false
 )]
-async fn docker_label_audit(_args: DockerLabelAuditArgs, _ctx: &ToolCtx) -> Result<LabelAudit> {
+async fn docker_label_audit(_args: DockerLabelAuditArgs, ctx: &ToolCtx) -> Result<LabelAudit> {
+    crate::execute::require_admin("docker.label_audit", ctx)?;
     let docker = crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
@@ -246,5 +247,17 @@ mod tests {
         assert_eq!(unknown.volumes, vec!["stray"]);
         assert_eq!(a.total, 7);
         assert!(e.paths("DELETE").is_empty() && e.paths("POST").is_empty());
+    }
+
+    #[test]
+    fn a_dry_run_needs_an_admin_caller() {
+        for ctx in crate::test_support::non_admins() {
+            let err = plugin_toolkit::reactor::block_on(docker_label_audit(
+                DockerLabelAuditArgs {},
+                &ctx,
+            ))
+            .unwrap_err();
+            crate::test_support::assert_admin_refusal(&err.to_string());
+        }
     }
 }

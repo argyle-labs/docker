@@ -494,6 +494,7 @@ async fn external_networks() -> Result<Option<HashSet<String>>> {
     execute_gated = false
 )]
 async fn docker_prune(args: DockerPruneArgs, ctx: &ToolCtx) -> Result<PruneChange> {
+    execute::require_admin(TOOL, ctx)?;
     execute::guard(TOOL, args.execute, ctx)?;
     let project = match &args.stack {
         Some(s) => Some(project_for(s).await?),
@@ -920,21 +921,15 @@ mod tests {
     }
 
     #[test]
-    fn a_dry_run_needs_no_admin_caller() {
-        let args = DockerPruneArgs {
-            stack: None,
-            items: vec![],
-            execute: false,
-        };
-        // With no engine or core DB under test the call may still fail, but
-        // never on the caller's role.
-        if let Err(e) = plugin_toolkit::reactor::block_on(docker_prune(args, &ctx_without_caller()))
-        {
-            let msg = e.to_string();
-            assert!(
-                !msg.contains("caller identity") && !msg.contains("requires role"),
-                "{msg}"
-            );
+    fn a_dry_run_needs_an_admin_caller() {
+        for ctx in crate::test_support::non_admins() {
+            let args = DockerPruneArgs {
+                stack: None,
+                items: vec![],
+                execute: false,
+            };
+            let err = plugin_toolkit::reactor::block_on(docker_prune(args, &ctx)).unwrap_err();
+            crate::test_support::assert_admin_refusal(&err.to_string());
         }
     }
 }
