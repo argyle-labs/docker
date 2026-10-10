@@ -21,13 +21,9 @@ pub fn require_admin(tool: &str, ctx: &ToolCtx) -> Result<()> {
     check_admin(tool, ctx.caller().as_ref())
 }
 
-/// Refuse a caller orca identified that is not an admin. A call with no
-/// caller is left to orca's central gate (orca#704, orca#788).
-pub fn refuse_non_admin(subject: &str, caller: Option<&CallerIdentity>) -> Result<()> {
-    match caller {
-        Some(_) => check_admin(subject, caller),
-        None => Ok(()),
-    }
+/// Admin for `subject`, failing closed: no caller is refused.
+pub fn require_caller_admin(subject: &str, caller: Option<&CallerIdentity>) -> Result<()> {
+    check_admin(subject, caller)
 }
 
 fn check_admin(subject: &str, caller: Option<&CallerIdentity>) -> Result<()> {
@@ -106,11 +102,12 @@ mod tests {
     }
 
     #[test]
-    fn a_present_non_admin_is_refused_and_no_caller_is_left_to_orca() {
-        assert!(refuse_non_admin("t", Some(&caller("admin"))).is_ok());
-        assert!(refuse_non_admin("t", None).is_ok());
+    fn require_caller_admin_fails_closed() {
+        assert!(require_caller_admin("t", Some(&caller("admin"))).is_ok());
+        let err = require_caller_admin("t", None).unwrap_err();
+        assert!(err.to_string().contains("no caller identity"), "{err}");
         for role in ["member", "user"] {
-            let err = refuse_non_admin("t", Some(&caller(role))).unwrap_err();
+            let err = require_caller_admin("t", Some(&caller(role))).unwrap_err();
             assert!(err.to_string().contains("requires role 'admin'"), "{err}");
         }
     }

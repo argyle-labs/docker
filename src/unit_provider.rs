@@ -39,7 +39,7 @@ use plugin_toolkit::contract::unit::{
 };
 use plugin_toolkit::schemars::{JsonSchema, schema_for};
 use plugin_toolkit::serde::{Deserialize, Serialize};
-use plugin_toolkit::serde_json;
+use plugin_toolkit::serde_json::{self, Value, json};
 
 use crate::compose::ORCA_FILE;
 use crate::compose_config::ComposeConfig;
@@ -58,6 +58,77 @@ const STACK_KIND: &str = "stack";
 /// handled separately (it carries a payload); these are argument-free actions
 /// forwarded to `docker compose <action>`.
 const STACK_LIFECYCLE: &[&str] = &["up", "down", "start", "stop", "restart", "build", "pull"];
+
+/// Stack update actions whose payload carries its own `execute` and `items`
+/// and plans itself; every other mutating action is gated here.
+const SELF_PLANNING: &[&str] = &["fix", "volume_policy", "label_volumes"];
+
+/// Tears the stack down and deregisters it: the executable form of `delete`,
+/// whose args carry no payload for an opt-in.
+const ACTION_REMOVE: &str = "remove";
+
+/// Container update actions; they take only the opt-in.
+const CONTAINER_ACTIONS: &[&str] = &["start", "stop", "restart"];
+
+/// Payload for an action that takes nothing but the opt-in.
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(crate = "plugin_toolkit::serde", deny_unknown_fields)]
+#[schemars(crate = "plugin_toolkit::schemars")]
+pub struct ExecuteOptIn {
+    /// Apply. Omitted, returns what would happen and changes nothing.
+    #[serde(default)]
+    pub execute: bool,
+}
+
+/// `(execute, rest)`: the payload's `execute` flag, and the payload without
+/// it for the action's own parser. A payload that is not a JSON object is
+/// passed on untouched, never read as an opt-in.
+pub(crate) fn split_execute(payload: Option<String>) -> Result<(bool, Option<String>)> {
+    let Some(raw) = payload else {
+        return Ok((false, None));
+    };
+    let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(&raw) else {
+        return Ok((false, Some(raw)));
+    };
+    let execute = match map.remove("execute") {
+        None => false,
+        Some(Value::Bool(b)) => b,
+        Some(other) => anyhow::bail!("`execute` must be true or false, got {other}"),
+    };
+    let rest = if map.is_empty() {
+        None
+    } else {
+        Some(Value::Object(map).to_string())
+    };
+    Ok((execute, rest))
+}
+
+/// The payload core's pre-mutation guard sends to `backup`: none, or empty.
+fn guard_shaped(payload: Option<&str>) -> bool {
+    match payload.map(str::trim) {
+        None | Some("") => true,
+        Some(raw) => serde_json::from_str::<Value>(raw)
+            .is_ok_and(|v| v.as_object().is_some_and(|m| m.is_empty())),
+    }
+}
+
+/// What a gated verb would do, without doing it.
+pub(crate) fn dry_run(id: UnitId, plan: String) -> VerbOutcome {
+    let body = json!({
+        "dryRun": true,
+        "plan": plan,
+        "howToExecute": "re-invoke with `execute: true` in the payload",
+    });
+    VerbOutcome::Item(ItemOutcome::new(id, body.to_string()))
+}
+
+/// Admin, failing closed: a request with no verified caller is refused.
+fn require_admin(
+    subject: &str,
+    caller: Option<&plugin_toolkit::contract::CallerIdentity>,
+) -> Result<()> {
+    crate::execute::require_caller_admin(subject, caller)
+}
 
 pub struct DockerUnitProvider {
     adapter: &'static DockerAdapter,
@@ -258,6 +329,7 @@ impl DockerUnitProvider {
                     message,
                 }))
             }
+            ACTION_REMOVE => Ok(stack_remove(&row).await?),
             "fix" => self.stack_fix(&args.id, &row, args.payload).await,
             "volume_policy" => self.stack_volume_policy(&args.id, &row, args.payload).await,
             ACTION_BACKUP => self.do_stack_backup(&args.id, &row, args.payload).await,
@@ -665,10 +737,51 @@ impl DockerUnitProvider {
     }
 
     async fn do_update(&self, args: UpdateArgs) -> Result<VerbOutcome> {
-        crate::execute::refuse_non_admin(
-            &format!("docker {} update", args.id.kind),
-            args.caller.as_ref(),
-        )?;
+        let stack = args.id.kind == STACK_KIND;
+        let action = args.action.as_str();
+        // Backup only adds an archive, and core's pre-mutation guard
+        // (`dispatch_guarded`) sends it with no caller and no payload: it must
+        // run for real, never answer with a plan. A caller, when present, is
+        // still held to admin, and so is any payload (a `dest` steers where
+        // the archive goes), since the guard never sends one. Remove the
+        // no-caller allowance once core forwards the mutation's caller to the
+        // guard (orca#704).
+        let backup = stack && action == ACTION_BACKUP;
+        if !(backup && args.caller.is_none() && guard_shaped(args.payload.as_deref())) {
+            require_admin(
+                &format!("docker {} update", args.id.kind),
+                args.caller.as_ref(),
+            )?;
+        }
+        let args = if backup {
+            let (_, payload) = split_execute(args.payload.clone())?;
+            UpdateArgs { payload, ..args }
+        } else if stack && SELF_PLANNING.contains(&action) {
+            args
+        } else if (stack && (STACK_LIFECYCLE.contains(&action) || action == ACTION_REMOVE))
+            || (!stack && CONTAINER_ACTIONS.contains(&action))
+        {
+            let opt_in: ExecuteOptIn = match args.payload.as_deref() {
+                None => ExecuteOptIn::default(),
+                Some(raw) => serde_json::from_str(raw)
+                    .map_err(|e| anyhow::anyhow!("{action} payload: {e}"))?,
+            };
+            if !opt_in.execute {
+                let plan = format!("{} {} {}", args.action, args.id.kind, args.id.id);
+                return Ok(dry_run(args.id, plan));
+            }
+            UpdateArgs {
+                payload: None,
+                ..args
+            }
+        } else {
+            let (execute, payload) = split_execute(args.payload.clone())?;
+            if !execute {
+                let plan = format!("{} {} {}", args.action, args.id.kind, args.id.id);
+                return Ok(dry_run(args.id, plan));
+            }
+            UpdateArgs { payload, ..args }
+        };
         if args.id.kind == STACK_KIND {
             let name = args.id.id.clone();
             let secrets = stack_secrets(&name, args.payload.as_deref());
@@ -701,7 +814,36 @@ impl DockerUnitProvider {
         }
     }
 
+    /// Dry run by default. Not admin-checked here: orca's `CreateArgs` carries
+    /// no caller yet, so the surface's admin gate is the only check.
     async fn do_create(&self, args: CreateArgs) -> Result<VerbOutcome> {
+        let (execute, payload) = split_execute(args.payload.clone())?;
+        if !execute {
+            let target = match args.action.as_str() {
+                "deploy" => format!("stack {}", payload_name(payload.as_deref())),
+                _ => payload
+                    .as_deref()
+                    .and_then(|p| serde_json::from_str::<ExecPayload>(p).ok())
+                    // Arguments can hold secrets; the plan names the program only.
+                    .map(|e| {
+                        let program = e.cmd.first().map_or("", String::as_str);
+                        format!(
+                            "{program} (+{} args) in {}",
+                            e.cmd.len().saturating_sub(1),
+                            e.id
+                        )
+                    })
+                    .unwrap_or_default(),
+            };
+            let id = UnitId {
+                manager: format!("docker@{}", self.hostname),
+                kind: args.action.clone(),
+                id: target.clone(),
+                name: target.clone(),
+            };
+            return Ok(dry_run(id, format!("{} {target}", args.action)));
+        }
+        let args = CreateArgs { payload, ..args };
         match args.action.as_str() {
             "deploy" => {
                 let name = payload_name(args.payload.as_deref());
@@ -740,36 +882,20 @@ impl DockerUnitProvider {
         }
     }
 
+    /// Never acts: delete's args carry no payload for the opt-in, so the plan
+    /// names the `remove` update action that does.
     async fn do_delete(&self, args: DeleteArgs) -> Result<VerbOutcome> {
-        crate::execute::refuse_non_admin(
+        require_admin(
             &format!("docker {} delete", args.id.kind),
             args.caller.as_ref(),
         )?;
         if args.id.kind == STACK_KIND {
-            // Delete is one command: tear the stack down (`compose down`), then
-            // deregister it. No separate `action=down` step first.
-            let row = stacks::require(&args.id.id)?;
-            let secrets = stack_secrets(&row.name, None);
-            let teardown = match row.compose() {
-                Ok(c) => match c.run_action("down", None, None).await {
-                    Ok(out) => {
-                        let out = out.trim();
-                        if out.is_empty() {
-                            "torn down".to_string()
-                        } else {
-                            format!("torn down ({out})")
-                        }
-                    }
-                    Err(e) => format!("teardown warning: {e}"),
-                },
-                Err(e) => format!("teardown skipped: {e}"),
-            };
-            let teardown = stacks::redact(&teardown, &secrets);
-            stacks::remove(&args.id.id)?;
-            return Ok(VerbOutcome::Action(ActionOutcome {
-                changed: true,
-                message: format!("stack '{}' {teardown}; deregistered", args.id.id),
-            }));
+            stacks::require(&args.id.id)?;
+            let plan = format!(
+                "tear down stack '{}' (`compose down`) and deregister it; apply with update action={ACTION_REMOVE}",
+                args.id.id
+            );
+            return Ok(dry_run(args.id, plan));
         }
         Err(anyhow::anyhow!(
             "container delete is managed by Compose/CLI; use the docker.delete tool"
@@ -777,11 +903,17 @@ impl DockerUnitProvider {
     }
 
     async fn do_upsert(&self, args: UpsertArgs) -> Result<VerbOutcome> {
-        crate::execute::refuse_non_admin(
+        require_admin(
             &format!("docker {} upsert", args.id.kind),
             args.caller.as_ref(),
         )?;
         if args.id.kind == STACK_KIND {
+            let (execute, payload) = split_execute(args.payload.clone())?;
+            if !execute {
+                let plan = format!("{} stack {}", args.action, payload_name(payload.as_deref()));
+                return Ok(dry_run(args.id, plan));
+            }
+            let args = UpsertArgs { payload, ..args };
             return match args.action.as_str() {
                 "set" => {
                     let name = payload_name(args.payload.as_deref());
@@ -795,6 +927,31 @@ impl DockerUnitProvider {
             "containers are not provisioned by the docker plugin (Compose/dockge owns creation); upsert is unsupported for the container kind"
         ))
     }
+}
+
+/// `compose down`, then deregister the stack.
+async fn stack_remove(row: &StackRow) -> Result<VerbOutcome> {
+    let secrets = stack_secrets(&row.name, None);
+    let teardown = match row.compose() {
+        Ok(c) => match c.run_action("down", None, None).await {
+            Ok(out) => {
+                let out = out.trim();
+                if out.is_empty() {
+                    "torn down".to_string()
+                } else {
+                    format!("torn down ({out})")
+                }
+            }
+            Err(e) => format!("teardown warning: {e}"),
+        },
+        Err(e) => format!("teardown skipped: {e}"),
+    };
+    let teardown = stacks::redact(&teardown, &secrets);
+    stacks::remove(&row.name)?;
+    Ok(VerbOutcome::Action(ActionOutcome {
+        changed: true,
+        message: format!("stack '{}' {teardown}; deregistered", row.name),
+    }))
 }
 
 /// Typed payload for `Create { action: "exec" }`.
@@ -1119,9 +1276,10 @@ pub struct StackFixResult {
     pub how_to_execute: Option<String>,
 }
 
-/// Optional payload for `Update{action:"backup"}`. Every field defaults, so the
-/// core pre-mutation guard (which dispatches `backup` with no payload) drives a
-/// minimal backup of the stack's project directory.
+/// Optional payload for `Update{action:"backup"}`. Every field defaults, so
+/// core's pre-mutation guard, which sends no payload, gets a minimal backup of
+/// the stack's project directory. Backup is never a dry run: it only adds an
+/// archive, and `execute` is accepted and ignored.
 #[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(crate = "plugin_toolkit::serde")]
 #[schemars(crate = "plugin_toolkit::schemars")]
@@ -1201,11 +1359,16 @@ fn stack_declaration() -> KindDeclaration {
         payload_schema: Some(schema_for!(VolumePolicyPayload)),
         response_schema: Some(schema_for!(VolumePolicyResult)),
     });
-    update_actions.extend(STACK_LIFECYCLE.iter().map(|a| ActionDecl {
-        action: (*a).into(),
-        payload_schema: None,
-        response_schema: None,
-    }));
+    update_actions.extend(
+        STACK_LIFECYCLE
+            .iter()
+            .chain([&ACTION_REMOVE])
+            .map(|a| ActionDecl {
+                action: (*a).into(),
+                payload_schema: Some(schema_for!(ExecuteOptIn)),
+                response_schema: None,
+            }),
+    );
     // Minimal backup/restore as managed-unit actions (the pre-mutation guard and
     // scheduler reach these), routed to the stack's host over the mesh.
     update_actions.push(ActionDecl {
@@ -2288,9 +2451,16 @@ mod tests {
                 name: "web".into(),
             },
             action: action.into(),
-            payload: payload.map(|p| p.to_string()),
-            caller: None,
+            payload: Some(executed(payload).to_string()),
+            caller: Some(crate::test_support::caller("admin")),
         }))
+    }
+
+    /// `payload` with the execute opt-in set.
+    fn executed(payload: Option<serde_json::Value>) -> serde_json::Value {
+        let mut p = payload.unwrap_or_else(|| serde_json::json!({}));
+        p["execute"] = true.into();
+        p
     }
 
     /// A stack archive in `<dir>/.orca-backups`, where a backup without
@@ -2323,7 +2493,7 @@ mod tests {
     }
 
     #[test]
-    fn a_present_non_admin_caller_is_refused_on_every_mutating_verb() {
+    fn a_non_admin_or_missing_caller_is_refused_on_every_mutating_verb() {
         use crate::test_support::caller;
         let provider = DockerUnitProvider::new(crate::registration::adapter());
         let id = |kind: &str| UnitId {
@@ -2333,8 +2503,7 @@ mod tests {
             name: "web".into(),
         };
         let ((), _) = crate::test_support::with_db(|| {
-            for role in ["member", "user"] {
-                let who = Some(caller(role));
+            for who in [None, Some(caller("member")), Some(caller("user"))] {
                 for (kind, action) in [
                     (STACK_KIND, "restart"),
                     (STACK_KIND, "volume_policy"),
@@ -2368,17 +2537,15 @@ mod tests {
                 )));
                 crate::test_support::assert_admin_refusal(&err);
             }
-            for who in [None, Some(caller("admin"))] {
-                let err = err_of(plugin_toolkit::reactor::block_on(provider.do_update(
-                    UpdateArgs {
-                        id: id(STACK_KIND),
-                        action: "restart".into(),
-                        payload: None,
-                        caller: who,
-                    },
-                )));
-                assert!(err.contains("no managed stack named 'web'"), "{err}");
-            }
+            let err = err_of(plugin_toolkit::reactor::block_on(provider.do_update(
+                UpdateArgs {
+                    id: id(STACK_KIND),
+                    action: "restart".into(),
+                    payload: Some(r#"{"execute":true}"#.into()),
+                    caller: Some(caller("admin")),
+                },
+            )));
+            assert!(err.contains("no managed stack named 'web'"), "{err}");
         });
     }
 
@@ -2583,5 +2750,235 @@ mod tests {
         assert!(!tables.contains_key(&("docker".into(), "stacks".into())));
         assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
         assert!(!root.path().join("web").exists());
+    }
+
+    #[test]
+    fn split_execute_reads_and_strips_the_opt_in() {
+        assert_eq!(split_execute(None).unwrap(), (false, None));
+        assert_eq!(split_execute(Some("{}".into())).unwrap(), (false, None));
+        assert_eq!(
+            split_execute(Some(r#"{"execute":true}"#.into())).unwrap(),
+            (true, None)
+        );
+        let (go, rest) = split_execute(Some(r#"{"execute":true,"dest":"/x"}"#.into())).unwrap();
+        assert!(go);
+        assert_eq!(rest.as_deref(), Some(r#"{"dest":"/x"}"#));
+        assert!(split_execute(Some(r#"{"execute":"yes"}"#.into())).is_err());
+        assert_eq!(
+            split_execute(Some("[1]".into())).unwrap(),
+            (false, Some("[1]".into()))
+        );
+    }
+
+    fn dry_run_body(out: VerbOutcome) -> serde_json::Value {
+        let VerbOutcome::Item(item) = out else {
+            panic!("a dry run returns an item");
+        };
+        serde_json::from_str(&item.payload).unwrap()
+    }
+
+    #[test]
+    fn every_mutating_verb_is_a_dry_run_without_the_opt_in() {
+        use crate::test_support::caller;
+        let provider = DockerUnitProvider::new(crate::registration::adapter());
+        let id = |kind: &str| UnitId {
+            manager: "docker@test".into(),
+            kind: kind.into(),
+            id: "web".into(),
+            name: "web".into(),
+        };
+        let admin = Some(caller("admin"));
+        let ((), _) = crate::test_support::with_db(|| {
+            // Nothing named `web` exists: acting would fail, planning does not.
+            for (kind, action) in [
+                (STACK_KIND, "restart"),
+                (STACK_KIND, "edit"),
+                (STACK_KIND, ACTION_REMOVE),
+                (KIND, "stop"),
+            ] {
+                let out = plugin_toolkit::reactor::block_on(provider.do_update(UpdateArgs {
+                    id: id(kind),
+                    action: action.into(),
+                    payload: None,
+                    caller: admin.clone(),
+                }))
+                .unwrap();
+                assert_eq!(dry_run_body(out)["dryRun"], true, "{kind} {action}");
+            }
+            let out = plugin_toolkit::reactor::block_on(provider.do_upsert(UpsertArgs {
+                id: id(STACK_KIND),
+                action: "set".into(),
+                payload: Some(r#"{"name":"web","dir":"/nowhere"}"#.into()),
+                caller: admin.clone(),
+            }))
+            .unwrap();
+            assert_eq!(dry_run_body(out)["dryRun"], true);
+            for (action, payload) in [
+                ("deploy", r#"{"name":"web","dir":"/nowhere"}"#),
+                ("exec", r#"{"id":"c1","cmd":["rm","-rf","/"]}"#),
+            ] {
+                let out = plugin_toolkit::reactor::block_on(provider.do_create(CreateArgs {
+                    action: action.into(),
+                    payload: Some(payload.into()),
+                }))
+                .unwrap();
+                assert_eq!(dry_run_body(out)["dryRun"], true, "{action}");
+            }
+        });
+    }
+
+    #[test]
+    fn delete_only_plans_and_names_the_remove_action() {
+        let provider = DockerUnitProvider::new(crate::registration::adapter());
+        let root = tempfile::tempdir().unwrap();
+        let ((), _) = crate::test_support::with_db(|| {
+            register_root(root.path());
+            registered_stack(
+                &root.path().join("web"),
+                "services:\n  app:\n    image: x:1\n",
+                None,
+            );
+            let out = plugin_toolkit::reactor::block_on(provider.do_delete(DeleteArgs {
+                id: UnitId {
+                    manager: "docker@test".into(),
+                    kind: STACK_KIND.into(),
+                    id: "web".into(),
+                    name: "web".into(),
+                },
+                caller: Some(crate::test_support::caller("admin")),
+            }))
+            .unwrap();
+            let body = dry_run_body(out);
+            assert!(
+                body["plan"].as_str().unwrap().contains("action=remove"),
+                "{body}"
+            );
+            assert!(stacks::get("web").unwrap().is_some(), "still registered");
+        });
+    }
+
+    fn web(kind: &str) -> UnitId {
+        UnitId {
+            manager: "docker@test".into(),
+            kind: kind.into(),
+            id: "web".into(),
+            name: "web".into(),
+        }
+    }
+
+    #[test]
+    fn a_guard_shaped_backup_runs_for_real_and_returns_a_backup_ref() {
+        let provider = DockerUnitProvider::new(crate::registration::adapter());
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let ((), _) = crate::test_support::with_db(|| {
+            register_root(&root);
+            registered_stack(
+                &root.join("web"),
+                "services:\n  app:\n    image: x:1\n",
+                None,
+            );
+            // Exactly what `dispatch_guarded` sends: no caller, no payload.
+            let out = plugin_toolkit::reactor::block_on(provider.do_update(UpdateArgs {
+                id: web(STACK_KIND),
+                action: ACTION_BACKUP.into(),
+                payload: None,
+                caller: None,
+            }));
+            // The backup itself needs an engine (volume exports); without one
+            // it fails there. Either way it ran: not refused, not a plan.
+            match out {
+                Ok(VerbOutcome::Item(item)) => {
+                    let r: BackupRef = serde_json::from_str(&item.payload).unwrap();
+                    assert!(std::path::Path::new(&r.locator).is_file(), "{}", r.locator);
+                }
+                Ok(other) => panic!("backup must return its BackupRef, got {other:?}"),
+                Err(e) => {
+                    let e = format!("{e:#}");
+                    assert!(
+                        !e.contains("caller identity") && !e.contains("requires role"),
+                        "{e}"
+                    );
+                }
+            }
+            let not_admin = plugin_toolkit::reactor::block_on(provider.do_update(UpdateArgs {
+                id: web(STACK_KIND),
+                action: ACTION_BACKUP.into(),
+                payload: None,
+                caller: Some(crate::test_support::caller("member")),
+            }));
+            crate::test_support::assert_admin_refusal(&err_of(not_admin));
+            let steered = plugin_toolkit::reactor::block_on(provider.do_update(UpdateArgs {
+                id: web(STACK_KIND),
+                action: ACTION_BACKUP.into(),
+                payload: Some(r#"{"dest":"/tmp/elsewhere"}"#.into()),
+                caller: None,
+            }));
+            crate::test_support::assert_admin_refusal(&err_of(steered));
+        });
+    }
+
+    #[test]
+    fn only_an_empty_payload_is_guard_shaped() {
+        assert!(guard_shaped(None));
+        assert!(guard_shaped(Some("")));
+        assert!(guard_shaped(Some(" {} ")));
+        assert!(!guard_shaped(Some(r#"{"dest":"/x"}"#)));
+        assert!(!guard_shaped(Some(r#"{"execute":true}"#)));
+        assert!(!guard_shaped(Some("null")));
+    }
+
+    #[test]
+    fn restore_needs_an_admin_caller_and_the_opt_in() {
+        let provider = DockerUnitProvider::new(crate::registration::adapter());
+        let restore = |caller, payload: serde_json::Value| {
+            plugin_toolkit::reactor::block_on(provider.do_update(UpdateArgs {
+                id: web(STACK_KIND),
+                action: ACTION_RESTORE.into(),
+                payload: Some(payload.to_string()),
+                caller,
+            }))
+        };
+        let from = serde_json::json!({"from": {"locator": "/x.tar.gz", "manager": "docker@test", "timestamp": 0}});
+        let ((), _) = crate::test_support::with_db(|| {
+            crate::test_support::assert_admin_refusal(&err_of(restore(None, from.clone())));
+            let out = restore(Some(crate::test_support::caller("admin")), from.clone()).unwrap();
+            assert_eq!(dry_run_body(out)["dryRun"], true);
+        });
+    }
+
+    #[test]
+    fn opt_in_only_actions_refuse_other_payload_fields() {
+        let provider = DockerUnitProvider::new(crate::registration::adapter());
+        for (kind, action) in [
+            (STACK_KIND, "restart"),
+            (STACK_KIND, ACTION_REMOVE),
+            (KIND, "start"),
+        ] {
+            let err = err_of(plugin_toolkit::reactor::block_on(provider.do_update(
+                UpdateArgs {
+                    id: web(kind),
+                    action: action.into(),
+                    payload: Some(r#"{"execute":true,"force":true}"#.into()),
+                    caller: Some(crate::test_support::caller("admin")),
+                },
+            )));
+            assert!(err.contains("unknown field"), "{action}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_exec_plan_names_the_program_only() {
+        let provider = DockerUnitProvider::new(crate::registration::adapter());
+        let out = plugin_toolkit::reactor::block_on(provider.do_create(CreateArgs {
+            action: "exec".into(),
+            payload: Some(
+                r#"{"id":"c1","cmd":["psql","-c","ALTER USER x PASSWORD 's3cr3t'"]}"#.into(),
+            ),
+        }))
+        .unwrap();
+        let body = dry_run_body(out).to_string();
+        assert!(body.contains("psql (+2 args) in c1"), "{body}");
+        assert!(!body.contains("s3cr3t"), "{body}");
     }
 }

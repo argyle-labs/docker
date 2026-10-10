@@ -35,6 +35,7 @@ Once orca is on the host you never touch the scripts — drive the tools. Payloa
 | `docker.host_prepare` | inside an LXC on cgroup v2 with OpenRC whose controllers are not delegated: install and start the `cgroup-delegate` boot service (embedded `scripts/cgroup-delegate.openrc`; runs after `cgroups` and before docker, moves every process in the root cgroup — init, gettys — into `/init.scope`, then delegates every controller) and set `DOCKER_ULIMIT="-n N"` in `/etc/conf.d/docker`, N = min(524288, the CT hard open-files limit). Never restarts dockerd; the ulimit applies on its next start. systemd hosts get a note, not a change. Verify with `docker.host_probe`. Admin, dry run included; dry run by default | `execute` |
 | `docker.mount_check` | running containers whose bind source is on a network share (cifs/smb3/nfs/nfs4/ceph/glusterfs/sshfs/rclone) on the host, compared with what each container actually sees there (`/proc/<pid>/mountinfo`: device `major:minor` and path within it, against dockerd's mount table via `/var/run/docker.pid` when that pid is `dockerd` in this daemon's pid namespace, else this daemon's). `stale`: the container captured the empty local mountpoint because it started before the share was mounted. An unreadable host mount table is an error. Containers are only read when the host table is dockerd's own (same pid namespace); otherwise, or when a running container's table cannot be read, it is listed in `unreadable`. Containers that exited or were removed mid-scan are skipped. Containers whose mount table cannot be read (docker in a VM) are listed in `unreadable`. With `execute`, restarts the confirmed containers that are still stale (a finding whose container pid changed during the scan is dropped); a failed restart is listed in `failed` and the rest still run. Run after boot as a backstop. Admin, dry run included; dry run by default | `execute` + `items` (`container:*`) from the dry run |
 | `docker.manageability_audit` | the container manageability contract: every running container must declare a healthcheck (its own or its image's; `NONE` counts as missing), carry `orca.stack` or compose project provenance, and pin its timezone (`TZ` or an `/etc/localtime` bind). Lists containers with `gaps` (`healthcheck`, `provenance`, `tz`). Read-only; admin | none |
+| `docker.stack_manifest` | what moving a compose stack to another docker host must carry: each container's image (`Config.Image`, one entry per replica) pinned by the digest this host runs (`repo@sha256:…`), so the target never pulls a newer `:latest`; images without a registry digest (built locally) are reported in `problem`, and `complete` is false. Read-only; admin | `stack` (compose project) |
 | `docker.list` | registered docker runtimes | optional `limit`, `cursor` |
 | `docker.detail` | one registered docker runtime | `name` |
 | `docker.create` | register a docker runtime, with the `stacks_root` its managed stacks must live under (absolute; default `/opt/stacks`). Admin, dry run included; dry run by default | `name`, one of `socketPath`\|`host`\|`url`, optional `stacksRoot`, `route`; `execute` |
@@ -119,7 +120,7 @@ vocabulary spans both). Every operation is available through `unit` list / detai
 
 #### Compose policy
 
-`deploy` is a unit create, which reaches the plugin without a caller identity (orca#788), so the plugin cannot require admin on every stack verb. Instead the resolved config (`compose config`, every profile enabled) is checked against an allowlist before a compose file or `.env` is written (`deploy`, `set`, `edit`, `fix`, `restore`) and before compose runs it (`up`, `start`, `restart`, `build`, `pull`, `docker.host_update`). A key the policy does not know is refused. A service that uses any of these needs a grant:
+`deploy` is a unit create, which reaches the plugin without a caller identity (orca#788), so the plugin cannot require admin on it. On every verb the resolved config (`compose config`, every profile enabled) is checked against an allowlist before a compose file or `.env` is written (`deploy`, `set`, `edit`, `fix`, `restore`) and before compose runs it (`up`, `start`, `restart`, `build`, `pull`, `docker.host_update`). A key the policy does not know is refused. A service that uses any of these needs a grant:
 
 | setting | grant |
 | --- | --- |
@@ -180,7 +181,8 @@ The conversions live only in `compose.orca.yaml`. A plain `docker compose down &
     "dir": "/srv/stacks/myapp",
     "compose_yaml": "services:\n  web:\n    image: nginx\n    ports: [\"8080:80\"]\n",
     "compose_env": "TZ=UTC\n",
-    "deploy": true
+    "deploy": true,
+    "execute": true
   }
 }
 
@@ -189,10 +191,10 @@ The conversions live only in `compose.orca.yaml`. A plain `docker compose down &
 
 // update (edit) — change the YAML without redeploying
 { "id": { "kind": "stack", "id": "myapp", ... }, "action": "edit",
-  "payload": { "compose_yaml": "services:\n  web:\n    image: nginx:1.27\n" } }
+  "payload": { "compose_yaml": "services:\n  web:\n    image: nginx:1.27\n", "execute": true } }
 
 // update (deploy the edit) — bring the changed stack up
-{ "id": { "kind": "stack", "id": "myapp", ... }, "action": "up" }
+{ "id": { "kind": "stack", "id": "myapp", ... }, "action": "up", "payload": { "execute": true } }
 
 // detail (audit) — flags restart `no`/unset/`on-failure[:N]` (proposes unless-stopped),
 // bind sources that are missing or outside the managed mounts (proposes the same
@@ -222,8 +224,22 @@ The conversions live only in `compose.orca.yaml`. A plain `docker compose down &
                "command": "pg_dumpall -U postgres", "execute": true } }
 ```
 
-`delete` runs `compose down` and then deregisters the stack; a failed
-teardown is reported in its message and the stack is deregistered anyway.
+Every mutating unit verb (create, update, upsert, delete) is a dry run unless
+the payload sets `"execute": true`; the dry run returns `{ "dryRun": true,
+"plan": … }` and changes nothing. `backup` is never a dry run (it only adds an archive), and core's
+pre-mutation guard may send it without a caller, with no or an empty
+payload, until it forwards one (orca#704); any other backup, and any
+caller, must be admin. `restore` needs an admin
+caller and the opt-in. `fix`, `volume_policy` and `label_volumes`
+plan themselves and take `execute` with the dry run's `items`. Update, upsert
+and delete require an admin caller and refuse a request that carries none.
+Create cannot check the caller itself (orca's `CreateArgs` carries none,
+orca#788), so it relies on the surface's admin gate.
+
+`delete` only plans: its args carry no payload for the opt-in. Apply it with
+`update` action `remove` and `{"execute": true}`, which runs `compose down`
+and then deregisters the stack; a failed teardown is reported in its message
+and the stack is deregistered anyway.
 
 ---
 
