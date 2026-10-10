@@ -762,6 +762,7 @@ pub struct DockerHostUpdateArgs {
     execute_gated = false
 )]
 async fn docker_host_update(args: DockerHostUpdateArgs, ctx: &ToolCtx) -> Result<HostUpdateChange> {
+    execute::require_admin(TOOL, ctx)?;
     execute::guard(TOOL, args.execute, ctx)?;
     let pkg = std::fs::read_to_string(OS_RELEASE)
         .ok()
@@ -1211,5 +1212,21 @@ mod tests {
             .map(|o| o.name)
             .collect();
         assert_eq!(names, vec!["media-old-1", "media-unlabeled"]);
+    }
+
+    #[test]
+    fn a_dry_run_needs_an_admin_caller() {
+        for ctx in crate::test_support::non_admins() {
+            let err = plugin_toolkit::reactor::block_on(docker_host_update(
+                DockerHostUpdateArgs {
+                    skip_backup_gate: false,
+                    items: vec![],
+                    execute: false,
+                },
+                &ctx,
+            ))
+            .unwrap_err();
+            crate::test_support::assert_admin_refusal(&err.to_string());
+        }
     }
 }
