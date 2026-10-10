@@ -7,6 +7,7 @@
 //! No bollard yet. When a real Engine API call site lands (exec streaming,
 //! event subscription) we'll add a third layer rather than retro-fitting.
 
+pub mod cgroup;
 pub mod compose;
 pub mod compose_config;
 pub mod containers;
@@ -16,6 +17,7 @@ pub mod engine_state;
 pub mod execute;
 pub mod fsat;
 pub mod host_update;
+pub mod init;
 pub mod label_audit;
 pub mod labels;
 pub mod lifecycle;
