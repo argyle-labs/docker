@@ -30,6 +30,7 @@ Once orca is on the host you never touch the scripts — drive the tools. Payloa
 | --- | --- | --- |
 | `docker.install` | provision + start a runtime (the embedded `scripts/install.sh`; no other script can be run). Admin, dry run included; dry run by default | `runtime`: `docker`\|`colima`\|`podman`; `execute` |
 | `docker.engine_update` | upgrade the runtime (the embedded `scripts/update.sh`). Admin, dry run included; dry run by default | `runtime`; `execute` |
+| `docker.engine_resources` | every volume and network name on this engine (sorted; built-in networks included), so dockge's ownership labeller can leave pre-existing ones unlabeled. Read-only; admin | none |
 | `docker.list` | registered docker runtimes | optional `limit`, `cursor` |
 | `docker.detail` | one registered docker runtime | `name` |
 | `docker.create` | register a docker runtime, with the `stacks_root` its managed stacks must live under (absolute; default `/opt/stacks`). Admin, dry run included; dry run by default | `name`, one of `socketPath`\|`host`\|`url`, optional `stacksRoot`, `route`; `execute` |
