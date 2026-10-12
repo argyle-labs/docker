@@ -236,7 +236,7 @@ const BUILD_KEYS: &[&str] = &[
 const REMOTE_VOLUME_TYPES: &[&str] = &["nfs", "nfs4", "cifs", "tmpfs"];
 const DIGEST_PREFIX: &str = "sha256:";
 
-fn is_digest(d: &str) -> bool {
+pub fn is_digest(d: &str) -> bool {
     d.strip_prefix(DIGEST_PREFIX)
         .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
 }

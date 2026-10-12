@@ -17,6 +17,7 @@ pub mod engine_state;
 pub mod execute;
 pub mod fsat;
 pub mod host_update;
+pub mod image_update;
 pub mod init;
 pub mod label_audit;
 pub mod labels;
