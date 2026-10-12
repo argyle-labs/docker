@@ -520,7 +520,7 @@ async fn dump(docker: &Docker, container: &str, command: &str, out: &Path) -> Re
                     stderr.extend_from_slice(&message[..message.len().min(room)]);
                 }
                 LogOutput::StdOut { message } | LogOutput::Console { message } => {
-                    writer.send(message)?
+                    writer.send(message).await?
                 }
                 LogOutput::StdIn { .. } => {}
             }
@@ -553,19 +553,24 @@ async fn exit_code(docker: &Docker, id: &str, polls: u32) -> Result<i64> {
         }
         plugin_toolkit::time::sleep(EXEC_EXIT_POLL).await;
     }
-    anyhow::bail!("dump exec still running after its output closed")
+    anyhow::bail!(
+        "dump exec still running after its output closed; the dump file may be complete but its exit status is unconfirmed"
+    )
 }
+
+const WRITER_QUEUE: usize = 4;
 
 /// Blocking file writes on their own thread: the toolkit offers no async
 /// file IO, and the executor must not stall on disk.
 struct Writer {
-    tx: std::sync::mpsc::Sender<bytes::Bytes>,
+    tx: std::sync::mpsc::SyncSender<bytes::Bytes>,
     thread: std::thread::JoinHandle<std::io::Result<()>>,
 }
 
 impl Writer {
     fn spawn(mut file: std::fs::File) -> Self {
-        let (tx, rx) = std::sync::mpsc::channel::<bytes::Bytes>();
+        // Bounded so a slow disk applies backpressure instead of buffering the dump.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<bytes::Bytes>(WRITER_QUEUE);
         let thread = std::thread::spawn(move || {
             for chunk in rx {
                 file.write_all(&chunk)?;
@@ -575,10 +580,20 @@ impl Writer {
         Self { tx, thread }
     }
 
-    fn send(&self, chunk: bytes::Bytes) -> Result<()> {
-        self.tx
-            .send(chunk)
-            .map_err(|_| anyhow::anyhow!("dump writer stopped"))
+    /// Waits for room without blocking the executor thread.
+    async fn send(&self, mut chunk: bytes::Bytes) -> Result<()> {
+        loop {
+            match self.tx.try_send(chunk) {
+                Ok(()) => return Ok(()),
+                Err(std::sync::mpsc::TrySendError::Full(c)) => {
+                    chunk = c;
+                    plugin_toolkit::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    anyhow::bail!("dump writer stopped")
+                }
+            }
+        }
     }
 
     async fn finish(self) -> Result<()> {
@@ -1290,6 +1305,7 @@ mod tests {
         let err =
             plugin_toolkit::reactor::block_on(exit_code(&running.client(), "e1", 2)).unwrap_err();
         assert!(err.to_string().contains("still running"), "{err}");
+        assert!(err.to_string().contains("may be complete"), "{err}");
         assert_eq!(running.paths("GET").len(), 2);
         let done = FakeEngine::routed(vec![Route::new(
             "GET",
@@ -1308,9 +1324,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let w = Writer::spawn(std::fs::File::create(&path).unwrap());
-        w.send(bytes::Bytes::from_static(b"ab")).unwrap();
-        w.send(bytes::Bytes::from_static(b"cd")).unwrap();
-        plugin_toolkit::reactor::block_on(w.finish()).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"abcd");
+        plugin_toolkit::reactor::block_on(async {
+            for _ in 0..(WRITER_QUEUE * 4) {
+                w.send(bytes::Bytes::from_static(b"ab")).await.unwrap();
+            }
+            w.finish().await
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"ab".repeat(WRITER_QUEUE * 4)
+        );
+    }
+
+    #[test]
+    fn a_dump_writer_failure_reaches_the_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        std::fs::write(&path, b"").unwrap();
+        let w = Writer::spawn(std::fs::File::open(&path).unwrap());
+        let err = plugin_toolkit::reactor::block_on(async {
+            for _ in 0..(WRITER_QUEUE * 4) {
+                if w.send(bytes::Bytes::from_static(b"ab")).await.is_err() {
+                    break;
+                }
+            }
+            w.finish().await
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("write dump"), "{err}");
     }
 }

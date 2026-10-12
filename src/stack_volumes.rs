@@ -1021,8 +1021,8 @@ async fn restore_into(docker: &Docker, name: &str, act: ImportAction, archive: F
     restored.and(removed)
 }
 
-/// Whether volume `name` belongs to compose `project`: one of its stack
-/// volumes (`members`), or labeled with the project.
+/// Whether existing volume `name` belongs to compose `project`: one of its
+/// stack volumes (`members`), or labeled with the project.
 fn belongs<'a>(
     name: &str,
     mut labels: impl Iterator<Item = (&'a String, &'a String)>,
@@ -1093,6 +1093,32 @@ pub(crate) async fn remove_project_containers(docker: &Docker, project: &str) ->
     Ok(live)
 }
 
+/// Whether any container of compose `project` is live.
+pub(crate) async fn project_live(docker: &Docker, project: &str) -> Result<bool> {
+    let containers = crate::ownership::project_containers(docker, project).await?;
+    Ok(containers.iter().any(is_live))
+}
+
+/// Stop every live container of compose `project`.
+pub(crate) async fn stop_project(docker: &Docker, project: &str) -> Result<()> {
+    for c in crate::ownership::project_containers(docker, project).await? {
+        let Some(id) = c.id.as_deref() else { continue };
+        if is_live(&c) {
+            docker
+                .stop_container(id, None::<bollard::query_parameters::StopContainerOptions>)
+                .await
+                .or_else(|e| match e {
+                    bollard::errors::Error::DockerResponseServerError {
+                        status_code: 304, ..
+                    } => Ok(()),
+                    e => Err(e),
+                })
+                .map_err(|e| anyhow!("stop {}: {e}", container_name(&c)))?;
+        }
+    }
+    Ok(())
+}
+
 fn open_artifact(dir: &Path, a: &VolumeArtifact) -> Result<File> {
     let path = dir.join(STAGING_DIR).join(&a.artifact);
     OpenOptions::new()
@@ -1108,28 +1134,39 @@ struct Snapshot {
     sha: String,
 }
 
-/// Write the export artifacts `artifacts` of a stack backup staged in `dir`
-/// into their volumes, all or nothing. Every target must belong to compose
-/// `project` (see [`belongs`]); one that exists is overwritten and must have
-/// no users outside the project, one that does not is created as the backup
-/// recorded it, plain local only. Each existing target is first exported to
-/// a private temp dir; on any failure the changed volumes are put back from
-/// those (created ones removed) and the error says what changed and whether
-/// that worked. Returns the restored volume names.
-pub(crate) async fn restore_stack_volumes(
+struct Target<'a> {
+    artifact: &'a VolumeArtifact,
+    existed: bool,
+    archive: File,
+}
+
+/// A stack volume restore checked against the engine and the backup, with
+/// every artifact already copied and sum-verified, but nothing changed.
+pub(crate) struct Preflight<'a> {
+    targets: Vec<Target<'a>>,
+}
+
+/// Check, without changing anything, that the export artifacts `artifacts`
+/// of a stack backup staged in `dir` can be restored into compose
+/// `project`: an existing target must belong to it (see [`belongs`]) and
+/// have no users outside it; a missing one must be one of its stack volumes
+/// (`members`) and plain local, as it is created from the backup's record.
+/// Every artifact is copied to a private temp file and checked against its
+/// recorded sum.
+pub(crate) async fn preflight<'a>(
     docker: &Docker,
     project: &str,
     members: &[String],
     dir: &Path,
-    artifacts: &[&VolumeArtifact],
-) -> Result<Vec<String>> {
-    let mut existed = Vec::new();
+    artifacts: &[&'a VolumeArtifact],
+) -> Result<Preflight<'a>> {
+    let mut targets = Vec::new();
     for a in artifacts {
         let name = &a.engine_name;
         let have = existing(docker, name).await?;
         let ours = match &have {
             Some(h) => belongs(name, h.labels.iter(), project, members),
-            None => belongs(name, a.labels.iter(), project, members),
+            None => members.iter().any(|m| m == name),
         };
         if !ours {
             bail!("volume '{name}' does not belong to stack '{project}'; refusing to restore it");
@@ -1138,37 +1175,82 @@ pub(crate) async fn restore_stack_volumes(
             Some(_) => refuse_foreign_users(docker, name, project).await?,
             None => plain_local(name, &a.driver, a.options.len())?,
         }
-        existed.push(have.is_some());
+        let archive = open_artifact(dir, a).and_then(|f| verified_copy(f, name, &a.sha256))?;
+        targets.push(Target {
+            artifact: a,
+            existed: have.is_some(),
+            archive,
+        });
+    }
+    Ok(Preflight { targets })
+}
+
+/// Volumes a stack restore wrote, with the snapshots that can put them back.
+pub(crate) struct Written {
+    pub(crate) names: Vec<String>,
+    snapshots: HashMap<String, Snapshot>,
+    _scratch: tempfile::TempDir,
+}
+
+impl Written {
+    /// Put every written volume back as it was before the restore; returns
+    /// `cause` with what changed and how that went.
+    pub(crate) async fn roll_back(
+        &self,
+        docker: &Docker,
+        cause: plugin_toolkit::anyhow::Error,
+    ) -> plugin_toolkit::anyhow::Error {
+        rollback(docker, &self.names, &self.snapshots, cause).await
+    }
+}
+
+/// Snapshot room for a volume whose backup is `size` bytes: the live data
+/// may have grown past the backup, so twice that plus [`SCRATCH_MARGIN`].
+fn snapshot_room(size: u64) -> u64 {
+    size.saturating_mul(2).saturating_add(SCRATCH_MARGIN)
+}
+
+/// Write a [`preflight`]ed restore into its volumes, all or nothing. Users
+/// outside `project` are checked again, as the stack is down by now. Each
+/// existing target is first exported to a private temp dir; on any failure
+/// the changed volumes are put back from those (created ones removed) and
+/// the error says what changed and whether that worked. The snapshots stay
+/// in the result so a later step can still roll back.
+pub(crate) async fn restore_stack_volumes(
+    docker: &Docker,
+    project: &str,
+    preflight: Preflight<'_>,
+) -> Result<Written> {
+    for t in preflight.targets.iter().filter(|t| t.existed) {
+        refuse_foreign_users(docker, &t.artifact.engine_name, project).await?;
     }
     let scratch = tempfile::tempdir().context("failed to create a temp dir")?;
-    let mut snapshots: HashMap<&str, Snapshot> = HashMap::new();
-    for (a, _) in artifacts.iter().zip(&existed).filter(|(_, e)| **e) {
-        let name = a.engine_name.as_str();
-        // The backup's size stands in for the volume's, which the API does
-        // not report cheaply.
-        enough_scratch(free_space(&File::open(scratch.path())?)?, a.size).map_err(|e| {
-            anyhow!(
-                "volume '{name}': {e} in {} to keep its current data; set TMPDIR to a larger disk",
-                std::env::temp_dir().display()
-            )
-        })?;
+    let mut snapshots = HashMap::new();
+    for t in preflight.targets.iter().filter(|t| t.existed) {
+        let name = t.artifact.engine_name.as_str();
+        let want = snapshot_room(t.artifact.size);
+        let available = free_space(&File::open(scratch.path())?)?;
+        if available < want {
+            bail!(
+                "volume '{name}': need {want} bytes in {} to keep its current data (twice the backup's {} bytes plus a {SCRATCH_MARGIN}-byte margin), {available} available; set TMPDIR to a larger disk",
+                std::env::temp_dir().display(),
+                t.artifact.size
+            );
+        }
         let path = scratch.path().join(format!("{name}.tar.gz"));
         let (sha, _) = export_one(docker, name, &path)
             .await
             .with_context(|| format!("save the current data of volume '{name}'"))?;
-        snapshots.insert(name, Snapshot { path, sha });
+        snapshots.insert(name.to_string(), Snapshot { path, sha });
     }
-    let mut changed: Vec<&str> = Vec::new();
-    for (a, had) in artifacts.iter().zip(&existed) {
+    let mut changed: Vec<String> = Vec::new();
+    for t in preflight.targets {
+        let a = t.artifact;
         let name = a.engine_name.as_str();
-        let archive = match open_artifact(dir, a).and_then(|f| verified_copy(f, name, &a.sha256)) {
-            Ok(f) => f,
-            Err(e) => return Err(rollback(docker, &changed, &snapshots, e).await),
-        };
-        changed.push(name);
+        changed.push(name.to_string());
         let written = async {
-            if *had {
-                restore_into(docker, name, ImportAction::Overwrite, archive).await
+            if t.existed {
+                restore_into(docker, name, ImportAction::Overwrite, t.archive).await
             } else {
                 create(
                     docker,
@@ -1178,7 +1260,7 @@ pub(crate) async fn restore_stack_volumes(
                     a.labels.clone().into_iter().collect(),
                 )
                 .await?;
-                restore_into(docker, name, ImportAction::CreateAndRestore, archive).await
+                restore_into(docker, name, ImportAction::CreateAndRestore, t.archive).await
             }
         }
         .await;
@@ -1187,7 +1269,11 @@ pub(crate) async fn restore_stack_volumes(
             return Err(rollback(docker, &changed, &snapshots, e).await);
         }
     }
-    Ok(changed.into_iter().map(String::from).collect())
+    Ok(Written {
+        names: changed,
+        snapshots,
+        _scratch: scratch,
+    })
 }
 
 /// Put every volume in `changed` back as it was, from its snapshot, or
@@ -1195,8 +1281,8 @@ pub(crate) async fn restore_stack_volumes(
 /// and how the rollback went.
 async fn rollback(
     docker: &Docker,
-    changed: &[&str],
-    snapshots: &HashMap<&str, Snapshot>,
+    changed: &[String],
+    snapshots: &HashMap<String, Snapshot>,
     cause: plugin_toolkit::anyhow::Error,
 ) -> plugin_toolkit::anyhow::Error {
     if changed.is_empty() {
@@ -2343,42 +2429,42 @@ mod tests {
         assert!(removed.iter().all(|t| t.contains("v=false")), "{removed:?}");
     }
 
+    fn restore(
+        e: &FakeEngine,
+        project: &str,
+        members: &[&str],
+        dir: &Path,
+        artifacts: &[&VolumeArtifact],
+    ) -> Result<Vec<String>> {
+        let docker = e.client();
+        block(async {
+            let p = preflight(&docker, project, &strs(members), dir, artifacts).await?;
+            Ok(restore_stack_volumes(&docker, project, p).await?.names)
+        })
+    }
+
     #[test]
     fn a_stack_restore_touches_only_its_own_plain_local_volumes() {
         let dir = tempfile::tempdir().unwrap();
         let e = stack_engine("[]", &["s_data"]);
         let foreign = artifact(dir.path(), "s_data", "local", None);
-        let err = block(restore_stack_volumes(
-            &e.client(),
-            "other",
-            &[],
-            dir.path(),
-            &[&foreign],
-        ))
-        .unwrap_err();
+        let err = restore(&e, "other", &[], dir.path(), &[&foreign]).unwrap_err();
         assert!(
             err.to_string().contains("does not belong to stack 'other'"),
             "{err}"
         );
-        let member = block(restore_stack_volumes(
-            &e.client(),
-            "other",
-            &strs(&["s_data"]),
-            dir.path(),
-            &[&foreign],
-        ));
+        let member = restore(&e, "other", &["s_data"], dir.path(), &[&foreign]);
         assert!(member.is_ok(), "{member:?}");
 
+        // A label alone never lets a restore create a volume.
         let e = stack_engine("[]", &[]);
+        let labeled = artifact(dir.path(), "s_new", "local", None);
+        let err = restore(&e, "s", &[], dir.path(), &[&labeled]).unwrap_err();
+        assert!(err.to_string().contains("does not belong"), "{err}");
+        assert!(e.paths("POST").is_empty());
+
         let nfs = artifact(dir.path(), "s_new", "nfs", None);
-        let err = block(restore_stack_volumes(
-            &e.client(),
-            "s",
-            &[],
-            dir.path(),
-            &[&nfs],
-        ))
-        .unwrap_err();
+        let err = restore(&e, "s", &["s_new"], dir.path(), &[&nfs]).unwrap_err();
         assert!(err.to_string().contains("cannot be emptied here"), "{err}");
         assert_eq!(writes(&e), 0);
         assert!(e.paths("POST").is_empty());
@@ -2386,14 +2472,7 @@ mod tests {
         let users = r#"[{"Id":"x","Names":["/other-app-1"],"State":"exited","Labels":{"com.docker.compose.project":"other"}}]"#;
         let e = stack_engine(users, &["s_data"]);
         let data = artifact(dir.path(), "s_data", "local", None);
-        let err = block(restore_stack_volumes(
-            &e.client(),
-            "s",
-            &[],
-            dir.path(),
-            &[&data],
-        ))
-        .unwrap_err();
+        let err = restore(&e, "s", &[], dir.path(), &[&data]).unwrap_err();
         assert!(
             err.to_string().contains("outside stack 's': other-app-1"),
             "{err}"
@@ -2402,23 +2481,46 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_stack_volume_restore_rolls_back_the_volumes_it_changed() {
+    fn a_restore_preflight_checks_every_artifact_and_only_reads() {
         let dir = tempfile::tempdir().unwrap();
         let e = stack_engine("[]", &["s_data"]);
         let data = artifact(dir.path(), "s_data", "local", None);
-        let new = artifact(dir.path(), "s_new", "local", None);
         let bad = artifact(dir.path(), "s_bad", "local", Some(&"0".repeat(64)));
-        let err = block(restore_stack_volumes(
+        let err = block(preflight(
             &e.client(),
             "s",
-            &[],
+            &strs(&["s_bad"]),
             dir.path(),
-            &[&data, &new, &bad],
+            &[&data, &bad],
         ))
-        .unwrap_err();
+        .err()
+        .unwrap();
+        assert!(err.to_string().contains("s_bad"), "{err}");
+        assert!(
+            e.requests().iter().all(|r| r.starts_with("GET")),
+            "{:?}",
+            e.requests()
+        );
+    }
+
+    #[test]
+    fn a_snapshot_needs_twice_the_backup_plus_the_margin() {
+        assert_eq!(snapshot_room(10), 20 + SCRATCH_MARGIN);
+        assert_eq!(snapshot_room(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn a_failed_stack_volume_restore_rolls_back_the_volumes_it_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        // s_two cannot be removed, so its overwrite and its rollback fail.
+        let e = stack_engine("[]", &["s_data", "s_two"]);
+        let data = artifact(dir.path(), "s_data", "local", None);
+        let new = artifact(dir.path(), "s_new", "local", None);
+        let two = artifact(dir.path(), "s_two", "local", None);
+        let err = restore(&e, "s", &["s_new"], dir.path(), &[&data, &new, &two]).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("volumes changed: s_data, s_new; all rolled back"),
+            msg.contains("volumes changed: s_data, s_new, s_two; rollback FAILED for s_two"),
             "{msg}"
         );
         // The current data is saved before anything is written.

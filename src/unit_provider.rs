@@ -583,16 +583,17 @@ impl DockerUnitProvider {
         )))
     }
 
-    /// Restore a stack in place from a prior [`BackupRef`]: check its sums and
-    /// the policy on the restored compose, then, when it carries volume
-    /// exports, stop and remove the stack's own containers (volumes kept) and
-    /// write the exports back through the Engine API, all or nothing (see
-    /// [`stack_volumes::restore_stack_volumes`]); a container of another
-    /// project on a target volume refuses the restore. On a volume failure
-    /// the old stack is brought back up. Then the archive replaces the
-    /// project directory and `docker compose up -d` returns the stack to
-    /// service. Dumps are not loaded: the outcome is a partial restore naming
-    /// them. The inverse of [`Self::do_stack_backup`].
+    /// Restore a stack in place from a prior [`BackupRef`]: check its sums,
+    /// the policy on the restored compose and, read-only, every volume export
+    /// it carries (see [`stack_volumes::preflight`]) before anything changes.
+    /// Then, with exports, stop and remove the stack's own containers
+    /// (volumes kept) and write the exports back through the Engine API, all
+    /// or nothing (see [`stack_volumes::restore_stack_volumes`]). The archive
+    /// then replaces the project directory and `docker compose up -d`
+    /// returns the stack to service; a stack that was stopped before is
+    /// stopped again. Any failure puts the volumes and dir back and brings a
+    /// previously live stack back up. Dumps are not loaded: the outcome is a
+    /// partial restore naming them. The inverse of [`Self::do_stack_backup`].
     async fn do_stack_restore(
         &self,
         _id: &UnitId,
@@ -664,73 +665,57 @@ impl DockerUnitProvider {
             .flat_map(|m| &m.artifacts)
             .filter(|a| a.strategy == Strategy::Export)
             .collect();
-        let mut restored = Vec::new();
-        if !exports.is_empty() {
-            let found = async {
-                let (project, members) = self.stack_volumes(row).await?;
-                let docker = self.adapter.client().map_err(adapter_err)?;
-                Ok::<_, anyhow::Error>((project, members, docker))
-            }
-            .await;
-            let (project, members, docker) = match found {
-                Ok(f) => f,
-                Err(e) => {
-                    return Err(staged.fail(e.context(
-                        "volume restore failed before any change; the stack dir is unchanged",
-                    )));
-                }
-            };
+        let found = async {
+            let (project, members) = self.stack_volumes(row).await?;
+            let docker = self.adapter.client().map_err(adapter_err)?;
             let members: Vec<String> = members.into_iter().map(|v| v.engine_name).collect();
-            // A failed removal may have stopped some containers: bring it back.
-            let written = match stack_volumes::remove_project_containers(docker, &project).await {
-                Ok(live) => stack_volumes::restore_stack_volumes(
-                    docker,
-                    &project,
-                    &members,
-                    staged.path(),
-                    &exports,
+            let preflight = if exports.is_empty() {
+                None
+            } else {
+                Some(
+                    stack_volumes::preflight(docker, &project, &members, staged.path(), &exports)
+                        .await?,
                 )
-                .await
-                .map_err(|e| (live, e)),
-                Err(e) => Err((
-                    true,
-                    e.context("take the stack down for the volume restore"),
-                )),
             };
-            match written {
-                Ok(names) => restored = names,
-                Err((live, e)) => {
-                    let back = if live {
-                        match ownership::up(row, &[]).await {
-                            Ok(_) => "; the previous stack is back up".to_string(),
-                            Err(up) => format!("; bringing the previous stack back failed: {up:#}"),
-                        }
-                    } else {
-                        String::new()
-                    };
-                    return Err(staged.fail(e.context(format!(
-                        "volume restore failed; the stack dir is unchanged{back}"
-                    ))));
-                }
-            }
+            Ok::<_, anyhow::Error>((project, docker, preflight))
         }
-        let leftover = staged.swap()?;
-        let out = ownership::up(row, &[]).await?;
-        let notes = restore_notes(&restored, &dumps, volumes.is_none() && p.allow_unverified);
+        .await;
+        let (project, docker, preflight) = match found {
+            Ok(f) => f,
+            Err(e) => {
+                return Err(staged.fail(e.context("restore refused; the stack dir is unchanged")));
+            }
+        };
+        let with_volumes = preflight.is_some();
+        let mut steps = EngineRestore {
+            row,
+            docker,
+            project: &project,
+            staged: Some(staged),
+            preflight,
+            written: None,
+        };
+        let done = run_restore(&mut steps, with_volumes).await?;
+        let notes = restore_notes(
+            &done.volumes,
+            &dumps,
+            volumes.is_none() && p.allow_unverified,
+        );
         Ok(VerbOutcome::Action(ActionOutcome {
             changed: true,
             message: format!(
-                "{}restored stack '{}' from {archive}{}{notes}; up: {}",
+                "{}restored stack '{}' from {archive}{}{notes}{}; up: {}",
                 if dumps.is_empty() {
                     ""
                 } else {
                     "partial restore: "
                 },
                 row.name,
-                leftover
+                done.leftover
                     .map(|p| format!(" (the previous dir is left at {})", p.display()))
                     .unwrap_or_default(),
-                out.trim()
+                done.stopped.map(|s| format!("; {s}")).unwrap_or_default(),
+                done.up.trim()
             ),
         }))
     }
@@ -1629,6 +1614,182 @@ fn fix_result(
 /// Where a stack backup goes when the caller names no destination: a
 /// `.orca-backups` sibling of the stack dir, so the archive is never written
 /// inside the directory being archived.
+/// The side effects of a stack restore past its read-only checks, behind a
+/// trait so their order and recovery are testable without an engine.
+trait RestoreSteps {
+    /// Whether the stack is running now.
+    fn live(&mut self) -> BoxFuture<'_, Result<bool>>;
+    /// Stop and remove the stack's containers; whether any was live.
+    fn take_down(&mut self) -> BoxFuture<'_, Result<bool>>;
+    /// Write the volume exports; the volumes written.
+    fn write(&mut self) -> BoxFuture<'_, Result<Vec<String>>>;
+    /// Undo [`Self::write`]; returns `cause` with how that went.
+    fn roll_back(&mut self, cause: anyhow::Error) -> BoxFuture<'_, anyhow::Error>;
+    /// Swap the staged dir in; on failure the old dir is in place.
+    fn swap(&mut self) -> Result<Option<std::path::PathBuf>>;
+    /// Discard the staged dir; returns `e` with anything left behind.
+    fn fail(&mut self, e: anyhow::Error) -> anyhow::Error;
+    /// `compose up -d` from the stack dir.
+    fn up(&mut self) -> BoxFuture<'_, Result<String>>;
+    fn stop(&mut self) -> BoxFuture<'_, Result<()>>;
+}
+
+struct Restored {
+    volumes: Vec<String>,
+    leftover: Option<std::path::PathBuf>,
+    up: String,
+    stopped: Option<String>,
+}
+
+async fn bring_back(s: &mut impl RestoreSteps) -> String {
+    match s.up().await {
+        Ok(_) => "; the previous stack is back up".to_string(),
+        Err(up) => format!("; bringing the previous stack back failed: {up:#}"),
+    }
+}
+
+/// Run a checked restore: take down and write volumes (when `with_volumes`),
+/// swap the dir, bring the stack up, and stop it again if it was stopped.
+async fn run_restore(s: &mut impl RestoreSteps, with_volumes: bool) -> Result<Restored> {
+    let mut volumes = Vec::new();
+    let live = if with_volumes {
+        let live = match s.take_down().await {
+            Ok(live) => live,
+            Err(e) => {
+                // A failed removal may have stopped some containers.
+                let back = bring_back(s).await;
+                return Err(s.fail(e.context(format!(
+                    "take the stack down for the volume restore; the stack dir is unchanged{back}"
+                ))));
+            }
+        };
+        match s.write().await {
+            Ok(names) => volumes = names,
+            Err(e) => {
+                let back = if live {
+                    bring_back(s).await
+                } else {
+                    String::new()
+                };
+                return Err(s.fail(e.context(format!(
+                    "volume restore failed; the stack dir is unchanged{back}"
+                ))));
+            }
+        }
+        live
+    } else {
+        match s.live().await {
+            Ok(live) => live,
+            Err(e) => {
+                return Err(s.fail(e.context("restore failed before any change")));
+            }
+        }
+    };
+    let leftover = match s.swap() {
+        Ok(l) => l,
+        Err(e) => {
+            let e = if with_volumes {
+                s.roll_back(e).await
+            } else {
+                e
+            };
+            let back = if live {
+                bring_back(s).await
+            } else {
+                String::new()
+            };
+            return Err(e.context(format!(
+                "swapping in the restored stack dir failed; the previous dir is in place{back}"
+            )));
+        }
+    };
+    let up = s
+        .up()
+        .await
+        .map_err(|e| e.context("the restored stack dir is in place but compose up failed"))?;
+    let stopped = if live {
+        None
+    } else {
+        Some(match s.stop().await {
+            Ok(()) => "it was stopped before and is stopped again".to_string(),
+            Err(e) => format!("it was stopped before but stopping it again failed: {e:#}"),
+        })
+    };
+    Ok(Restored {
+        volumes,
+        leftover,
+        up,
+        stopped,
+    })
+}
+
+struct EngineRestore<'a> {
+    row: &'a StackRow,
+    docker: &'a bollard::Docker,
+    project: &'a str,
+    staged: Option<StagedRestore>,
+    preflight: Option<stack_volumes::Preflight<'a>>,
+    written: Option<stack_volumes::Written>,
+}
+
+impl RestoreSteps for EngineRestore<'_> {
+    fn live(&mut self) -> BoxFuture<'_, Result<bool>> {
+        Box::pin(stack_volumes::project_live(self.docker, self.project))
+    }
+
+    fn take_down(&mut self) -> BoxFuture<'_, Result<bool>> {
+        Box::pin(stack_volumes::remove_project_containers(
+            self.docker,
+            self.project,
+        ))
+    }
+
+    fn write(&mut self) -> BoxFuture<'_, Result<Vec<String>>> {
+        Box::pin(async move {
+            let preflight = self
+                .preflight
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("no volume restore was prepared"))?;
+            let written =
+                stack_volumes::restore_stack_volumes(self.docker, self.project, preflight).await?;
+            let names = written.names.clone();
+            self.written = Some(written);
+            Ok(names)
+        })
+    }
+
+    fn roll_back(&mut self, cause: anyhow::Error) -> BoxFuture<'_, anyhow::Error> {
+        Box::pin(async move {
+            match &self.written {
+                Some(w) => w.roll_back(self.docker, cause).await,
+                None => cause,
+            }
+        })
+    }
+
+    fn swap(&mut self) -> Result<Option<std::path::PathBuf>> {
+        self.staged
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("the restore was already swapped"))?
+            .swap()
+    }
+
+    fn fail(&mut self, e: anyhow::Error) -> anyhow::Error {
+        match self.staged.as_mut() {
+            Some(s) => s.fail(e),
+            None => e,
+        }
+    }
+
+    fn up(&mut self) -> BoxFuture<'_, Result<String>> {
+        Box::pin(ownership::up(self.row, &[]))
+    }
+
+    fn stop(&mut self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(stack_volumes::stop_project(self.docker, self.project))
+    }
+}
+
 fn default_backup_dir(dir: &std::path::Path) -> std::path::PathBuf {
     dir.parent().unwrap_or(dir).join(".orca-backups")
 }
@@ -3214,5 +3375,166 @@ mod tests {
             Some(manifest)
         );
         assert_eq!(verified_source(&mut f, None, true).unwrap(), None);
+    }
+
+    #[derive(Default)]
+    struct FakeSteps {
+        calls: Vec<&'static str>,
+        live: bool,
+        fail_take_down: bool,
+        fail_write: bool,
+        fail_swap: bool,
+        /// `up` calls that fail, by order.
+        fail_up: Vec<usize>,
+        ups: usize,
+    }
+
+    impl RestoreSteps for FakeSteps {
+        fn live(&mut self) -> BoxFuture<'_, Result<bool>> {
+            self.calls.push("live");
+            Box::pin(async move { Ok(self.live) })
+        }
+        fn take_down(&mut self) -> BoxFuture<'_, Result<bool>> {
+            self.calls.push("take_down");
+            Box::pin(async move {
+                if self.fail_take_down {
+                    anyhow::bail!("take down broke")
+                }
+                Ok(self.live)
+            })
+        }
+        fn write(&mut self) -> BoxFuture<'_, Result<Vec<String>>> {
+            self.calls.push("write");
+            Box::pin(async move {
+                if self.fail_write {
+                    anyhow::bail!("write broke")
+                }
+                Ok(vec!["s_data".to_string()])
+            })
+        }
+        fn roll_back(&mut self, cause: anyhow::Error) -> BoxFuture<'_, anyhow::Error> {
+            self.calls.push("roll_back");
+            Box::pin(async move { cause.context("rolled back") })
+        }
+        fn swap(&mut self) -> Result<Option<std::path::PathBuf>> {
+            self.calls.push("swap");
+            if self.fail_swap {
+                anyhow::bail!("swap broke")
+            }
+            Ok(None)
+        }
+        fn fail(&mut self, e: anyhow::Error) -> anyhow::Error {
+            self.calls.push("fail");
+            e
+        }
+        fn up(&mut self) -> BoxFuture<'_, Result<String>> {
+            self.calls.push("up");
+            self.ups += 1;
+            let n = self.ups;
+            Box::pin(async move {
+                if self.fail_up.contains(&n) {
+                    anyhow::bail!("up broke")
+                }
+                Ok("started".to_string())
+            })
+        }
+        fn stop(&mut self) -> BoxFuture<'_, Result<()>> {
+            self.calls.push("stop");
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn run(s: &mut FakeSteps, with_volumes: bool) -> Result<Restored> {
+        plugin_toolkit::reactor::block_on(run_restore(s, with_volumes))
+    }
+
+    #[test]
+    fn a_restore_writes_volumes_while_down_then_swaps_and_comes_up() {
+        let mut s = FakeSteps {
+            live: true,
+            ..Default::default()
+        };
+        let done = run(&mut s, true).unwrap();
+        assert_eq!(s.calls, ["take_down", "write", "swap", "up"]);
+        assert_eq!(done.volumes, ["s_data"]);
+        assert!(done.stopped.is_none());
+    }
+
+    #[test]
+    fn a_stopped_stack_is_stopped_again_after_its_restore() {
+        let mut s = FakeSteps::default();
+        let done = run(&mut s, true).unwrap();
+        assert_eq!(s.calls, ["take_down", "write", "swap", "up", "stop"]);
+        assert!(done.stopped.unwrap().contains("stopped again"));
+        let mut s = FakeSteps::default();
+        run(&mut s, false).unwrap();
+        assert_eq!(s.calls, ["live", "swap", "up", "stop"]);
+    }
+
+    #[test]
+    fn a_failed_take_down_brings_the_stack_back_and_discards_the_staging() {
+        let mut s = FakeSteps {
+            live: true,
+            fail_take_down: true,
+            ..Default::default()
+        };
+        let err = format!("{:#}", run(&mut s, true).err().unwrap());
+        assert_eq!(s.calls, ["take_down", "up", "fail"]);
+        assert!(err.contains("the previous stack is back up"), "{err}");
+    }
+
+    #[test]
+    fn a_failed_volume_write_brings_only_a_live_stack_back() {
+        let mut s = FakeSteps {
+            live: true,
+            fail_write: true,
+            ..Default::default()
+        };
+        run(&mut s, true).err().unwrap();
+        assert_eq!(s.calls, ["take_down", "write", "up", "fail"]);
+        let mut s = FakeSteps {
+            fail_write: true,
+            ..Default::default()
+        };
+        let err = format!("{:#}", run(&mut s, true).err().unwrap());
+        assert_eq!(s.calls, ["take_down", "write", "fail"]);
+        assert!(err.contains("stack dir is unchanged"), "{err}");
+    }
+
+    #[test]
+    fn a_failed_swap_rolls_the_volumes_back_and_brings_the_old_stack_up() {
+        let mut s = FakeSteps {
+            live: true,
+            fail_swap: true,
+            ..Default::default()
+        };
+        let err = format!("{:#}", run(&mut s, true).err().unwrap());
+        assert_eq!(s.calls, ["take_down", "write", "swap", "roll_back", "up"]);
+        assert!(err.contains("rolled back"), "{err}");
+        assert!(err.contains("the previous stack is back up"), "{err}");
+
+        let mut s = FakeSteps {
+            live: true,
+            fail_swap: true,
+            fail_up: vec![1],
+            ..Default::default()
+        };
+        let err = format!("{:#}", run(&mut s, true).err().unwrap());
+        assert!(
+            err.contains("bringing the previous stack back failed: up broke"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_failed_final_up_is_reported_after_the_swap() {
+        let mut s = FakeSteps {
+            live: true,
+            fail_up: vec![1],
+            ..Default::default()
+        };
+        let err = format!("{:#}", run(&mut s, true).err().unwrap());
+        assert_eq!(s.calls, ["take_down", "write", "swap", "up"]);
+        assert!(err.contains("compose up failed: up broke"), "{err}");
     }
 }
