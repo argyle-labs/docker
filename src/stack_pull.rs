@@ -8,7 +8,7 @@ use bollard::Docker;
 use bollard::query_parameters::{CreateImageOptionsBuilder, TagImageOptionsBuilder};
 use plugin_toolkit::prelude::*;
 
-use crate::stack_manifest::repo_of;
+use crate::stack_manifest::{normalize, repo_of};
 
 const TOOL: &str = "docker.stack_pull_pinned";
 
@@ -23,8 +23,24 @@ pub fn parse(pair: &str) -> Result<Pin> {
     let (image, pinned) = pair
         .split_once('=')
         .ok_or_else(|| anyhow!("'{pair}': expected <image>=<repo@sha256:…>"))?;
-    if !pinned.contains("@sha256:") {
+    let (image, pinned) = (image.trim(), pinned.trim());
+    if image.is_empty() {
+        bail!("'{pair}': empty image");
+    }
+    let Some((_, digest)) = pinned.split_once('@') else {
         bail!("'{pair}': '{pinned}' is not pinned by digest");
+    };
+    let valid = digest.strip_prefix("sha256:").is_some_and(|h| {
+        h.len() == 64
+            && h.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    });
+    if !valid {
+        bail!("'{pair}': '{digest}' is not a sha256 digest");
+    }
+    // Tagging a different repository's digest as `image` would run the wrong software.
+    if normalize(repo_of(pinned)) != normalize(repo_of(image)) {
+        bail!("'{pair}': '{pinned}' is not a digest of '{image}'");
     }
     Ok(Pin {
         image: image.to_owned(),
@@ -73,26 +89,47 @@ pub struct StackPullOutput {
     /// `image=pinned` pairs pulled and tagged (execute), or that would be.
     pub pulled: Vec<String>,
     pub findings: Vec<PullFinding>,
+    /// Dry run only: what each pin would be tagged as.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plan: Vec<PlannedPin>,
 }
 
-/// A registry that dropped a digest answers 404 or `manifest unknown`.
-fn is_digest_gone(e: &bollard::errors::Error) -> bool {
-    match e {
-        bollard::errors::Error::DockerResponseServerError {
-            status_code: 404, ..
-        } => true,
-        other => {
-            let m = other.to_string().to_lowercase();
-            m.contains("manifest unknown") || m.contains("not found")
-        }
+#[orca_struct]
+#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedPin {
+    pub image: String,
+    pub pinned: String,
+    /// `repo:tag` the pulled digest would be tagged as, or `no retag`.
+    pub tag_as: String,
+}
+
+/// Only a missing manifest means the digest is gone; a 404 for a missing
+/// repository or unreachable host is a plain pull failure.
+fn is_digest_gone(e: &bollard::errors::Error, pinned: &str) -> bool {
+    let m = e.to_string().to_lowercase();
+    if m.contains("manifest unknown") {
+        return true;
     }
+    let digest = pinned.split_once('@').map_or("", |(_, d)| d);
+    matches!(
+        e,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            ..
+        }
+    ) && m.contains(digest)
 }
 
 async fn pull(docker: &Docker, reference: &str) -> std::result::Result<(), bollard::errors::Error> {
     let opts = CreateImageOptionsBuilder::new()
         .from_image(reference)
         .build();
-    let mut stream = Box::pin(docker.create_image(Some(opts), None, None));
+    let mut stream = Box::pin(docker.create_image(
+        Some(opts),
+        None,
+        crate::image_update::registry_credentials(reference),
+    ));
     while let Some(item) = plugin_toolkit::stream::next(&mut stream).await {
         item?;
     }
@@ -112,7 +149,7 @@ pub async fn apply(docker: &Docker, pins: &[Pin]) -> StackPullOutput {
     };
     for p in pins {
         if let Err(e) = pull(docker, &p.pinned).await {
-            let kind = if is_digest_gone(&e) {
+            let kind = if is_digest_gone(&e, &p.pinned) {
                 FindingKind::DigestGone
             } else {
                 FindingKind::PullFailed
@@ -169,8 +206,16 @@ async fn docker_stack_pull_pinned(
     if !args.execute {
         return Ok(StackPullOutput {
             executed: false,
-            pulled: args.pins.clone(),
-            findings: Vec::new(),
+            plan: pins
+                .iter()
+                .map(|p| PlannedPin {
+                    image: p.image.clone(),
+                    pinned: p.pinned.clone(),
+                    tag_as: tag_target(&p.image)
+                        .map_or_else(|| "no retag".into(), |(r, t)| format!("{r}:{t}")),
+                })
+                .collect(),
+            ..Default::default()
         });
     }
     let docker = crate::registration::adapter()
@@ -184,6 +229,14 @@ mod tests {
     use super::*;
     use crate::test_engine::{FakeEngine, Route};
 
+    const A: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const B: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const G: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+    fn at(repo: &str, d: &str) -> String {
+        format!("{repo}@{d}")
+    }
+
     fn pin(image: &str, pinned: &str) -> Pin {
         Pin {
             image: image.into(),
@@ -194,11 +247,85 @@ mod tests {
     #[test]
     fn parse_requires_a_digest() {
         assert_eq!(
-            parse("redis:7=redis@sha256:a").unwrap(),
-            pin("redis:7", "redis@sha256:a")
+            parse(&format!(" redis:7 = {} ", at("redis", A))).unwrap(),
+            pin("redis:7", &at("redis", A))
         );
         assert!(parse("redis:7").is_err());
         assert!(parse("redis:7=redis:7").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_empty_halves_and_malformed_digests() {
+        assert!(parse(&format!("={}", at("redis", A))).is_err());
+        assert!(parse("redis:7=").is_err());
+        assert!(parse("redis:7=redis@sha256:a").is_err());
+        assert!(
+            parse(&format!(
+                "redis:7=redis@{}",
+                A.to_uppercase().replace("SHA", "sha")
+            ))
+            .is_err()
+        );
+        assert!(parse(&format!("redis:7=redis@md5:{}", &A[7..])).is_err());
+    }
+
+    #[test]
+    fn parse_matches_repos_across_implicit_docker_hub_prefixes() {
+        assert!(parse(&format!("redis:7={}", at("docker.io/library/redis", A))).is_ok());
+        assert!(parse(&format!("library/redis={}", at("redis", A))).is_ok());
+        let err = parse(&format!("redis:7={}", at("evil/miner", A))).unwrap_err();
+        assert!(err.to_string().contains("is not a digest of"));
+    }
+
+    #[test]
+    fn digest_gone_only_for_a_missing_manifest() {
+        let e = |code, msg: &str| bollard::errors::Error::DockerResponseServerError {
+            status_code: code,
+            message: msg.into(),
+        };
+        let p = at("redis", A);
+        assert!(is_digest_gone(&e(404, "manifest unknown"), &p));
+        assert!(is_digest_gone(&e(404, &format!("{A} not found")), &p));
+        assert!(!is_digest_gone(&e(404, "repository does not exist"), &p));
+        assert!(!is_digest_gone(
+            &e(500, "dial tcp: lookup reg: host not found"),
+            &p
+        ));
+    }
+
+    #[test]
+    fn stream_error_and_tag_failure_become_findings() {
+        let e = FakeEngine::routed(vec![
+            Route::new(
+                "POST",
+                "/images/create",
+                200,
+                r#"{"errorDetail":{"message":"unauthorized"},"error":"unauthorized"}"#,
+            )
+            .when_query("fromImage=private"),
+            Route::new("POST", "/images/create", 200, r#"{"status":"ok"}"#),
+            Route::new("POST", "/tag", 500, r#"{"message":"tag boom"}"#),
+        ]);
+        let out = plugin_toolkit::reactor::block_on(apply(
+            &e.client(),
+            &[
+                pin("private:1", &at("private", A)),
+                pin("redis:7", &at("redis", B)),
+            ],
+        ));
+        assert!(out.pulled.is_empty());
+        let kinds: Vec<_> = out
+            .findings
+            .iter()
+            .map(|f| (f.image.as_str(), f.kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("private:1", FindingKind::PullFailed),
+                ("redis:7", FindingKind::TagFailed)
+            ]
+        );
     }
 
     #[test]
@@ -218,7 +345,7 @@ mod tests {
                 404,
                 r#"{"message":"manifest unknown"}"#,
             )
-            .when_query("fromImage=old@sha256:gone"),
+            .when_query("fromImage=old"),
             Route::new(
                 "POST",
                 "/images/create",
@@ -230,14 +357,17 @@ mod tests {
         let out = plugin_toolkit::reactor::block_on(apply(
             &e.client(),
             &[
-                pin("redis:latest", "redis@sha256:a"),
-                pin("old:1", "old@sha256:gone"),
-                pin("app@sha256:b", "app@sha256:b"),
+                pin("redis:latest", &at("redis", A)),
+                pin("old:1", &at("old", G)),
+                pin(&at("app", B), &at("app", B)),
             ],
         ));
         assert_eq!(
             out.pulled,
-            ["redis:latest=redis@sha256:a", "app@sha256:b=app@sha256:b"]
+            [
+                format!("redis:latest={}", at("redis", A)),
+                format!("{}={}", at("app", B), at("app", B))
+            ]
         );
         assert_eq!(out.findings.len(), 1);
         assert_eq!(out.findings[0].kind, FindingKind::DigestGone);
@@ -248,7 +378,7 @@ mod tests {
             .filter(|t| t.contains("/tag"))
             .collect();
         assert_eq!(tags.len(), 1, "a digest reference is not re-tagged");
-        assert!(tags[0].contains("redis@sha256:a/tag"));
+        assert!(tags[0].contains(&format!("{}/tag", at("redis", A))));
         assert!(tags[0].contains("repo=redis") && tags[0].contains("tag=latest"));
     }
 
@@ -256,14 +386,19 @@ mod tests {
     fn dry_run_lists_and_touches_nothing() {
         let out = plugin_toolkit::reactor::block_on(docker_stack_pull_pinned(
             DockerStackPullPinnedArgs {
-                pins: vec!["redis:7=redis@sha256:a".into()],
+                pins: vec![
+                    format!("redis:7={}", at("redis", A)),
+                    format!("{}={}", at("app", B), at("app", B)),
+                ],
                 execute: false,
             },
             &crate::test_support::admin(),
         ))
         .unwrap();
         assert!(!out.executed);
-        assert_eq!(out.pulled, ["redis:7=redis@sha256:a"]);
+        assert!(out.pulled.is_empty());
+        let tags: Vec<_> = out.plan.iter().map(|p| p.tag_as.as_str()).collect();
+        assert_eq!(tags, ["redis:7", "no retag"]);
     }
 
     #[test]

@@ -81,7 +81,7 @@ pub fn parse_credentials(value: &str) -> Option<DockerCredentials> {
 
 /// Credentials for `reference`'s registry from orca's secrets backend; `None`
 /// when no usable secret is registered or the backend is unreachable.
-fn registry_credentials(reference: &str) -> Option<DockerCredentials> {
+pub(crate) fn registry_credentials(reference: &str) -> Option<DockerCredentials> {
     let name = auth_secret_name(&registry_host(reference));
     let value = plugin_toolkit::secrets::get(&name).ok().flatten()?;
     parse_credentials(&value)

@@ -27,7 +27,7 @@ pub fn repo_of(reference: &str) -> &str {
 
 /// `docker.io/library/redis`, `index.docker.io/library/redis` and `redis`
 /// name the same repository.
-fn normalize(repo: &str) -> &str {
+pub(crate) fn normalize(repo: &str) -> &str {
     let r = repo
         .strip_prefix("docker.io/")
         .or_else(|| repo.strip_prefix("index.docker.io/"))
