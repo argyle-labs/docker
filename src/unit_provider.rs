@@ -583,12 +583,16 @@ impl DockerUnitProvider {
         )))
     }
 
-    /// Restore a stack in place from a prior [`BackupRef`]: check its sums,
-    /// write its exported volumes back through the Engine API, extract the
-    /// archive back over the project directory, then `docker compose up -d` so
-    /// the running stack reconciles to the restored compose and returns to
-    /// service. The inverse of [`Self::do_stack_backup`], which the RFC pairs
-    /// it with.
+    /// Restore a stack in place from a prior [`BackupRef`]: check its sums and
+    /// the policy on the restored compose, then, when it carries volume
+    /// exports, stop and remove the stack's own containers (volumes kept) and
+    /// write the exports back through the Engine API, all or nothing (see
+    /// [`stack_volumes::restore_stack_volumes`]); a container of another
+    /// project on a target volume refuses the restore. On a volume failure
+    /// the old stack is brought back up. Then the archive replaces the
+    /// project directory and `docker compose up -d` returns the stack to
+    /// service. Dumps are not loaded: the outcome is a partial restore naming
+    /// them. The inverse of [`Self::do_stack_backup`].
     async fn do_stack_restore(
         &self,
         _id: &UnitId,
@@ -649,43 +653,79 @@ impl DockerUnitProvider {
             let e = anyhow::anyhow!(stacks::redact(&format!("{e:#}"), &staged_secrets));
             return Err(staged.fail(e.context("restore refused; the stack dir is unchanged")));
         }
+        let dumps: Vec<String> = volumes
+            .iter()
+            .flat_map(|m| &m.artifacts)
+            .filter(|a| a.strategy == Strategy::Dump)
+            .map(|a| a.artifact.clone())
+            .collect();
+        let exports: Vec<&volume_coverage::VolumeArtifact> = volumes
+            .iter()
+            .flat_map(|m| &m.artifacts)
+            .filter(|a| a.strategy == Strategy::Export)
+            .collect();
         let mut restored = Vec::new();
-        let mut dumps = Vec::new();
-        if let Some(m) = &volumes {
-            let written = self
-                .restore_volumes(staged.path(), m, &mut restored, &mut dumps)
-                .await;
-            if let Err(e) = written {
-                let done = if restored.is_empty() {
-                    "no volume was written".to_string()
-                } else {
-                    format!("volumes already restored: {}", restored.join(", "))
-                };
-                return Err(staged.fail(e.context(format!(
-                    "volume restore failed ({done}); the stack dir is unchanged"
-                ))));
+        if !exports.is_empty() {
+            let found = async {
+                let (project, members) = self.stack_volumes(row).await?;
+                let docker = self.adapter.client().map_err(adapter_err)?;
+                Ok::<_, anyhow::Error>((project, members, docker))
+            }
+            .await;
+            let (project, members, docker) = match found {
+                Ok(f) => f,
+                Err(e) => {
+                    return Err(staged.fail(e.context(
+                        "volume restore failed before any change; the stack dir is unchanged",
+                    )));
+                }
+            };
+            let members: Vec<String> = members.into_iter().map(|v| v.engine_name).collect();
+            // A failed removal may have stopped some containers: bring it back.
+            let written = match stack_volumes::remove_project_containers(docker, &project).await {
+                Ok(live) => stack_volumes::restore_stack_volumes(
+                    docker,
+                    &project,
+                    &members,
+                    staged.path(),
+                    &exports,
+                )
+                .await
+                .map_err(|e| (live, e)),
+                Err(e) => Err((
+                    true,
+                    e.context("take the stack down for the volume restore"),
+                )),
+            };
+            match written {
+                Ok(names) => restored = names,
+                Err((live, e)) => {
+                    let back = if live {
+                        match ownership::up(row, &[]).await {
+                            Ok(_) => "; the previous stack is back up".to_string(),
+                            Err(up) => format!("; bringing the previous stack back failed: {up:#}"),
+                        }
+                    } else {
+                        String::new()
+                    };
+                    return Err(staged.fail(e.context(format!(
+                        "volume restore failed; the stack dir is unchanged{back}"
+                    ))));
+                }
             }
         }
         let leftover = staged.swap()?;
         let out = ownership::up(row, &[]).await?;
-        let mut notes = String::new();
-        if !restored.is_empty() {
-            notes.push_str(&format!("; volumes restored: {}", restored.join(", ")));
-        }
-        if !dumps.is_empty() {
-            notes.push_str(&format!(
-                "; dumps left in {}/ for the app to load: {}",
-                volume_coverage::STAGING_DIR,
-                dumps.join(", ")
-            ));
-        }
-        if volumes.is_none() && p.allow_unverified {
-            notes.push_str("; restored unverified, volume data not restored");
-        }
+        let notes = restore_notes(&restored, &dumps, volumes.is_none() && p.allow_unverified);
         Ok(VerbOutcome::Action(ActionOutcome {
             changed: true,
             message: format!(
-                "restored stack '{}' from {archive}{}{notes}; up: {}",
+                "{}restored stack '{}' from {archive}{}{notes}; up: {}",
+                if dumps.is_empty() {
+                    ""
+                } else {
+                    "partial restore: "
+                },
                 row.name,
                 leftover
                     .map(|p| format!(" (the previous dir is left at {})", p.display()))
@@ -693,44 +733,6 @@ impl DockerUnitProvider {
                 out.trim()
             ),
         }))
-    }
-
-    /// Write each exported volume of `m` back from the staged dir `dir`,
-    /// pushing restored names onto `restored` and dump artifacts onto `dumps`.
-    async fn restore_volumes(
-        &self,
-        dir: &std::path::Path,
-        m: &volume_coverage::VolumesManifest,
-        restored: &mut Vec<String>,
-        dumps: &mut Vec<String>,
-    ) -> Result<()> {
-        use std::os::unix::fs::OpenOptionsExt;
-        let docker = self.adapter.client().map_err(adapter_err)?;
-        for a in &m.artifacts {
-            if a.strategy == Strategy::Dump {
-                dumps.push(a.artifact.clone());
-                continue;
-            }
-            let path = dir.join(volume_coverage::STAGING_DIR).join(&a.artifact);
-            let src = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&path)
-                .map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
-            stack_volumes::restore_stack_volume(
-                docker,
-                &a.engine_name,
-                &a.driver,
-                &a.options,
-                &a.labels,
-                &a.sha256,
-                src,
-            )
-            .await
-            .map_err(|e| e.context(format!("restore volume '{}'", a.volume)))?;
-            restored.push(a.engine_name.clone());
-        }
-        Ok(())
     }
 
     /// Shared create/upsert path: register the stack, (optionally) write its
@@ -1650,7 +1652,9 @@ fn verified_source(
             "the backup ref carries no checksum, so the archive cannot be verified; \
              pass allow_unverified: true to restore it unchecked"
         ),
-        None => {}
+        // The inner manifest sits in the same unchecked archive, so its sums
+        // prove nothing.
+        None => return Ok(None),
     }
     match volume_coverage::verify_archive(file)? {
         ArchiveVolumes::None => Ok(None),
@@ -1661,6 +1665,26 @@ fn verified_source(
              pass allow_unverified: true to restore the stack files without it"
         ),
     }
+}
+
+/// The volume part of a restore's outcome message. Dumps are not loaded:
+/// the app restores those itself.
+fn restore_notes(restored: &[String], dumps: &[String], unverified: bool) -> String {
+    let mut notes = String::new();
+    if !restored.is_empty() {
+        notes.push_str(&format!("; volumes restored: {}", restored.join(", ")));
+    }
+    if !dumps.is_empty() {
+        notes.push_str(&format!(
+            "; volume data NOT restored from dumps, left in {}/ for the app to load: {}",
+            volume_coverage::STAGING_DIR,
+            dumps.join(", ")
+        ));
+    }
+    if unverified {
+        notes.push_str("; restored unverified, volume data not restored");
+    }
+    notes
 }
 
 /// Open a restore archive, refused outside the backup roots and outside the
@@ -3151,5 +3175,44 @@ mod tests {
         let body = dry_run_body(out).to_string();
         assert!(body.contains("psql (+2 args) in c1"), "{body}");
         assert!(!body.contains("s3cr3t"), "{body}");
+    }
+
+    #[test]
+    fn a_dump_only_restore_is_reported_partial() {
+        let notes = restore_notes(&[], &["pg.sql".into()], false);
+        assert!(
+            notes.contains("NOT restored from dumps") && notes.contains("pg.sql"),
+            "{notes}"
+        );
+        assert!(restore_notes(&["s_data".into()], &[], false).contains("volumes restored: s_data"));
+    }
+
+    #[test]
+    fn an_unsummed_ref_never_restores_volume_data_whatever_its_manifest_says() {
+        let manifest = volume_coverage::VolumesManifest {
+            artifacts: vec![volume_coverage::VolumeArtifact {
+                volume: "data".into(),
+                engine_name: "web_data".into(),
+                strategy: Strategy::Export,
+                artifact: "data.tar.gz".into(),
+                sha256: plugin_toolkit::hash::sha256_hex(b"vol"),
+                size: 3,
+                driver: "local".into(),
+                labels: Default::default(),
+                options: Default::default(),
+            }],
+            skipped: Vec::new(),
+        };
+        let json = serde_json::to_string(&manifest).unwrap();
+        let mut f = gz_tar(&[
+            (".orca-volumes/manifest.json", &json),
+            (".orca-volumes/data.tar.gz", "vol"),
+        ]);
+        let sum = stack_volumes::fd_sha256(&mut f).unwrap();
+        assert_eq!(
+            verified_source(&mut f, Some(&sum), false).unwrap(),
+            Some(manifest)
+        );
+        assert_eq!(verified_source(&mut f, None, true).unwrap(), None);
     }
 }

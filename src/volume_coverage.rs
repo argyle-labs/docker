@@ -439,23 +439,13 @@ pub fn ensure_nonempty(path: &Path, what: &str) -> Result<()> {
     Ok(())
 }
 
-/// Whether the engine has a volume named `name`. External volumes and ones
-/// with an explicit `name:` carry no project label, so only an inspect by
-/// name answers this.
-pub async fn volume_exists(docker: &Docker, name: &str) -> Result<bool> {
-    match docker.inspect_volume(name).await {
-        Ok(_) => Ok(true),
-        Err(bollard::errors::Error::DockerResponseServerError {
-            status_code: 404, ..
-        }) => Ok(false),
-        Err(e) => Err(anyhow::anyhow!("inspect volume {name}: {e}")),
-    }
-}
-
-/// Set `exists` on volumes the project-label listing could not see.
+/// Set `exists` on volumes the project-label listing could not see: external
+/// volumes and ones with an explicit `name:` carry no project label.
 pub async fn mark_existing(docker: &Docker, volumes: &mut [StackVolume]) -> Result<()> {
     for v in volumes.iter_mut().filter(|v| !v.exists) {
-        v.exists = volume_exists(docker, &v.engine_name).await?;
+        v.exists = crate::stack_volumes::existing(docker, &v.engine_name)
+            .await?
+            .is_some();
     }
     Ok(())
 }
@@ -486,6 +476,11 @@ async fn service_container(docker: &Docker, project: &str, service: &str) -> Res
         .ok_or_else(|| anyhow::anyhow!("service '{service}' has no running container to dump from"))
 }
 
+/// How long [`dump`] waits for the engine to report the exec finished after
+/// its output closed.
+const EXEC_EXIT_POLLS: u32 = 100;
+const EXEC_EXIT_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Exec `command` in `container` through [`DUMP_WRAPPER`], streaming its
 /// stdout into `out`. A non-zero exit fails with its stderr.
 async fn dump(docker: &Docker, container: &str, command: &str, out: &Path) -> Result<()> {
@@ -508,12 +503,16 @@ async fn dump(docker: &Docker, container: &str, command: &str, out: &Path) -> Re
         .start_exec(&exec.id, None)
         .await
         .map_err(|e| anyhow::anyhow!("start dump exec: {e}"))?;
-    let mut file = std::fs::OpenOptions::new()
+    let StartExecResults::Attached { mut output, .. } = started else {
+        anyhow::bail!("dump exec started detached; its output cannot be read");
+    };
+    let file = std::fs::OpenOptions::new()
         .write(true)
         .open(out)
         .map_err(|e| anyhow::anyhow!("open {}: {e}", out.display()))?;
+    let writer = Writer::spawn(file);
     let mut stderr = Vec::new();
-    if let StartExecResults::Attached { mut output, .. } = started {
+    let streamed = async {
         while let Some(chunk) = plugin_toolkit::stream::next(&mut output).await {
             match chunk.map_err(|e| anyhow::anyhow!("read dump output: {e}"))? {
                 LogOutput::StdErr { message } => {
@@ -521,27 +520,77 @@ async fn dump(docker: &Docker, container: &str, command: &str, out: &Path) -> Re
                     stderr.extend_from_slice(&message[..message.len().min(room)]);
                 }
                 LogOutput::StdOut { message } | LogOutput::Console { message } => {
-                    file.write_all(&message)?
+                    writer.send(message)?
                 }
                 LogOutput::StdIn { .. } => {}
             }
         }
+        Ok::<_, anyhow::Error>(())
     }
-    file.sync_all()?;
-    // The exit code is only known once the attached stream has drained.
-    let code = docker
-        .inspect_exec(&exec.id)
-        .await
-        .map_err(|e| anyhow::anyhow!("inspect dump exec: {e}"))?
-        .exit_code;
-    if code != Some(0) {
-        anyhow::bail!(
-            "exit {}: {}",
-            code.map_or("unknown".into(), |c| c.to_string()),
-            String::from_utf8_lossy(&stderr).trim()
-        );
+    .await;
+    let written = writer.finish().await;
+    written?;
+    streamed?;
+    let code = exit_code(docker, &exec.id, EXEC_EXIT_POLLS).await?;
+    if code != 0 {
+        anyhow::bail!("exit {code}: {}", String::from_utf8_lossy(&stderr).trim());
     }
     Ok(())
+}
+
+/// The exit code of exec `id`, once the engine reports it no longer running:
+/// the output stream can close before the process is reaped.
+async fn exit_code(docker: &Docker, id: &str, polls: u32) -> Result<i64> {
+    for _ in 0..polls {
+        let inspected = docker
+            .inspect_exec(id)
+            .await
+            .map_err(|e| anyhow::anyhow!("inspect dump exec: {e}"))?;
+        if inspected.running == Some(false) {
+            return inspected
+                .exit_code
+                .ok_or_else(|| anyhow::anyhow!("dump exec finished without an exit code"));
+        }
+        plugin_toolkit::time::sleep(EXEC_EXIT_POLL).await;
+    }
+    anyhow::bail!("dump exec still running after its output closed")
+}
+
+/// Blocking file writes on their own thread: the toolkit offers no async
+/// file IO, and the executor must not stall on disk.
+struct Writer {
+    tx: std::sync::mpsc::Sender<bytes::Bytes>,
+    thread: std::thread::JoinHandle<std::io::Result<()>>,
+}
+
+impl Writer {
+    fn spawn(mut file: std::fs::File) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<bytes::Bytes>();
+        let thread = std::thread::spawn(move || {
+            for chunk in rx {
+                file.write_all(&chunk)?;
+            }
+            file.sync_all()
+        });
+        Self { tx, thread }
+    }
+
+    fn send(&self, chunk: bytes::Bytes) -> Result<()> {
+        self.tx
+            .send(chunk)
+            .map_err(|_| anyhow::anyhow!("dump writer stopped"))
+    }
+
+    async fn finish(self) -> Result<()> {
+        drop(self.tx);
+        while !self.thread.is_finished() {
+            plugin_toolkit::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        self.thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("dump writer panicked"))?
+            .map_err(|e| anyhow::anyhow!("write dump: {e}"))
+    }
 }
 
 /// A policy the backup did not stage, and why.
@@ -1228,5 +1277,40 @@ mod tests {
         let row = to_dbrow(&e);
         assert_eq!(row["service"], DbValue::Null);
         assert_eq!(from_dbrow(&row).unwrap(), e);
+    }
+
+    #[test]
+    fn a_dump_exit_code_waits_for_the_exec_to_stop() {
+        let running = FakeEngine::routed(vec![Route::new(
+            "GET",
+            "/exec/e1/json",
+            200,
+            r#"{"ID":"e1","Running":true}"#,
+        )]);
+        let err =
+            plugin_toolkit::reactor::block_on(exit_code(&running.client(), "e1", 2)).unwrap_err();
+        assert!(err.to_string().contains("still running"), "{err}");
+        assert_eq!(running.paths("GET").len(), 2);
+        let done = FakeEngine::routed(vec![Route::new(
+            "GET",
+            "/exec/e1/json",
+            200,
+            r#"{"ID":"e1","Running":false,"ExitCode":3}"#,
+        )]);
+        assert_eq!(
+            plugin_toolkit::reactor::block_on(exit_code(&done.client(), "e1", 2)).unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn the_dump_writer_writes_every_chunk_off_the_executor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        let w = Writer::spawn(std::fs::File::create(&path).unwrap());
+        w.send(bytes::Bytes::from_static(b"ab")).unwrap();
+        w.send(bytes::Bytes::from_static(b"cd")).unwrap();
+        plugin_toolkit::reactor::block_on(w.finish()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"abcd");
     }
 }
