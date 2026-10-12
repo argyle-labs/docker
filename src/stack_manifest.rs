@@ -151,7 +151,7 @@ pub fn images(
     out
 }
 
-async fn containers_of(docker: &Docker, stack: &str) -> Result<Vec<ContainerSummary>> {
+pub(crate) async fn containers_of(docker: &Docker, stack: &str) -> Result<Vec<ContainerSummary>> {
     let filters = HashMap::from([(
         "label".to_string(),
         vec![format!("{COMPOSE_PROJECT_LABEL}={stack}")],

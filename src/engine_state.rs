@@ -299,12 +299,63 @@ pub fn validate(file: &mut File) -> Result<()> {
     validate_within(file, LIMITS)
 }
 
-fn validate_within(file: &mut File, limits: Limits) -> Result<()> {
+pub(crate) fn validate_within(file: &mut File, limits: Limits) -> Result<()> {
     let mut seen = 0;
     for entry in archive(file, limits, ENGINE)?.entries()? {
         count(&mut seen, limits)?;
         admit(&entry?)?;
     }
+    Ok(())
+}
+
+/// Admit one entry of a volume archive as the Engine API writes it: every
+/// path under `root`, nothing traversing out. Symlink targets are not
+/// checked: the engine extracts chrooted into the volume, where an absolute
+/// or `..` target resolves inside it. A hard link names another archive
+/// member, so its target gets the path check.
+fn admit_volume<R: Read>(entry: &Entry<'_, R>, root: &str) -> Result<bool> {
+    let path = entry.path()?;
+    let under = |p: &Path| {
+        !leaves_root(p) && p.components().next() == Some(Component::Normal(root.as_ref()))
+    };
+    if !under(&path) {
+        bail!("archive entry '{}' is not under '{root}/'", path.display());
+    }
+    match entry.header().entry_type() {
+        EntryType::Regular | EntryType::Directory | EntryType::Symlink => Ok(true),
+        EntryType::Link => match entry.link_name()? {
+            Some(target) if under(&target) => Ok(true),
+            Some(target) => bail!(
+                "archive entry '{}' hard-links '{}', outside '{root}/'",
+                path.display(),
+                target.display()
+            ),
+            None => bail!("archive link '{}' has no target", path.display()),
+        },
+        EntryType::Char | EntryType::Block => bail!(
+            "archive entry '{}' is a device node; volumes are not restored with devices",
+            path.display()
+        ),
+        EntryType::Fifo => bail!(
+            "archive entry '{}' is a fifo; it holds no data and is not restored",
+            path.display()
+        ),
+        EntryType::XGlobalHeader => Ok(false),
+        other => bail!(
+            "archive entry '{}' is {other:?}, not a file, directory or link",
+            path.display()
+        ),
+    }
+}
+
+/// Check every entry of the volume archive open as `file`, rooted at `root`.
+pub(crate) fn validate_volume(file: &mut File, root: &str, limits: Limits) -> Result<()> {
+    let mut seen = 0;
+    for entry in archive(file, limits, ENGINE)?.entries()? {
+        count(&mut seen, limits)?;
+        admit_volume(&entry?, root)?;
+    }
+    file.seek(SeekFrom::Start(0))?;
     Ok(())
 }
 
