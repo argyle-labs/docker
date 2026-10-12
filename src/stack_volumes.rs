@@ -8,15 +8,21 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{DirBuilder, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::task::{Context as TaskContext, Poll};
 
 use bollard::Docker;
-use bollard::models::{ContainerCreateBody, HostConfig, Volume, VolumeCreateRequest};
+use bollard::models::{
+    ContainerCreateBody, ContainerSummary, HostConfig, Volume, VolumeCreateRequest,
+};
 use bollard::query_parameters::{
     CreateContainerOptions, DownloadFromContainerOptionsBuilder, InspectContainerOptionsBuilder,
-    RemoveContainerOptionsBuilder, UploadToContainerOptionsBuilder,
+    ListContainersOptionsBuilder, RemoveContainerOptionsBuilder, RemoveVolumeOptionsBuilder,
+    UploadToContainerOptionsBuilder,
 };
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -24,9 +30,9 @@ use plugin_toolkit::prelude::*;
 
 use crate::engine_state::{self, Limits};
 use crate::lifecycle::{in_backup_root, open_archive};
-use crate::prune::COMPOSE_VOLUME_LABEL;
+use crate::prune::{COMPOSE_PROJECT_LABEL, COMPOSE_VOLUME_LABEL};
 use crate::stack_manifest::repo_of;
-use crate::volume_coverage::{HELPER_IMAGE, engine_volumes, volume_exists};
+use crate::volume_coverage::{HELPER_IMAGE, engine_volumes};
 
 const EXPORT_TOOL: &str = "docker.stack_volumes_export";
 const IMPORT_TOOL: &str = "docker.stack_volumes_import";
@@ -34,6 +40,8 @@ const MANIFEST_FILE: &str = "manifest.json";
 /// Set by the engine on a volume it created for an anonymous mount.
 const ANONYMOUS_LABEL: &str = "com.docker.volume.anonymous";
 const MOUNT: &str = "/v";
+/// The top dir of a volume archive: the engine names it after [`MOUNT`].
+const ARCHIVE_ROOT: &str = "v";
 /// Images whose volumes hold only a cache the service rebuilds on start.
 const CACHE_IMAGES: &[&str] = &["redis", "valkey", "memcached", "keydb", "dragonfly"];
 
@@ -43,12 +51,10 @@ const VOLUME_LIMITS: Limits = Limits {
     bytes: 1 << 40,
     entries: 10_000_000,
 };
-/// Import holds an archive in memory so the bytes it restores are the bytes
-/// whose sum it checked.
-const MAX_ARCHIVE_BYTES: u64 = 2 << 30;
 const MAX_MANIFEST_BYTES: u64 = 16 << 20;
 /// Enough of a volume's tar to see whether anything follows its root entry.
 const PEEK_BYTES: usize = 64 << 10;
+const UPLOAD_CHUNK: usize = 1 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(crate = "plugin_toolkit::serde")]
@@ -65,6 +71,8 @@ pub enum VolumeKind {
     Cache,
     /// Skipped: compose creates a fresh one.
     Anonymous,
+    /// Skipped: another compose project owns it (`external: true` here).
+    Foreign,
 }
 
 #[orca_struct]
@@ -76,17 +84,23 @@ pub struct VolumeEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
     pub driver: String,
-    /// Recreated verbatim on the target, compose's config-hash included.
     pub labels: BTreeMap<String, String>,
     pub options: BTreeMap<String, String>,
     pub kind: VolumeKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Running containers that mount it at export; its archive may then not
+    /// be a consistent snapshot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub running: Vec<String>,
     /// Archive file name, beside the manifest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archive: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    /// Archive size in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
     /// Why a data volume could not be exported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub problem: Option<String>,
@@ -109,10 +123,17 @@ pub struct Skipped {
     pub reason: String,
 }
 
+fn is_skipped(kind: VolumeKind) -> bool {
+    matches!(
+        kind,
+        VolumeKind::Cache | VolumeKind::Anonymous | VolumeKind::Foreign
+    )
+}
+
 fn skipped(volumes: &[VolumeEntry]) -> Vec<Skipped> {
     volumes
         .iter()
-        .filter(|v| matches!(v.kind, VolumeKind::Cache | VolumeKind::Anonymous))
+        .filter(|v| is_skipped(v.kind))
         .map(|v| Skipped {
             name: v.name.clone(),
             kind: v.kind,
@@ -126,10 +147,12 @@ fn is_cache_image(image: &str) -> bool {
     CACHE_IMAGES.contains(&repo.rsplit('/').next().unwrap_or(repo))
 }
 
-/// What a move does with `vol`, mounted by containers of `images`; a name
-/// in `include` is copied even when only cache images mount it.
+/// What a move of `stack` does with `vol`, mounted by containers of
+/// `images`; a name in `include` is copied even when only cache images mount
+/// it.
 pub fn classify(
     vol: &Volume,
+    stack: &str,
     images: &[String],
     include: &[String],
 ) -> (VolumeKind, Option<String>) {
@@ -140,6 +163,14 @@ pub fn classify(
             "anonymous volume: compose creates a fresh one"
         };
         return (VolumeKind::Anonymous, Some(why.into()));
+    }
+    if let Some(owner) = vol.labels.get(COMPOSE_PROJECT_LABEL)
+        && owner != stack
+    {
+        return (
+            VolumeKind::Foreign,
+            Some(format!("owned by project {owner}")),
+        );
     }
     if vol.driver != "local" || !vol.options.is_empty() {
         return (
@@ -165,10 +196,16 @@ pub fn classify(
     (VolumeKind::Data, None)
 }
 
+#[derive(Default)]
+struct Users {
+    images: Vec<String>,
+    running: Vec<String>,
+}
+
 /// Every volume the stack's containers mount or that carries its project
 /// label, sorted by name.
 pub async fn collect(docker: &Docker, stack: &str, include: &[String]) -> Result<Vec<VolumeEntry>> {
-    let mut images: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut users: BTreeMap<String, Users> = BTreeMap::new();
     for id in crate::stack_manifest::containers_of(docker, stack)
         .await?
         .iter()
@@ -187,6 +224,13 @@ pub async fn collect(docker: &Docker, stack: &str, include: &[String]) -> Result
             .as_ref()
             .and_then(|cfg| cfg.image.clone())
             .unwrap_or_default();
+        let running = c.state.as_ref().and_then(|s| s.running).unwrap_or(false);
+        let cname = c
+            .name
+            .as_deref()
+            .unwrap_or(id)
+            .trim_start_matches('/')
+            .to_string();
         // Only volume mounts carry a name.
         for name in c
             .mounts
@@ -194,28 +238,31 @@ pub async fn collect(docker: &Docker, stack: &str, include: &[String]) -> Result
             .into_iter()
             .filter_map(|m| m.name)
         {
-            let users = images.entry(name).or_default();
-            if !users.contains(&image) {
-                users.push(image.clone());
+            let u = users.entry(name).or_default();
+            if !u.images.contains(&image) {
+                u.images.push(image.clone());
+            }
+            if running && !u.running.contains(&cname) {
+                u.running.push(cname.clone());
             }
         }
     }
     for v in engine_volumes(docker, stack).await? {
-        images.entry(v.name).or_default();
+        users.entry(v.name).or_default();
     }
-    if images.is_empty() {
+    if users.is_empty() {
         bail!("stack '{stack}' has no volumes on this host");
     }
     let mut out = Vec::new();
-    for (name, users) in &images {
-        let vol = match docker.inspect_volume(name).await {
+    for (name, u) in users {
+        let vol = match docker.inspect_volume(&name).await {
             Ok(v) => v,
             Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 404, ..
             }) => continue,
             Err(e) => bail!("inspect volume {name}: {e}"),
         };
-        let (kind, reason) = classify(&vol, users, include);
+        let (kind, reason) = classify(&vol, stack, &u.images, include);
         out.push(VolumeEntry {
             name: vol.name.clone(),
             key: vol.labels.get(COMPOSE_VOLUME_LABEL).cloned(),
@@ -224,24 +271,33 @@ pub async fn collect(docker: &Docker, stack: &str, include: &[String]) -> Result
             options: vol.options.into_iter().collect(),
             kind,
             reason,
+            running: u.running,
             archive: None,
             sha256: None,
+            size: None,
             problem: None,
         });
     }
     Ok(out)
 }
 
-async fn ensure_helper_image(docker: &Docker) -> Result<()> {
+async fn helper_image_present(docker: &Docker) -> Result<bool> {
     match docker.inspect_image(HELPER_IMAGE).await {
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(true),
         Err(bollard::errors::Error::DockerResponseServerError {
             status_code: 404, ..
-        }) => crate::stack_pull::pull(docker, HELPER_IMAGE)
-            .await
-            .map_err(|e| anyhow!("pull {HELPER_IMAGE}: {e}")),
+        }) => Ok(false),
         Err(e) => Err(anyhow!("inspect image {HELPER_IMAGE}: {e}")),
     }
+}
+
+async fn ensure_helper_image(docker: &Docker) -> Result<()> {
+    if helper_image_present(docker).await? {
+        return Ok(());
+    }
+    crate::stack_pull::pull(docker, HELPER_IMAGE)
+        .await
+        .map_err(|e| anyhow!("pull {HELPER_IMAGE}: {e}"))
 }
 
 /// A created, never started, network-less container with `volume` at
@@ -296,16 +352,20 @@ async fn download(docker: &Docker, id: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Write `volume` to `path` and return its sha256. The archive is checked as
-/// import will check it, so a volume import would refuse fails here instead.
-async fn export_one(docker: &Docker, volume: &str, path: &Path) -> Result<String> {
+/// Write `volume` to `path` and return its sha256 and size. The archive is
+/// checked as import will check it, so a volume import would refuse fails
+/// here instead.
+async fn export_one(docker: &Docker, volume: &str, path: &Path) -> Result<(String, u64)> {
     let id = helper(docker, volume, true).await?;
     let written = download(docker, &id, path).await;
     let removed = remove_helper(docker, &id).await;
     let checked = written.and(removed).and_then(|()| {
         let mut f = File::open(path)?;
-        engine_state::validate_within(&mut f, VOLUME_LIMITS)?;
-        plugin_toolkit::hash::sha256_file(path)
+        engine_state::validate_volume(&mut f, ARCHIVE_ROOT, VOLUME_LIMITS)?;
+        Ok((
+            plugin_toolkit::hash::sha256_file(path)?,
+            f.metadata()?.len(),
+        ))
     });
     if checked.is_err() {
         let _removed = std::fs::remove_file(path);
@@ -365,7 +425,7 @@ pub struct DockerStackVolumesExportArgs {
     #[arg(long)]
     pub stack: String,
     /// Absolute dir inside the daemon's backup roots; the export goes in a
-    /// fresh `<stack>-volumes-<stamp>` dir under it.
+    /// fresh `<stack>-volumes-<stamp>-<ms>` dir under it.
     #[arg(long)]
     pub destination: String,
     /// Volume names to copy even though only cache images mount them.
@@ -373,6 +433,11 @@ pub struct DockerStackVolumesExportArgs {
     #[arg(long, value_delimiter = ',')]
     #[serde(default)]
     pub include: Vec<String>,
+    /// Export data volumes that running containers mount. Their archives may
+    /// not be consistent; each records the containers in `running`.
+    #[arg(long)]
+    #[serde(default)]
+    pub allow_running: bool,
     /// Apply. Omitted, lists what would be exported and writes nothing.
     #[arg(long)]
     #[serde(default)]
@@ -389,12 +454,30 @@ pub struct StackVolumesExportOutput {
     pub skipped: Vec<Skipped>,
     /// `true` when every data volume was exported.
     pub complete: bool,
+    /// Dry run only, when a data volume would be copied: whether the helper
+    /// image is already on this host (execute pulls it otherwise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub helper_image_present: Option<bool>,
     /// Pass with [`Self::manifest_sha256`] to `docker.stack_volumes_import`
     /// on the target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_sha256: Option<String>,
+}
+
+fn running_refusal(volumes: &[VolumeEntry]) -> Option<String> {
+    let busy: Vec<String> = volumes
+        .iter()
+        .filter(|v| v.kind == VolumeKind::Data && !v.running.is_empty())
+        .map(|v| format!("{} ({})", v.name, v.running.join(", ")))
+        .collect();
+    (!busy.is_empty()).then(|| {
+        format!(
+            "running containers mount data volumes: {}; stop the stack first or pass allowRunning",
+            busy.join("; ")
+        )
+    })
 }
 
 pub async fn export(
@@ -405,6 +488,9 @@ pub async fn export(
     valid_stack(&args.stack)?;
     let destination = in_backup_root(&args.destination, roots)?;
     let mut volumes = collect(docker, &args.stack, &args.include).await?;
+    let refusal = (!args.allow_running)
+        .then(|| running_refusal(&volumes))
+        .flatten();
     let mut out = StackVolumesExportOutput {
         executed: args.execute,
         stack: args.stack.clone(),
@@ -412,9 +498,23 @@ pub async fn export(
         ..Default::default()
     };
     if !args.execute {
-        out.complete = true;
+        if let Some(why) = &refusal {
+            for v in volumes
+                .iter_mut()
+                .filter(|v| v.kind == VolumeKind::Data && !v.running.is_empty())
+            {
+                v.problem = Some(why.clone());
+            }
+        }
+        if volumes.iter().any(|v| v.kind == VolumeKind::Data) {
+            out.helper_image_present = Some(helper_image_present(docker).await?);
+        }
+        out.complete = volumes.iter().all(|v| v.problem.is_none());
         out.volumes = volumes;
         return Ok(out);
+    }
+    if let Some(why) = refusal {
+        bail!("{why}");
     }
     std::fs::create_dir_all(&destination)
         .with_context(|| format!("failed to create '{}'", destination.display()))?;
@@ -426,18 +526,29 @@ pub async fn export(
             destination.display()
         );
     }
-    let stamp = plugin_toolkit::time::now().compact();
-    let bundle = destination.join(format!("{}-volumes-{stamp}", args.stack));
-    DirBuilder::new()
-        .mode(0o700)
-        .create(&bundle)
-        .with_context(|| format!("failed to create '{}'", bundle.display()))?;
+    let now = plugin_toolkit::time::now();
+    let base = format!(
+        "{}-volumes-{}-{:03}",
+        args.stack,
+        now.compact(),
+        now.unix_millis().rem_euclid(1000)
+    );
+    let mut bundle = destination.join(&base);
+    let mut n = 1;
+    while let Err(e) = DirBuilder::new().mode(0o700).create(&bundle) {
+        if e.kind() != std::io::ErrorKind::AlreadyExists || n > 99 {
+            return Err(e).with_context(|| format!("failed to create '{}'", bundle.display()));
+        }
+        bundle.set_file_name(format!("{base}-{n}"));
+        n += 1;
+    }
     for v in volumes.iter_mut().filter(|v| v.kind == VolumeKind::Data) {
         let name = format!("{}.tar.gz", v.name);
         match export_one(docker, &v.name, &bundle.join(&name)).await {
-            Ok(sha) => {
+            Ok((sha, size)) => {
                 v.archive = Some(name);
                 v.sha256 = Some(sha);
+                v.size = Some(size);
             }
             Err(e) => v.problem = Some(format!("{e:#}")),
         }
@@ -467,9 +578,10 @@ pub async fn export(
 
 /// **Export a stack's named volumes for a move** (source host): each data
 /// volume to a gzip tar, read through the Engine API, plus a manifest with
-/// every volume's labels, driver options and archive sha256. Anonymous
-/// volumes and cache-only volumes (redis, valkey, memcached, …) are skipped
-/// and listed with the reason.
+/// every volume's labels, driver options, archive sha256 and size. Refused
+/// while running containers mount a data volume unless `allowRunning`.
+/// Anonymous volumes, cache-only volumes (redis, valkey, memcached, …) and
+/// volumes another project owns are skipped and listed with the reason.
 #[orca_tool(
     domain = "docker",
     verb = "stack_volumes_export",
@@ -500,8 +612,7 @@ fn read_capped(file: &mut File, cap: u64, what: &str) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn check_sum(data: &[u8], want: &str, what: &str) -> Result<()> {
-    let got = plugin_toolkit::hash::sha256_hex(data);
+fn check_sum(got: &str, want: &str, what: &str) -> Result<()> {
     if !got.eq_ignore_ascii_case(want.trim()) {
         bail!("{what}: sha256 {got} does not match {want}; refusing it");
     }
@@ -515,15 +626,16 @@ fn load(manifest: &str, sha256: &str, roots: &[String]) -> Result<(VolumeManifes
         .map(Path::to_path_buf)
         .ok_or_else(|| anyhow!("manifest '{manifest}' has no parent dir"))?;
     let data = read_capped(&mut file, MAX_MANIFEST_BYTES, "manifest")?;
-    check_sum(&data, sha256, "manifest")?;
+    check_sum(&plugin_toolkit::hash::sha256_hex(&data), sha256, "manifest")?;
     let parsed = plugin_toolkit::serde_json::from_slice(&data)
         .map_err(|e| anyhow!("manifest '{manifest}': {e}"))?;
     Ok((parsed, dir))
 }
 
-/// The archive of `v`, read once, sum-checked and entry-checked: the bytes
-/// returned are the bytes that passed.
-fn verified_archive(dir: &Path, v: &VolumeEntry, roots: &[String]) -> Result<Vec<u8>> {
+/// The archive of `v`, copied to a private unlinked file beside it, then
+/// sum-checked and entry-checked there: the returned descriptor, rewound,
+/// holds exactly the bytes that passed, whatever happens to the original.
+fn verified_archive(dir: &Path, v: &VolumeEntry, roots: &[String]) -> Result<File> {
     let (Some(name), Some(sha)) = (v.archive.as_deref(), v.sha256.as_deref()) else {
         bail!(
             "volume '{}' has no archive and sha256 in the manifest",
@@ -536,13 +648,50 @@ fn verified_archive(dir: &Path, v: &VolumeEntry, roots: &[String]) -> Result<Vec
             v.name
         );
     }
-    let path = dir.join(name);
-    let mut file = open_archive(&path.to_string_lossy(), roots)?;
+    let mut src = open_archive(&dir.join(name).to_string_lossy(), roots)?;
+    let tmp = dir.join(format!(
+        ".{name}.{}-{}.verify",
+        std::process::id(),
+        plugin_toolkit::time::now().unix_millis()
+    ));
+    let mut copy = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .with_context(|| format!("failed to create '{}'", tmp.display()))?;
+    std::fs::remove_file(&tmp).with_context(|| format!("failed to unlink '{}'", tmp.display()))?;
+    std::io::copy(&mut src, &mut copy)?;
+    // On macOS `/dev/fd/N` shares this descriptor's offset.
+    copy.rewind()?;
     let what = format!("archive of volume '{}'", v.name);
-    let data = read_capped(&mut file, MAX_ARCHIVE_BYTES, &what)?;
-    check_sum(&data, sha, &what)?;
-    engine_state::validate_bytes(&data, VOLUME_LIMITS).with_context(|| what.clone())?;
-    Ok(data)
+    // `/dev/fd/N` reaches the unlinked copy; nothing else can.
+    let got =
+        plugin_toolkit::hash::sha256_file(Path::new(&format!("/dev/fd/{}", copy.as_raw_fd())))?;
+    check_sum(&got, sha, &what)?;
+    engine_state::validate_volume(&mut copy, ARCHIVE_ROOT, VOLUME_LIMITS)
+        .with_context(|| what.clone())?;
+    Ok(copy)
+}
+
+/// A file read in chunks as a request body.
+struct FileBody(File);
+
+impl futures_core::Stream for FileBody {
+    type Item = std::io::Result<bytes::Bytes>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        let mut buf = vec![0u8; UPLOAD_CHUNK];
+        Poll::Ready(match self.0.read(&mut buf) {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some(Ok(buf.into()))
+            }
+            Err(e) => Some(Err(e)),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -554,7 +703,8 @@ pub enum ImportAction {
     CreateAndRestore,
     /// Exists: restored only if it turns out empty.
     RestoreIfEmpty,
-    /// Exists: restored over its contents (`force`).
+    /// Exists: removed, recreated empty with its own driver, options and
+    /// labels, then restored (`force`).
     Overwrite,
     /// Exists and holds no copied data: left as is.
     Keep,
@@ -589,6 +739,10 @@ pub struct StackVolumesImportOutput {
     /// Dry run only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plan: Vec<PlannedVolume>,
+    /// Dry run only, when a volume would be restored: whether the helper
+    /// image is already on this host (execute pulls it otherwise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub helper_image_present: Option<bool>,
 }
 
 #[orca_struct(args)]
@@ -600,7 +754,8 @@ pub struct DockerStackVolumesImportArgs {
     /// The export's `manifestSha256`.
     #[arg(long)]
     pub manifest_sha256: String,
-    /// Restore into an existing volume that already holds data.
+    /// Replace an existing volume that already holds data: it is removed and
+    /// recreated empty before the restore.
     #[arg(long)]
     #[serde(default)]
     pub force: bool,
@@ -621,45 +776,173 @@ fn action(v: &VolumeEntry, exists: bool, force: bool) -> ImportAction {
     }
 }
 
+async fn existing(docker: &Docker, name: &str) -> Result<Option<Volume>> {
+    match docker.inspect_volume(name).await {
+        Ok(v) => Ok(Some(v)),
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => Ok(None),
+        Err(e) => Err(anyhow!("inspect volume {name}: {e}")),
+    }
+}
+
+/// Why keeping `have` as `v` would not match the source, if it would not.
+fn keep_mismatch(v: &VolumeEntry, have: &Volume) -> Option<String> {
+    let options: BTreeMap<String, String> = have.options.clone().into_iter().collect();
+    (have.driver != v.driver || options != v.options).then(|| {
+        format!(
+            "exists with driver '{}' options {:?}; the source has driver '{}' options {:?}; left as is",
+            have.driver, options, v.driver, v.options
+        )
+    })
+}
+
+async fn containers_using(docker: &Docker, volume: &str) -> Result<Vec<ContainerSummary>> {
+    let filters = HashMap::from([("volume".to_string(), vec![volume.to_string()])]);
+    docker
+        .list_containers(Some(
+            ListContainersOptionsBuilder::new()
+                .all(true)
+                .filters(&filters)
+                .build(),
+        ))
+        .await
+        .map_err(|e| anyhow!("list containers using {volume}: {e}"))
+}
+
+fn container_name(c: &ContainerSummary) -> String {
+    c.names
+        .as_ref()
+        .and_then(|n| n.first())
+        .map(|n| n.trim_start_matches('/').to_string())
+        .or_else(|| c.id.clone())
+        .unwrap_or_default()
+}
+
+/// Refuse a restore into `volume` while a container runs on it, and an
+/// overwrite while any container references it: the volume is removed to
+/// empty it, which the engine refuses for a volume in use.
+async fn refuse_in_use(docker: &Docker, volume: &str, act: ImportAction) -> Result<()> {
+    let users = containers_using(docker, volume).await?;
+    let running: Vec<String> = users
+        .iter()
+        .filter(|c| c.state.as_ref().map(|s| s.to_string()).as_deref() == Some("running"))
+        .map(container_name)
+        .collect();
+    if !running.is_empty() {
+        bail!(
+            "volume '{volume}' is mounted by running containers: {}; stop them first",
+            running.join(", ")
+        );
+    }
+    if act == ImportAction::Overwrite && !users.is_empty() {
+        let names: Vec<String> = users.iter().map(container_name).collect();
+        bail!(
+            "volume '{volume}' is referenced by containers: {}; remove them (compose down) before overwriting it",
+            names.join(", ")
+        );
+    }
+    Ok(())
+}
+
+async fn create(
+    docker: &Docker,
+    name: &str,
+    driver: &str,
+    opts: HashMap<String, String>,
+    labels: HashMap<String, String>,
+) -> Result<()> {
+    docker
+        .create_volume(VolumeCreateRequest {
+            name: Some(name.into()),
+            driver: Some(driver.into()),
+            driver_opts: Some(opts),
+            labels: Some(labels),
+            ..Default::default()
+        })
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow!("create volume {name}: {e}"))
+}
+
+/// Empty `have` by removing it and creating it again as it was. Only a plain
+/// local volume: removing one with driver options leaves its data in place.
+async fn recreate(docker: &Docker, have: &Volume) -> Result<()> {
+    if have.driver != "local" || !have.options.is_empty() {
+        bail!(
+            "volume '{}' has driver '{}' with options; it cannot be emptied here",
+            have.name,
+            have.driver
+        );
+    }
+    docker
+        .remove_volume(
+            &have.name,
+            Some(RemoveVolumeOptionsBuilder::new().force(false).build()),
+        )
+        .await
+        .map_err(|e| anyhow!("remove volume {}: {e}", have.name))?;
+    create(
+        docker,
+        &have.name,
+        &have.driver,
+        have.options.clone(),
+        have.labels.clone(),
+    )
+    .await
+    .with_context(|| format!("volume '{}' was removed; rerun to create it", have.name))
+}
+
 async fn apply_one(
     docker: &Docker,
     v: &VolumeEntry,
     act: ImportAction,
+    have: Option<&Volume>,
     dir: &Path,
     roots: &[String],
     out: &mut StackVolumesImportOutput,
 ) -> Result<()> {
     if matches!(act, ImportAction::Create | ImportAction::CreateAndRestore) {
-        docker
-            .create_volume(VolumeCreateRequest {
-                name: Some(v.name.clone()),
-                driver: Some(v.driver.clone()),
-                driver_opts: Some(v.options.clone().into_iter().collect::<HashMap<_, _>>()),
-                labels: Some(v.labels.clone().into_iter().collect::<HashMap<_, _>>()),
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| anyhow!("create volume {}: {e}", v.name))?;
+        create(
+            docker,
+            &v.name,
+            &v.driver,
+            v.options.clone().into_iter().collect(),
+            v.labels.clone().into_iter().collect(),
+        )
+        .await?;
         out.created.push(v.name.clone());
     }
     if matches!(act, ImportAction::Create | ImportAction::Keep) {
         return Ok(());
     }
-    // Read and checked again: the file may have changed since the pre-check.
-    let data = verified_archive(dir, v, roots)?;
+    // Checked again: the file may have changed since the pre-check.
+    let archive = verified_archive(dir, v, roots)?;
+    if matches!(act, ImportAction::RestoreIfEmpty | ImportAction::Overwrite) {
+        refuse_in_use(docker, &v.name, act).await?;
+    }
+    if act == ImportAction::Overwrite {
+        let have = have.ok_or_else(|| anyhow!("volume '{}' vanished", v.name))?;
+        recreate(docker, have).await?;
+    }
     let id = helper(docker, &v.name, false).await?;
     let restored = async {
         if act == ImportAction::RestoreIfEmpty && !is_empty(docker, &id).await? {
             bail!(
-                "volume '{}' already holds data; pass force to restore over it",
+                "volume '{}' already holds data; pass force to replace it",
                 v.name
             );
         }
         let opts = UploadToContainerOptionsBuilder::new().path("/").build();
         docker
-            .upload_to_container(&id, Some(opts), bollard::body_full(data.into()))
+            .upload_to_container(&id, Some(opts), bollard::body_try_stream(FileBody(archive)))
             .await
-            .map_err(|e| anyhow!("restore volume {}: {e}", v.name))
+            .map_err(|e| {
+                anyhow!(
+                    "restore volume {}: {e}; partial restore; rerun with force",
+                    v.name
+                )
+            })
     }
     .await;
     let removed = remove_helper(docker, &id).await;
@@ -684,7 +967,7 @@ pub async fn import(
     // Every archive passes before any volume is created.
     for v in &manifest.volumes {
         match v.kind {
-            VolumeKind::Cache | VolumeKind::Anonymous => {}
+            k if is_skipped(k) => {}
             VolumeKind::Data if v.problem.is_some() => out.findings.push(ImportFinding {
                 name: v.name.clone(),
                 message: format!(
@@ -696,24 +979,46 @@ pub async fn import(
                 verified_archive(&dir, v, roots)?;
                 todo.push(v);
             }
-            VolumeKind::External => todo.push(v),
+            _ => todo.push(v),
         }
     }
+    let mut restores = false;
     for v in todo {
-        let act = action(v, volume_exists(docker, &v.name).await?, args.force);
+        let have = existing(docker, &v.name).await?;
+        let act = action(v, have.is_some(), args.force);
+        if act == ImportAction::Keep
+            && let Some(why) = have.as_ref().and_then(|h| keep_mismatch(v, h))
+        {
+            out.findings.push(ImportFinding {
+                name: v.name.clone(),
+                message: why,
+            });
+        }
         if !args.execute {
+            if matches!(act, ImportAction::RestoreIfEmpty | ImportAction::Overwrite)
+                && let Err(e) = refuse_in_use(docker, &v.name, act).await
+            {
+                out.findings.push(ImportFinding {
+                    name: v.name.clone(),
+                    message: format!("{e:#}"),
+                });
+            }
+            restores |= !matches!(act, ImportAction::Create | ImportAction::Keep);
             out.plan.push(PlannedVolume {
                 name: v.name.clone(),
                 action: act,
             });
             continue;
         }
-        if let Err(e) = apply_one(docker, v, act, &dir, roots, &mut out).await {
+        if let Err(e) = apply_one(docker, v, act, have.as_ref(), &dir, roots, &mut out).await {
             out.findings.push(ImportFinding {
                 name: v.name.clone(),
                 message: format!("{e:#}"),
             });
         }
+    }
+    if restores {
+        out.helper_image_present = Some(helper_image_present(docker).await?);
     }
     Ok(out)
 }
@@ -722,8 +1027,10 @@ pub async fn import(
 /// `docker.stack_volumes_export`: checks the manifest's sha256 and every
 /// archive's sum and entries before anything is created, then creates each
 /// volume with the source's labels and driver options and restores its data
-/// through the Engine API. An existing volume that holds data is refused
-/// unless `force`. Skipped volumes are listed with the reason.
+/// through the Engine API. A volume a running container mounts is refused;
+/// an existing volume that holds data is refused unless `force`, which
+/// removes and recreates it empty first. Skipped volumes are listed with the
+/// reason.
 #[orca_tool(
     domain = "docker",
     verb = "stack_volumes_import",
@@ -752,13 +1059,7 @@ mod tests {
     }
 
     fn volume(name: &str, key: Option<&str>, driver: &str, opts: &[(&str, &str)]) -> Volume {
-        let mut labels = HashMap::from([
-            ("com.docker.compose.project".to_string(), "s".to_string()),
-            (
-                "com.docker.compose.config-hash".to_string(),
-                "h1".to_string(),
-            ),
-        ]);
+        let mut labels = HashMap::from([(COMPOSE_PROJECT_LABEL.to_string(), "s".to_string())]);
         if let Some(k) = key {
             labels.insert(COMPOSE_VOLUME_LABEL.into(), k.into());
         }
@@ -804,11 +1105,14 @@ mod tests {
     #[test]
     fn classify_skips_anonymous_and_cache_and_keeps_external_uncopied() {
         let data = volume("s_data", Some("data"), "local", &[]);
-        assert_eq!(classify(&data, &strs(&["app:1"]), &[]).0, VolumeKind::Data);
-        assert_eq!(classify(&data, &[], &[]).0, VolumeKind::Data);
+        assert_eq!(
+            classify(&data, "s", &strs(&["app:1"]), &[]).0,
+            VolumeKind::Data
+        );
+        assert_eq!(classify(&data, "s", &[], &[]).0, VolumeKind::Data);
 
         let anon = volume("0a1b", None, "local", &[]);
-        let (kind, why) = classify(&anon, &[], &[]);
+        let (kind, why) = classify(&anon, "s", &[], &[]);
         assert_eq!(kind, VolumeKind::Anonymous);
         assert!(why.unwrap().contains("stale"));
         let mut labelled_anon = data.clone();
@@ -816,30 +1120,43 @@ mod tests {
             .labels
             .insert(ANONYMOUS_LABEL.into(), String::new());
         assert_eq!(
-            classify(&labelled_anon, &strs(&["app:1"]), &[]).0,
+            classify(&labelled_anon, "s", &strs(&["app:1"]), &[]).0,
             VolumeKind::Anonymous
         );
 
         let cache = volume("s_cache", Some("cache"), "local", &[]);
         let redis = strs(&["docker.io/library/redis:7@sha256:a", "valkey/valkey:8"]);
-        assert_eq!(classify(&cache, &redis, &[]).0, VolumeKind::Cache);
+        assert_eq!(classify(&cache, "s", &redis, &[]).0, VolumeKind::Cache);
         assert_eq!(
-            classify(&cache, &redis, &strs(&["s_cache"])).0,
+            classify(&cache, "s", &redis, &strs(&["s_cache"])).0,
             VolumeKind::Data
         );
         assert_eq!(
-            classify(&cache, &strs(&["redis:7", "app:1"]), &[]).0,
+            classify(&cache, "s", &strs(&["redis:7", "app:1"]), &[]).0,
             VolumeKind::Data
         );
 
         let nfs = volume("s_nfs", Some("nfs"), "local", &[("type", "nfs")]);
-        assert_eq!(classify(&nfs, &[], &[]).0, VolumeKind::External);
+        assert_eq!(classify(&nfs, "s", &[], &[]).0, VolumeKind::External);
+
+        let mut shared = volume("other_data", Some("data"), "local", &[]);
+        shared
+            .labels
+            .insert(COMPOSE_PROJECT_LABEL.into(), "other".into());
+        let (kind, why) = classify(&shared, "s", &strs(&["app:1"]), &[]);
+        assert_eq!(kind, VolumeKind::Foreign);
+        assert_eq!(why.unwrap(), "owned by project other");
     }
 
     fn export_engine() -> FakeEngine {
-        let inspect = |name: &str, image: &str, mounts: &str| {
+        export_engine_with(false)
+    }
+
+    fn export_engine_with(app_running: bool) -> FakeEngine {
+        let inspect = move |name: &str, image: &str, mounts: &str| {
+            let running = app_running && name == "app1";
             format!(
-                r#"{{"Id":"{name}","Name":"/{name}","Image":"sha256:x","Config":{{"Image":"{image}"}},"Mounts":[{mounts}]}}"#
+                r#"{{"Id":"{name}","Name":"/{name}","Image":"sha256:x","State":{{"Running":{running}}},"Config":{{"Image":"{image}"}},"Mounts":[{mounts}]}}"#
             )
         };
         FakeEngine::routed(vec![
@@ -916,6 +1233,7 @@ mod tests {
             stack: "s".into(),
             destination: dest.to_string_lossy().into_owned(),
             include: vec![],
+            allow_running: false,
             execute,
         }
     }
@@ -970,7 +1288,8 @@ mod tests {
                 v.sha256.as_deref().unwrap(),
                 plugin_toolkit::hash::sha256_file(&archive).unwrap()
             );
-            assert_eq!(v.labels["com.docker.compose.config-hash"], "h1");
+            assert_eq!(v.size, Some(std::fs::metadata(&archive).unwrap().len()));
+            assert!(v.running.is_empty());
         }
         let creates = e.bodies("/containers/create");
         assert!(
@@ -1038,7 +1357,9 @@ mod tests {
             kind: VolumeKind::Data,
             reason: None,
             archive: Some("s_data.tar.gz".into()),
+            running: vec![],
             sha256: Some(plugin_toolkit::hash::sha256_hex(&archive)),
+            size: Some(archive.len() as u64),
             problem: None,
         };
         let cache = VolumeEntry {
@@ -1077,7 +1398,13 @@ mod tests {
     }
 
     fn target_engine(existing: Option<&[(&str, &str)]>) -> FakeEngine {
-        let mut routes = vec![];
+        target_engine_with(existing, "[]", 200)
+    }
+
+    /// `users` answers the volume-filtered container list; `put` is the
+    /// upload's status.
+    fn target_engine_with(existing: Option<&[(&str, &str)]>, users: &str, put: u16) -> FakeEngine {
+        let mut routes = vec![Route::new("GET", "/containers/json", 200, users)];
         match existing {
             Some(files) => {
                 routes.push(Route::new(
@@ -1113,8 +1440,14 @@ mod tests {
                 201,
                 r#"{"Id":"h1","Warnings":[]}"#,
             ),
-            Route::new("PUT", "/containers/h1/archive", 200, ""),
+            Route::new(
+                "PUT",
+                "/containers/h1/archive",
+                put,
+                r#"{"message":"disk full"}"#,
+            ),
             Route::new("DELETE", "/containers/h1", 204, ""),
+            Route::new("DELETE", "/volumes/s_data", 204, ""),
             Route::new("GET", "/json", 200, r#"{"Id":"sha256:helper"}"#),
         ]);
         FakeEngine::routed(routes)
@@ -1136,7 +1469,7 @@ mod tests {
         assert_eq!(out.restored, ["s_data"]);
         assert_eq!(out.skipped.len(), 1);
         let create = &e.bodies("/volumes/create")[0];
-        assert!(create.contains("com.docker.compose.config-hash") && create.contains("\"s_data\""));
+        assert!(create.contains(COMPOSE_PROJECT_LABEL) && create.contains("\"s_data\""));
         assert!(
             e.targets("PUT")
                 .iter()
@@ -1198,6 +1531,24 @@ mod tests {
         .unwrap();
         assert_eq!(out.restored, ["s_data"]);
         assert!(e.paths("GET").iter().all(|p| !p.ends_with("/archive")));
+        assert!(
+            e.targets("GET")
+                .iter()
+                .any(|t| t.contains("/containers/json") && t.contains(r#""volume":["s_data"]"#))
+        );
+        let reqs = e.requests();
+        let removed = reqs
+            .iter()
+            .position(|r| r.starts_with("DELETE") && r.contains("/volumes/s_data"))
+            .expect("the volume is removed to empty it");
+        let created = reqs
+            .iter()
+            .position(|r| r.starts_with("POST") && r.contains("/volumes/create"))
+            .expect("and created again");
+        let put = reqs.iter().position(|r| r.starts_with("PUT")).unwrap();
+        assert!(removed < created && created < put);
+        assert!(e.bodies("/volumes/create")[0].contains(COMPOSE_PROJECT_LABEL));
+        assert!(out.created.is_empty());
     }
 
     #[test]
@@ -1252,5 +1603,286 @@ mod tests {
             .unwrap_err();
             crate::test_support::assert_admin_refusal(&err.to_string());
         }
+    }
+    #[test]
+    fn export_refuses_running_data_volumes_unless_allowed() {
+        let root = tempfile::tempdir().unwrap();
+        let e = export_engine_with(true);
+        let err = block(export(
+            &e.client(),
+            &export_args(root.path(), true),
+            &roots(root.path()),
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("s_data (app1)") && err.contains("allowRunning"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+
+        let out = block(export(
+            &e.client(),
+            &export_args(root.path(), false),
+            &roots(root.path()),
+        ))
+        .unwrap();
+        assert!(!out.complete);
+        let data = out.volumes.iter().find(|v| v.name == "s_data").unwrap();
+        assert!(data.problem.as_deref().unwrap().contains("allowRunning"));
+
+        let mut args = export_args(root.path(), true);
+        args.allow_running = true;
+        let out = block(export(&e.client(), &args, &roots(root.path()))).unwrap();
+        assert!(out.complete);
+        let json = std::fs::read(out.manifest.unwrap()).unwrap();
+        let parsed: VolumeManifest = plugin_toolkit::serde_json::from_slice(&json).unwrap();
+        let data = parsed.volumes.iter().find(|v| v.name == "s_data").unwrap();
+        assert_eq!(data.running, ["app1"]);
+    }
+
+    #[test]
+    fn export_bundles_never_collide() {
+        let root = tempfile::tempdir().unwrap();
+        let e = export_engine();
+        let a = block(export(
+            &e.client(),
+            &export_args(root.path(), true),
+            &roots(root.path()),
+        ))
+        .unwrap();
+        let b = block(export(
+            &e.client(),
+            &export_args(root.path(), true),
+            &roots(root.path()),
+        ))
+        .unwrap();
+        assert_ne!(a.manifest, b.manifest);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn dry_runs_report_the_helper_image() {
+        let root = tempfile::tempdir().unwrap();
+        let out = block(export(
+            &export_engine().client(),
+            &export_args(root.path(), false),
+            &roots(root.path()),
+        ))
+        .unwrap();
+        assert_eq!(out.helper_image_present, Some(true));
+
+        let (manifest, sha) = bundle(root.path(), &[("db", "rows")]);
+        let e = FakeEngine::routed(vec![
+            Route::new("GET", "/containers/json", 200, "[]"),
+            Route::new(
+                "GET",
+                "/volumes/s_data",
+                404,
+                r#"{"message":"no such volume"}"#,
+            ),
+        ]);
+        let out = block(import(
+            &e.client(),
+            &import_args(&manifest, &sha, false, false),
+            &roots(root.path()),
+        ))
+        .unwrap();
+        assert_eq!(out.helper_image_present, Some(false));
+        assert!(e.paths("POST").is_empty(), "inspect only, never pull");
+    }
+
+    #[test]
+    fn import_refuses_a_volume_a_running_container_mounts() {
+        let root = tempfile::tempdir().unwrap();
+        let (manifest, sha) = bundle(root.path(), &[("db", "rows")]);
+        let users = r#"[{"Id":"c1","Names":["/s-app-1"],"State":"running"}]"#;
+        for force in [false, true] {
+            let e = target_engine_with(Some(&[]), users, 200);
+            let out = block(import(
+                &e.client(),
+                &import_args(&manifest, &sha, force, true),
+                &roots(root.path()),
+            ))
+            .unwrap();
+            assert!(out.restored.is_empty());
+            assert!(
+                out.findings[0]
+                    .message
+                    .contains("running containers: s-app-1")
+            );
+            assert!(e.paths("PUT").is_empty() && e.paths("DELETE").is_empty());
+        }
+    }
+
+    #[test]
+    fn overwrite_refuses_a_volume_a_stopped_container_references() {
+        let root = tempfile::tempdir().unwrap();
+        let (manifest, sha) = bundle(root.path(), &[("db", "rows")]);
+        let users = r#"[{"Id":"c1","Names":["/s-app-1"],"State":"exited"}]"#;
+        let e = target_engine_with(Some(&[("old", "x")]), users, 200);
+        let out = block(import(
+            &e.client(),
+            &import_args(&manifest, &sha, true, true),
+            &roots(root.path()),
+        ))
+        .unwrap();
+        assert!(out.restored.is_empty());
+        assert!(
+            out.findings[0]
+                .message
+                .contains("referenced by containers: s-app-1")
+        );
+        assert!(e.paths("DELETE").is_empty() && e.paths("PUT").is_empty());
+
+        let e = target_engine_with(Some(&[]), users, 200);
+        let out = block(import(
+            &e.client(),
+            &import_args(&manifest, &sha, false, true),
+            &roots(root.path()),
+        ))
+        .unwrap();
+        assert_eq!(
+            out.restored,
+            ["s_data"],
+            "an empty volume is restored in place"
+        );
+    }
+
+    #[test]
+    fn a_failed_upload_says_rerun_with_force() {
+        let root = tempfile::tempdir().unwrap();
+        let (manifest, sha) = bundle(root.path(), &[("db", "rows")]);
+        let e = target_engine_with(None, "[]", 500);
+        let out = block(import(
+            &e.client(),
+            &import_args(&manifest, &sha, false, true),
+            &roots(root.path()),
+        ))
+        .unwrap();
+        assert!(out.restored.is_empty());
+        assert!(
+            out.findings[0]
+                .message
+                .contains("partial restore; rerun with force"),
+            "{:?}",
+            out.findings
+        );
+    }
+
+    #[test]
+    fn keep_reports_a_driver_or_options_mismatch() {
+        let root = tempfile::tempdir().unwrap();
+        let nfs = VolumeEntry {
+            name: "s_nfs".into(),
+            key: Some("nfs".into()),
+            driver: "local".into(),
+            labels: BTreeMap::new(),
+            options: BTreeMap::from([("type".to_string(), "nfs".to_string())]),
+            kind: VolumeKind::External,
+            reason: None,
+            running: vec![],
+            archive: None,
+            sha256: None,
+            size: None,
+            problem: None,
+        };
+        let json = plugin_toolkit::serde_json::to_vec(&VolumeManifest {
+            stack: "s".into(),
+            volumes: vec![nfs],
+        })
+        .unwrap();
+        let path = root.path().join(MANIFEST_FILE);
+        std::fs::write(&path, &json).unwrap();
+        let sha = plugin_toolkit::hash::sha256_hex(&json);
+        let run = |opts: &[(&str, &str)]| {
+            let e = FakeEngine::routed(vec![Route::new(
+                "GET",
+                "/volumes/s_nfs",
+                200,
+                plugin_toolkit::serde_json::to_string(&volume("s_nfs", Some("nfs"), "local", opts))
+                    .unwrap(),
+            )]);
+            block(import(
+                &e.client(),
+                &import_args(&path.to_string_lossy(), &sha, false, false),
+                &roots(root.path()),
+            ))
+            .unwrap()
+        };
+        let out = run(&[("type", "nfs4")]);
+        assert_eq!(out.plan[0].action, ImportAction::Keep);
+        assert!(
+            out.findings[0].message.contains("nfs4"),
+            "{:?}",
+            out.findings
+        );
+        assert!(run(&[("type", "nfs")]).findings.is_empty());
+    }
+
+    fn volume_archive(build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> File {
+        let mut b = tar::Builder::new(Vec::new());
+        let mut dir = tar::Header::new_gnu();
+        dir.set_entry_type(tar::EntryType::Directory);
+        dir.set_mode(0o755);
+        dir.set_size(0);
+        b.append_data(&mut dir, "v/", std::io::empty()).unwrap();
+        build(&mut b);
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(&b.into_inner().unwrap()).unwrap();
+        let mut f = tempfile::tempfile().unwrap();
+        f.write_all(&gz.finish().unwrap()).unwrap();
+        f
+    }
+
+    fn special(
+        b: &mut tar::Builder<Vec<u8>>,
+        kind: tar::EntryType,
+        path: &str,
+        link: Option<&str>,
+    ) {
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(kind);
+        h.set_mode(0o644);
+        h.set_size(0);
+        match link {
+            Some(target) => b.append_link(&mut h, path, target).unwrap(),
+            None => b.append_data(&mut h, path, std::io::empty()).unwrap(),
+        }
+    }
+
+    fn admit(build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> Result<()> {
+        engine_state::validate_volume(&mut volume_archive(build), ARCHIVE_ROOT, VOLUME_LIMITS)
+    }
+
+    #[test]
+    fn volume_archives_admit_any_symlink_but_no_devices_fifos_or_escapes() {
+        admit(|b| {
+            special(b, tar::EntryType::Symlink, "v/abs", Some("/etc/passwd"));
+            special(b, tar::EntryType::Symlink, "v/up", Some("../../x"));
+            special(b, tar::EntryType::Link, "v/hard", Some("v/abs"));
+        })
+        .unwrap();
+        let refused = |build: fn(&mut tar::Builder<Vec<u8>>), why: &str| {
+            let err = format!("{:#}", admit(build).unwrap_err());
+            assert!(err.contains(why), "{err}");
+        };
+        refused(
+            |b| special(b, tar::EntryType::Char, "v/null", None),
+            "device node",
+        );
+        refused(
+            |b| special(b, tar::EntryType::Block, "v/sda", None),
+            "device node",
+        );
+        refused(|b| special(b, tar::EntryType::Fifo, "v/pipe", None), "fifo");
+        refused(
+            |b| special(b, tar::EntryType::Regular, "w/x", None),
+            "not under 'v/'",
+        );
+        refused(
+            |b| special(b, tar::EntryType::Link, "v/h", Some("etc/shadow")),
+            "outside 'v/'",
+        );
     }
 }

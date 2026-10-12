@@ -646,7 +646,9 @@ name = "docker"
 version = "0.1.0"
 dependencies = [
  "bollard",
+ "bytes",
  "flate2",
+ "futures-core",
  "libc",
  "plugin-toolkit",
  "tar",

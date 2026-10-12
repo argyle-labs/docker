@@ -49,6 +49,10 @@ plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main",
 # bollard" means: the concrete engine client rides with the plugin, orca stays
 # generic.
 bollard = { version = "0.21", default-features = false, features = ["pipe"] }
+# bollard's streaming request body: a volume archive is uploaded from its
+# verified file without being held in memory.
+bytes = "1"
+futures-core = "0.3"
 
 # Engine-state backup/restore reads and writes the archive in-process, so each
 # entry is checked from the same open file it is extracted from.
