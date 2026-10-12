@@ -31,6 +31,7 @@ pub mod prune;
 pub mod registration;
 pub mod runtime_adapter;
 pub mod stack_manifest;
+pub mod stack_pull;
 pub mod stacks;
 #[cfg(test)]
 mod test_engine;
