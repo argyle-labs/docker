@@ -126,7 +126,10 @@ fn is_digest_gone(e: &bollard::errors::Error, pinned: &str) -> bool {
         && m.contains(digest)
 }
 
-async fn pull(docker: &Docker, reference: &str) -> std::result::Result<(), bollard::errors::Error> {
+pub(crate) async fn pull(
+    docker: &Docker,
+    reference: &str,
+) -> std::result::Result<(), bollard::errors::Error> {
     let opts = CreateImageOptionsBuilder::new()
         .from_image(reference)
         .build();

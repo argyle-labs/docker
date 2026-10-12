@@ -299,9 +299,24 @@ pub fn validate(file: &mut File) -> Result<()> {
     validate_within(file, LIMITS)
 }
 
-fn validate_within(file: &mut File, limits: Limits) -> Result<()> {
+pub(crate) fn validate_within(file: &mut File, limits: Limits) -> Result<()> {
     let mut seen = 0;
     for entry in archive(file, limits, ENGINE)?.entries()? {
+        count(&mut seen, limits)?;
+        admit(&entry?)?;
+    }
+    Ok(())
+}
+
+/// Check every entry of a gzip tar held in memory, as [`validate`] does.
+pub(crate) fn validate_bytes(data: &[u8], limits: Limits) -> Result<()> {
+    let mut archive = Archive::new(Capped {
+        inner: GzDecoder::new(data),
+        left: limits.bytes,
+        limit: limits.bytes,
+    });
+    let mut seen = 0;
+    for entry in archive.entries()? {
         count(&mut seen, limits)?;
         admit(&entry?)?;
     }
