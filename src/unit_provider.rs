@@ -1611,9 +1611,6 @@ fn fix_result(
     Ok((result, write))
 }
 
-/// Where a stack backup goes when the caller names no destination: a
-/// `.orca-backups` sibling of the stack dir, so the archive is never written
-/// inside the directory being archived.
 /// The side effects of a stack restore past its read-only checks, behind a
 /// trait so their order and recovery are testable without an engine.
 trait RestoreSteps {
@@ -1653,11 +1650,21 @@ async fn bring_back(s: &mut impl RestoreSteps) -> String {
 async fn run_restore(s: &mut impl RestoreSteps, with_volumes: bool) -> Result<Restored> {
     let mut volumes = Vec::new();
     let live = if with_volumes {
-        let live = match s.take_down().await {
+        let was_live = match s.live().await {
             Ok(live) => live,
             Err(e) => {
+                return Err(s.fail(e.context("restore failed before any change")));
+            }
+        };
+        let live = match s.take_down().await {
+            Ok(live) => live || was_live,
+            Err(e) => {
                 // A failed removal may have stopped some containers.
-                let back = bring_back(s).await;
+                let back = if was_live {
+                    bring_back(s).await
+                } else {
+                    String::new()
+                };
                 return Err(s.fail(e.context(format!(
                     "take the stack down for the volume restore; the stack dir is unchanged{back}"
                 ))));
@@ -1790,6 +1797,9 @@ impl RestoreSteps for EngineRestore<'_> {
     }
 }
 
+/// Where a stack backup goes when the caller names no destination: a
+/// `.orca-backups` sibling of the stack dir, so the archive is never written
+/// inside the directory being archived.
 fn default_backup_dir(dir: &std::path::Path) -> std::path::PathBuf {
     dir.parent().unwrap_or(dir).join(".orca-backups")
 }
@@ -3455,7 +3465,7 @@ mod tests {
             ..Default::default()
         };
         let done = run(&mut s, true).unwrap();
-        assert_eq!(s.calls, ["take_down", "write", "swap", "up"]);
+        assert_eq!(s.calls, ["live", "take_down", "write", "swap", "up"]);
         assert_eq!(done.volumes, ["s_data"]);
         assert!(done.stopped.is_none());
     }
@@ -3464,7 +3474,10 @@ mod tests {
     fn a_stopped_stack_is_stopped_again_after_its_restore() {
         let mut s = FakeSteps::default();
         let done = run(&mut s, true).unwrap();
-        assert_eq!(s.calls, ["take_down", "write", "swap", "up", "stop"]);
+        assert_eq!(
+            s.calls,
+            ["live", "take_down", "write", "swap", "up", "stop"]
+        );
         assert!(done.stopped.unwrap().contains("stopped again"));
         let mut s = FakeSteps::default();
         run(&mut s, false).unwrap();
@@ -3479,8 +3492,19 @@ mod tests {
             ..Default::default()
         };
         let err = format!("{:#}", run(&mut s, true).err().unwrap());
-        assert_eq!(s.calls, ["take_down", "up", "fail"]);
+        assert_eq!(s.calls, ["live", "take_down", "up", "fail"]);
         assert!(err.contains("the previous stack is back up"), "{err}");
+    }
+
+    #[test]
+    fn a_failed_take_down_leaves_a_stopped_stack_stopped() {
+        let mut s = FakeSteps {
+            fail_take_down: true,
+            ..Default::default()
+        };
+        let err = format!("{:#}", run(&mut s, true).err().unwrap());
+        assert_eq!(s.calls, ["live", "take_down", "fail"]);
+        assert!(!err.contains("back up"), "{err}");
     }
 
     #[test]
@@ -3491,13 +3515,13 @@ mod tests {
             ..Default::default()
         };
         run(&mut s, true).err().unwrap();
-        assert_eq!(s.calls, ["take_down", "write", "up", "fail"]);
+        assert_eq!(s.calls, ["live", "take_down", "write", "up", "fail"]);
         let mut s = FakeSteps {
             fail_write: true,
             ..Default::default()
         };
         let err = format!("{:#}", run(&mut s, true).err().unwrap());
-        assert_eq!(s.calls, ["take_down", "write", "fail"]);
+        assert_eq!(s.calls, ["live", "take_down", "write", "fail"]);
         assert!(err.contains("stack dir is unchanged"), "{err}");
     }
 
@@ -3509,7 +3533,10 @@ mod tests {
             ..Default::default()
         };
         let err = format!("{:#}", run(&mut s, true).err().unwrap());
-        assert_eq!(s.calls, ["take_down", "write", "swap", "roll_back", "up"]);
+        assert_eq!(
+            s.calls,
+            ["live", "take_down", "write", "swap", "roll_back", "up"]
+        );
         assert!(err.contains("rolled back"), "{err}");
         assert!(err.contains("the previous stack is back up"), "{err}");
 
@@ -3534,7 +3561,7 @@ mod tests {
             ..Default::default()
         };
         let err = format!("{:#}", run(&mut s, true).err().unwrap());
-        assert_eq!(s.calls, ["take_down", "write", "swap", "up"]);
+        assert_eq!(s.calls, ["live", "take_down", "write", "swap", "up"]);
         assert!(err.contains("compose up failed: up broke"), "{err}");
     }
 }
