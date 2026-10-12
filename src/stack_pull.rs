@@ -42,6 +42,9 @@ pub fn parse(pair: &str) -> Result<Pin> {
     if normalize(repo_of(pinned)) != normalize(repo_of(image)) {
         bail!("'{pair}': '{pinned}' is not a digest of '{image}'");
     }
+    if image.contains('@') && image != pinned {
+        bail!("'{pair}': '{image}' already names a different digest");
+    }
     Ok(Pin {
         image: image.to_owned(),
         pinned: pinned.to_owned(),
@@ -112,13 +115,15 @@ fn is_digest_gone(e: &bollard::errors::Error, pinned: &str) -> bool {
         return true;
     }
     let digest = pinned.split_once('@').map_or("", |(_, d)| d);
-    matches!(
-        e,
-        bollard::errors::Error::DockerResponseServerError {
-            status_code: 404,
-            ..
-        }
-    ) && m.contains(digest)
+    !digest.is_empty()
+        && matches!(
+            e,
+            bollard::errors::Error::DockerResponseServerError {
+                status_code: 404,
+                ..
+            }
+        )
+        && m.contains(digest)
 }
 
 async fn pull(docker: &Docker, reference: &str) -> std::result::Result<(), bollard::errors::Error> {
@@ -267,6 +272,14 @@ mod tests {
             .is_err()
         );
         assert!(parse(&format!("redis:7=redis@md5:{}", &A[7..])).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_a_digest_image_pinned_to_another_digest() {
+        let a = format!("app@sha256:{}", "a".repeat(64));
+        let b = format!("app@sha256:{}", "b".repeat(64));
+        assert!(parse(&format!("{a}={b}")).is_err());
+        assert!(parse(&format!("{a}={a}")).is_ok());
     }
 
     #[test]
