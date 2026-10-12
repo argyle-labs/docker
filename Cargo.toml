@@ -61,12 +61,13 @@ flate2 = "1"
 # The path an open descriptor refers to (F_GETPATH / /proc/self/fd), to
 # confirm the archive read is the one inside the backup root.
 libc = "0.2"
+# A private unlinked copy of a volume archive to verify and upload from.
+tempfile = "3"
 
 [dev-dependencies]
 # Dev-only: in-crate tests reach the toolkit's seams (serde, `reactor::block_on`)
 # the same way the lib does. Not a runtime dep.
 plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", default-features = false, features = ["tools", "db", "containers"] }
-tempfile = "3"
 
 # Match orca's workspace lint floor: discarding a Result/Option via
 # `let _ = ...` stays a hard error so the plugin remains portable back into the

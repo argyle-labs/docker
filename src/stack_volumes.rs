@@ -362,10 +362,7 @@ async fn export_one(docker: &Docker, volume: &str, path: &Path) -> Result<(Strin
     let checked = written.and(removed).and_then(|()| {
         let mut f = File::open(path)?;
         engine_state::validate_volume(&mut f, ARCHIVE_ROOT, VOLUME_LIMITS)?;
-        Ok((
-            plugin_toolkit::hash::sha256_file(path)?,
-            f.metadata()?.len(),
-        ))
+        Ok((fd_sha256(&mut f)?, f.metadata()?.len()))
     });
     if checked.is_err() {
         let _removed = std::fs::remove_file(path);
@@ -632,10 +629,32 @@ fn load(manifest: &str, sha256: &str, roots: &[String]) -> Result<(VolumeManifes
     Ok((parsed, dir))
 }
 
-/// The archive of `v`, copied to a private unlinked file beside it, then
-/// sum-checked and entry-checked there: the returned descriptor, rewound,
-/// holds exactly the bytes that passed, whatever happens to the original.
-fn verified_archive(dir: &Path, v: &VolumeEntry, roots: &[String]) -> Result<File> {
+/// sha256 of everything `file` holds, read through its own descriptor.
+fn fd_sha256(file: &mut File) -> Result<String> {
+    // On macOS `/dev/fd/N` shares this descriptor's offset.
+    file.rewind()?;
+    let sum =
+        plugin_toolkit::hash::sha256_file(Path::new(&format!("/dev/fd/{}", file.as_raw_fd())))?;
+    file.rewind()?;
+    Ok(sum)
+}
+
+/// Sum-check and entry-check `file` as the archive of `v`, leaving it rewound.
+fn verify(file: &mut File, v: &VolumeEntry, sha: &str) -> Result<()> {
+    let what = format!("archive of volume '{}'", v.name);
+    check_sum(&fd_sha256(file)?, sha, &what)?;
+    engine_state::validate_volume(file, ARCHIVE_ROOT, VOLUME_LIMITS)
+        .with_context(|| what.clone())?;
+    file.rewind()?;
+    Ok(())
+}
+
+/// The archive of `v`, opened read-only from beside the manifest.
+fn open_volume_archive<'a>(
+    dir: &Path,
+    v: &'a VolumeEntry,
+    roots: &[String],
+) -> Result<(File, &'a str)> {
     let (Some(name), Some(sha)) = (v.archive.as_deref(), v.sha256.as_deref()) else {
         bail!(
             "volume '{}' has no archive and sha256 in the manifest",
@@ -648,30 +667,23 @@ fn verified_archive(dir: &Path, v: &VolumeEntry, roots: &[String]) -> Result<Fil
             v.name
         );
     }
-    let mut src = open_archive(&dir.join(name).to_string_lossy(), roots)?;
-    let tmp = dir.join(format!(
-        ".{name}.{}-{}.verify",
-        std::process::id(),
-        plugin_toolkit::time::now().unix_millis()
-    ));
-    let mut copy = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)
-        .with_context(|| format!("failed to create '{}'", tmp.display()))?;
-    std::fs::remove_file(&tmp).with_context(|| format!("failed to unlink '{}'", tmp.display()))?;
+    Ok((open_archive(&dir.join(name).to_string_lossy(), roots)?, sha))
+}
+
+/// Check the archive of `v` in place.
+fn check_archive(dir: &Path, v: &VolumeEntry, roots: &[String]) -> Result<()> {
+    let (mut src, sha) = open_volume_archive(dir, v, roots)?;
+    verify(&mut src, v, sha)
+}
+
+/// The archive of `v` copied to a private unlinked temp file and checked
+/// there: the returned descriptor holds exactly the bytes that passed,
+/// whatever happens to the original, and the backup dir may be read-only.
+fn verified_archive(dir: &Path, v: &VolumeEntry, roots: &[String]) -> Result<File> {
+    let (mut src, sha) = open_volume_archive(dir, v, roots)?;
+    let mut copy = tempfile::tempfile().context("failed to create a temp file")?;
     std::io::copy(&mut src, &mut copy)?;
-    // On macOS `/dev/fd/N` shares this descriptor's offset.
-    copy.rewind()?;
-    let what = format!("archive of volume '{}'", v.name);
-    // `/dev/fd/N` reaches the unlinked copy; nothing else can.
-    let got =
-        plugin_toolkit::hash::sha256_file(Path::new(&format!("/dev/fd/{}", copy.as_raw_fd())))?;
-    check_sum(&got, sha, &what)?;
-    engine_state::validate_volume(&mut copy, ARCHIVE_ROOT, VOLUME_LIMITS)
-        .with_context(|| what.clone())?;
+    verify(&mut copy, v, sha)?;
     Ok(copy)
 }
 
@@ -824,22 +836,36 @@ fn container_name(c: &ContainerSummary) -> String {
 /// empty it, which the engine refuses for a volume in use.
 async fn refuse_in_use(docker: &Docker, volume: &str, act: ImportAction) -> Result<()> {
     let users = containers_using(docker, volume).await?;
+    refuse_live(volume, &users, None)?;
+    if act == ImportAction::Overwrite && !users.is_empty() {
+        let names: Vec<String> = users.iter().map(container_name).collect();
+        bail!(
+            "volume '{volume}' is referenced by containers: {}; remove them (compose down) before overwriting it",
+            names.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Anything but created/exited/dead may write to the volume (running, paused,
+/// restarting, removing); an unknown state counts as live.
+fn is_live(c: &ContainerSummary) -> bool {
+    !matches!(
+        c.state.as_ref().map(|s| s.to_string()).as_deref(),
+        Some("created" | "exited" | "dead")
+    )
+}
+
+fn refuse_live(volume: &str, users: &[ContainerSummary], helper: Option<&str>) -> Result<()> {
     let running: Vec<String> = users
         .iter()
-        .filter(|c| c.state.as_ref().map(|s| s.to_string()).as_deref() == Some("running"))
+        .filter(|c| c.id.as_deref().is_none_or(|id| Some(id) != helper) && is_live(c))
         .map(container_name)
         .collect();
     if !running.is_empty() {
         bail!(
             "volume '{volume}' is mounted by running containers: {}; stop them first",
             running.join(", ")
-        );
-    }
-    if act == ImportAction::Overwrite && !users.is_empty() {
-        let names: Vec<String> = users.iter().map(container_name).collect();
-        bail!(
-            "volume '{volume}' is referenced by containers: {}; remove them (compose down) before overwriting it",
-            names.join(", ")
         );
     }
     Ok(())
@@ -897,7 +923,6 @@ async fn apply_one(
     docker: &Docker,
     v: &VolumeEntry,
     act: ImportAction,
-    have: Option<&Volume>,
     dir: &Path,
     roots: &[String],
     out: &mut StackVolumesImportOutput,
@@ -922,8 +947,10 @@ async fn apply_one(
         refuse_in_use(docker, &v.name, act).await?;
     }
     if act == ImportAction::Overwrite {
-        let have = have.ok_or_else(|| anyhow!("volume '{}' vanished", v.name))?;
-        recreate(docker, have).await?;
+        let have = existing(docker, &v.name)
+            .await?
+            .ok_or_else(|| anyhow!("volume '{}' was removed during the import", v.name))?;
+        recreate(docker, &have).await?;
     }
     let id = helper(docker, &v.name, false).await?;
     let restored = async {
@@ -933,6 +960,12 @@ async fn apply_one(
                 v.name
             );
         }
+        // The stack may have been started since the first check.
+        refuse_live(
+            &v.name,
+            &containers_using(docker, &v.name).await?,
+            Some(&id),
+        )?;
         let opts = UploadToContainerOptionsBuilder::new().path("/").build();
         docker
             .upload_to_container(&id, Some(opts), bollard::body_try_stream(FileBody(archive)))
@@ -976,7 +1009,7 @@ pub async fn import(
                 ),
             }),
             VolumeKind::Data => {
-                verified_archive(&dir, v, roots)?;
+                check_archive(&dir, v, roots)?;
                 todo.push(v);
             }
             _ => todo.push(v),
@@ -1010,7 +1043,7 @@ pub async fn import(
             });
             continue;
         }
-        if let Err(e) = apply_one(docker, v, act, have.as_ref(), &dir, roots, &mut out).await {
+        if let Err(e) = apply_one(docker, v, act, &dir, roots, &mut out).await {
             out.findings.push(ImportFinding {
                 name: v.name.clone(),
                 message: format!("{e:#}"),
@@ -1030,7 +1063,8 @@ pub async fn import(
 /// through the Engine API. A volume a running container mounts is refused;
 /// an existing volume that holds data is refused unless `force`, which
 /// removes and recreates it empty first. Skipped volumes are listed with the
-/// reason.
+/// reason. Keep the stack down for the whole import: a container that starts
+/// on a volume between the last check and its upload is not seen.
 #[orca_tool(
     domain = "docker",
     verb = "stack_volumes_import",
@@ -1713,6 +1747,68 @@ mod tests {
             );
             assert!(e.paths("PUT").is_empty() && e.paths("DELETE").is_empty());
         }
+    }
+
+    #[test]
+    fn import_refuses_paused_and_restarting_containers() {
+        let root = tempfile::tempdir().unwrap();
+        let (manifest, sha) = bundle(root.path(), &[("db", "rows")]);
+        for state in ["paused", "restarting"] {
+            let users = format!(r#"[{{"Id":"c1","Names":["/s-app-1"],"State":"{state}"}}]"#);
+            let e = target_engine_with(Some(&[]), &users, 200);
+            let out = block(import(
+                &e.client(),
+                &import_args(&manifest, &sha, false, true),
+                &roots(root.path()),
+            ))
+            .unwrap();
+            assert!(out.restored.is_empty(), "{state}");
+            assert!(
+                out.findings[0]
+                    .message
+                    .contains("running containers: s-app-1"),
+                "{state}"
+            );
+            assert!(e.paths("PUT").is_empty(), "{state}");
+        }
+    }
+
+    #[test]
+    fn upload_rechecks_users_after_the_helper_is_created() {
+        let root = tempfile::tempdir().unwrap();
+        let (manifest, sha) = bundle(root.path(), &[("db", "rows")]);
+        // A new volume has no users to check up front, so only the re-check
+        // before the upload can see this container.
+        let users = r#"[{"Id":"c1","Names":["/s-app-1"],"State":"running"}]"#;
+        let e = target_engine_with(None, users, 200);
+        let out = block(import(
+            &e.client(),
+            &import_args(&manifest, &sha, false, true),
+            &roots(root.path()),
+        ))
+        .unwrap();
+        assert!(out.restored.is_empty());
+        assert!(
+            out.findings[0]
+                .message
+                .contains("running containers: s-app-1")
+        );
+        assert!(e.paths("PUT").is_empty());
+        assert!(
+            e.paths("DELETE")
+                .iter()
+                .any(|p| p.ends_with("/containers/h1"))
+        );
+
+        let helper = r#"[{"Id":"h1","Names":["/helper"],"State":"running"}]"#;
+        let e = target_engine_with(None, helper, 200);
+        let out = block(import(
+            &e.client(),
+            &import_args(&manifest, &sha, false, true),
+            &roots(root.path()),
+        ))
+        .unwrap();
+        assert_eq!(out.restored, ["s_data"], "the helper is not a user");
     }
 
     #[test]
