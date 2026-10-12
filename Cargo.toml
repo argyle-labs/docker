@@ -63,6 +63,8 @@ flate2 = "1"
 libc = "0.2"
 # A private unlinked copy of a volume archive to verify and upload from.
 tempfile = "3"
+# Hashes volume artifacts as they stream out of a stack archive.
+sha2 = "0.10"
 
 [dev-dependencies]
 # Dev-only: in-crate tests reach the toolkit's seams (serde, `reactor::block_on`)

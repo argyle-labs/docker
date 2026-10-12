@@ -807,7 +807,10 @@ async fn copy_one(
     created: &mut Vec<String>,
 ) -> Result<()> {
     let c = &p.conversion;
-    if crate::volume_coverage::volume_exists(docker, &c.name).await? {
+    if crate::stack_volumes::existing(docker, &c.name)
+        .await?
+        .is_some()
+    {
         anyhow::bail!(
             "target volume {} already exists; remove it or convert by hand",
             c.name
