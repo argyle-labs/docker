@@ -679,12 +679,43 @@ fn check_archive(dir: &Path, v: &VolumeEntry, roots: &[String]) -> Result<()> {
 /// The archive of `v` copied to a private unlinked temp file and checked
 /// there: the returned descriptor holds exactly the bytes that passed,
 /// whatever happens to the original, and the backup dir may be read-only.
+/// The copy needs scratch space in the temp dir equal to the archive size.
 fn verified_archive(dir: &Path, v: &VolumeEntry, roots: &[String]) -> Result<File> {
     let (mut src, sha) = open_volume_archive(dir, v, roots)?;
     let mut copy = tempfile::tempfile().context("failed to create a temp file")?;
+    let needed = src.metadata()?.len();
+    enough_scratch(free_space(&copy)?, needed).map_err(|e| {
+        anyhow!(
+            "volume '{}': {e} in {}; set TMPDIR to a larger disk",
+            v.name,
+            std::env::temp_dir().display()
+        )
+    })?;
     std::io::copy(&mut src, &mut copy)?;
     verify(&mut copy, v, sha)?;
     Ok(copy)
+}
+
+/// Bytes available to an unprivileged writer on the filesystem holding `f`.
+fn free_space(f: &File) -> Result<u64> {
+    use std::os::fd::AsRawFd;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: valid open fd and a properly sized out-param.
+    if unsafe { libc::fstatvfs(f.as_raw_fd(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to stat the temp filesystem");
+    }
+    Ok((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+}
+
+/// Headroom so the copy never fills the scratch filesystem completely.
+const SCRATCH_MARGIN: u64 = 64 * 1024 * 1024;
+
+fn enough_scratch(available: u64, needed: u64) -> Result<()> {
+    let want = needed.saturating_add(SCRATCH_MARGIN);
+    if available < want {
+        bail!("not enough scratch space: need {want} bytes, {available} available");
+    }
+    Ok(())
 }
 
 /// A file read in chunks as a request body.
@@ -941,11 +972,11 @@ async fn apply_one(
     if matches!(act, ImportAction::Create | ImportAction::Keep) {
         return Ok(());
     }
-    // Checked again: the file may have changed since the pre-check.
-    let archive = verified_archive(dir, v, roots)?;
     if matches!(act, ImportAction::RestoreIfEmpty | ImportAction::Overwrite) {
         refuse_in_use(docker, &v.name, act).await?;
     }
+    // Checked again: the file may have changed since the pre-check.
+    let archive = verified_archive(dir, v, roots)?;
     if act == ImportAction::Overwrite {
         let have = existing(docker, &v.name)
             .await?
@@ -1087,6 +1118,13 @@ async fn docker_stack_volumes_import(
 mod tests {
     use super::*;
     use crate::test_engine::{FakeEngine, Route};
+
+    #[test]
+    fn scratch_space_must_cover_archive_and_margin() {
+        assert!(enough_scratch(100 + SCRATCH_MARGIN, 100).is_ok());
+        assert!(enough_scratch(99 + SCRATCH_MARGIN, 100).is_err());
+        assert!(enough_scratch(0, 0).is_err());
+    }
 
     fn block<F: std::future::Future>(f: F) -> F::Output {
         plugin_toolkit::reactor::block_on(f)
