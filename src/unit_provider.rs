@@ -48,8 +48,9 @@ use crate::lint::{self, Finding, NotFixed};
 use crate::ownership::{self, Migrated, Migrator};
 use crate::policy;
 use crate::runtime_adapter::DockerAdapter;
+use crate::stack_volumes;
 use crate::stacks::{self, StackRow, StagedRestore};
-use crate::volume_coverage::{self, Strategy, VolumePolicy};
+use crate::volume_coverage::{self, ArchiveVolumes, Strategy, VolumePolicy};
 
 const KIND: &str = "container";
 const STACK_KIND: &str = "stack";
@@ -536,26 +537,28 @@ impl DockerUnitProvider {
         std::fs::create_dir_all(&dest)
             .map_err(|e| anyhow::anyhow!("create backup dir {}: {e}", dest.display()))?;
         let policies = volume_coverage::policies(&row.name)?;
-        let volumes = if policies.is_empty() {
-            Vec::new()
+        let (project, volumes) = if policies.is_empty() {
+            (String::new(), Vec::new())
         } else {
-            self.stack_volumes(row).await?.1
+            self.stack_volumes(row).await?
         };
-        let compose = row.compose().map_err(anyhow::Error::from)?;
         let docker = self.adapter.client().map_err(adapter_err)?;
         let root = volume_coverage::staging_root(&dest, &row.name)?;
         let ts = plugin_toolkit::time::now().unix_seconds();
         let archive = dest.join(format!("{}-{ts}.tar.gz", row.name));
         let result = async {
-            let staged =
-                volume_coverage::stage(docker, &root, &compose, &volumes, &policies).await?;
+            volume_coverage::stage(docker, &root, &project, &volumes, &policies).await?;
             // The archive holds config and secrets: private from creation, and
             // tar keeps an existing file's mode.
             volume_coverage::create_private(&archive)?;
-            let has_staging = !staged.artifacts.is_empty() || !staged.skipped.is_empty();
-            let args = tar_args(&archive, &row.dir, &root, has_staging);
+            let args = tar_args(&archive, &row.dir, &root, !policies.is_empty());
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            run_tar(&args).await
+            run_tar(&args).await?;
+            // Read back what was written, so a backup is only returned once
+            // its volume sums check out.
+            let mut file = std::fs::File::open(&archive)?;
+            volume_coverage::verify_archive(&mut file)?;
+            stack_volumes::fd_sha256(&mut file)
         }
         .await;
         // Exports can be large; they live on only inside the archive.
@@ -565,14 +568,14 @@ impl DockerUnitProvider {
             std::fs::remove_file(&archive)
                 .map_err(|e| anyhow::anyhow!("remove {}: {e}", archive.display()))?;
         }
-        result?;
+        let sha = result?;
         cleared?;
 
         let backup = BackupRef {
             locator: archive.to_string_lossy().into_owned(),
             manager: format!("docker@{}", self.hostname),
             timestamp: ts,
-            checksum: None,
+            checksum: Some(format!("sha256:{sha}")),
         };
         Ok(VerbOutcome::Item(ItemOutcome::new(
             id.clone(),
@@ -580,10 +583,12 @@ impl DockerUnitProvider {
         )))
     }
 
-    /// Restore a stack in place from a prior [`BackupRef`]: extract the archive
-    /// back over the project directory, then `docker compose up -d` so the running
-    /// stack reconciles to the restored compose and returns to service. The
-    /// inverse of [`Self::do_stack_backup`], which the RFC pairs it with.
+    /// Restore a stack in place from a prior [`BackupRef`]: check its sums,
+    /// write its exported volumes back through the Engine API, extract the
+    /// archive back over the project directory, then `docker compose up -d` so
+    /// the running stack reconciles to the restored compose and returns to
+    /// service. The inverse of [`Self::do_stack_backup`], which the RFC pairs
+    /// it with.
     async fn do_stack_restore(
         &self,
         _id: &UnitId,
@@ -591,18 +596,23 @@ impl DockerUnitProvider {
         payload: Option<String>,
     ) -> Result<VerbOutcome> {
         let raw = payload.ok_or_else(|| anyhow::anyhow!("restore requires a payload"))?;
-        let p: RestorePayload =
+        let p: StackRestorePayload =
             serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("restore payload: {e}"))?;
-        if let Some(component) = &p.component {
+        if let Some(component) = &p.restore.component {
             return Err(anyhow::anyhow!(
                 "docker stack restore has no component scope (got '{component}')"
             ));
         }
-        let archive = p.from.locator;
+        let archive = p.restore.from.locator;
         if archive.is_empty() {
             return Err(anyhow::anyhow!("restore backup ref has an empty locator"));
         }
         let mut file = restore_source(&archive, &row.dir, &engine_state::backup_roots())?;
+        let volumes = verified_source(
+            &mut file,
+            p.restore.from.checksum.as_deref(),
+            p.allow_unverified,
+        )?;
         engine_state::validate(&mut file)?;
         let roots = crate::tools::stacks_roots()?;
         let mut staged = StagedRestore::stage(row, &mut file, &roots)?;
@@ -639,12 +649,43 @@ impl DockerUnitProvider {
             let e = anyhow::anyhow!(stacks::redact(&format!("{e:#}"), &staged_secrets));
             return Err(staged.fail(e.context("restore refused; the stack dir is unchanged")));
         }
+        let mut restored = Vec::new();
+        let mut dumps = Vec::new();
+        if let Some(m) = &volumes {
+            let written = self
+                .restore_volumes(staged.path(), m, &mut restored, &mut dumps)
+                .await;
+            if let Err(e) = written {
+                let done = if restored.is_empty() {
+                    "no volume was written".to_string()
+                } else {
+                    format!("volumes already restored: {}", restored.join(", "))
+                };
+                return Err(staged.fail(e.context(format!(
+                    "volume restore failed ({done}); the stack dir is unchanged"
+                ))));
+            }
+        }
         let leftover = staged.swap()?;
         let out = ownership::up(row, &[]).await?;
+        let mut notes = String::new();
+        if !restored.is_empty() {
+            notes.push_str(&format!("; volumes restored: {}", restored.join(", ")));
+        }
+        if !dumps.is_empty() {
+            notes.push_str(&format!(
+                "; dumps left in {}/ for the app to load: {}",
+                volume_coverage::STAGING_DIR,
+                dumps.join(", ")
+            ));
+        }
+        if volumes.is_none() && p.allow_unverified {
+            notes.push_str("; restored unverified, volume data not restored");
+        }
         Ok(VerbOutcome::Action(ActionOutcome {
             changed: true,
             message: format!(
-                "restored stack '{}' from {archive}{}; up: {}",
+                "restored stack '{}' from {archive}{}{notes}; up: {}",
                 row.name,
                 leftover
                     .map(|p| format!(" (the previous dir is left at {})", p.display()))
@@ -652,6 +693,44 @@ impl DockerUnitProvider {
                 out.trim()
             ),
         }))
+    }
+
+    /// Write each exported volume of `m` back from the staged dir `dir`,
+    /// pushing restored names onto `restored` and dump artifacts onto `dumps`.
+    async fn restore_volumes(
+        &self,
+        dir: &std::path::Path,
+        m: &volume_coverage::VolumesManifest,
+        restored: &mut Vec<String>,
+        dumps: &mut Vec<String>,
+    ) -> Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let docker = self.adapter.client().map_err(adapter_err)?;
+        for a in &m.artifacts {
+            if a.strategy == Strategy::Dump {
+                dumps.push(a.artifact.clone());
+                continue;
+            }
+            let path = dir.join(volume_coverage::STAGING_DIR).join(&a.artifact);
+            let src = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path)
+                .map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
+            stack_volumes::restore_stack_volume(
+                docker,
+                &a.engine_name,
+                &a.driver,
+                &a.options,
+                &a.labels,
+                &a.sha256,
+                src,
+            )
+            .await
+            .map_err(|e| e.context(format!("restore volume '{}'", a.volume)))?;
+            restored.push(a.engine_name.clone());
+        }
+        Ok(())
     }
 
     /// Shared create/upsert path: register the stack, (optionally) write its
@@ -1293,6 +1372,19 @@ pub struct StackBackupPayload {
     pub dest: Option<String>,
 }
 
+/// Payload for `Update{action:"restore"}`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(crate = "plugin_toolkit::serde")]
+#[schemars(crate = "plugin_toolkit::schemars")]
+pub struct StackRestorePayload {
+    #[serde(flatten)]
+    pub restore: RestorePayload,
+    /// Restore a backup whose ref or volume data carries no checksums. Its
+    /// stack files are restored unchecked and its volume data is not.
+    #[serde(default)]
+    pub allow_unverified: bool,
+}
+
 /// Payload for `Create{action:"deploy"}` and `Upsert{action:"set"}` — register
 /// a stack, optionally (re)write its files, then deploy.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -1378,7 +1470,7 @@ fn stack_declaration() -> KindDeclaration {
     });
     update_actions.push(ActionDecl {
         action: ACTION_RESTORE.into(),
-        payload_schema: Some(schema_for!(RestorePayload)),
+        payload_schema: Some(schema_for!(StackRestorePayload)),
         response_schema: None,
     });
 
@@ -1537,6 +1629,38 @@ fn fix_result(
 /// inside the directory being archived.
 fn default_backup_dir(dir: &std::path::Path) -> std::path::PathBuf {
     dir.parent().unwrap_or(dir).join(".orca-backups")
+}
+
+/// Check a restore archive before anything is written: its sha256 against
+/// the backup ref's, and each volume artifact against the archive's manifest.
+/// A backup without them is refused unless `allow_unverified`; its volume
+/// data is then not restored.
+fn verified_source(
+    file: &mut std::fs::File,
+    checksum: Option<&str>,
+    allow_unverified: bool,
+) -> Result<Option<volume_coverage::VolumesManifest>> {
+    match checksum {
+        Some(sum) => stack_volumes::check_sum(
+            &stack_volumes::fd_sha256(file)?,
+            sum.strip_prefix("sha256:").unwrap_or(sum),
+            "backup archive",
+        )?,
+        None if !allow_unverified => anyhow::bail!(
+            "the backup ref carries no checksum, so the archive cannot be verified; \
+             pass allow_unverified: true to restore it unchecked"
+        ),
+        None => {}
+    }
+    match volume_coverage::verify_archive(file)? {
+        ArchiveVolumes::None => Ok(None),
+        ArchiveVolumes::Verified(m) => Ok(Some(m)),
+        ArchiveVolumes::Unverified if allow_unverified => Ok(None),
+        ArchiveVolumes::Unverified => anyhow::bail!(
+            "the backup's volume data carries no checksums, so it cannot be verified; \
+             pass allow_unverified: true to restore the stack files without it"
+        ),
+    }
 }
 
 /// Open a restore archive, refused outside the backup roots and outside the
@@ -2482,7 +2606,54 @@ mod tests {
             b.append_data(&mut h, name, body.as_bytes()).unwrap();
         }
         b.into_inner().unwrap().finish().unwrap();
-        serde_json::json!({"from": {"locator": path(&archive), "manager": "docker@test", "timestamp": 0}})
+        let sum = plugin_toolkit::hash::sha256_file(&archive).unwrap();
+        serde_json::json!({"from": {
+            "locator": path(&archive),
+            "manager": "docker@test",
+            "timestamp": 0,
+            "checksum": format!("sha256:{sum}"),
+        }})
+    }
+
+    fn gz_tar(files: &[(&str, &str)]) -> std::fs::File {
+        let mut file = tempfile::tempfile().unwrap();
+        let gz = flate2::write::GzEncoder::new(&mut file, flate2::Compression::default());
+        let mut b = tar::Builder::new(gz);
+        for (name, body) in files {
+            let mut h = tar::Header::new_gnu();
+            h.set_mode(0o644);
+            h.set_size(body.len() as u64);
+            b.append_data(&mut h, name, body.as_bytes()).unwrap();
+        }
+        b.into_inner().unwrap().finish().unwrap();
+        file
+    }
+
+    #[test]
+    fn restore_checks_the_ref_sum_and_refuses_unsummed_backups_without_the_override() {
+        let mut f = gz_tar(&[("./compose.yaml", "services: {}\n")]);
+        let sum = stack_volumes::fd_sha256(&mut f).unwrap();
+        assert_eq!(
+            verified_source(&mut f, Some(&format!("sha256:{sum}")), false).unwrap(),
+            None
+        );
+        let err = verified_source(&mut f, Some(&"0".repeat(64)), true).unwrap_err();
+        assert!(err.to_string().contains("does not match"), "{err}");
+        let err = verified_source(&mut f, None, false).unwrap_err();
+        assert!(err.to_string().contains("allow_unverified"), "{err}");
+        assert_eq!(verified_source(&mut f, None, true).unwrap(), None);
+
+        let mut legacy = gz_tar(&[(".orca-volumes/data.tar.gz", "old")]);
+        let sum = stack_volumes::fd_sha256(&mut legacy).unwrap();
+        let err = verified_source(&mut legacy, Some(&sum), false).unwrap_err();
+        assert!(
+            err.to_string().contains("volume data carries no checksums"),
+            "{err}"
+        );
+        assert_eq!(
+            verified_source(&mut legacy, Some(&sum), true).unwrap(),
+            None
+        );
     }
 
     fn err_of(r: Result<VerbOutcome>) -> String {

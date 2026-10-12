@@ -355,7 +355,11 @@ async fn download(docker: &Docker, id: &str, path: &Path) -> Result<()> {
 /// Write `volume` to `path` and return its sha256 and size. The archive is
 /// checked as import will check it, so a volume import would refuse fails
 /// here instead.
-async fn export_one(docker: &Docker, volume: &str, path: &Path) -> Result<(String, u64)> {
+pub(crate) async fn export_one(
+    docker: &Docker,
+    volume: &str,
+    path: &Path,
+) -> Result<(String, u64)> {
     let id = helper(docker, volume, true).await?;
     let written = download(docker, &id, path).await;
     let removed = remove_helper(docker, &id).await;
@@ -609,7 +613,7 @@ fn read_capped(file: &mut File, cap: u64, what: &str) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn check_sum(got: &str, want: &str, what: &str) -> Result<()> {
+pub(crate) fn check_sum(got: &str, want: &str, what: &str) -> Result<()> {
     if !got.eq_ignore_ascii_case(want.trim()) {
         bail!("{what}: sha256 {got} does not match {want}; refusing it");
     }
@@ -630,7 +634,7 @@ fn load(manifest: &str, sha256: &str, roots: &[String]) -> Result<(VolumeManifes
 }
 
 /// sha256 of everything `file` holds, read through its own descriptor.
-fn fd_sha256(file: &mut File) -> Result<String> {
+pub(crate) fn fd_sha256(file: &mut File) -> Result<String> {
     // On macOS `/dev/fd/N` shares this descriptor's offset.
     file.rewind()?;
     let sum =
@@ -639,9 +643,10 @@ fn fd_sha256(file: &mut File) -> Result<String> {
     Ok(sum)
 }
 
-/// Sum-check and entry-check `file` as the archive of `v`, leaving it rewound.
-fn verify(file: &mut File, v: &VolumeEntry, sha: &str) -> Result<()> {
-    let what = format!("archive of volume '{}'", v.name);
+/// Sum-check and entry-check `file` as the archive of `volume`, leaving it
+/// rewound.
+fn verify(file: &mut File, volume: &str, sha: &str) -> Result<()> {
+    let what = format!("archive of volume '{volume}'");
     check_sum(&fd_sha256(file)?, sha, &what)?;
     engine_state::validate_volume(file, ARCHIVE_ROOT, VOLUME_LIMITS)
         .with_context(|| what.clone())?;
@@ -673,7 +678,7 @@ fn open_volume_archive<'a>(
 /// Check the archive of `v` in place.
 fn check_archive(dir: &Path, v: &VolumeEntry, roots: &[String]) -> Result<()> {
     let (mut src, sha) = open_volume_archive(dir, v, roots)?;
-    verify(&mut src, v, sha)
+    verify(&mut src, &v.name, sha)
 }
 
 /// The archive of `v` copied to a private unlinked temp file and checked
@@ -681,18 +686,22 @@ fn check_archive(dir: &Path, v: &VolumeEntry, roots: &[String]) -> Result<()> {
 /// whatever happens to the original, and the backup dir may be read-only.
 /// The copy needs scratch space in the temp dir equal to the archive size.
 fn verified_archive(dir: &Path, v: &VolumeEntry, roots: &[String]) -> Result<File> {
-    let (mut src, sha) = open_volume_archive(dir, v, roots)?;
+    let (src, sha) = open_volume_archive(dir, v, roots)?;
+    verified_copy(src, &v.name, sha)
+}
+
+/// `src` copied to a private unlinked temp file, checked there against `sha`.
+pub(crate) fn verified_copy(mut src: File, volume: &str, sha: &str) -> Result<File> {
     let mut copy = tempfile::tempfile().context("failed to create a temp file")?;
     let needed = src.metadata()?.len();
     enough_scratch(free_space(&copy)?, needed).map_err(|e| {
         anyhow!(
-            "volume '{}': {e} in {}; set TMPDIR to a larger disk",
-            v.name,
+            "volume '{volume}': {e} in {}; set TMPDIR to a larger disk",
             std::env::temp_dir().display()
         )
     })?;
     std::io::copy(&mut src, &mut copy)?;
-    verify(&mut copy, v, sha)?;
+    verify(&mut copy, volume, sha)?;
     Ok(copy)
 }
 
@@ -819,7 +828,7 @@ fn action(v: &VolumeEntry, exists: bool, force: bool) -> ImportAction {
     }
 }
 
-async fn existing(docker: &Docker, name: &str) -> Result<Option<Volume>> {
+pub(crate) async fn existing(docker: &Docker, name: &str) -> Result<Option<Volume>> {
     match docker.inspect_volume(name).await {
         Ok(v) => Ok(Some(v)),
         Err(bollard::errors::Error::DockerResponseServerError {
@@ -977,42 +986,69 @@ async fn apply_one(
     }
     // Checked again: the file may have changed since the pre-check.
     let archive = verified_archive(dir, v, roots)?;
+    restore_into(docker, &v.name, act, archive).await?;
+    out.restored.push(v.name.clone());
+    Ok(())
+}
+
+/// Write the verified `archive` into volume `name`, emptying it first for
+/// an overwrite.
+async fn restore_into(docker: &Docker, name: &str, act: ImportAction, archive: File) -> Result<()> {
     if act == ImportAction::Overwrite {
-        let have = existing(docker, &v.name)
+        let have = existing(docker, name)
             .await?
-            .ok_or_else(|| anyhow!("volume '{}' was removed during the import", v.name))?;
+            .ok_or_else(|| anyhow!("volume '{name}' was removed during the import"))?;
         recreate(docker, &have).await?;
     }
-    let id = helper(docker, &v.name, false).await?;
+    let id = helper(docker, name, false).await?;
     let restored = async {
         if act == ImportAction::RestoreIfEmpty && !is_empty(docker, &id).await? {
-            bail!(
-                "volume '{}' already holds data; pass force to replace it",
-                v.name
-            );
+            bail!("volume '{name}' already holds data; pass force to replace it");
         }
         // The stack may have been started since the first check.
-        refuse_live(
-            &v.name,
-            &containers_using(docker, &v.name).await?,
-            Some(&id),
-        )?;
+        refuse_live(name, &containers_using(docker, name).await?, Some(&id))?;
         let opts = UploadToContainerOptionsBuilder::new().path("/").build();
         docker
             .upload_to_container(&id, Some(opts), bollard::body_try_stream(FileBody(archive)))
             .await
-            .map_err(|e| {
-                anyhow!(
-                    "restore volume {}: {e}; partial restore; rerun with force",
-                    v.name
-                )
-            })
+            .map_err(|e| anyhow!("restore volume {name}: {e}; partial restore; rerun with force"))
     }
     .await;
     let removed = remove_helper(docker, &id).await;
-    restored.and(removed)?;
-    out.restored.push(v.name.clone());
-    Ok(())
+    restored.and(removed)
+}
+
+/// Restore volume `name` of a stack backup from `src`, checked against
+/// `sha`: replaced when it exists, else created as the backup recorded it.
+pub(crate) async fn restore_stack_volume(
+    docker: &Docker,
+    name: &str,
+    driver: &str,
+    options: &BTreeMap<String, String>,
+    labels: &BTreeMap<String, String>,
+    sha: &str,
+    src: File,
+) -> Result<()> {
+    let act = if existing(docker, name).await?.is_some() {
+        ImportAction::Overwrite
+    } else {
+        ImportAction::CreateAndRestore
+    };
+    if act == ImportAction::Overwrite {
+        refuse_in_use(docker, name, act).await?;
+    }
+    let archive = verified_copy(src, name, sha)?;
+    if act == ImportAction::CreateAndRestore {
+        create(
+            docker,
+            name,
+            driver,
+            options.clone().into_iter().collect(),
+            labels.clone().into_iter().collect(),
+        )
+        .await?;
+    }
+    restore_into(docker, name, act, archive).await
 }
 
 pub async fn import(

@@ -3,21 +3,26 @@
 //! A stack backup tars the stack's project directory, which misses data on
 //! named volumes. Each named volume gets a policy in the `docker.volume_policies`
 //! table:
-//! - `export`: the stack backup tars the volume through a throwaway helper
-//!   container (`docker run --rm -v <vol>:/v:ro … tar`);
-//! - `dump`: the stack backup runs an app-native dump command in a service
-//!   (e.g. `pg_dumpall -U postgres` for a postgres volume) and keeps its stdout.
+//! - `export`: the stack backup archives the volume through the Engine API
+//!   (see [`crate::stack_volumes`]) and a stack restore writes it back;
+//! - `dump`: the stack backup execs an app-native dump command in the
+//!   service's container (e.g. `pg_dumpall -U postgres` for a postgres
+//!   volume) and keeps its stdout; restoring a dump is left to the app.
 //!
 //! A volume with neither is reported as uncovered. Exports and dumps are
 //! staged in a per-run directory beside the archive and travel in the stack
-//! archive under `.orca-volumes/`.
+//! archive under `.orca-volumes/`, with a [`MANIFEST_FILE`] of their sha256
+//! sums that every restore checks before it writes anything.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use bollard::Docker;
+use bollard::container::LogOutput;
+use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::models::Volume;
-use bollard::query_parameters::ListVolumesOptionsBuilder;
+use bollard::query_parameters::{ListContainersOptionsBuilder, ListVolumesOptionsBuilder};
 use plugin_toolkit::abi::{DbOp, DbRow, DbValue};
 use plugin_toolkit::anyhow::{self, Result};
 use plugin_toolkit::runtime::{db_op, field_from_row};
@@ -25,6 +30,7 @@ use plugin_toolkit::schemars::JsonSchema;
 use plugin_toolkit::serde::{Deserialize, Serialize};
 
 use crate::compose_config::ComposeConfig;
+use crate::ownership::COMPOSE_SERVICE_LABEL;
 use crate::prune::{COMPOSE_PROJECT_LABEL, COMPOSE_VOLUME_LABEL};
 
 const TABLE: &str = "volume_policies";
@@ -40,6 +46,12 @@ pub const HELPER_IMAGE: &str =
 /// Lists the policies a backup skipped, inside the staging dir, so the
 /// archive itself says what it lacks.
 pub const SKIPPED_FILE: &str = "SKIPPED";
+
+/// The [`VolumesManifest`] inside the staging dir.
+pub const MANIFEST_FILE: &str = "manifest.json";
+const MAX_MANIFEST_BYTES: u64 = 16 << 20;
+/// Dump stderr kept for the error message.
+const MAX_STDERR_BYTES: usize = 64 << 10;
 
 /// Runs the dump command in the container with `pipefail` where that shell
 /// has it, so `pg_dump | gzip` fails when `pg_dump` does. The command is
@@ -404,69 +416,6 @@ pub fn artifact_name(p: &VolumePolicy) -> String {
     }
 }
 
-/// Streams the command after `$1` into the file `$1`; every value is a
-/// positional parameter.
-const TO_FILE: &str = r#"out="$1"; shift; exec "$@" > "$out""#;
-
-/// `sh` arguments that run `program args…` with stdout written to `out`.
-fn to_file_args(out: &Path, program: &str, args: Vec<String>) -> Vec<String> {
-    let mut v = vec![
-        "-c".to_string(),
-        TO_FILE.to_string(),
-        "sh".to_string(),
-        out.display().to_string(),
-        program.to_string(),
-    ];
-    v.extend(args);
-    v
-}
-
-/// `docker` arguments that stream a tar.gz of `engine_name` to stdout, from
-/// a helper with no network and the volume mounted read-only.
-pub fn export_args(engine_name: &str) -> Vec<String> {
-    vec![
-        "run".into(),
-        "--rm".into(),
-        "--network".into(),
-        "none".into(),
-        "--mount".into(),
-        format!("type=volume,src={engine_name},dst=/v,readonly"),
-        HELPER_IMAGE.into(),
-        "tar".into(),
-        "czf".into(),
-        "-".into(),
-        "-C".into(),
-        "/v".into(),
-        ".".into(),
-    ]
-}
-
-/// `sh` arguments that stream a dump to `out_file` without holding it in
-/// memory, through every compose file of the stack (`compose_files`, the
-/// `-f` pairs). Values travel as positional parameters, never spliced into
-/// either script.
-pub fn dump_args(
-    docker_bin: &str,
-    compose_files: &[String],
-    service: &str,
-    command: &str,
-    out_file: &Path,
-) -> Vec<String> {
-    let mut args: Vec<String> = vec!["compose".into()];
-    args.extend(compose_files.iter().cloned());
-    args.extend([
-        "exec".into(),
-        "-T".into(),
-        service.into(),
-        "sh".into(),
-        "-c".into(),
-        DUMP_WRAPPER.into(),
-        "orca-dump".into(),
-        command.into(),
-    ]);
-    to_file_args(out_file, docker_bin, args)
-}
-
 /// Create `path` empty with mode 0600; refuses an existing file.
 pub fn create_private(path: &Path) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -511,30 +460,128 @@ pub async fn mark_existing(docker: &Docker, volumes: &mut [StackVolume]) -> Resu
     Ok(())
 }
 
-async fn run_checked(program: &str, args: &[String], what: &str) -> Result<()> {
-    // The dump runs `docker compose` through `sh`, which interpolates.
-    let out = crate::clean_command(program)
+/// The id of a running container of compose `service` in `project`.
+async fn service_container(docker: &Docker, project: &str, service: &str) -> Result<String> {
+    let filters = HashMap::from([
+        (
+            "label".to_string(),
+            vec![
+                format!("{COMPOSE_PROJECT_LABEL}={project}"),
+                format!("{COMPOSE_SERVICE_LABEL}={service}"),
+            ],
+        ),
+        ("status".to_string(), vec!["running".to_string()]),
+    ]);
+    let found = docker
+        .list_containers(Some(
+            ListContainersOptionsBuilder::new()
+                .filters(&filters)
+                .build(),
+        ))
         .await
-        .args(args)
-        .output()
-        .await?;
-    if !out.status.success {
-        anyhow::bail!("{what}: {}", String::from_utf8_lossy(&out.stderr).trim());
+        .map_err(|e| anyhow::anyhow!("list containers of service {service}: {e}"))?;
+    found
+        .into_iter()
+        .find_map(|c| c.id)
+        .ok_or_else(|| anyhow::anyhow!("service '{service}' has no running container to dump from"))
+}
+
+/// Exec `command` in `container` through [`DUMP_WRAPPER`], streaming its
+/// stdout into `out`. A non-zero exit fails with its stderr.
+async fn dump(docker: &Docker, container: &str, command: &str, out: &Path) -> Result<()> {
+    let cmd = ["sh", "-c", DUMP_WRAPPER, "orca-dump", command]
+        .map(String::from)
+        .to_vec();
+    let exec = docker
+        .create_exec(
+            container,
+            CreateExecOptions {
+                cmd: Some(cmd),
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("create dump exec: {e}"))?;
+    let started = docker
+        .start_exec(&exec.id, None)
+        .await
+        .map_err(|e| anyhow::anyhow!("start dump exec: {e}"))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(out)
+        .map_err(|e| anyhow::anyhow!("open {}: {e}", out.display()))?;
+    let mut stderr = Vec::new();
+    if let StartExecResults::Attached { mut output, .. } = started {
+        while let Some(chunk) = plugin_toolkit::stream::next(&mut output).await {
+            match chunk.map_err(|e| anyhow::anyhow!("read dump output: {e}"))? {
+                LogOutput::StdErr { message } => {
+                    let room = MAX_STDERR_BYTES.saturating_sub(stderr.len());
+                    stderr.extend_from_slice(&message[..message.len().min(room)]);
+                }
+                LogOutput::StdOut { message } | LogOutput::Console { message } => {
+                    file.write_all(&message)?
+                }
+                LogOutput::StdIn { .. } => {}
+            }
+        }
+    }
+    file.sync_all()?;
+    // The exit code is only known once the attached stream has drained.
+    let code = docker
+        .inspect_exec(&exec.id)
+        .await
+        .map_err(|e| anyhow::anyhow!("inspect dump exec: {e}"))?
+        .exit_code;
+    if code != Some(0) {
+        anyhow::bail!(
+            "exit {}: {}",
+            code.map_or("unknown".into(), |c| c.to_string()),
+            String::from_utf8_lossy(&stderr).trim()
+        );
     }
     Ok(())
 }
 
 /// A policy the backup did not stage, and why.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(crate = "plugin_toolkit::serde")]
 pub struct SkippedVolume {
     pub volume: String,
     pub reason: String,
 }
 
-/// What [`stage`] wrote and what it skipped.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Staged {
-    pub artifacts: Vec<String>,
+fn local_driver() -> String {
+    "local".into()
+}
+
+/// One staged export or dump. `driver`, `labels` and `options` are the
+/// volume's at backup, so a restore can create it as it was.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(crate = "plugin_toolkit::serde")]
+#[serde(rename_all = "camelCase")]
+pub struct VolumeArtifact {
+    pub volume: String,
+    pub engine_name: String,
+    pub strategy: Strategy,
+    /// File name inside [`STAGING_DIR`].
+    pub artifact: String,
+    pub sha256: String,
+    pub size: u64,
+    #[serde(default = "local_driver")]
+    pub driver: String,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    #[serde(default)]
+    pub options: BTreeMap<String, String>,
+}
+
+/// What [`stage`] wrote and what it skipped; written as [`MANIFEST_FILE`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(crate = "plugin_toolkit::serde")]
+pub struct VolumesManifest {
+    pub artifacts: Vec<VolumeArtifact>,
     pub skipped: Vec<SkippedVolume>,
 }
 
@@ -564,31 +611,32 @@ pub fn staging_root(parent: &Path, stack: &str) -> Result<PathBuf> {
 /// skipped and listed in [`SKIPPED_FILE`]: exporting it would create and
 /// archive an empty volume. An export or dump that fails or writes nothing
 /// fails the backup: an archive that claims coverage it lacks is worse than
-/// none.
+/// none. Dumps run in a running container of the policy's service in compose
+/// project `project`.
 pub async fn stage(
     docker: &Docker,
     root: &Path,
-    compose: &crate::Compose,
+    project: &str,
     volumes: &[StackVolume],
     policies: &[VolumePolicy],
-) -> Result<Staged> {
+) -> Result<VolumesManifest> {
     use std::os::unix::fs::DirBuilderExt;
     if policies.is_empty() {
-        return Ok(Staged::default());
+        return Ok(VolumesManifest::default());
     }
     let staging = root.join(STAGING_DIR);
     std::fs::DirBuilder::new()
         .mode(0o700)
         .create(&staging)
         .map_err(|e| anyhow::anyhow!("create {}: {e}", staging.display()))?;
-    let mut staged = Staged::default();
+    let mut staged = VolumesManifest::default();
     for p in policies {
         let found = volumes.iter().find(|v| v.volume == p.volume);
-        let exists = match found {
-            Some(v) => volume_exists(docker, &v.engine_name).await?,
-            None => false,
+        let have = match found {
+            Some(v) => crate::stack_volumes::existing(docker, &v.engine_name).await?,
+            None => None,
         };
-        let (Some(v), true) = (found, exists) else {
+        let (Some(v), Some(have)) = (found, have) else {
             staged.skipped.push(SkippedVolume {
                 volume: p.volume.clone(),
                 reason: "the volume does not exist on the engine; nothing to back up".into(),
@@ -597,44 +645,36 @@ pub async fn stage(
         };
         let artifact = artifact_name(p);
         let out = staging.join(&artifact);
-        create_private(&out)?;
-        let what = match p.strategy {
-            Strategy::Export => {
-                let what = format!("export volume '{}'", p.volume);
-                run_checked(
-                    "sh",
-                    &to_file_args(
-                        &out,
-                        crate::resolve_docker_bin(),
-                        export_args(&v.engine_name),
-                    ),
-                    &what,
-                )
-                .await?;
-                what
-            }
+        let (sha256, size) = match p.strategy {
+            Strategy::Export => crate::stack_volumes::export_one(docker, &v.engine_name, &out)
+                .await
+                .map_err(|e| e.context(format!("export volume '{}'", p.volume)))?,
             Strategy::Dump => {
                 let (Some(svc), Some(command)) = (&p.service, &p.command) else {
                     anyhow::bail!("dump policy for '{}' lacks a service or command", p.volume);
                 };
                 let what = format!("dump volume '{}'", p.volume);
-                run_checked(
-                    "sh",
-                    &dump_args(
-                        crate::resolve_docker_bin(),
-                        &compose.file_args(),
-                        svc,
-                        command,
-                        &out,
-                    ),
-                    &what,
-                )
-                .await?;
-                what
+                create_private(&out)?;
+                let container = service_container(docker, project, svc).await?;
+                dump(docker, &container, command, &out)
+                    .await
+                    .map_err(|e| e.context(what.clone()))?;
+                ensure_nonempty(&out, &what)?;
+                let size = std::fs::metadata(&out)?.len();
+                (plugin_toolkit::hash::sha256_file(&out)?, size)
             }
         };
-        ensure_nonempty(&out, &what)?;
-        staged.artifacts.push(format!("{STAGING_DIR}/{artifact}"));
+        staged.artifacts.push(VolumeArtifact {
+            volume: p.volume.clone(),
+            engine_name: v.engine_name.clone(),
+            strategy: p.strategy,
+            artifact,
+            sha256,
+            size,
+            driver: have.driver,
+            labels: have.labels.into_iter().collect(),
+            options: have.options.into_iter().collect(),
+        });
     }
     if !staged.skipped.is_empty() {
         let lines: String = staged
@@ -649,7 +689,110 @@ pub async fn stage(
             plugin_toolkit::tracing::warn!(target: "docker::volumes", volume = %s.volume, reason = %s.reason, "volume backup skipped");
         }
     }
+    let path = staging.join(MANIFEST_FILE);
+    create_private(&path)?;
+    std::fs::write(&path, plugin_toolkit::serde_json::to_vec_pretty(&staged)?)
+        .map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
     Ok(staged)
+}
+
+/// Volume data a stack archive carries, as [`verify_archive`] found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArchiveVolumes {
+    /// No [`STAGING_DIR`] in the archive.
+    None,
+    /// Every artifact matches the manifest's sha256 and size.
+    Verified(VolumesManifest),
+    /// [`STAGING_DIR`] without a [`MANIFEST_FILE`]: a backup made before
+    /// volume checksums, whose volume data cannot be checked.
+    Unverified,
+}
+
+/// `path` relative to [`STAGING_DIR`] when it is a file directly in it.
+fn staged_name(path: &Path) -> Option<String> {
+    let mut parts = path
+        .components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir));
+    if parts.next()?.as_os_str() != STAGING_DIR {
+        return None;
+    }
+    let name = parts.next()?.as_os_str().to_str()?.to_string();
+    parts.next().is_none().then_some(name)
+}
+
+/// Check the volume artifacts of the stack archive (`.tar.gz`) read from
+/// `file` against its [`MANIFEST_FILE`], hashing each entry as it streams,
+/// so nothing is written. Leaves `file` rewound.
+pub fn verify_archive(file: &mut std::fs::File) -> Result<ArchiveVolumes> {
+    use sha2::Digest;
+    use std::io::Seek;
+    file.rewind()?;
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&mut *file));
+    let mut seen = false;
+    let mut manifest = None;
+    let mut sums: BTreeMap<String, (String, u64)> = BTreeMap::new();
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        if path
+            .components()
+            .find(|c| !matches!(c, std::path::Component::CurDir))
+            .is_some_and(|c| c.as_os_str() == STAGING_DIR)
+        {
+            seen = true;
+        }
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let Some(name) = staged_name(&path) else {
+            continue;
+        };
+        if name == MANIFEST_FILE {
+            let mut buf = Vec::new();
+            (&mut entry)
+                .take(MAX_MANIFEST_BYTES + 1)
+                .read_to_end(&mut buf)?;
+            if buf.len() as u64 > MAX_MANIFEST_BYTES {
+                anyhow::bail!("volume manifest is larger than {MAX_MANIFEST_BYTES} bytes");
+            }
+            let parsed: VolumesManifest = plugin_toolkit::serde_json::from_slice(&buf)
+                .map_err(|e| anyhow::anyhow!("volume manifest: {e}"))?;
+            manifest = Some(parsed);
+            continue;
+        }
+        let mut hasher = sha2::Sha256::new();
+        let size = std::io::copy(&mut entry, &mut hasher)?;
+        sums.insert(
+            name,
+            (plugin_toolkit::hash::hex_encode(&hasher.finalize()), size),
+        );
+    }
+    file.rewind()?;
+    let Some(manifest) = manifest else {
+        return Ok(if seen {
+            ArchiveVolumes::Unverified
+        } else {
+            ArchiveVolumes::None
+        });
+    };
+    for a in &manifest.artifacts {
+        let Some((sha, size)) = sums.get(&a.artifact) else {
+            anyhow::bail!(
+                "volume '{}': artifact '{}' is missing from the archive",
+                a.volume,
+                a.artifact
+            );
+        };
+        crate::stack_volumes::check_sum(sha, &a.sha256, &format!("volume '{}'", a.volume))?;
+        if *size != a.size {
+            anyhow::bail!(
+                "volume '{}': {size} bytes, the manifest says {}",
+                a.volume,
+                a.size
+            );
+        }
+    }
+    Ok(ArchiveVolumes::Verified(manifest))
 }
 
 #[cfg(test)]
@@ -799,69 +942,145 @@ mod tests {
         assert!(policy("data", Strategy::Export).validate(&cfg()).is_ok());
     }
 
-    #[test]
-    fn export_streams_from_a_networkless_pinned_helper_with_the_volume_read_only() {
-        assert_eq!(
-            export_args("media_data"),
-            vec![
-                "run",
-                "--rm",
-                "--network",
-                "none",
-                "--mount",
-                "type=volume,src=media_data,dst=/v,readonly",
-                HELPER_IMAGE,
-                "tar",
-                "czf",
-                "-",
-                "-C",
-                "/v",
-                "."
-            ]
-        );
-        assert!(HELPER_IMAGE.contains("@sha256:"));
-        let a = to_file_args(Path::new("/s/data.tar.gz"), "docker", export_args("v"));
-        assert_eq!(a[..5], ["-c", TO_FILE, "sh", "/s/data.tar.gz", "docker"]);
+    const HELPER_ARCHIVE: &str = "/containers/h1/archive";
+
+    /// A volume archive as the Engine API returns it: rooted at `v/`.
+    fn volume_tar() -> String {
+        let mut b = tar::Builder::new(Vec::new());
+        let mut dir = tar::Header::new_gnu();
+        dir.set_entry_type(tar::EntryType::Directory);
+        dir.set_mode(0o755);
+        dir.set_size(0);
+        b.append_data(&mut dir, "v/", std::io::empty()).unwrap();
+        let mut h = tar::Header::new_gnu();
+        h.set_mode(0o644);
+        h.set_size(4);
+        b.append_data(&mut h, "v/db", &b"rows"[..]).unwrap();
+        String::from_utf8(b.into_inner().unwrap()).unwrap()
+    }
+
+    fn export_engine() -> FakeEngine {
+        FakeEngine::routed(vec![
+            Route::new("GET", "/volumes/media_data", 200, VOLUME_JSON),
+            Route::new(
+                "POST",
+                "/containers/create",
+                201,
+                r#"{"Id":"h1","Warnings":[]}"#,
+            ),
+            Route::new("GET", HELPER_ARCHIVE, 200, volume_tar()),
+            Route::new("DELETE", "/containers/h1", 204, ""),
+            Route::new("GET", "/json", 200, r#"{"Id":"sha256:helper"}"#),
+        ])
+    }
+
+    /// A stack archive of `root`'s staging dir, as the backup writes it.
+    fn stack_archive(root: &Path) -> std::fs::File {
+        let mut file = tempfile::tempfile().unwrap();
+        let gz = flate2::write::GzEncoder::new(&mut file, flate2::Compression::default());
+        let mut b = tar::Builder::new(gz);
+        b.append_dir_all(STAGING_DIR, root.join(STAGING_DIR))
+            .unwrap();
+        b.into_inner().unwrap().finish().unwrap();
+        file
     }
 
     #[test]
-    fn dump_passes_values_as_positional_parameters_through_every_compose_file() {
-        let files = vec![
-            "-f".to_string(),
-            "/srv/media/docker-compose.yml".to_string(),
-            "-f".to_string(),
-            "/srv/media/compose.override.yml".to_string(),
-        ];
-        let a = dump_args(
-            "/usr/bin/docker",
-            &files,
-            "db",
-            "pg_dumpall -U postgres; rm -rf /",
-            Path::new("/srv/media/.orca-volumes/pg.dump"),
-        );
-        // Both scripts are fixed; the command is the last positional argument.
-        assert_eq!(a[1], r#"out="$1"; shift; exec "$@" > "$out""#);
-        assert_eq!(a[3], "/srv/media/.orca-volumes/pg.dump");
+    fn export_stages_an_engine_api_archive_and_its_sum() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = export_engine();
+        let staged = plugin_toolkit::reactor::block_on(stage(
+            &e.client(),
+            dir.path(),
+            "media",
+            &detect(&cfg(), &[]),
+            &[policy("data", Strategy::Export)],
+        ))
+        .unwrap();
+        assert!(e.paths("GET").iter().any(|p| p.ends_with(HELPER_ARCHIVE)));
+        let a = &staged.artifacts[0];
         assert_eq!(
-            a[4..10],
-            [
-                "/usr/bin/docker",
-                "compose",
-                "-f",
-                "/srv/media/docker-compose.yml",
-                "-f",
-                "/srv/media/compose.override.yml"
-            ]
+            (a.engine_name.as_str(), a.artifact.as_str()),
+            ("media_data", "data.tar.gz")
         );
-        assert_eq!(a[10..13], ["exec", "-T", "db"]);
-        assert_eq!(a[15], DUMP_WRAPPER);
+        let staging = dir.path().join(STAGING_DIR);
+        let sum = plugin_toolkit::hash::sha256_file(&staging.join(&a.artifact)).unwrap();
+        assert_eq!(a.sha256, sum);
+        let written: VolumesManifest = plugin_toolkit::serde_json::from_slice(
+            &std::fs::read(staging.join(MANIFEST_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(written, staged);
+        assert_eq!(
+            verify_archive(&mut stack_archive(dir.path())).unwrap(),
+            ArchiveVolumes::Verified(staged)
+        );
+    }
+
+    #[test]
+    fn verify_archive_refuses_a_changed_artifact_and_flags_unsummed_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = export_engine();
+        plugin_toolkit::reactor::block_on(stage(
+            &e.client(),
+            dir.path(),
+            "media",
+            &detect(&cfg(), &[]),
+            &[policy("data", Strategy::Export)],
+        ))
+        .unwrap();
+        let staging = dir.path().join(STAGING_DIR);
+        std::fs::write(staging.join("data.tar.gz"), b"changed").unwrap();
+        let err = verify_archive(&mut stack_archive(dir.path())).unwrap_err();
+        assert!(err.to_string().contains("does not match"), "{err}");
+        std::fs::remove_file(staging.join(MANIFEST_FILE)).unwrap();
+        assert_eq!(
+            verify_archive(&mut stack_archive(dir.path())).unwrap(),
+            ArchiveVolumes::Unverified
+        );
+        std::fs::remove_dir_all(&staging).unwrap();
+        std::fs::create_dir(&staging).unwrap();
+        let mut none = tempfile::tempfile().unwrap();
+        {
+            let gz = flate2::write::GzEncoder::new(&mut none, flate2::Compression::default());
+            let mut b = tar::Builder::new(gz);
+            let mut h = tar::Header::new_gnu();
+            h.set_mode(0o644);
+            h.set_size(3);
+            b.append_data(&mut h, "./compose.yaml", &b"x: 1"[..3])
+                .unwrap();
+            b.into_inner().unwrap().finish().unwrap();
+        }
+        assert_eq!(verify_archive(&mut none).unwrap(), ArchiveVolumes::None);
+    }
+
+    #[test]
+    fn a_dump_needs_a_running_container_of_its_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = FakeEngine::routed(vec![
+            Route::new("GET", "/volumes/media_pg", 200, VOLUME_JSON),
+            Route::new("GET", "/containers/json", 200, "[]"),
+        ]);
+        let err = plugin_toolkit::reactor::block_on(stage(
+            &e.client(),
+            dir.path(),
+            "media",
+            &detect(&cfg(), &[]),
+            &[policy("pg", Strategy::Dump)],
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("no running container"), "{err}");
+        let listed = e.targets("GET");
+        let query = listed
+            .iter()
+            .find(|t| t.contains("/containers/json"))
+            .unwrap();
+        assert!(
+            query.contains("com.docker.compose.project=media")
+                && query.contains("com.docker.compose.service=db"),
+            "{query}"
+        );
         assert!(DUMP_WRAPPER.contains("set -o pipefail") && DUMP_WRAPPER.contains(r#"eval "$1""#));
-        assert_eq!(a.last().unwrap(), "pg_dumpall -U postgres; rm -rf /");
-    }
-
-    fn compose_in(dir: &Path) -> crate::Compose {
-        std::fs::write(dir.join("docker-compose.yml"), "services: {}\n").unwrap();
-        crate::Compose::open(dir).unwrap()
     }
 
     const VOLUME_JSON: &str =
@@ -871,15 +1090,10 @@ mod tests {
     fn stage_with_no_policies_stages_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let e = FakeEngine::routed(vec![]);
-        let staged = plugin_toolkit::reactor::block_on(stage(
-            &e.client(),
-            dir.path(),
-            &compose_in(dir.path()),
-            &[],
-            &[],
-        ))
-        .unwrap();
-        assert_eq!(staged, Staged::default());
+        let staged =
+            plugin_toolkit::reactor::block_on(stage(&e.client(), dir.path(), "media", &[], &[]))
+                .unwrap();
+        assert_eq!(staged, VolumesManifest::default());
         assert!(!dir.path().join(STAGING_DIR).exists());
     }
 
@@ -892,7 +1106,7 @@ mod tests {
         let staged = plugin_toolkit::reactor::block_on(stage(
             &e.client(),
             dir.path(),
-            &compose_in(dir.path()),
+            "media",
             &declared_only,
             &[
                 policy("data", Strategy::Export),
@@ -946,7 +1160,7 @@ mod tests {
         let err = plugin_toolkit::reactor::block_on(stage(
             &e.client(),
             dir.path(),
-            &compose_in(dir.path()),
+            "media",
             &detect(&cfg(), &[]),
             &[p],
         ))

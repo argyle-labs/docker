@@ -651,6 +651,7 @@ dependencies = [
  "futures-core",
  "libc",
  "plugin-toolkit",
+ "sha2 0.10.9",
  "tar",
  "tempfile",
 ]
