@@ -89,7 +89,9 @@ fn is_digest_gone(e: &bollard::errors::Error) -> bool {
 }
 
 async fn pull(docker: &Docker, reference: &str) -> std::result::Result<(), bollard::errors::Error> {
-    let opts = CreateImageOptionsBuilder::new().from_image(reference).build();
+    let opts = CreateImageOptionsBuilder::new()
+        .from_image(reference)
+        .build();
     let mut stream = Box::pin(docker.create_image(Some(opts), None, None));
     while let Some(item) = plugin_toolkit::stream::next(&mut stream).await {
         item?;
