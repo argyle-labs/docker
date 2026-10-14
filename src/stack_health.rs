@@ -170,7 +170,7 @@ pub struct DockerStackWaitHealthyArgs {
     #[arg(long)]
     pub stack: String,
     /// Give up after this many seconds (default and maximum 25, under orca's
-    /// plugin call timeout). To wait longer, call again while `ready` is false.
+    /// plugin call timeout; 0 counts as 1). To wait longer, call again while `ready` is false.
     #[arg(long)]
     #[serde(default)]
     pub timeout_secs: Option<u64>,
@@ -199,7 +199,7 @@ async fn docker_stack_wait_healthy(
 }
 
 fn timeout(requested: Option<u64>) -> Duration {
-    Duration::from_secs(requested.map_or(MAX_TIMEOUT_SECS, |s| s.min(MAX_TIMEOUT_SECS)))
+    Duration::from_secs(requested.map_or(MAX_TIMEOUT_SECS, |s| s.clamp(1, MAX_TIMEOUT_SECS)))
 }
 
 #[cfg(test)]
@@ -260,6 +260,7 @@ mod tests {
         assert_eq!(timeout(None), Duration::from_secs(MAX_TIMEOUT_SECS));
         assert_eq!(timeout(Some(600)), Duration::from_secs(MAX_TIMEOUT_SECS));
         assert_eq!(timeout(Some(5)), Duration::from_secs(5));
+        assert_eq!(timeout(Some(0)), Duration::from_secs(1));
     }
 
     #[test]
