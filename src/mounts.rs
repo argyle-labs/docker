@@ -695,18 +695,43 @@ pub fn apply_gate(root: &Path, change: &GateChange) -> Result<()> {
     }
 }
 
+/// Whether systemd must reload: the gate just changed, or `NeedDaemonReload`
+/// (from `systemctl show`) says the loaded unit is behind its files.
+pub fn reload_due(changed: bool, need_daemon_reload: &str) -> bool {
+    changed || need_daemon_reload.trim() == "yes"
+}
+
+/// Runs systemctl; the plugin toolkit has no D-Bus client to ask systemd
+/// directly.
+async fn systemctl(args: &[&str]) -> Result<String> {
+    let out = plugin_toolkit::process::Command::new(SYSTEMCTL)
+        .args(args)
+        .output()
+        .await
+        .context("failed to spawn systemctl")?;
+    if !out.status.success {
+        bail!(
+            "systemctl {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 #[orca_struct(args)]
 pub struct DockerMountGateArgs {
-    /// Write the gate. Omitted, returns the plan and changes nothing.
+    /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
-    #[serde(default)]
-    pub execute: bool,
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
+    pub dry_run: bool,
 }
 
 #[orca_struct]
 #[serde(rename_all = "camelCase")]
 #[derive(Debug)]
 pub struct DockerMountGateOutput {
+    /// true: nothing was changed.
     pub dry_run: bool,
     /// `openrc`, `systemd` or `other`.
     pub init: String,
@@ -737,8 +762,8 @@ pub struct DockerMountGateOutput {
 /// `netmount` added to `rc_use` and `rc_after` in `/etc/conf.d/docker`, and
 /// removed again once no share needs it.
 /// Soft ordering: a share that fails to mount never keeps dockerd down.
-/// Never restarts dockerd; the order applies from the next boot. Without
-/// `execute`, returns the plan.
+/// Never restarts dockerd; the order applies from the next boot. With
+/// `dryRun`, returns the plan.
 #[orca_tool(
     domain = "docker",
     verb = "mount_gate",
@@ -751,7 +776,6 @@ async fn docker_mount_gate(
     ctx: &ToolCtx,
 ) -> Result<DockerMountGateOutput> {
     execute::require_admin(GATE_TOOL, ctx)?;
-    execute::guard(GATE_TOOL, args.execute, ctx)?;
     let root = Path::new("/");
     let host = host_mounts(&HostProc)?;
     let scanned: Vec<(String, Vec<Bind>)> = scan(true)
@@ -765,22 +789,26 @@ async fn docker_mount_gate(
             .partition(|p| is_safe_point(p));
     let init = crate::init::detect(root);
     let change = gate_change(root, init, &shares);
-    if args.execute
-        && let Some(c) = &change
-    {
-        apply_gate(root, c)?;
-        if init == Init::Systemd {
-            let out = plugin_toolkit::process::Command::new(SYSTEMCTL)
-                .arg("daemon-reload")
-                .output()
-                .await
-                .context("failed to spawn systemctl")?;
-            if !out.status.success {
-                bail!(
-                    "systemctl daemon-reload failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                );
-            }
+    if !args.dry_run {
+        if let Some(c) = &change {
+            apply_gate(root, c)?;
+        }
+        // A reload that failed after an earlier write or removal leaves the
+        // files right but systemd on the old unit; retry it then too.
+        if init == Init::Systemd
+            && reload_due(
+                change.is_some(),
+                &systemctl(&[
+                    "show",
+                    "-p",
+                    "NeedDaemonReload",
+                    "--value",
+                    "docker.service",
+                ])
+                .await?,
+            )
+        {
+            systemctl(&["daemon-reload"]).await?;
         }
     }
     let (kind, path, content) = match change {
@@ -789,7 +817,7 @@ async fn docker_mount_gate(
         None => (None, None, None),
     };
     Ok(DockerMountGateOutput {
-        dry_run: !args.execute,
+        dry_run: args.dry_run,
         init: init.as_str().to_owned(),
         change: kind.map(str::to_owned),
         path: path.map(|r| format!("/{r}")),
@@ -1232,5 +1260,27 @@ mod tests {
             ""
         );
         assert!(gate_change(t.path(), Init::OpenRc, &[]).is_none());
+    }
+
+    #[test]
+    fn an_unchanged_gate_still_reloads_when_systemd_is_behind_its_files() {
+        assert!(reload_due(true, "no\n"));
+        assert!(
+            reload_due(false, "yes\n"),
+            "retries a reload that failed last run"
+        );
+        assert!(!reload_due(false, "no\n"));
+        assert!(!reload_due(false, ""));
+    }
+
+    #[test]
+    fn the_gate_applies_unless_dry_run() {
+        let args: DockerMountGateArgs = plugin_toolkit::serde_json::from_value(json!({})).unwrap();
+        assert!(!args.dry_run);
+        for key in ["dryRun", "dry_run"] {
+            let args: DockerMountGateArgs =
+                plugin_toolkit::serde_json::from_value(json!({ key: true })).unwrap();
+            assert!(args.dry_run, "{key}");
+        }
     }
 }
