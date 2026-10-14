@@ -183,7 +183,7 @@ pub struct DockerInstallArgs {
 #[serde(rename_all = "camelCase")]
 #[derive(Debug)]
 pub struct DockerInstallOutput {
-    /// Return the plan and change nothing. Omitted, applies.
+    /// true: nothing was changed.
     pub dry_run: bool,
     /// The script and runtime execute runs.
     pub plan: String,
@@ -250,7 +250,7 @@ pub struct DockerEngineUpdateArgs {
 #[serde(rename_all = "camelCase")]
 #[derive(Debug)]
 pub struct DockerEngineUpdateOutput {
-    /// Return the plan and change nothing. Omitted, applies.
+    /// true: nothing was changed.
     pub dry_run: bool,
     /// The script and runtime execute runs.
     pub plan: String,
@@ -326,7 +326,7 @@ pub struct DockerBackupArgs {
 #[serde(rename_all = "camelCase")]
 #[derive(Debug)]
 pub struct DockerBackupOutput {
-    /// Return the plan and change nothing. Omitted, applies.
+    /// true: nothing was changed.
     pub dry_run: bool,
     /// Resolved directory the archive is (or would be) written into.
     pub destination: String,
@@ -432,7 +432,7 @@ pub struct DockerRestoreArgs {
 #[serde(rename_all = "camelCase")]
 #[derive(Debug)]
 pub struct DockerRestoreOutput {
-    /// Return the plan and change nothing. Omitted, applies.
+    /// true: nothing was changed.
     pub dry_run: bool,
     pub restored: bool,
     /// Resolved host path the state is (or would be) restored into.

@@ -66,7 +66,7 @@ pub fn intersect(confirmed: &[String], current: &[String]) -> (Vec<String>, Vec<
 pub fn require_confirmed(tool: &str, confirmed: &[String], current: &[String]) -> Result<()> {
     if confirmed.is_empty() && !current.is_empty() {
         bail!(
-            "{tool}: execute needs the items from the dry run; re-run with `dry_run` and pass its items"
+            "{tool}: execute needs the items from the dry run; re-run with `dryRun` and pass its items"
         );
     }
     Ok(())

@@ -304,7 +304,7 @@ pub struct DockerCreateArgs {
 #[serde(rename_all = "camelCase")]
 #[derive(Debug)]
 pub struct DockerCreateOutput {
-    /// Return the plan and change nothing. Omitted, applies.
+    /// true: nothing was changed.
     pub dry_run: bool,
     /// Dry run: what would be stored. Execute: what was read back after the
     /// write.
@@ -408,7 +408,7 @@ pub struct DockerUpdateArgs {
 #[serde(rename_all = "camelCase")]
 #[derive(Debug)]
 pub struct DockerUpdateOutput {
-    /// Return the plan and change nothing. Omitted, applies.
+    /// true: nothing was changed.
     pub dry_run: bool,
     /// Dry run: the patched runtime. Execute: what was read back after the
     /// write.
@@ -500,7 +500,7 @@ pub struct DockerDeleteArgs {
 #[serde(rename_all = "camelCase")]
 #[derive(Debug)]
 pub struct DockerDeleteOutput {
-    /// Return the plan and change nothing. Omitted, applies.
+    /// true: nothing was changed.
     pub dry_run: bool,
     pub name: String,
     /// Dry run: whether a runtime would be removed. Execute: whether one was.

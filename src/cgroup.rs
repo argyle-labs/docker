@@ -310,6 +310,7 @@ pub struct DockerHostPrepareArgs {
 #[serde(rename_all = "camelCase")]
 #[derive(Debug)]
 pub struct DockerHostPrepareOutput {
+    /// true: nothing was changed.
     pub dry_run: bool,
     pub cgroup: CgroupAssessment,
     pub plan: Vec<String>,

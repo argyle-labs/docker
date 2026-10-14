@@ -416,7 +416,7 @@ pub async fn update_stacks(runner: &dyn StackRunner, jobs: &[StackJob]) -> Vec<S
 #[serde(rename_all = "camelCase")]
 #[derive(Debug, Clone)]
 pub struct HostUpdateApplied {
-    /// Return the plan and change nothing. Omitted, applies.
+    /// true: nothing was changed.
     pub dry_run: bool,
     pub backup_gate: String,
     /// Absent when no package was confirmed.

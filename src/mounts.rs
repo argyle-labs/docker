@@ -214,6 +214,7 @@ pub struct ContainerMounts {
 #[serde(rename_all = "camelCase")]
 #[derive(Debug)]
 pub struct DockerMountCheckOutput {
+    /// true: nothing was changed.
     pub dry_run: bool,
     /// Running containers with network-backed binds.
     pub containers: Vec<ContainerMounts>,

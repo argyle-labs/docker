@@ -1989,7 +1989,7 @@ pub struct DockerStackAllowArgs {
 #[serde(rename_all = "camelCase")]
 #[derive(Debug)]
 pub struct DockerStackAllowOutput {
-    /// Return the plan and change nothing. Omitted, applies.
+    /// true: nothing was changed.
     pub dry_run: bool,
     pub name: String,
     /// `true`: the stack was not registered and is (or would be) registered

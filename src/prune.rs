@@ -277,7 +277,7 @@ pub struct Skipped {
 #[schemars(crate = "plugin_toolkit::schemars")]
 #[serde(rename_all = "camelCase")]
 pub struct PruneApplied {
-    /// Return the plan and change nothing. Omitted, applies.
+    /// true: nothing was changed.
     pub dry_run: bool,
     pub removed: Vec<String>,
     /// Not removed, and not an error: no longer a candidate, already gone,
