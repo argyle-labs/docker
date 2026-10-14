@@ -6,7 +6,9 @@
 use std::time::{Duration, Instant};
 
 use bollard::Docker;
-use bollard::models::{ContainerInspectResponse, ContainerStateStatusEnum, HealthStatusEnum};
+use bollard::models::{
+    ContainerInspectResponse, ContainerStateStatusEnum, HealthStatusEnum, RestartPolicyNameEnum,
+};
 use bollard::query_parameters::InspectContainerOptionsBuilder;
 use plugin_toolkit::prelude::*;
 
@@ -14,7 +16,9 @@ use crate::stack_manifest::{StackContainer, containers_of};
 
 const TOOL: &str = "docker.stack_wait_healthy";
 const POLL: Duration = Duration::from_secs(2);
-const DEFAULT_TIMEOUT_SECS: u64 = 120;
+/// orca drops a plugin call after 35 s, so one call waits at most this long;
+/// a longer wait is the caller re-polling while `ready` is false.
+const MAX_TIMEOUT_SECS: u64 = 25;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(crate = "plugin_toolkit::serde")]
@@ -26,6 +30,8 @@ pub enum Readiness {
     /// Running or restarting, healthcheck not yet passed.
     Starting,
     Unhealthy,
+    /// A one-shot (no restart policy) that exited 0: finished, not failed.
+    Done,
     /// Created, exited, dead or paused.
     Stopped,
 }
@@ -46,7 +52,7 @@ pub struct ContainerReadiness {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StackHealth {
     pub stack: String,
-    /// Every container is `ready` (and there is at least one).
+    /// Every container is `ready` or `done` (and there is at least one).
     pub ready: bool,
     /// Milliseconds from the call until `ready`, or until the timeout.
     pub waited_ms: u64,
@@ -71,6 +77,11 @@ pub fn judge(c: &ContainerInspectResponse) -> ContainerReadiness {
         (Some(ContainerStateStatusEnum::RUNNING | ContainerStateStatusEnum::RESTARTING), _) => {
             Readiness::Starting
         }
+        (Some(ContainerStateStatusEnum::EXITED), _)
+            if state.and_then(|s| s.exit_code) == Some(0) && !restarts(c) =>
+        {
+            Readiness::Done
+        }
         _ => Readiness::Stopped,
     };
     let mut detail = status.map_or_else(|| "unknown".to_owned(), |s| s.to_string());
@@ -83,6 +94,16 @@ pub fn judge(c: &ContainerInspectResponse) -> ContainerReadiness {
         readiness,
         detail,
     }
+}
+
+/// Whether the engine restarts this container on exit, i.e. it is a service
+/// rather than a one-shot.
+fn restarts(c: &ContainerInspectResponse) -> bool {
+    c.host_config
+        .as_ref()
+        .and_then(|h| h.restart_policy.as_ref())
+        .and_then(|p| p.name)
+        .is_some_and(|n| !matches!(n, RestartPolicyNameEnum::EMPTY | RestartPolicyNameEnum::NO))
 }
 
 async fn snapshot(docker: &Docker, stack: &str) -> Result<Vec<ContainerReadiness>> {
@@ -110,8 +131,10 @@ pub async fn wait(docker: &Docker, stack: &str, timeout: Duration) -> Result<Sta
     let start = Instant::now();
     loop {
         let containers = snapshot(docker, stack).await?;
-        let ready =
-            !containers.is_empty() && containers.iter().all(|c| c.readiness == Readiness::Ready);
+        let ready = !containers.is_empty()
+            && containers
+                .iter()
+                .all(|c| matches!(c.readiness, Readiness::Ready | Readiness::Done));
         let elapsed = start.elapsed();
         if ready || elapsed >= timeout {
             return Ok(StackHealth {
@@ -130,7 +153,8 @@ pub struct DockerStackWaitHealthyArgs {
     /// Compose project name.
     #[arg(long)]
     pub stack: String,
-    /// Give up after this many seconds (default 120).
+    /// Give up after this many seconds (default and maximum 25, under orca's
+    /// plugin call timeout). To wait longer, call again while `ready` is false.
     #[arg(long)]
     #[serde(default)]
     pub timeout_secs: Option<u64>,
@@ -138,8 +162,9 @@ pub struct DockerStackWaitHealthyArgs {
 
 /// **Wait for a stack to come up healthy**: polls every container of the
 /// compose project until all are running and passing their healthcheck (or
-/// declare none), or the timeout passes. Reports each container's readiness
-/// and the time waited. Read-only.
+/// declare none), or the timeout (at most 25 s) passes. One-shot containers
+/// that exited 0 count as done. Reports each container's readiness and the
+/// time waited; re-poll while `ready` is false to wait longer. Read-only.
 #[orca_tool(
     domain = "docker",
     verb = "stack_wait_healthy",
@@ -154,8 +179,11 @@ async fn docker_stack_wait_healthy(
     let docker = crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
-    let secs = args.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
-    wait(docker, &args.stack, Duration::from_secs(secs)).await
+    wait(docker, &args.stack, timeout(args.timeout_secs)).await
+}
+
+fn timeout(requested: Option<u64>) -> Duration {
+    Duration::from_secs(requested.map_or(MAX_TIMEOUT_SECS, |s| s.min(MAX_TIMEOUT_SECS)))
 }
 
 #[cfg(test)]
@@ -188,6 +216,31 @@ mod tests {
         assert_eq!(r("running", Some("unhealthy")), Readiness::Unhealthy);
         assert_eq!(r("exited", None), Readiness::Stopped);
         assert_eq!(r("created", Some("healthy")), Readiness::Stopped);
+    }
+
+    #[test]
+    fn a_one_shot_that_exited_zero_is_done() {
+        let exited = |code: i64, policy: Option<&str>| {
+            let mut v = json!({
+                "Name": "/init-1",
+                "State": { "Status": "exited", "ExitCode": code },
+            });
+            if let Some(p) = policy {
+                v["HostConfig"] = json!({ "RestartPolicy": { "Name": p } });
+            }
+            judge(&serde_json::from_value(v).unwrap()).readiness
+        };
+        assert_eq!(exited(0, None), Readiness::Done);
+        assert_eq!(exited(0, Some("no")), Readiness::Done);
+        assert_eq!(exited(1, None), Readiness::Stopped);
+        assert_eq!(exited(0, Some("unless-stopped")), Readiness::Stopped);
+    }
+
+    #[test]
+    fn the_timeout_is_clamped_to_the_call_budget() {
+        assert_eq!(timeout(None), Duration::from_secs(MAX_TIMEOUT_SECS));
+        assert_eq!(timeout(Some(600)), Duration::from_secs(MAX_TIMEOUT_SECS));
+        assert_eq!(timeout(Some(5)), Duration::from_secs(5));
     }
 
     #[test]
