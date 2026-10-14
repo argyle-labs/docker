@@ -172,7 +172,7 @@ pub struct DockerStackWaitHealthyArgs {
     /// Give up after this many seconds (default and maximum 25, under orca's
     /// plugin call timeout; 0 counts as 1). To wait longer, call again while `ready` is false.
     #[arg(long)]
-    #[serde(default)]
+    #[serde(default, rename = "timeoutSecs", alias = "timeout_secs")]
     pub timeout_secs: Option<u64>,
 }
 
@@ -207,6 +207,15 @@ mod tests {
     use super::*;
     use crate::test_engine::{FakeEngine, Route};
     use plugin_toolkit::serde_json::{self, json};
+
+    #[test]
+    fn args_accept_camel_and_snake_timeout() {
+        for key in ["timeoutSecs", "timeout_secs"] {
+            let a: DockerStackWaitHealthyArgs =
+                serde_json::from_value(json!({ "stack": "s", key: 7 })).unwrap();
+            assert_eq!(a.timeout_secs, Some(7), "{key}");
+        }
+    }
 
     fn inspect(status: &str, health: Option<&str>) -> ContainerInspectResponse {
         let mut state = json!({ "Status": status });
