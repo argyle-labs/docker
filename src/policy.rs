@@ -1426,7 +1426,7 @@ pub fn check(
             });
             match v.grant() {
                 Some(_) if upstream => format!(
-                    "{who}: {} (image changed upstream; re-approve with {ALLOW_TOOL} approveCurrent)",
+                    "{who}: {} (image changed upstream; re-approve with {ALLOW_TOOL} approve_current)",
                     v.detail
                 ),
                 Some(g) => format!("{who}: {} (grant '{g}')", v.detail),
@@ -1981,7 +1981,7 @@ pub struct DockerStackAllowArgs {
     pub items: Vec<String>,
     /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
-    #[serde(default)]
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
     pub dry_run: bool,
 }
 
@@ -3006,7 +3006,7 @@ mod tests {
                     .unwrap_err();
             assert!(
                 err.to_string().contains("image changed upstream")
-                    && err.to_string().contains("approveCurrent"),
+                    && err.to_string().contains("approve_current"),
                 "{err}"
             );
             let built = engine(&[]);

@@ -1,5 +1,5 @@
 {
-  "_comment": "docker.update — patch a registered runtime. Admin only, dry run included; set dry_run to plan without changing anything. stacksRoot is the absolute dir managed stacks must live under.",
+  "_comment": "docker.update — patch a registered runtime. Admin only, dry run included; set dryRun to plan without changing anything. stacksRoot is the absolute dir managed stacks must live under.",
   "name": "local",
   "stacksRoot": "/opt/stacks"
 }

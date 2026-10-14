@@ -186,7 +186,7 @@ pub struct DockerStackPullPinnedArgs {
     pub pins: Vec<String>,
     /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
-    #[serde(default)]
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
     pub dry_run: bool,
 }
 

@@ -77,12 +77,12 @@ const CONTAINER_ACTIONS: &[&str] = &["start", "stop", "restart"];
 #[schemars(crate = "plugin_toolkit::schemars")]
 pub struct DryRunOptIn {
     /// Return the plan and change nothing. Omitted, applies.
-    #[serde(default)]
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
     pub dry_run: bool,
 }
 
-/// `(dry_run, rest)`: the payload's `dry_run` flag, and the payload without
-/// it for the action's own parser. A payload that is not a JSON object is
+/// `(dry_run, rest)`: the payload's `dryRun` flag (or its `dry_run` alias),
+/// and the payload without it for the action's own parser. A payload that is not a JSON object is
 /// passed on untouched, never read as an opt-in.
 pub(crate) fn split_dry_run(payload: Option<String>) -> Result<(bool, Option<String>)> {
     let Some(raw) = payload else {
@@ -91,11 +91,14 @@ pub(crate) fn split_dry_run(payload: Option<String>) -> Result<(bool, Option<Str
     let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(&raw) else {
         return Ok((false, Some(raw)));
     };
-    let dry_run = match map.remove("dry_run") {
-        None => false,
-        Some(Value::Bool(b)) => b,
-        Some(other) => anyhow::bail!("`dry_run` must be true or false, got {other}"),
-    };
+    let mut dry_run = false;
+    for key in ["dryRun", "dry_run"] {
+        match map.remove(key) {
+            None => {}
+            Some(Value::Bool(b)) => dry_run |= b,
+            Some(other) => anyhow::bail!("`{key}` must be true or false, got {other}"),
+        }
+    }
     let rest = if map.is_empty() {
         None
     } else {
@@ -118,7 +121,7 @@ pub(crate) fn dry_run(id: UnitId, plan: String) -> VerbOutcome {
     let body = json!({
         "dryRun": true,
         "plan": plan,
-        "howToExecute": "re-invoke without `dry_run` in the payload",
+        "howToExecute": "re-invoke without `dryRun` in the payload",
     });
     VerbOutcome::Item(ItemOutcome::new(id, body.to_string()))
 }
@@ -1147,7 +1150,7 @@ pub struct VolumePolicyPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     /// Return the plan and change nothing. Omitted, applies.
-    #[serde(default)]
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
     pub dry_run: bool,
 }
 
@@ -1157,6 +1160,7 @@ pub struct VolumePolicyPayload {
 #[schemars(crate = "plugin_toolkit::schemars")]
 pub struct VolumePolicyResult {
     /// Return the plan and change nothing. Omitted, applies.
+    #[serde(rename = "dryRun", alias = "dry_run")]
     pub dry_run: bool,
     pub change: PlannedChange,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1220,7 +1224,7 @@ fn volume_policy_result(
 #[schemars(crate = "plugin_toolkit::schemars")]
 pub struct LabelVolumesPayload {
     /// Return the plan and change nothing. Omitted, applies.
-    #[serde(default)]
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
     pub dry_run: bool,
     /// The dry run's change targets (`<service>:<path>`) to convert.
     #[serde(default)]
@@ -1233,6 +1237,7 @@ pub struct LabelVolumesPayload {
 #[schemars(crate = "plugin_toolkit::schemars")]
 pub struct LabelVolumesResult {
     /// Return the plan and change nothing. Omitted, applies.
+    #[serde(rename = "dryRun", alias = "dry_run")]
     pub dry_run: bool,
     pub changes: Vec<PlannedChange>,
     /// Side effects to expect beyond the changes.
@@ -1322,7 +1327,7 @@ pub struct StackAudit {
 #[schemars(crate = "plugin_toolkit::schemars")]
 pub struct StackFixPayload {
     /// Return the plan and change nothing. Omitted, applies.
-    #[serde(default)]
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
     pub dry_run: bool,
     /// The dry run's change targets (finding ids) to apply.
     #[serde(default)]
@@ -1335,6 +1340,7 @@ pub struct StackFixPayload {
 #[schemars(crate = "plugin_toolkit::schemars")]
 pub struct StackFixResult {
     /// Return the plan and change nothing. Omitted, applies.
+    #[serde(rename = "dryRun", alias = "dry_run")]
     pub dry_run: bool,
     /// The rewrites (planned on a dry run, made on execute).
     pub changes: Vec<PlannedChange>,
@@ -3137,14 +3143,18 @@ mod tests {
         assert_eq!(split_dry_run(None).unwrap(), (false, None));
         assert_eq!(split_dry_run(Some("{}".into())).unwrap(), (false, None));
         assert_eq!(
-            split_dry_run(Some(r#"{"dry_run":true}"#.into())).unwrap(),
+            split_dry_run(Some(r#"{"dryRun":true}"#.into())).unwrap(),
             (true, None)
         );
         let (plan_only, rest) =
-            split_dry_run(Some(r#"{"dry_run":true,"dest":"/x"}"#.into())).unwrap();
+            split_dry_run(Some(r#"{"dryRun":true,"dest":"/x"}"#.into())).unwrap();
         assert!(plan_only);
         assert_eq!(rest.as_deref(), Some(r#"{"dest":"/x"}"#));
-        assert!(split_dry_run(Some(r#"{"dry_run":"yes"}"#.into())).is_err());
+        assert_eq!(
+            split_dry_run(Some(r#"{"dry_run":true}"#.into())).unwrap(),
+            (true, None)
+        );
+        assert!(split_dry_run(Some(r#"{"dryRun":"yes"}"#.into())).is_err());
         assert_eq!(
             split_dry_run(Some("[1]".into())).unwrap(),
             (false, Some("[1]".into()))
@@ -3180,7 +3190,7 @@ mod tests {
                 let out = plugin_toolkit::reactor::block_on(provider.do_update(UpdateArgs {
                     id: id(kind),
                     action: action.into(),
-                    payload: Some(r#"{"dry_run":true}"#.into()),
+                    payload: Some(r#"{"dryRun":true}"#.into()),
                     caller: admin.clone(),
                 }))
                 .unwrap();
@@ -3189,19 +3199,16 @@ mod tests {
             let out = plugin_toolkit::reactor::block_on(provider.do_upsert(UpsertArgs {
                 id: id(STACK_KIND),
                 action: "set".into(),
-                payload: Some(r#"{"name":"web","dir":"/nowhere","dry_run":true}"#.into()),
+                payload: Some(r#"{"name":"web","dir":"/nowhere","dryRun":true}"#.into()),
                 caller: admin.clone(),
             }))
             .unwrap();
             assert_eq!(dry_run_body(out)["dryRun"], true);
             for (action, payload) in [
-                (
-                    "deploy",
-                    r#"{"name":"web","dir":"/nowhere","dry_run":true}"#,
-                ),
+                ("deploy", r#"{"name":"web","dir":"/nowhere","dryRun":true}"#),
                 (
                     "exec",
-                    r#"{"id":"c1","cmd":["rm","-rf","/"],"dry_run":true}"#,
+                    r#"{"id":"c1","cmd":["rm","-rf","/"],"dryRun":true}"#,
                 ),
             ] {
                 let out = plugin_toolkit::reactor::block_on(provider.do_create(CreateArgs {
@@ -3311,7 +3318,7 @@ mod tests {
         assert!(guard_shaped(Some("")));
         assert!(guard_shaped(Some(" {} ")));
         assert!(!guard_shaped(Some(r#"{"dest":"/x"}"#)));
-        assert!(!guard_shaped(Some(r#"{"dry_run":true}"#)));
+        assert!(!guard_shaped(Some(r#"{"dryRun":true}"#)));
         assert!(!guard_shaped(Some("null")));
     }
 
@@ -3326,7 +3333,7 @@ mod tests {
                 caller,
             }))
         };
-        let from = serde_json::json!({"from": {"locator": "/x.tar.gz", "manager": "docker@test", "timestamp": 0}, "dry_run": true});
+        let from = serde_json::json!({"from": {"locator": "/x.tar.gz", "manager": "docker@test", "timestamp": 0}, "dryRun": true});
         let ((), _) = crate::test_support::with_db(|| {
             crate::test_support::assert_admin_refusal(&err_of(restore(None, from.clone())));
             let out = restore(Some(crate::test_support::caller("admin")), from.clone()).unwrap();
@@ -3346,7 +3353,7 @@ mod tests {
                 UpdateArgs {
                     id: web(kind),
                     action: action.into(),
-                    payload: Some(r#"{"dry_run":true,"force":true}"#.into()),
+                    payload: Some(r#"{"dryRun":true,"force":true}"#.into()),
                     caller: Some(crate::test_support::caller("admin")),
                 },
             )));
@@ -3360,7 +3367,7 @@ mod tests {
         let out = plugin_toolkit::reactor::block_on(provider.do_create(CreateArgs {
             action: "exec".into(),
             payload: Some(
-                r#"{"id":"c1","cmd":["psql","-c","ALTER USER x PASSWORD 's3cr3t'"],"dry_run":true}"#
+                r#"{"id":"c1","cmd":["psql","-c","ALTER USER x PASSWORD 's3cr3t'"],"dryRun":true}"#
                     .into(),
             ),
         }))

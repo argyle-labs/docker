@@ -193,7 +193,7 @@ fn sees(b: &Bind, h: &Mount, c: &Mount) -> bool {
 pub struct DockerMountCheckArgs {
     /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
-    #[serde(default)]
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
     pub dry_run: bool,
     /// `container:<name>` items from the dry run (when executing).
     /// Comma-separated on the CLI.

@@ -441,7 +441,7 @@ pub struct DockerStackVolumesExportArgs {
     pub allow_running: bool,
     /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
-    #[serde(default)]
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
     pub dry_run: bool,
 }
 
@@ -812,7 +812,7 @@ pub struct DockerStackVolumesImportArgs {
     pub force: bool,
     /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
-    #[serde(default)]
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
     pub dry_run: bool,
 }
 

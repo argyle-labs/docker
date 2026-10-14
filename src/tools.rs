@@ -296,7 +296,7 @@ pub struct DockerCreateArgs {
     pub routes: Vec<Route>,
     /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
-    #[serde(default, alias = "dry_run")]
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
     pub dry_run: bool,
 }
 
@@ -400,7 +400,7 @@ pub struct DockerUpdateArgs {
     pub enabled: Option<bool>,
     /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
-    #[serde(default, alias = "dry_run")]
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
     pub dry_run: bool,
 }
 
@@ -492,7 +492,7 @@ pub struct DockerDeleteArgs {
     pub name: String,
     /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
-    #[serde(default, alias = "dry_run")]
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
     pub dry_run: bool,
 }
 

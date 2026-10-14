@@ -175,7 +175,7 @@ pub struct DockerInstallArgs {
     pub runtime: ContainerRuntime,
     /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
-    #[serde(default)]
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
     pub dry_run: bool,
 }
 
@@ -242,7 +242,7 @@ pub struct DockerEngineUpdateArgs {
     pub runtime: ContainerRuntime,
     /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
-    #[serde(default)]
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
     pub dry_run: bool,
 }
 
@@ -318,7 +318,7 @@ pub struct DockerBackupArgs {
     pub state_path: Option<String>,
     /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
-    #[serde(default)]
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
     pub dry_run: bool,
 }
 
@@ -424,7 +424,7 @@ pub struct DockerRestoreArgs {
     pub state_path: Option<String>,
     /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
-    #[serde(default)]
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
     pub dry_run: bool,
 }
 
@@ -576,18 +576,18 @@ mod tests {
             keys.sort();
             keys
         }
-        assert_eq!(properties::<DockerInstallArgs>(), ["dry_run", "runtime"]);
+        assert_eq!(properties::<DockerInstallArgs>(), ["dryRun", "runtime"]);
         assert_eq!(
             properties::<DockerEngineUpdateArgs>(),
-            ["dry_run", "runtime"]
+            ["dryRun", "runtime"]
         );
         assert_eq!(
             properties::<DockerBackupArgs>(),
-            ["destination", "dry_run", "state_path"]
+            ["destination", "dryRun", "state_path"]
         );
         assert_eq!(
             properties::<DockerRestoreArgs>(),
-            ["archive", "dry_run", "state_path"]
+            ["archive", "dryRun", "state_path"]
         );
     }
 
@@ -600,7 +600,7 @@ mod tests {
                     .unwrap();
             assert!(!args.dry_run);
             let args: DockerInstallArgs = plugin_toolkit::serde_json::from_value(
-                plugin_toolkit::serde_json::json!({"dry_run": true}),
+                plugin_toolkit::serde_json::json!({"dryRun": true}),
             )
             .unwrap();
             let out = docker_install(args, &ctx).await.unwrap();

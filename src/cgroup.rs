@@ -105,7 +105,7 @@ pub struct DockerHostProbeArgs {
     /// Only read files and `docker info`. Omitted, also pulls
     /// `debian:stable-slim` if absent and runs a throwaway limited container.
     #[arg(long)]
-    #[serde(default)]
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
     pub dry_run: bool,
 }
 
@@ -302,7 +302,7 @@ pub(crate) fn write_files(root: &Path, a: &CgroupAssessment) -> Result<()> {
 pub struct DockerHostPrepareArgs {
     /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
-    #[serde(default)]
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
     pub dry_run: bool,
 }
 
