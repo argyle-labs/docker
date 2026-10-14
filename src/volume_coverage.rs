@@ -479,7 +479,6 @@ async fn service_container(docker: &Docker, project: &str, service: &str) -> Res
 /// How long [`dump`] waits for the engine to report the exec finished after
 /// its output closed.
 const EXEC_EXIT_POLLS: u32 = 100;
-const EXEC_EXIT_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Exec `command` in `container` through [`DUMP_WRAPPER`], streaming its
 /// stdout into `out`. A non-zero exit fails with its stderr.
@@ -538,24 +537,12 @@ async fn dump(docker: &Docker, container: &str, command: &str, out: &Path) -> Re
     Ok(())
 }
 
-/// The exit code of exec `id`, once the engine reports it no longer running:
-/// the output stream can close before the process is reaped.
 async fn exit_code(docker: &Docker, id: &str, polls: u32) -> Result<i64> {
-    for _ in 0..polls {
-        let inspected = docker
-            .inspect_exec(id)
-            .await
-            .map_err(|e| anyhow::anyhow!("inspect dump exec: {e}"))?;
-        if inspected.running == Some(false) {
-            return inspected
-                .exit_code
-                .ok_or_else(|| anyhow::anyhow!("dump exec finished without an exit code"));
-        }
-        plugin_toolkit::time::sleep(EXEC_EXIT_POLL).await;
-    }
-    anyhow::bail!(
-        "dump exec still running after its output closed; the dump file may be complete but its exit status is unconfirmed"
-    )
+    crate::exec::wait_exit(docker, id, polls).await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "dump exec still running after its output closed; the dump file may be complete but its exit status is unconfirmed"
+        )
+    })
 }
 
 const WRITER_QUEUE: usize = 4;

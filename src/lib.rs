@@ -14,6 +14,7 @@ pub mod containers;
 pub mod engine;
 pub mod engine_resources;
 pub mod engine_state;
+mod exec;
 pub mod execute;
 pub mod fsat;
 pub mod host_update;

@@ -102,18 +102,28 @@ pub struct ManageabilityAudit {
     /// Containers with at least one gap.
     pub failing: Vec<ContainerContract>,
     pub checked: usize,
+    /// Containers whose exec probe did not finish within the call's budget;
+    /// their other gaps are still in `failing`. Re-run to probe them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unprobed: Vec<String>,
 }
 
 pub fn audit(containers: &[ContainerInspectResponse]) -> ManageabilityAudit {
-    let mut failing: Vec<ContainerContract> = containers
-        .iter()
-        .map(judge)
-        .filter(|c| !c.gaps.is_empty())
-        .collect();
+    report(containers.iter().map(judge), containers.len(), Vec::new())
+}
+
+fn report(
+    judged: impl Iterator<Item = ContainerContract>,
+    checked: usize,
+    mut unprobed: Vec<String>,
+) -> ManageabilityAudit {
+    let mut failing: Vec<ContainerContract> = judged.filter(|c| !c.gaps.is_empty()).collect();
     failing.sort_by(|a, b| a.container.cmp(&b.container));
+    unprobed.sort();
     ManageabilityAudit {
         failing,
-        checked: containers.len(),
+        checked,
+        unprobed,
     }
 }
 
@@ -143,9 +153,12 @@ pub fn with_exec(mut contract: ContainerContract, exec_ok: bool) -> ContainerCon
     contract
 }
 
-/// How long one probe may take; a wedged container or engine fails it.
-const EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-const EXEC_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+/// Polls of one probe's exit status (100 ms apart).
+const EXEC_POLLS: u32 = 100;
+/// Stays under orca's 35 s plugin call timeout so a few wedged containers
+/// cost their own probe, not the whole audit.
+const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(25);
+const PROBE_CONCURRENCY: usize = 8;
 
 /// The probe's exit status, read through the Engine API exec endpoints.
 async fn probe_succeeds(docker: &Docker, id: &str, cmd: &[&str]) -> bool {
@@ -168,15 +181,10 @@ async fn probe_succeeds(docker: &Docker, id: &str, cmd: &[&str]) -> bool {
     if docker.start_exec(&exec.id, Some(detached)).await.is_err() {
         return false;
     }
-    let deadline = std::time::Instant::now() + EXEC_TIMEOUT;
-    while std::time::Instant::now() < deadline {
-        match docker.inspect_exec(&exec.id).await {
-            Ok(e) if e.running == Some(false) => return e.exit_code == Some(0),
-            Ok(_) => plugin_toolkit::time::sleep(EXEC_POLL).await,
-            Err(_) => return false,
-        }
-    }
-    false
+    matches!(
+        crate::exec::wait_exit(docker, &exec.id, EXEC_POLLS).await,
+        Ok(Some(0))
+    )
 }
 
 async fn exec_ok(docker: &Docker, id: &str) -> bool {
@@ -186,6 +194,28 @@ async fn exec_ok(docker: &Docker, id: &str) -> bool {
         }
     }
     false
+}
+
+/// Probes every container, `PROBE_CONCURRENCY` at a time, until `budget`
+/// runs out. `None` marks a container whose probe did not finish in time.
+async fn probe_all(
+    docker: &Docker,
+    containers: &[ContainerInspectResponse],
+    budget: std::time::Duration,
+) -> Vec<Option<bool>> {
+    let deadline = std::time::Instant::now() + budget;
+    let mut out = Vec::with_capacity(containers.len());
+    for batch in containers.chunks(PROBE_CONCURRENCY) {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        out.extend(
+            plugin_toolkit::reactor::join_all(batch.iter().map(|c| {
+                let id = c.id.as_deref().unwrap_or_default();
+                plugin_toolkit::time::timeout(left, exec_ok(docker, id))
+            }))
+            .await,
+        );
+    }
+    out
 }
 
 #[orca_struct(args)]
@@ -201,7 +231,8 @@ pub struct DockerManageabilityAuditArgs {
 /// must declare a healthcheck (its own or its image's), carry compose or
 /// `orca.stack` provenance, and pin its timezone (`TZ` or an
 /// `/etc/localtime` bind). With `exec_probe`, also proves an exec path by
-/// running a no-op inside each (10 s per probe). Lists containers with gaps.
+/// running a no-op inside each, concurrently within a 25 s budget; containers
+/// not probed in time are listed in `unprobed`. Lists containers with gaps.
 /// Changes nothing; `execProbe` only starts a short-lived process in each
 /// container. Admin.
 #[orca_tool(
@@ -222,19 +253,21 @@ async fn docker_manageability_audit(
     if !args.exec_probe {
         return Ok(audit(&containers));
     }
-    let mut failing = Vec::new();
-    for c in &containers {
-        let id = c.id.as_deref().unwrap_or_default();
-        let judged = with_exec(judge(c), exec_ok(docker, id).await);
-        if !judged.gaps.is_empty() {
-            failing.push(judged);
-        }
-    }
-    failing.sort_by(|a, b| a.container.cmp(&b.container));
-    Ok(ManageabilityAudit {
-        failing,
-        checked: containers.len(),
-    })
+    let probed = probe_all(docker, &containers, PROBE_BUDGET).await;
+    let mut unprobed = Vec::new();
+    let judged: Vec<ContainerContract> = containers
+        .iter()
+        .zip(probed)
+        .map(|(c, ok)| match ok {
+            Some(ok) => with_exec(judge(c), ok),
+            None => {
+                let j = judge(c);
+                unprobed.push(j.container.clone());
+                j
+            }
+        })
+        .collect();
+    Ok(report(judged.into_iter(), containers.len(), unprobed))
 }
 
 #[cfg(test)]
@@ -380,5 +413,26 @@ mod tests {
             EXEC_PROBES.len(),
             "every fallback probe is tried"
         );
+    }
+
+    #[test]
+    fn a_wedged_probe_is_unprobed_not_a_gap() {
+        use crate::test_engine::{FakeEngine, Route};
+        let wedged = FakeEngine::routed(vec![
+            Route::new("POST", "/containers/c1/exec", 201, r#"{"Id":"e1"}"#),
+            Route::new("POST", "/exec/e1/start", 200, ""),
+            Route::new("GET", "/exec/e1/json", 200, r#"{"Running":true}"#),
+        ]);
+        let mut c = container("c1", None, &[], &[]);
+        c.id = Some("c1".into());
+        let got = plugin_toolkit::reactor::block_on(probe_all(
+            &wedged.client(),
+            std::slice::from_ref(&c),
+            std::time::Duration::from_millis(300),
+        ));
+        assert_eq!(got, [None]);
+        let audit = report(std::iter::once(judge(&c)), 1, vec!["c1".into()]);
+        assert_eq!(audit.unprobed, ["c1"]);
+        assert!(!audit.failing[0].gaps.contains(&GAP_EXEC.to_owned()));
     }
 }
