@@ -1,9 +1,9 @@
-//! The execute opt-in shared by this plugin's mutating tools.
+//! The admin gate and `dry_run` opt-in shared by this plugin's mutating tools.
 //!
-//! Mutating tools set `execute_gated = false` and own their `execute` flag, so
+//! Mutating tools set `execute_gated = false` and own their `dry_run` flag, so
 //! the dry run can list the exact items a call would touch. Opting out of the
-//! central gate also opts out of the role check orca runs inside it, so
-//! [`authorize_execute`] replaces it.
+//! central gate also opts out of the role check orca runs inside it, so every
+//! mutating tool calls [`require_admin`], dry run included.
 
 use std::collections::BTreeSet;
 
@@ -40,13 +40,6 @@ fn check_admin(subject: &str, caller: Option<&CallerIdentity>) -> Result<()> {
     }
 }
 
-pub fn guard(tool: &str, execute: bool, ctx: &ToolCtx) -> Result<()> {
-    if execute {
-        authorize_execute(tool, ctx.caller().as_ref())?;
-    }
-    Ok(())
-}
-
 /// Split the operator's confirmed plan against what is valid right now:
 /// `(act_on, dropped)`. Only items in both are acted on; confirmed items that
 /// are no longer valid are reported, never acted on.
@@ -73,7 +66,7 @@ pub fn intersect(confirmed: &[String], current: &[String]) -> (Vec<String>, Vec<
 pub fn require_confirmed(tool: &str, confirmed: &[String], current: &[String]) -> Result<()> {
     if confirmed.is_empty() && !current.is_empty() {
         bail!(
-            "{tool}: execute needs the items from the dry run; re-run without execute and pass its items"
+            "{tool}: execute needs the items from the dry run; re-run with `dryRun` and pass its items"
         );
     }
     Ok(())

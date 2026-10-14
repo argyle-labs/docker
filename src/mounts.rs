@@ -191,12 +191,11 @@ fn sees(b: &Bind, h: &Mount, c: &Mount) -> bool {
 
 #[orca_struct(args)]
 pub struct DockerMountCheckArgs {
-    /// Restart the confirmed containers. Omitted, returns the findings and
-    /// changes nothing.
+    /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
-    #[serde(default)]
-    pub execute: bool,
-    /// `container:<name>` items from the dry run (execute only).
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
+    pub dry_run: bool,
+    /// `container:<name>` items from the dry run (when executing).
     /// Comma-separated on the CLI.
     #[arg(long, value_delimiter = ',')]
     #[serde(default)]
@@ -215,6 +214,7 @@ pub struct ContainerMounts {
 #[serde(rename_all = "camelCase")]
 #[derive(Debug)]
 pub struct DockerMountCheckOutput {
+    /// true: nothing was changed.
     pub dry_run: bool,
     /// Running containers with network-backed binds.
     pub containers: Vec<ContainerMounts>,
@@ -387,8 +387,7 @@ pub fn select(
 
 /// **Find containers holding a stale network mount**: a bind whose host
 /// source is on a network share (cifs/nfs/…) while the container sees local
-/// disk there, because it started before the share was mounted. With
-/// `execute` and the dry run's `items`, restarts those still stale. Run after
+/// disk there, because it started before the share was mounted. With the dry run's `items`, restarts those still stale. Run after
 /// boot as a backstop to `docker.mount_gate`.
 #[orca_tool(
     domain = "docker",
@@ -402,7 +401,6 @@ async fn docker_mount_check(
     ctx: &ToolCtx,
 ) -> Result<DockerMountCheckOutput> {
     execute::require_admin(CHECK_TOOL, ctx)?;
-    execute::guard(CHECK_TOOL, args.execute, ctx)?;
     let host = host_mounts(&HostProc)?;
     let checked = check(scan(false).await?, &host, &HostProc);
     // A pid that changed while its table was read may have named another
@@ -421,7 +419,7 @@ async fn docker_mount_check(
     }
     let items = stale_items(&containers);
     let mut out = DockerMountCheckOutput {
-        dry_run: !args.execute,
+        dry_run: args.dry_run,
         containers,
         items,
         unreadable,
@@ -429,7 +427,7 @@ async fn docker_mount_check(
         failed: Vec::new(),
         dropped: Vec::new(),
     };
-    if !args.execute {
+    if args.dry_run {
         return Ok(out);
     }
     let (act, dropped) = select(CHECK_TOOL, &args.items, &out.items)?;

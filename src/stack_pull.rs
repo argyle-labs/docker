@@ -184,10 +184,10 @@ pub struct DockerStackPullPinnedArgs {
     /// source host's `docker.stack_manifest`. Comma-separated on the CLI.
     #[arg(long, value_delimiter = ',')]
     pub pins: Vec<String>,
-    /// Apply. Omitted, lists what would be pulled and changes nothing.
+    /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
-    #[serde(default)]
-    pub execute: bool,
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
+    pub dry_run: bool,
 }
 
 /// **Stage a moved stack's images on this host**: pull each image by the
@@ -205,13 +205,12 @@ async fn docker_stack_pull_pinned(
     ctx: &ToolCtx,
 ) -> Result<StackPullOutput> {
     crate::execute::require_admin(TOOL, ctx)?;
-    crate::execute::guard(TOOL, args.execute, ctx)?;
     let pins = args
         .pins
         .iter()
         .map(|p| parse(p))
         .collect::<Result<Vec<_>>>()?;
-    if !args.execute {
+    if args.dry_run {
         return Ok(StackPullOutput {
             executed: false,
             plan: pins
@@ -406,7 +405,7 @@ mod tests {
                     format!("redis:7={}", at("redis", A)),
                     format!("{}={}", at("app", B), at("app", B)),
                 ],
-                execute: false,
+                dry_run: true,
             },
             &crate::test_support::admin(),
         ))
@@ -423,7 +422,7 @@ mod tests {
             let err = plugin_toolkit::reactor::block_on(docker_stack_pull_pinned(
                 DockerStackPullPinnedArgs {
                     pins: vec![],
-                    execute: false,
+                    dry_run: true,
                 },
                 &ctx,
             ))

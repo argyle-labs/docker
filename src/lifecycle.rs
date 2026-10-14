@@ -173,22 +173,22 @@ pub struct DockerInstallArgs {
     #[arg(long, value_enum, default_value_t = ContainerRuntime::Colima)]
     #[serde(default)]
     pub runtime: ContainerRuntime,
-    /// Run the install. Omitted, returns what would run and changes nothing.
+    /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
-    #[serde(default)]
-    pub execute: bool,
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
+    pub dry_run: bool,
 }
 
 #[orca_struct]
 #[serde(rename_all = "camelCase")]
 #[derive(Debug)]
 pub struct DockerInstallOutput {
-    /// `true`: nothing ran.
+    /// true: nothing was changed.
     pub dry_run: bool,
     /// The script and runtime execute runs.
     pub plan: String,
     pub provisioned: bool,
-    /// The script's stdout (execute only).
+    /// The script's stdout (when executing).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -199,8 +199,7 @@ pub struct DockerInstallOutput {
 /// which installs the requested runtime (docker engine, colima, or podman) via
 /// the right method for this target — brew on macOS; apt/apk/pacman/dnf on
 /// Linux; rpm-ostree layering on atomic hosts (Bazzite/Silverblue) — and starts
-/// it. Idempotent: a present, running runtime is left untouched. Without
-/// `execute`, returns what would run and changes nothing.
+/// it. Idempotent: a present, running runtime is left untouched. With `dry_run`, returns what would run and changes nothing.
 #[orca_tool(
     domain = "docker",
     verb = "install",
@@ -212,13 +211,13 @@ async fn docker_install(args: DockerInstallArgs, ctx: &ToolCtx) -> Result<Docker
     execute::require_admin(INSTALL_TOOL, ctx)?;
     let runtime = args.runtime.as_arg();
     let plan = format!("run the embedded install.sh {runtime}");
-    if !args.execute {
+    if args.dry_run {
         return Ok(DockerInstallOutput {
             dry_run: true,
             plan,
             provisioned: false,
             log: None,
-            how_to_execute: Some(format!("re-invoke {INSTALL_TOOL} with `execute: true`")),
+            how_to_execute: Some(format!("re-invoke {INSTALL_TOOL} without `dry_run`")),
         });
     }
     let output = run(script_command("install.sh", INSTALL_SH, &[runtime])).await?;
@@ -241,22 +240,22 @@ pub struct DockerEngineUpdateArgs {
     #[arg(long, value_enum, default_value_t = ContainerRuntime::Colima)]
     #[serde(default)]
     pub runtime: ContainerRuntime,
-    /// Run the upgrade. Omitted, returns what would run and changes nothing.
+    /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
-    #[serde(default)]
-    pub execute: bool,
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
+    pub dry_run: bool,
 }
 
 #[orca_struct]
 #[serde(rename_all = "camelCase")]
 #[derive(Debug)]
 pub struct DockerEngineUpdateOutput {
-    /// `true`: nothing ran.
+    /// true: nothing was changed.
     pub dry_run: bool,
     /// The script and runtime execute runs.
     pub plan: String,
     pub updated: bool,
-    /// The script's stdout (execute only).
+    /// The script's stdout (when executing).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -266,7 +265,7 @@ pub struct DockerEngineUpdateOutput {
 /// **Upgrade a container runtime** on this host. Runs `scripts/update.sh`, which
 /// bumps the runtime (docker engine, colima/lima, or podman) to the latest
 /// available release and restarts the daemon. Distinct from `docker.update`,
-/// which patches a registered runtime. Without `execute`, returns what would
+/// which patches a registered runtime. With `dry_run`, returns what would
 /// run and changes nothing.
 #[orca_tool(
     domain = "docker",
@@ -282,15 +281,13 @@ async fn docker_engine_update(
     execute::require_admin(ENGINE_UPDATE_TOOL, ctx)?;
     let runtime = args.runtime.as_arg();
     let plan = format!("run the embedded update.sh {runtime}");
-    if !args.execute {
+    if args.dry_run {
         return Ok(DockerEngineUpdateOutput {
             dry_run: true,
             plan,
             updated: false,
             log: None,
-            how_to_execute: Some(format!(
-                "re-invoke {ENGINE_UPDATE_TOOL} with `execute: true`"
-            )),
+            how_to_execute: Some(format!("re-invoke {ENGINE_UPDATE_TOOL} without `dry_run`")),
         });
     }
     let output = run(script_command("update.sh", UPDATE_SH, &[runtime])).await?;
@@ -319,24 +316,23 @@ pub struct DockerBackupArgs {
     #[arg(long)]
     #[serde(default)]
     pub state_path: Option<String>,
-    /// Write the archive. Omitted, validates the paths, returns what would
-    /// run and changes nothing.
+    /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
-    #[serde(default)]
-    pub execute: bool,
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
+    pub dry_run: bool,
 }
 
 #[orca_struct]
 #[serde(rename_all = "camelCase")]
 #[derive(Debug)]
 pub struct DockerBackupOutput {
-    /// `true`: nothing was written.
+    /// true: nothing was changed.
     pub dry_run: bool,
     /// Resolved directory the archive is (or would be) written into.
     pub destination: String,
     /// Resolved state dir that is (or would be) archived.
     pub state_path: String,
-    /// Absolute path of the archive written, mode 0600 (execute only).
+    /// Absolute path of the archive written, mode 0600 (when executing).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archive: Option<String>,
     /// State entries left out of the archive, with the reason.
@@ -348,7 +344,7 @@ pub struct DockerBackupOutput {
 /// **Back up the engine's persistent state** (the colima/lima profile dir, or a
 /// supplied state path inside it) to a `.tar.gz` in the destination directory.
 /// Captures the engine VM profile + config so a reprovisioned host can be
-/// restored. Without `execute`, returns what would run and changes nothing.
+/// restored. With `dry_run`, returns what would run and changes nothing.
 #[orca_tool(
     domain = "docker",
     verb = "backup",
@@ -375,7 +371,7 @@ async fn backup(
     let root = state_dir(None, home)?;
     let destination = in_backup_root(&args.destination, roots)?;
     let state_path = state.to_string_lossy().into_owned();
-    if !args.execute {
+    if args.dry_run {
         let (_, excluded) = engine_state::members(&state, &root)?;
         return Ok(DockerBackupOutput {
             dry_run: true,
@@ -383,7 +379,7 @@ async fn backup(
             state_path,
             archive: None,
             excluded,
-            how_to_execute: Some(format!("re-invoke {BACKUP_TOOL} with `execute: true`")),
+            how_to_execute: Some(format!("re-invoke {BACKUP_TOOL} without `dry_run`")),
         });
     }
     std::fs::create_dir_all(&destination)
@@ -426,18 +422,17 @@ pub struct DockerRestoreArgs {
     #[arg(long)]
     #[serde(default)]
     pub state_path: Option<String>,
-    /// Run the restore. Omitted, validates the paths, returns what would run
-    /// and changes nothing.
+    /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
-    #[serde(default)]
-    pub execute: bool,
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
+    pub dry_run: bool,
 }
 
 #[orca_struct]
 #[serde(rename_all = "camelCase")]
 #[derive(Debug)]
 pub struct DockerRestoreOutput {
-    /// `true`: nothing ran.
+    /// true: nothing was changed.
     pub dry_run: bool,
     pub restored: bool,
     /// Resolved host path the state is (or would be) restored into.
@@ -454,7 +449,7 @@ pub struct DockerRestoreOutput {
 /// state path inside it). Pair with `docker.install` to rebuild a host from a
 /// backup. An archive with any entry that could land outside the state dir is
 /// refused, as is a state dir already holding a symlink that leaves it.
-/// Without `execute`, returns what would run and changes nothing.
+/// With `dry_run`, returns what would run and changes nothing.
 #[orca_tool(
     domain = "docker",
     verb = "restore",
@@ -512,13 +507,13 @@ async fn restore(
     }
     engine_state::validate(&mut file)?;
     let state_path = state.to_string_lossy().into_owned();
-    if !args.execute {
+    if args.dry_run {
         return Ok(DockerRestoreOutput {
             dry_run: true,
             restored: false,
             state_path,
             leftover: None,
-            how_to_execute: Some(format!("re-invoke {RESTORE_TOOL} with `execute: true`")),
+            how_to_execute: Some(format!("re-invoke {RESTORE_TOOL} without `dry_run`")),
         });
     }
     if let Some(parent) = state.parent() {
@@ -581,36 +576,40 @@ mod tests {
             keys.sort();
             keys
         }
-        assert_eq!(properties::<DockerInstallArgs>(), ["execute", "runtime"]);
+        assert_eq!(properties::<DockerInstallArgs>(), ["dryRun", "runtime"]);
         assert_eq!(
             properties::<DockerEngineUpdateArgs>(),
-            ["execute", "runtime"]
+            ["dryRun", "runtime"]
         );
         assert_eq!(
             properties::<DockerBackupArgs>(),
-            ["destination", "execute", "state_path"]
+            ["destination", "dryRun", "state_path"]
         );
         assert_eq!(
             properties::<DockerRestoreArgs>(),
-            ["archive", "execute", "state_path"]
+            ["archive", "dryRun", "state_path"]
         );
     }
 
     #[test]
-    fn install_and_engine_update_dry_run_by_default() {
+    fn install_and_engine_update_execute_unless_dry_run() {
         let ctx = admin();
         block(async {
             let args: DockerInstallArgs =
                 plugin_toolkit::serde_json::from_value(plugin_toolkit::serde_json::json!({}))
                     .unwrap();
-            assert!(!args.execute);
+            assert!(!args.dry_run);
+            let args: DockerInstallArgs = plugin_toolkit::serde_json::from_value(
+                plugin_toolkit::serde_json::json!({"dryRun": true}),
+            )
+            .unwrap();
             let out = docker_install(args, &ctx).await.unwrap();
             assert!(out.dry_run && !out.provisioned && out.log.is_none());
             assert_eq!(out.plan, "run the embedded install.sh colima");
 
             let args = DockerEngineUpdateArgs {
                 runtime: ContainerRuntime::Podman,
-                execute: false,
+                dry_run: true,
             };
             let out = docker_engine_update(args, &ctx).await.unwrap();
             assert!(out.dry_run && !out.updated && out.log.is_none());
@@ -629,17 +628,29 @@ mod tests {
                 let errs = block(async {
                     let runtime = ContainerRuntime::Colima;
                     [
-                        docker_install(DockerInstallArgs { runtime, execute }, &ctx)
-                            .await
-                            .unwrap_err(),
-                        docker_engine_update(DockerEngineUpdateArgs { runtime, execute }, &ctx)
-                            .await
-                            .unwrap_err(),
+                        docker_install(
+                            DockerInstallArgs {
+                                runtime,
+                                dry_run: !execute,
+                            },
+                            &ctx,
+                        )
+                        .await
+                        .unwrap_err(),
+                        docker_engine_update(
+                            DockerEngineUpdateArgs {
+                                runtime,
+                                dry_run: !execute,
+                            },
+                            &ctx,
+                        )
+                        .await
+                        .unwrap_err(),
                         backup(
                             DockerBackupArgs {
                                 destination: r.clone(),
                                 state_path: None,
-                                execute,
+                                dry_run: !execute,
                             },
                             &h,
                             &roots,
@@ -651,7 +662,7 @@ mod tests {
                             DockerRestoreArgs {
                                 archive: archive.clone(),
                                 state_path: None,
-                                execute,
+                                dry_run: !execute,
                             },
                             &h,
                             &roots,
@@ -689,7 +700,7 @@ mod tests {
         let args = DockerBackupArgs {
             destination: s(dest.path()),
             state_path: None,
-            execute: false,
+            dry_run: true,
         };
         let err = block(backup(args, &s(home.path()), &[s(dest.path())], &admin())).unwrap_err();
         assert!(err.to_string().contains("not a directory"), "{err}");
@@ -702,7 +713,7 @@ mod tests {
         let args = DockerBackupArgs {
             destination: s(&dest),
             state_path: None,
-            execute: false,
+            dry_run: true,
         };
         let out = block(backup(args, &s(home.path()), &[s(root.path())], &admin())).unwrap();
         assert!(out.dry_run && out.archive.is_none() && out.how_to_execute.is_some());
@@ -716,7 +727,7 @@ mod tests {
         let args = DockerBackupArgs {
             destination: s(&root.path().join("engine")),
             state_path: None,
-            execute: true,
+            dry_run: false,
         };
         let out = block(backup(args, &s(home.path()), &[s(root.path())], &admin())).unwrap();
         assert!(!out.dry_run);
@@ -750,7 +761,7 @@ mod tests {
         let args = DockerBackupArgs {
             destination: s(root.path()),
             state_path: Some(s(root.path())),
-            execute: false,
+            dry_run: true,
         };
         let err = block(backup(args, &s(home.path()), &[s(root.path())], &admin())).unwrap_err();
         assert!(
@@ -919,7 +930,7 @@ mod tests {
         let args = DockerRestoreArgs {
             archive,
             state_path: Some(s(&state)),
-            execute: true,
+            dry_run: false,
         };
         let err = block(restore(args, &s(home.path()), &[s(root.path())], &admin())).unwrap_err();
         assert!(err.to_string().contains("links to '/etc'"), "{err}");
@@ -936,7 +947,7 @@ mod tests {
             let args = DockerRestoreArgs {
                 archive,
                 state_path: None,
-                execute: false,
+                dry_run: true,
             };
             block(restore(args, &s(home.path()), &roots, &admin()))
                 .unwrap_err()
@@ -956,7 +967,7 @@ mod tests {
         let args = DockerRestoreArgs {
             archive: s(&archive),
             state_path: None,
-            execute: true,
+            dry_run: false,
         };
         let err = block(restore(args, &s(home.path()), &[s(root.path())], &admin())).unwrap_err();
         assert!(
@@ -974,7 +985,7 @@ mod tests {
         let args = DockerRestoreArgs {
             archive: s(&archive),
             state_path: None,
-            execute: false,
+            dry_run: true,
         };
         let out = block(restore(args, &s(home.path()), &[s(root.path())], &admin())).unwrap();
         assert!(out.dry_run && !out.restored && out.how_to_execute.is_some());
@@ -991,7 +1002,7 @@ mod tests {
         let args = DockerRestoreArgs {
             archive: s(&archive),
             state_path: Some(s(&target)),
-            execute: true,
+            dry_run: false,
         };
         let out = block(restore(args, &s(home.path()), &[s(root.path())], &admin())).unwrap();
         assert!(!out.dry_run && out.restored);

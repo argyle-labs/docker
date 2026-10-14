@@ -16,7 +16,7 @@
 //! candidates. When a stack's config cannot be read, no network is a
 //! candidate, because any of them might be that stack's external network.
 //!
-//! Dry run by default: the plan lists every candidate by key. Execute takes
+//! `dry_run` returns the plan, which lists every candidate by key. Execute takes
 //! those keys back, recomputes the candidates, and removes only keys present
 //! in both. The engine still refuses to remove anything in use, which is
 //! reported as skipped.
@@ -277,7 +277,7 @@ pub struct Skipped {
 #[schemars(crate = "plugin_toolkit::schemars")]
 #[serde(rename_all = "camelCase")]
 pub struct PruneApplied {
-    /// Always `false`: changes were applied.
+    /// true: nothing was changed.
     pub dry_run: bool,
     pub removed: Vec<String>,
     /// Not removed, and not an error: no longer a candidate, already gone,
@@ -441,7 +441,7 @@ pub fn plan<A: Serialize>(
         .collect();
     let mut p = ExecutionPlan::generic(TOOL, inputs.into()).detailed(summary, changes);
     p.how_to_execute = format!(
-        "re-invoke {TOOL} with `execute: true` and `items` set to the change targets to remove; only items still orphaned are removed"
+        "re-invoke {TOOL} without `dry_run`, with `items` set to the change targets to remove; only items still orphaned are removed"
     );
     Ok(p)
 }
@@ -452,15 +452,15 @@ pub struct DockerPruneArgs {
     #[arg(long)]
     #[serde(default)]
     pub stack: Option<String>,
-    /// The plan's change targets to remove (execute only). Comma-separated on
+    /// The plan's change targets to remove (when executing). Comma-separated on
     /// the CLI.
     #[arg(long, value_delimiter = ',')]
     #[serde(default)]
     pub items: Vec<String>,
-    /// Apply. Omitted, returns the plan and changes nothing.
+    /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
-    #[serde(default)]
-    pub execute: bool,
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
+    pub dry_run: bool,
 }
 
 async fn project_for(stack: &str) -> Result<String> {
@@ -486,7 +486,7 @@ async fn external_networks() -> Result<Option<HashSet<String>>> {
 
 /// **Remove orphaned engine resources**: dangling images, dangling anonymous
 /// volumes and compose networks no container uses. Named volumes are never
-/// removed. Without `execute`, returns the candidates and changes nothing.
+/// removed. With `dry_run`, returns the candidates and changes nothing.
 #[orca_tool(
     domain = "docker",
     verb = "prune",
@@ -495,7 +495,6 @@ async fn external_networks() -> Result<Option<HashSet<String>>> {
 )]
 async fn docker_prune(args: DockerPruneArgs, ctx: &ToolCtx) -> Result<PruneChange> {
     execute::require_admin(TOOL, ctx)?;
-    execute::guard(TOOL, args.execute, ctx)?;
     let project = match &args.stack {
         Some(s) => Some(project_for(s).await?),
         None => None,
@@ -508,7 +507,7 @@ async fn docker_prune(args: DockerPruneArgs, ctx: &ToolCtx) -> Result<PruneChang
         project: project.as_deref(),
         external_networks: external.as_ref(),
     };
-    if args.execute {
+    if !args.dry_run {
         return Ok(PruneChange::Applied(
             apply(docker, scope, &args.items).await?,
         ));
@@ -769,7 +768,7 @@ mod tests {
         let args = DockerPruneArgs {
             stack: None,
             items: vec![],
-            execute: false,
+            dry_run: true,
         };
         let p = plan(&args, None, &f, false).unwrap();
         assert!(p.dry_run && p.detailed);
@@ -913,7 +912,7 @@ mod tests {
         let args = DockerPruneArgs {
             stack: None,
             items: vec!["volume:anon1".into()],
-            execute: true,
+            dry_run: false,
         };
         let err = plugin_toolkit::reactor::block_on(docker_prune(args, &ctx_without_caller()))
             .unwrap_err();
@@ -926,7 +925,7 @@ mod tests {
             let args = DockerPruneArgs {
                 stack: None,
                 items: vec![],
-                execute: false,
+                dry_run: true,
             };
             let err = plugin_toolkit::reactor::block_on(docker_prune(args, &ctx)).unwrap_err();
             crate::test_support::assert_admin_refusal(&err.to_string());

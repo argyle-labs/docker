@@ -18,7 +18,7 @@
 //!   [`crate::lint`]); `query.kind = "coverage"` → named-volume backup
 //!   coverage (see [`crate::volume_coverage`])
 //! - [`Verb::Update`] → **edit** (action `edit`, rewrite YAML/env, no deploy),
-//!   **fix** (rewrite lint findings, dry run by default), **volume_policy**
+//!   **fix** (rewrite lint findings, `dry_run` to plan), **volume_policy**
 //!   (declare how a named volume is backed up), **label_volumes** (convert
 //!   anonymous volumes into labeled named ones, see [`crate::ownership`]), or
 //!   lifecycle (`up` regenerates `compose.orca.yaml` first; `up` /
@@ -60,7 +60,11 @@ const STACK_KIND: &str = "stack";
 /// forwarded to `docker compose <action>`.
 const STACK_LIFECYCLE: &[&str] = &["up", "down", "start", "stop", "restart", "build", "pull"];
 
-/// Stack update actions whose payload carries its own `execute` and `items`
+/// Refusal for executing `deploy`/`exec` creates while no caller can be verified.
+const CREATE_NEEDS_CALLER: &str = "execute needs an orca that passes the caller on unit create; \
+     upgrade orca, or re-run with `dryRun` to see the plan";
+
+/// Stack update actions whose payload carries its own `dry_run` and `items`
 /// and plans itself; every other mutating action is gated here.
 const SELF_PLANNING: &[&str] = &["fix", "volume_policy", "label_volumes"];
 
@@ -75,33 +79,36 @@ const CONTAINER_ACTIONS: &[&str] = &["start", "stop", "restart"];
 #[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(crate = "plugin_toolkit::serde", deny_unknown_fields)]
 #[schemars(crate = "plugin_toolkit::schemars")]
-pub struct ExecuteOptIn {
-    /// Apply. Omitted, returns what would happen and changes nothing.
-    #[serde(default)]
-    pub execute: bool,
+pub struct DryRunOptIn {
+    /// Return the plan and change nothing. Omitted, applies.
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
+    pub dry_run: bool,
 }
 
-/// `(execute, rest)`: the payload's `execute` flag, and the payload without
-/// it for the action's own parser. A payload that is not a JSON object is
+/// `(dry_run, rest)`: the payload's `dryRun` flag (or its `dry_run` alias),
+/// and the payload without it for the action's own parser. A payload that is not a JSON object is
 /// passed on untouched, never read as an opt-in.
-pub(crate) fn split_execute(payload: Option<String>) -> Result<(bool, Option<String>)> {
+pub(crate) fn split_dry_run(payload: Option<String>) -> Result<(bool, Option<String>)> {
     let Some(raw) = payload else {
         return Ok((false, None));
     };
     let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(&raw) else {
         return Ok((false, Some(raw)));
     };
-    let execute = match map.remove("execute") {
-        None => false,
-        Some(Value::Bool(b)) => b,
-        Some(other) => anyhow::bail!("`execute` must be true or false, got {other}"),
-    };
+    let mut dry_run = false;
+    for key in ["dryRun", "dry_run"] {
+        match map.remove(key) {
+            None => {}
+            Some(Value::Bool(b)) => dry_run |= b,
+            Some(other) => anyhow::bail!("`{key}` must be true or false, got {other}"),
+        }
+    }
     let rest = if map.is_empty() {
         None
     } else {
         Some(Value::Object(map).to_string())
     };
-    Ok((execute, rest))
+    Ok((dry_run, rest))
 }
 
 /// The payload core's pre-mutation guard sends to `backup`: none, or empty.
@@ -118,7 +125,7 @@ pub(crate) fn dry_run(id: UnitId, plan: String) -> VerbOutcome {
     let body = json!({
         "dryRun": true,
         "plan": plan,
-        "howToExecute": "re-invoke with `execute: true` in the payload",
+        "howToExecute": "re-invoke without `dryRun` in the payload",
     });
     VerbOutcome::Item(ItemOutcome::new(id, body.to_string()))
 }
@@ -370,7 +377,7 @@ impl DockerUnitProvider {
     }
 
     /// **fix** — rewrite the fixable lint findings in the compose file through
-    /// the edit path. Dry run by default: returns the changes and the diff.
+    /// the edit path. With `dry_run`, returns the changes and the diff.
     /// Execute applies only the confirmed `items` that still apply cleanly to
     /// the file as it is now. Does not deploy; run `up` afterwards.
     async fn stack_fix(
@@ -383,7 +390,10 @@ impl DockerUnitProvider {
             Some(raw) => {
                 serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("fix payload: {e}"))?
             }
-            None => StackFixPayload::default(),
+            None => StackFixPayload {
+                dry_run: true,
+                ..Default::default()
+            },
         };
         let roots = lint::managed_roots(None);
         let findings = stack_findings(row, &roots).await?;
@@ -432,7 +442,7 @@ impl DockerUnitProvider {
 
     /// **label_volumes**: convert the stack's anonymous volumes into labeled
     /// named volumes declared in [`ORCA_FILE`], copying and verifying their
-    /// data. Dry run by default; execute acts only on confirmed items that
+    /// data. `dry_run` returns the plan; execute acts only on confirmed items that
     /// are still convertible.
     async fn stack_label_volumes(
         &self,
@@ -443,7 +453,10 @@ impl DockerUnitProvider {
         let p: LabelVolumesPayload = match payload {
             Some(raw) => serde_json::from_str(&raw)
                 .map_err(|e| anyhow::anyhow!("label_volumes payload: {e}"))?,
-            None => LabelVolumesPayload::default(),
+            None => LabelVolumesPayload {
+                dry_run: true,
+                ..Default::default()
+            },
         };
         let (_, cfg) = ownership::user_config(row).await?;
         let docker = self.adapter.client().map_err(adapter_err)?;
@@ -466,7 +479,7 @@ impl DockerUnitProvider {
     }
 
     /// **volume_policy**: declare (or with no `strategy`, clear) how one named
-    /// volume is backed up. Dry run by default.
+    /// volume is backed up. `dry_run` returns the change only.
     async fn stack_volume_policy(
         &self,
         id: &UnitId,
@@ -820,19 +833,19 @@ impl DockerUnitProvider {
             )?;
         }
         let args = if backup {
-            let (_, payload) = split_execute(args.payload.clone())?;
+            let (_, payload) = split_dry_run(args.payload.clone())?;
             UpdateArgs { payload, ..args }
         } else if stack && SELF_PLANNING.contains(&action) {
             args
         } else if (stack && (STACK_LIFECYCLE.contains(&action) || action == ACTION_REMOVE))
             || (!stack && CONTAINER_ACTIONS.contains(&action))
         {
-            let opt_in: ExecuteOptIn = match args.payload.as_deref() {
-                None => ExecuteOptIn::default(),
+            let opt_in: DryRunOptIn = match args.payload.as_deref() {
+                None => DryRunOptIn::default(),
                 Some(raw) => serde_json::from_str(raw)
                     .map_err(|e| anyhow::anyhow!("{action} payload: {e}"))?,
             };
-            if !opt_in.execute {
+            if opt_in.dry_run {
                 let plan = format!("{} {} {}", args.action, args.id.kind, args.id.id);
                 return Ok(dry_run(args.id, plan));
             }
@@ -841,8 +854,8 @@ impl DockerUnitProvider {
                 ..args
             }
         } else {
-            let (execute, payload) = split_execute(args.payload.clone())?;
-            if !execute {
+            let (plan_only, payload) = split_dry_run(args.payload.clone())?;
+            if plan_only {
                 let plan = format!("{} {} {}", args.action, args.id.kind, args.id.id);
                 return Ok(dry_run(args.id, plan));
             }
@@ -880,11 +893,10 @@ impl DockerUnitProvider {
         }
     }
 
-    /// Dry run by default. Not admin-checked here: orca's `CreateArgs` carries
-    /// no caller yet, so the surface's admin gate is the only check.
+    /// `dry_run` returns the plan; execute is refused (see [`CREATE_NEEDS_CALLER`]).
     async fn do_create(&self, args: CreateArgs) -> Result<VerbOutcome> {
-        let (execute, payload) = split_execute(args.payload.clone())?;
-        if !execute {
+        let (plan_only, payload) = split_dry_run(args.payload.clone())?;
+        if plan_only {
             let target = match args.action.as_str() {
                 "deploy" => format!("stack {}", payload_name(payload.as_deref())),
                 _ => payload
@@ -908,6 +920,10 @@ impl DockerUnitProvider {
                 name: target.clone(),
             };
             return Ok(dry_run(id, format!("{} {target}", args.action)));
+        }
+        // orca's `CreateArgs` carries no caller, so an admin-only execute can't be verified.
+        if matches!(args.action.as_str(), "deploy" | "exec") {
+            return Err(anyhow::anyhow!("{}: {CREATE_NEEDS_CALLER}", args.action));
         }
         let args = CreateArgs { payload, ..args };
         match args.action.as_str() {
@@ -974,8 +990,8 @@ impl DockerUnitProvider {
             args.caller.as_ref(),
         )?;
         if args.id.kind == STACK_KIND {
-            let (execute, payload) = split_execute(args.payload.clone())?;
-            if !execute {
+            let (plan_only, payload) = split_dry_run(args.payload.clone())?;
+            if plan_only {
                 let plan = format!("{} stack {}", args.action, payload_name(payload.as_deref()));
                 return Ok(dry_run(args.id, plan));
             }
@@ -1140,9 +1156,9 @@ pub struct VolumePolicyPayload {
     /// (e.g. `pg_dumpall -U postgres`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
-    /// Write the policy. Omitted, returns the change only.
-    #[serde(default)]
-    pub execute: bool,
+    /// Return the plan and change nothing. Omitted, applies.
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
+    pub dry_run: bool,
 }
 
 /// Response for `Update{action:"volume_policy"}`.
@@ -1150,7 +1166,8 @@ pub struct VolumePolicyPayload {
 #[serde(crate = "plugin_toolkit::serde")]
 #[schemars(crate = "plugin_toolkit::schemars")]
 pub struct VolumePolicyResult {
-    /// `true`: nothing was written.
+    /// true: nothing was changed.
+    #[serde(rename = "dryRun", alias = "dry_run")]
     pub dry_run: bool,
     pub change: PlannedChange,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1201,10 +1218,10 @@ fn volume_policy_result(
         None => PlannedChange::new(target, "clear-policy"),
     };
     Ok(VolumePolicyResult {
-        dry_run: !p.execute,
+        dry_run: p.dry_run,
         change,
-        how_to_execute: (!p.execute)
-            .then(|| "re-invoke action=volume_policy with `execute: true`".to_string()),
+        how_to_execute: (p.dry_run)
+            .then(|| "re-invoke action=volume_policy without `dry_run`".to_string()),
     })
 }
 
@@ -1213,9 +1230,9 @@ fn volume_policy_result(
 #[serde(crate = "plugin_toolkit::serde")]
 #[schemars(crate = "plugin_toolkit::schemars")]
 pub struct LabelVolumesPayload {
-    /// Convert. Omitted, returns the plan only.
-    #[serde(default)]
-    pub execute: bool,
+    /// Return the plan and change nothing. Omitted, applies.
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
+    pub dry_run: bool,
     /// The dry run's change targets (`<service>:<path>`) to convert.
     #[serde(default)]
     pub items: Vec<String>,
@@ -1226,7 +1243,8 @@ pub struct LabelVolumesPayload {
 #[serde(crate = "plugin_toolkit::serde")]
 #[schemars(crate = "plugin_toolkit::schemars")]
 pub struct LabelVolumesResult {
-    /// `true`: nothing was changed.
+    /// true: nothing was changed.
+    #[serde(rename = "dryRun", alias = "dry_run")]
     pub dry_run: bool,
     pub changes: Vec<PlannedChange>,
     /// Side effects to expect beyond the changes.
@@ -1253,14 +1271,14 @@ async fn label_volumes_result(
     p: &LabelVolumesPayload,
 ) -> Result<LabelVolumesResult> {
     let changes: Vec<PlannedChange> = planned.iter().map(ownership::planned_change).collect();
-    if !p.execute {
+    if p.dry_run {
         return Ok(LabelVolumesResult {
             dry_run: true,
             changes,
             warnings: Vec::new(),
             migrated: None,
             how_to_execute: Some(
-                "re-invoke action=label_volumes with `execute: true` and `items` set to the change targets; only those still convertible are converted".into(),
+                "re-invoke action=label_volumes without `dry_run`, with `items` set to the change targets; only those still convertible are converted".into(),
             ),
         });
     }
@@ -1315,9 +1333,9 @@ pub struct StackAudit {
 #[serde(crate = "plugin_toolkit::serde", deny_unknown_fields)]
 #[schemars(crate = "plugin_toolkit::schemars")]
 pub struct StackFixPayload {
-    /// Write the file. Omitted, returns the changes and diff only.
-    #[serde(default)]
-    pub execute: bool,
+    /// Return the plan and change nothing. Omitted, applies.
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
+    pub dry_run: bool,
     /// The dry run's change targets (finding ids) to apply.
     #[serde(default)]
     pub items: Vec<String>,
@@ -1328,13 +1346,14 @@ pub struct StackFixPayload {
 #[serde(crate = "plugin_toolkit::serde")]
 #[schemars(crate = "plugin_toolkit::schemars")]
 pub struct StackFixResult {
-    /// `true`: nothing was written.
+    /// true: nothing was changed.
+    #[serde(rename = "dryRun", alias = "dry_run")]
     pub dry_run: bool,
     /// The rewrites (planned on a dry run, made on execute).
     pub changes: Vec<PlannedChange>,
     /// Line diff of the compose file.
     pub diff: String,
-    /// Finding ids written (execute only).
+    /// Finding ids written (when executing).
     pub applied: Vec<String>,
     /// Findings that could not be rewritten, and why.
     pub not_fixed: Vec<NotFixed>,
@@ -1345,7 +1364,7 @@ pub struct StackFixResult {
 /// Optional payload for `Update{action:"backup"}`. Every field defaults, so
 /// core's pre-mutation guard, which sends no payload, gets a minimal backup of
 /// the stack's project directory. Backup is never a dry run: it only adds an
-/// archive, and `execute` is accepted and ignored.
+/// archive, and `dry_run` is accepted and ignored.
 #[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(crate = "plugin_toolkit::serde")]
 #[schemars(crate = "plugin_toolkit::schemars")]
@@ -1444,7 +1463,7 @@ fn stack_declaration() -> KindDeclaration {
             .chain([&ACTION_REMOVE])
             .map(|a| ActionDecl {
                 action: (*a).into(),
-                payload_schema: Some(schema_for!(ExecuteOptIn)),
+                payload_schema: Some(schema_for!(DryRunOptIn)),
                 response_schema: None,
             }),
     );
@@ -1578,7 +1597,7 @@ fn fix_result(
             None => String::new(),
         })
     };
-    if !p.execute {
+    if p.dry_run {
         let result = StackFixResult {
             dry_run: true,
             changes: planned.applied.iter().map(change).collect(),
@@ -1586,7 +1605,7 @@ fn fix_result(
             applied: Vec::new(),
             not_fixed: planned.not_fixed,
             how_to_execute: Some(
-                "re-invoke action=fix with `execute: true` and `items` set to the change targets; only those still applicable are written".into(),
+                "re-invoke action=fix without `dry_run`, with `items` set to the change targets; only those still applicable are written".into(),
             ),
         };
         return Ok((result, None));
@@ -2359,8 +2378,16 @@ mod tests {
 
     #[test]
     fn fix_dry_run_returns_changes_and_diff_and_writes_nothing() {
-        let (result, write) =
-            fix_result(FIX_YAML, None, &fix_findings(), &StackFixPayload::default()).unwrap();
+        let (result, write) = fix_result(
+            FIX_YAML,
+            None,
+            &fix_findings(),
+            &StackFixPayload {
+                dry_run: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(result.dry_run && write.is_none());
         let targets: Vec<_> = result.changes.iter().map(|c| c.target.as_str()).collect();
         assert_eq!(targets, vec!["restart:app", "restart:worker"]);
@@ -2377,7 +2404,7 @@ mod tests {
     #[test]
     fn fix_execute_writes_only_confirmed_items_still_applicable() {
         let p = StackFixPayload {
-            execute: true,
+            dry_run: false,
             items: vec!["restart:app".into(), "restart:gone".into()],
         };
         let (result, write) = fix_result(FIX_YAML, None, &fix_findings(), &p).unwrap();
@@ -2393,7 +2420,7 @@ mod tests {
     #[test]
     fn fix_refuses_caller_supplied_roots() {
         let err = serde_json::from_str::<StackFixPayload>(
-            r#"{"execute":true,"items":["bind:app:/x"],"managed_roots":["/"]}"#,
+            r#"{"items":["bind:app:/x"],"managed_roots":["/"]}"#,
         )
         .unwrap_err();
         assert!(err.to_string().contains("managed_roots"), "{err}");
@@ -2475,7 +2502,7 @@ mod tests {
     #[test]
     fn fix_execute_without_items_is_refused() {
         let p = StackFixPayload {
-            execute: true,
+            dry_run: false,
             ..Default::default()
         };
         let err = fix_result(FIX_YAML, None, &fix_findings(), &p).unwrap_err();
@@ -2499,7 +2526,7 @@ mod tests {
             strategy,
             service: (strategy == Some(Strategy::Dump)).then(|| "db".into()),
             command: (strategy == Some(Strategy::Dump)).then(|| "pg_dumpall -U postgres".into()),
-            execute,
+            dry_run: !execute,
         }
     }
 
@@ -2648,7 +2675,14 @@ mod tests {
     #[test]
     fn label_volumes_dry_run_plans_and_touches_nothing() {
         let e = crate::test_engine::FakeEngine::routed(vec![]);
-        let r = label_run(&e, LabelVolumesPayload::default()).unwrap();
+        let r = label_run(
+            &e,
+            LabelVolumesPayload {
+                dry_run: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(r.dry_run && r.migrated.is_none() && r.how_to_execute.is_some());
         assert_eq!(r.changes[0].target, "app:/cache");
         assert!(e.requests().is_empty());
@@ -2660,7 +2694,7 @@ mod tests {
         let err = label_run(
             &e,
             LabelVolumesPayload {
-                execute: true,
+                dry_run: false,
                 items: vec![],
             },
         )
@@ -2669,7 +2703,7 @@ mod tests {
         let r = label_run(
             &e,
             LabelVolumesPayload {
-                execute: true,
+                dry_run: false,
                 items: vec!["app:/gone".into()],
             },
         )
@@ -2733,7 +2767,7 @@ mod tests {
             url: None,
             stacks_root: Some(path(root)),
             routes: Vec::new(),
-            execute: true,
+            dry_run: false,
         };
         plugin_toolkit::reactor::block_on(crate::tools::docker_create(
             args,
@@ -2770,16 +2804,9 @@ mod tests {
                 name: "web".into(),
             },
             action: action.into(),
-            payload: Some(executed(payload).to_string()),
+            payload: payload.map(|p| p.to_string()),
             caller: Some(crate::test_support::caller("admin")),
         }))
-    }
-
-    /// `payload` with the execute opt-in set.
-    fn executed(payload: Option<serde_json::Value>) -> serde_json::Value {
-        let mut p = payload.unwrap_or_else(|| serde_json::json!({}));
-        p["execute"] = true.into();
-        p
     }
 
     /// A stack archive in `<dir>/.orca-backups`, where a backup without
@@ -2907,7 +2934,7 @@ mod tests {
                 UpdateArgs {
                     id: id(STACK_KIND),
                     action: "restart".into(),
-                    payload: Some(r#"{"execute":true}"#.into()),
+                    payload: None,
                     caller: Some(caller("admin")),
                 },
             )));
@@ -3088,7 +3115,7 @@ mod tests {
                 url: None,
                 stacks_root: Some(root_s.clone()),
                 routes: Vec::new(),
-                execute: true,
+                dry_run: false,
             };
             plugin_toolkit::reactor::block_on(crate::tools::docker_create(args, &admin())).unwrap();
             let yaml = "services: {}\n";
@@ -3119,19 +3146,24 @@ mod tests {
     }
 
     #[test]
-    fn split_execute_reads_and_strips_the_opt_in() {
-        assert_eq!(split_execute(None).unwrap(), (false, None));
-        assert_eq!(split_execute(Some("{}".into())).unwrap(), (false, None));
+    fn split_dry_run_reads_and_strips_the_opt_in() {
+        assert_eq!(split_dry_run(None).unwrap(), (false, None));
+        assert_eq!(split_dry_run(Some("{}".into())).unwrap(), (false, None));
         assert_eq!(
-            split_execute(Some(r#"{"execute":true}"#.into())).unwrap(),
+            split_dry_run(Some(r#"{"dryRun":true}"#.into())).unwrap(),
             (true, None)
         );
-        let (go, rest) = split_execute(Some(r#"{"execute":true,"dest":"/x"}"#.into())).unwrap();
-        assert!(go);
+        let (plan_only, rest) =
+            split_dry_run(Some(r#"{"dryRun":true,"dest":"/x"}"#.into())).unwrap();
+        assert!(plan_only);
         assert_eq!(rest.as_deref(), Some(r#"{"dest":"/x"}"#));
-        assert!(split_execute(Some(r#"{"execute":"yes"}"#.into())).is_err());
         assert_eq!(
-            split_execute(Some("[1]".into())).unwrap(),
+            split_dry_run(Some(r#"{"dry_run":true}"#.into())).unwrap(),
+            (true, None)
+        );
+        assert!(split_dry_run(Some(r#"{"dryRun":"yes"}"#.into())).is_err());
+        assert_eq!(
+            split_dry_run(Some("[1]".into())).unwrap(),
             (false, Some("[1]".into()))
         );
     }
@@ -3144,7 +3176,7 @@ mod tests {
     }
 
     #[test]
-    fn every_mutating_verb_is_a_dry_run_without_the_opt_in() {
+    fn every_mutating_verb_is_a_dry_run_with_the_opt_in() {
         use crate::test_support::caller;
         let provider = DockerUnitProvider::new(crate::registration::adapter());
         let id = |kind: &str| UnitId {
@@ -3165,7 +3197,7 @@ mod tests {
                 let out = plugin_toolkit::reactor::block_on(provider.do_update(UpdateArgs {
                     id: id(kind),
                     action: action.into(),
-                    payload: None,
+                    payload: Some(r#"{"dryRun":true}"#.into()),
                     caller: admin.clone(),
                 }))
                 .unwrap();
@@ -3174,14 +3206,17 @@ mod tests {
             let out = plugin_toolkit::reactor::block_on(provider.do_upsert(UpsertArgs {
                 id: id(STACK_KIND),
                 action: "set".into(),
-                payload: Some(r#"{"name":"web","dir":"/nowhere"}"#.into()),
+                payload: Some(r#"{"name":"web","dir":"/nowhere","dryRun":true}"#.into()),
                 caller: admin.clone(),
             }))
             .unwrap();
             assert_eq!(dry_run_body(out)["dryRun"], true);
             for (action, payload) in [
-                ("deploy", r#"{"name":"web","dir":"/nowhere"}"#),
-                ("exec", r#"{"id":"c1","cmd":["rm","-rf","/"]}"#),
+                ("deploy", r#"{"name":"web","dir":"/nowhere","dryRun":true}"#),
+                (
+                    "exec",
+                    r#"{"id":"c1","cmd":["rm","-rf","/"],"dryRun":true}"#,
+                ),
             ] {
                 let out = plugin_toolkit::reactor::block_on(provider.do_create(CreateArgs {
                     action: action.into(),
@@ -3290,12 +3325,12 @@ mod tests {
         assert!(guard_shaped(Some("")));
         assert!(guard_shaped(Some(" {} ")));
         assert!(!guard_shaped(Some(r#"{"dest":"/x"}"#)));
-        assert!(!guard_shaped(Some(r#"{"execute":true}"#)));
+        assert!(!guard_shaped(Some(r#"{"dryRun":true}"#)));
         assert!(!guard_shaped(Some("null")));
     }
 
     #[test]
-    fn restore_needs_an_admin_caller_and_the_opt_in() {
+    fn restore_needs_an_admin_caller_and_honors_dry_run() {
         let provider = DockerUnitProvider::new(crate::registration::adapter());
         let restore = |caller, payload: serde_json::Value| {
             plugin_toolkit::reactor::block_on(provider.do_update(UpdateArgs {
@@ -3305,7 +3340,7 @@ mod tests {
                 caller,
             }))
         };
-        let from = serde_json::json!({"from": {"locator": "/x.tar.gz", "manager": "docker@test", "timestamp": 0}});
+        let from = serde_json::json!({"from": {"locator": "/x.tar.gz", "manager": "docker@test", "timestamp": 0}, "dryRun": true});
         let ((), _) = crate::test_support::with_db(|| {
             crate::test_support::assert_admin_refusal(&err_of(restore(None, from.clone())));
             let out = restore(Some(crate::test_support::caller("admin")), from.clone()).unwrap();
@@ -3325,11 +3360,38 @@ mod tests {
                 UpdateArgs {
                     id: web(kind),
                     action: action.into(),
-                    payload: Some(r#"{"execute":true,"force":true}"#.into()),
+                    payload: Some(r#"{"dryRun":true,"force":true}"#.into()),
                     caller: Some(crate::test_support::caller("admin")),
                 },
             )));
             assert!(err.contains("unknown field"), "{action}: {err}");
+        }
+    }
+
+    #[test]
+    fn create_execute_is_refused_without_a_caller_and_dry_run_plans() {
+        let provider = DockerUnitProvider::new(crate::registration::adapter());
+        for (action, payload) in [
+            ("deploy", r#"{"name":"web","dir":"/nowhere"}"#),
+            ("exec", r#"{"id":"c1","cmd":["true"]}"#),
+        ] {
+            let err = plugin_toolkit::reactor::block_on(provider.do_create(CreateArgs {
+                action: action.into(),
+                payload: Some(payload.into()),
+            }))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("caller") && err.contains("dryRun"),
+                "{action}: {err}"
+            );
+            let planned = payload.replace('}', r#","dryRun":true}"#);
+            let out = plugin_toolkit::reactor::block_on(provider.do_create(CreateArgs {
+                action: action.into(),
+                payload: Some(planned),
+            }))
+            .unwrap();
+            assert_eq!(dry_run_body(out)["dryRun"], true, "{action}");
         }
     }
 
@@ -3339,7 +3401,8 @@ mod tests {
         let out = plugin_toolkit::reactor::block_on(provider.do_create(CreateArgs {
             action: "exec".into(),
             payload: Some(
-                r#"{"id":"c1","cmd":["psql","-c","ALTER USER x PASSWORD 's3cr3t'"]}"#.into(),
+                r#"{"id":"c1","cmd":["psql","-c","ALTER USER x PASSWORD 's3cr3t'"],"dryRun":true}"#
+                    .into(),
             ),
         }))
         .unwrap();

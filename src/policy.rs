@@ -1426,7 +1426,7 @@ pub fn check(
             });
             match v.grant() {
                 Some(_) if upstream => format!(
-                    "{who}: {} (image changed upstream; re-approve with {ALLOW_TOOL} approveCurrent)",
+                    "{who}: {} (image changed upstream; re-approve with {ALLOW_TOOL} approve_current)",
                     v.detail
                 ),
                 Some(g) => format!("{who}: {} (grant '{g}')", v.detail),
@@ -1979,17 +1979,17 @@ pub struct DockerStackAllowArgs {
     #[arg(long = "item")]
     #[serde(default)]
     pub items: Vec<String>,
-    /// Record the grants. Omitted, returns them and changes nothing.
+    /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
-    #[serde(default)]
-    pub execute: bool,
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
+    pub dry_run: bool,
 }
 
 #[orca_struct]
 #[serde(rename_all = "camelCase")]
 #[derive(Debug)]
 pub struct DockerStackAllowOutput {
-    /// `true`: nothing was written.
+    /// true: nothing was changed.
     pub dry_run: bool,
     pub name: String,
     /// `true`: the stack was not registered and is (or would be) registered
@@ -2005,7 +2005,7 @@ pub struct DockerStackAllowOutput {
 /// bound to a service and its resolved definition, or adopt an existing
 /// compose project as a stack together with its grants. Never starts or
 /// changes containers.
-/// Without `execute`, returns the grants and changes nothing.
+/// With `dry_run`, returns the grants and changes nothing.
 #[orca_tool(
     domain = "docker",
     verb = "stack_allow",
@@ -2054,15 +2054,15 @@ async fn stack_allow(
     if adopted {
         planned.push(adopt_item(&row));
     }
-    if !args.execute {
+    if args.dry_run {
         let how = if adopted {
             format!(
-                "re-invoke {ALLOW_TOOL} with `execute: true`, the same `dir` and `file`, and `items` set to `after`"
+                "re-invoke {ALLOW_TOOL} without `dry_run`, with the same `dir` and `file`, and `items` set to `after`"
             )
         } else if args.approve_current {
-            format!("re-invoke {ALLOW_TOOL} with `execute: true` and `items` set to `after`")
+            format!("re-invoke {ALLOW_TOOL} without `dry_run`, with `items` set to `after`")
         } else {
-            format!("re-invoke {ALLOW_TOOL} with `execute: true`")
+            format!("re-invoke {ALLOW_TOOL} without `dry_run`")
         };
         return Ok(DockerStackAllowOutput {
             dry_run: true,
@@ -2852,7 +2852,7 @@ mod tests {
             url: None,
             stacks_root: Some(root.to_string_lossy().into_owned()),
             routes: Vec::new(),
-            execute: true,
+            dry_run: false,
         };
         plugin_toolkit::reactor::block_on(crate::tools::docker_create(
             args,
@@ -2878,7 +2878,7 @@ mod tests {
             allow: Vec::new(),
             approve_current,
             items,
-            execute,
+            dry_run: !execute,
         };
         plugin_toolkit::reactor::block_on(stack_allow(args, docker))
     }
@@ -3006,7 +3006,7 @@ mod tests {
                     .unwrap_err();
             assert!(
                 err.to_string().contains("image changed upstream")
-                    && err.to_string().contains("approveCurrent"),
+                    && err.to_string().contains("approve_current"),
                 "{err}"
             );
             let built = engine(&[]);
@@ -3035,7 +3035,7 @@ mod tests {
             allow: Vec::new(),
             approve_current: true,
             items,
-            execute,
+            dry_run: !execute,
         };
         plugin_toolkit::reactor::block_on(stack_allow(args, docker))
     }
@@ -3153,7 +3153,7 @@ mod tests {
                     allow: Vec::new(),
                     approve_current: true,
                     items: Vec::new(),
-                    execute: false,
+                    dry_run: true,
                 };
                 let err = plugin_toolkit::reactor::block_on(stack_allow(args, &docker))
                     .unwrap_err()
@@ -3251,7 +3251,7 @@ mod tests {
                 allow: Vec::new(),
                 approve_current: false,
                 items: Vec::new(),
-                execute: true,
+                dry_run: false,
             };
             let err = plugin_toolkit::reactor::block_on(stack_allow(args, &docker))
                 .unwrap_err()
@@ -3280,7 +3280,7 @@ mod tests {
                     allow: Vec::new(),
                     approve_current: false,
                     items: Vec::new(),
-                    execute: true,
+                    dry_run: false,
                 };
                 plugin_toolkit::reactor::block_on(stack_allow(args, &docker))
             };
@@ -3991,7 +3991,7 @@ mod tests {
                         "a".repeat(64)
                     )],
                     items: Vec::new(),
-                    execute,
+                    dry_run: !execute,
                 };
                 let err = plugin_toolkit::reactor::block_on(docker_stack_allow(args, &ctx))
                     .unwrap_err()
