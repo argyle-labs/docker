@@ -13,6 +13,7 @@ use plugin_toolkit::prelude::*;
 use plugin_toolkit::serde_json::Value;
 
 use crate::execute;
+use crate::init::Init;
 
 const CHECK_TOOL: &str = "docker.mount_check";
 const NETWORK_FS: &[&str] = &[
@@ -442,6 +443,395 @@ async fn docker_mount_check(
     Ok(out)
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// docker.mount_gate — start dockerd after the shares its binds use
+// ═══════════════════════════════════════════════════════════════════════════
+
+const GATE_TOOL: &str = "docker.mount_gate";
+const DROP_IN: &str = "etc/systemd/system/docker.service.d/orca-mounts.conf";
+const OPENRC_CONF: &str = "etc/conf.d/docker";
+/// `/bin` is `/usr/bin` on merged-usr hosts and holds systemctl on the rest.
+const SYSTEMCTL: &str = "/bin/systemctl";
+/// Said in every plan: the ordering is soft by design.
+const FAILURE_MODE: &str = "ordering is soft: if a share is not mounted when dockerd starts (slow or failed mount), dockerd still starts and containers binding it may capture the empty mountpoint; docker.mount_check restarts those once the share is up";
+
+/// Network mount points on the host that any bind's source lives on.
+/// A mount point holding a control character (mountinfo escapes newlines as
+/// `\012`) could end a line of the drop-in and inject a setting.
+pub fn is_safe_point(point: &str) -> bool {
+    !point.chars().any(char::is_control)
+}
+
+pub fn share_points<'a>(binds: impl IntoIterator<Item = &'a Bind>, host: &[Mount]) -> Vec<String> {
+    let mut points: Vec<String> = binds
+        .into_iter()
+        .filter_map(|b| mount_at(&b.source, host))
+        .filter(|m| is_network(&m.fstype))
+        .map(|m| m.point.clone())
+        .collect();
+    points.sort();
+    points.dedup();
+    points
+}
+
+/// A path as one word of a systemd unit setting: quoted, with `\`, `"` and
+/// the specifier character `%` escaped.
+fn systemd_word(path: &str) -> String {
+    let escaped = path
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%");
+    format!("\"{escaped}\"")
+}
+
+/// systemd's unit name for the mount at `path` (`systemd-escape --path
+/// --suffix=mount`), with `%` doubled for use inside a unit file.
+fn mount_unit(path: &str) -> String {
+    let trimmed = path.trim_matches('/');
+    let mut out = String::new();
+    for (i, b) in trimmed.bytes().enumerate() {
+        match b {
+            b'/' => out.push('-'),
+            b'.' if i == 0 => out.push_str("\\x2e"),
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'.' => out.push(b as char),
+            _ => out.push_str(&format!("\\x{b:02x}")),
+        }
+    }
+    if out.is_empty() {
+        out.push('-');
+    }
+    format!("{out}.mount").replace('%', "%%")
+}
+
+/// The drop-in ordering docker.service after `points`, without requiring
+/// them.
+pub fn drop_in(points: &[String]) -> String {
+    let units: Vec<String> = points.iter().map(|p| mount_unit(p)).collect();
+    let words: Vec<String> = points.iter().map(|p| systemd_word(p)).collect();
+    format!(
+        "# Written by orca docker.mount_gate: start dockerd after the network\n\
+         # shares its containers bind. Soft: a share that fails to mount does\n\
+         # not keep dockerd down.\n\
+         [Unit]\nWants=remote-fs.target\nAfter=remote-fs.target {}\nWantsMountsFor={}\n",
+        units.join(" "),
+        words.join(" ")
+    )
+}
+
+/// Records which settings the gate added `netmount` to, so removal never
+/// takes out one an operator put there.
+const NETMOUNT_MARKER: &str = "# orca docker.mount_gate added netmount to:";
+const NETMOUNT_KEYS: [&str; 2] = ["rc_use", "rc_after"];
+
+/// The words of `key`'s first assignment in `conf`.
+fn words_of(conf: &str, key: &str) -> Vec<String> {
+    conf.lines()
+        .find_map(|l| crate::init::assignment(l, key))
+        .map(|(v, _)| v.split_whitespace().map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
+/// The keys the marker says the gate added `netmount` to.
+fn marked_keys(conf: &str) -> Vec<String> {
+    conf.lines()
+        .find_map(|l| l.strip_prefix(NETMOUNT_MARKER))
+        .map(|k| k.split_whitespace().map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
+/// `conf` without the marker line.
+fn unmarked(conf: &str) -> String {
+    let kept: Vec<&str> = conf
+        .lines()
+        .filter(|l| !l.starts_with(NETMOUNT_MARKER))
+        .collect();
+    if kept.is_empty() {
+        String::new()
+    } else {
+        kept.join("\n") + "\n"
+    }
+}
+
+/// `conf` using and ordering after `netmount`, without needing it. Each key
+/// the gate adds the word to is recorded in the marker; a key that already
+/// had it is the operator's and is not recorded.
+pub fn with_netmount(conf: &str) -> String {
+    let mut keys = marked_keys(conf);
+    let mut c = unmarked(conf);
+    for key in NETMOUNT_KEYS {
+        if !words_of(&c, key).iter().any(|w| w == "netmount") {
+            c = crate::init::add_word(&c, key, "netmount");
+            keys.push(key.to_owned());
+        }
+    }
+    if keys.is_empty() {
+        return c;
+    }
+    keys.sort();
+    keys.dedup();
+    let marked = format!("{c}{NETMOUNT_MARKER} {}\n", keys.join(" "));
+    // Unchanged input stays byte-identical, so the gate sees nothing to do.
+    if unmarked(&marked) == unmarked(conf) && marked_keys(conf) == keys {
+        conf.to_owned()
+    } else {
+        marked
+    }
+}
+
+/// `conf` without `word` in `key`; a setting left empty is dropped. Other
+/// lines stay where they are.
+pub fn remove_word(conf: &str, key: &str, word: &str) -> String {
+    let mut out = Vec::new();
+    for line in conf.lines() {
+        let Some((value, trailer)) = crate::init::assignment(line, key) else {
+            out.push(line.to_owned());
+            continue;
+        };
+        let words: Vec<&str> = value.split_whitespace().filter(|w| *w != word).collect();
+        if words.len() == value.split_whitespace().count() {
+            out.push(line.to_owned());
+        } else if !words.is_empty() {
+            out.push(format!(
+                "{key}=\"{}\"{}",
+                words.join(" "),
+                trailer.trim_end()
+            ));
+        } else if !trailer.trim().is_empty() {
+            out.push(trailer.trim().to_owned());
+        }
+    }
+    if out.is_empty() {
+        String::new()
+    } else {
+        out.join("\n") + "\n"
+    }
+}
+
+/// `conf` without the `netmount` the gate added; an operator's stays.
+pub fn without_netmount(conf: &str) -> String {
+    let mut c = unmarked(conf);
+    for key in marked_keys(conf) {
+        c = remove_word(&c, &key, "netmount");
+    }
+    c
+}
+
+/// `container: source -> destination` binds that would not pick up a late
+/// mount on their own.
+pub fn propagation_advice(scanned: &[(String, Vec<Bind>)], host: &[Mount]) -> Vec<String> {
+    scanned
+        .iter()
+        .flat_map(|(c, binds)| binds.iter().map(move |b| (c, b)))
+        .filter(|(_, b)| mount_at(&b.source, host).is_some_and(|m| is_network(&m.fstype)))
+        .filter(|(_, b)| {
+            !matches!(
+                b.propagation.as_str(),
+                "rslave" | "rshared" | "slave" | "shared"
+            )
+        })
+        .map(|(c, b)| {
+            format!(
+                "{c}: {} -> {} uses {}; add `:rslave` to the bind so a late mount propagates in",
+                b.source, b.destination, b.propagation
+            )
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateChange {
+    Write {
+        rel: &'static str,
+        content: String,
+    },
+    /// A drop-in left from shares no container binds any more.
+    Remove {
+        rel: &'static str,
+    },
+}
+
+/// The change `init` needs under `root` to gate dockerd on `points`, or
+/// `None` when the files already say so.
+pub fn gate_change(root: &Path, init: Init, points: &[String]) -> Option<GateChange> {
+    let current = |rel: &str| std::fs::read_to_string(root.join(rel)).ok();
+    match init {
+        Init::Systemd if points.is_empty() => current(DROP_IN)
+            .is_some()
+            .then_some(GateChange::Remove { rel: DROP_IN }),
+        Init::Systemd => {
+            let content = drop_in(points);
+            (current(DROP_IN).as_deref() != Some(content.as_str())).then_some(GateChange::Write {
+                rel: DROP_IN,
+                content,
+            })
+        }
+        Init::OpenRc if points.is_empty() => {
+            let now = current(OPENRC_CONF)?;
+            let content = without_netmount(&now);
+            (content != now).then_some(GateChange::Write {
+                rel: OPENRC_CONF,
+                content,
+            })
+        }
+        Init::OpenRc => {
+            let now = current(OPENRC_CONF).unwrap_or_default();
+            let content = with_netmount(&now);
+            (content != now).then_some(GateChange::Write {
+                rel: OPENRC_CONF,
+                content,
+            })
+        }
+        Init::Other => None,
+    }
+}
+
+pub fn apply_gate(root: &Path, change: &GateChange) -> Result<()> {
+    match change {
+        GateChange::Write { rel, content } => {
+            crate::init::write_atomic(&root.join(rel), content, 0o644)
+        }
+        GateChange::Remove { rel } => std::fs::remove_file(root.join(rel))
+            .with_context(|| format!("failed to remove '/{rel}'")),
+    }
+}
+
+/// Whether systemd must reload: the gate just changed, or `NeedDaemonReload`
+/// (from `systemctl show`) says the loaded unit is behind its files.
+pub fn reload_due(changed: bool, need_daemon_reload: &str) -> bool {
+    changed || need_daemon_reload.trim() == "yes"
+}
+
+/// Runs systemctl; the plugin toolkit has no D-Bus client to ask systemd
+/// directly.
+async fn systemctl(args: &[&str]) -> Result<String> {
+    let out = plugin_toolkit::process::Command::new(SYSTEMCTL)
+        .args(args)
+        .output()
+        .await
+        .context("failed to spawn systemctl")?;
+    if !out.status.success {
+        bail!(
+            "systemctl {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[orca_struct(args)]
+pub struct DockerMountGateArgs {
+    /// Return the plan and change nothing. Omitted, applies.
+    #[arg(long)]
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
+    pub dry_run: bool,
+}
+
+#[orca_struct]
+#[serde(rename_all = "camelCase")]
+#[derive(Debug)]
+pub struct DockerMountGateOutput {
+    /// true: nothing was changed.
+    pub dry_run: bool,
+    /// `openrc`, `systemd` or `other`.
+    pub init: String,
+    /// Network mount points containers (running or stopped) bind from.
+    pub shares: Vec<String>,
+    /// Shares left out of the gate: their mount point holds a control
+    /// character. Shown escaped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejected: Vec<String>,
+    /// `write` or `remove`, when a change is due.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change: Option<String>,
+    /// File changed (or to change), absolute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// What happens when a share is not mounted in time.
+    pub failure_mode: String,
+    /// Binds on private propagation; compose files are left to their owner.
+    pub advice: Vec<String>,
+}
+
+/// **Order dockerd after the network shares its containers bind.** systemd:
+/// a `docker.service` drop-in with `After=` each share's mount unit and
+/// `remote-fs.target` and `WantsMountsFor=` each share, then `systemctl
+/// daemon-reload`; a drop-in no share needs any more is removed. OpenRC:
+/// `netmount` added to `rc_use` and `rc_after` in `/etc/conf.d/docker`, and
+/// removed again once no share needs it.
+/// Soft ordering: a share that fails to mount never keeps dockerd down.
+/// Never restarts dockerd; the order applies from the next boot. With
+/// `dryRun`, returns the plan.
+#[orca_tool(
+    domain = "docker",
+    verb = "mount_gate",
+    local_only = true,
+    role = "admin",
+    execute_gated = false
+)]
+async fn docker_mount_gate(
+    args: DockerMountGateArgs,
+    ctx: &ToolCtx,
+) -> Result<DockerMountGateOutput> {
+    execute::require_admin(GATE_TOOL, ctx)?;
+    let root = Path::new("/");
+    let host = host_mounts(&HostProc)?;
+    let scanned: Vec<(String, Vec<Bind>)> = scan(true)
+        .await?
+        .into_iter()
+        .map(|s| (s.name, s.binds))
+        .collect();
+    let (shares, rejected): (Vec<String>, Vec<String>) =
+        share_points(scanned.iter().flat_map(|(_, b)| b), &host.mounts)
+            .into_iter()
+            .partition(|p| is_safe_point(p));
+    let init = crate::init::detect(root);
+    let change = gate_change(root, init, &shares);
+    if !args.dry_run {
+        if let Some(c) = &change {
+            apply_gate(root, c)?;
+        }
+        // A reload that failed after an earlier write or removal leaves the
+        // files right but systemd on the old unit; retry it then too.
+        if init == Init::Systemd
+            && reload_due(
+                change.is_some(),
+                &systemctl(&[
+                    "show",
+                    "-p",
+                    "NeedDaemonReload",
+                    "--value",
+                    "docker.service",
+                ])
+                .await?,
+            )
+        {
+            systemctl(&["daemon-reload"]).await?;
+        }
+    }
+    let (kind, path, content) = match change {
+        Some(GateChange::Write { rel, content }) => (Some("write"), Some(rel), Some(content)),
+        Some(GateChange::Remove { rel }) => (Some("remove"), Some(rel), None),
+        None => (None, None, None),
+    };
+    Ok(DockerMountGateOutput {
+        dry_run: args.dry_run,
+        init: init.as_str().to_owned(),
+        change: kind.map(str::to_owned),
+        path: path.map(|r| format!("/{r}")),
+        content,
+        failure_mode: FAILURE_MODE.to_owned(),
+        advice: propagation_advice(&scanned, &host.mounts),
+        rejected: rejected
+            .iter()
+            .map(|p| p.escape_debug().to_string())
+            .collect(),
+        shares,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,5 +1109,178 @@ mod tests {
         assert_eq!(act, ["container:b"]);
         assert_eq!(dropped, ["container:gone"]);
         assert_eq!(select(CHECK_TOOL, &[], &[]).unwrap(), (vec![], vec![]));
+    }
+
+    fn bind(source: &str, propagation: &str) -> Bind {
+        Bind {
+            source: source.into(),
+            destination: "/data".into(),
+            propagation: propagation.into(),
+        }
+    }
+
+    #[test]
+    fn share_points_are_the_network_mounts_sources_live_on() {
+        let host = parse_mountinfo(HOST);
+        let b = [
+            bind("/mnt/data/media", "rprivate"),
+            bind("/mnt/data/tv", "rslave"),
+            bind("/mnt/my share/x", "rslave"),
+            bind("/srv/x", "rprivate"),
+        ];
+        assert_eq!(share_points(&b, &host), ["/mnt/data", "/mnt/my share"]);
+    }
+
+    #[test]
+    fn drop_in_orders_softly_and_escapes() {
+        let d = drop_in(&[
+            "/mnt/data".into(),
+            "/mnt/my share".into(),
+            "/mnt/100%".into(),
+        ]);
+        assert!(
+            d.contains("WantsMountsFor=\"/mnt/data\" \"/mnt/my share\" \"/mnt/100%%\"\n"),
+            "{d}"
+        );
+        assert!(
+            d.contains(
+                "After=remote-fs.target mnt-data.mount mnt-my\\x20share.mount mnt-100\\x25.mount\n"
+            ),
+            "{d}"
+        );
+        assert!(!d.contains("Requires"), "never a hard requirement");
+    }
+
+    #[test]
+    fn mount_units_match_systemd_escape() {
+        assert_eq!(mount_unit("/mnt/data"), "mnt-data.mount");
+        assert_eq!(mount_unit("/mnt/a-b"), "mnt-a\\x2db.mount");
+        assert_eq!(mount_unit("/"), "-.mount");
+    }
+
+    #[test]
+    fn netmount_is_soft_added_once_and_other_words_kept() {
+        let once = with_netmount("DOCKER_OPTS=\"\"\nrc_use='localmount'\n");
+        assert_eq!(
+            once,
+            "DOCKER_OPTS=\"\"\nrc_use=\"localmount netmount\"\nrc_after=\"netmount\"\n\
+             # orca docker.mount_gate added netmount to: rc_after rc_use\n"
+        );
+        assert_eq!(with_netmount(&once), once);
+        assert!(!once.contains("rc_need"));
+    }
+
+    #[test]
+    fn only_the_netmount_the_gate_added_is_removed() {
+        let added = with_netmount("A=1\n");
+        assert_eq!(without_netmount(&added), "A=1\n");
+
+        let operator = "A=1\nrc_use=\"localmount netmount\"\nB=2\n";
+        let gated = with_netmount(operator);
+        assert!(gated.ends_with("added netmount to: rc_after\n"), "{gated}");
+        assert_eq!(
+            without_netmount(&gated),
+            operator,
+            "the operator's rc_use stays"
+        );
+
+        let hand = "rc_use=\"netmount\"\nrc_after=\"netmount\"\n";
+        assert_eq!(with_netmount(hand), hand, "nothing added, nothing marked");
+        assert_eq!(
+            without_netmount(hand),
+            hand,
+            "unmarked netmount is never removed"
+        );
+    }
+
+    #[test]
+    fn control_characters_never_reach_the_drop_in() {
+        assert!(is_safe_point("/mnt/my share"));
+        assert!(!is_safe_point("/mnt/x\n[Service]\nExecStartPre=/bin/sh"));
+        let host = parse_mountinfo("95 22 0:50 / /mnt/x\\012ExecStart=evil rw - cifs //w/d rw\n");
+        let points = share_points(&[bind("/mnt/x\nExecStart=evil/a", "rslave")], &host);
+        assert_eq!(points.len(), 1);
+        assert!(
+            !is_safe_point(&points[0]),
+            "mountinfo's \\012 unescapes to a newline"
+        );
+    }
+
+    #[test]
+    fn remove_word_keeps_trailing_comments() {
+        assert_eq!(
+            remove_word(
+                "rc_use=\"localmount netmount\" # boot order\n",
+                "rc_use",
+                "netmount"
+            ),
+            "rc_use=\"localmount\" # boot order\n"
+        );
+        assert_eq!(
+            remove_word("rc_after=netmount # orca\n", "rc_after", "netmount"),
+            "# orca\n"
+        );
+    }
+
+    #[test]
+    fn advice_names_only_private_network_binds() {
+        let host = parse_mountinfo(HOST);
+        let scanned = vec![(
+            "sonarr".to_string(),
+            vec![
+                bind("/mnt/data/a", "rprivate"),
+                bind("/mnt/data/b", "rslave"),
+                bind("/srv/c", "rprivate"),
+            ],
+        )];
+        let a = propagation_advice(&scanned, &host);
+        assert_eq!(a.len(), 1);
+        assert!(a[0].contains("/mnt/data/a") && a[0].contains(":rslave"));
+    }
+
+    #[test]
+    fn gate_changes_are_idempotent_and_a_stale_drop_in_is_removed() {
+        let t = tempfile::tempdir().unwrap();
+        let points = vec!["/mnt/data".to_string()];
+        assert!(gate_change(t.path(), Init::Systemd, &[]).is_none());
+        assert!(gate_change(t.path(), Init::Other, &points).is_none());
+        for init in [Init::Systemd, Init::OpenRc] {
+            let c = gate_change(t.path(), init, &points).unwrap();
+            apply_gate(t.path(), &c).unwrap();
+            assert!(gate_change(t.path(), init, &points).is_none(), "{init:?}");
+        }
+        let remove = gate_change(t.path(), Init::Systemd, &[]).unwrap();
+        assert_eq!(remove, GateChange::Remove { rel: DROP_IN });
+        apply_gate(t.path(), &remove).unwrap();
+        assert!(!t.path().join(DROP_IN).exists());
+        let unwind = gate_change(t.path(), Init::OpenRc, &[]).unwrap();
+        apply_gate(t.path(), &unwind).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(t.path().join(OPENRC_CONF)).unwrap(),
+            ""
+        );
+        assert!(gate_change(t.path(), Init::OpenRc, &[]).is_none());
+    }
+
+    #[test]
+    fn an_unchanged_gate_still_reloads_when_systemd_is_behind_its_files() {
+        assert!(reload_due(true, "no\n"));
+        assert!(
+            reload_due(false, "yes\n"),
+            "retries a reload that failed last run"
+        );
+        assert!(!reload_due(false, "no\n"));
+        assert!(!reload_due(false, ""));
+    }
+
+    #[test]
+    fn the_gate_applies_unless_dry_run() {
+        let args: DockerMountGateArgs = plugin_toolkit::serde_json::from_value(json!({})).unwrap();
+        assert!(!args.dry_run);
+        for key in ["dryRun", "dry_run"] {
+            let args: DockerMountGateArgs =
+                plugin_toolkit::serde_json::from_value(json!({ key: true })).unwrap();
+            assert!(args.dry_run, "{key}");
+        }
     }
 }

@@ -37,20 +37,23 @@ pub fn detect(root: &Path) -> Init {
     }
 }
 
-/// `KEY=value` with `"…"`, `'…'` or no quotes, as OpenRC's conf.d files are
-/// sourced by sh.
+/// `(value, trailer)` of a `KEY=value` line, the value with `"…"`, `'…'` or
+/// no quotes (conf.d files are sourced by sh), the trailer being whatever
+/// follows it, such as ` # comment`.
+pub fn assignment<'a>(line: &'a str, key: &str) -> Option<(&'a str, &'a str)> {
+    let rest = line.trim_start().strip_prefix(key)?.strip_prefix('=')?;
+    for q in ['"', '\''] {
+        if let Some(inner) = rest.strip_prefix(q) {
+            let end = inner.find(q)?;
+            return Some((&inner[..end], &inner[end + 1..]));
+        }
+    }
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    Some((&rest[..end], &rest[end..]))
+}
+
 fn value_of<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-    let v = line
-        .trim_start()
-        .strip_prefix(key)?
-        .strip_prefix('=')?
-        .trim_end();
-    Some(
-        v.strip_prefix('"')
-            .and_then(|v| v.strip_suffix('"'))
-            .or_else(|| v.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
-            .unwrap_or(v),
-    )
+    assignment(line, key).map(|(v, _)| v)
 }
 
 /// `conf` with `key` set to `value`, edited in place: the first assignment is
@@ -60,9 +63,9 @@ pub fn set_var(conf: &str, key: &str, value: &str) -> String {
     let mut out = Vec::new();
     let mut set = false;
     for line in conf.lines() {
-        if value_of(line, key).is_some() {
+        if let Some((_, trailer)) = assignment(line, key) {
             if !set {
-                out.push(format!("{key}=\"{value}\""));
+                out.push(format!("{key}=\"{value}\"{}", trailer.trim_end()));
                 set = true;
             }
         } else {
@@ -135,6 +138,19 @@ mod tests {
         let conf = "# c\nA='0'\nB=x\nA=2\n";
         assert_eq!(set_var(conf, "A", "1"), "# c\nA=\"1\"\nB=x\n");
         assert_eq!(set_var("AB=1\n", "A", "1"), "AB=1\nA=\"1\"\n");
+    }
+
+    #[test]
+    fn trailing_comments_survive_edits() {
+        assert_eq!(assignment("A=\"x y\" # why", "A"), Some(("x y", " # why")));
+        assert_eq!(assignment("A=x # why", "A"), Some(("x", " # why")));
+        assert_eq!(assignment("A='x'", "A"), Some(("x", "")));
+        assert_eq!(assignment("AB=1", "A"), None);
+        assert_eq!(set_var("A=\"1\" # keep\n", "A", "2"), "A=\"2\" # keep\n");
+        assert_eq!(
+            add_word("rc_use=\"localmount\" # boot order\n", "rc_use", "netmount"),
+            "rc_use=\"localmount netmount\" # boot order\n"
+        );
     }
 
     #[test]
