@@ -30,7 +30,8 @@ pub enum Readiness {
     /// Running or restarting, healthcheck not yet passed.
     Starting,
     Unhealthy,
-    /// A one-shot (no restart policy) that exited 0: finished, not failed.
+    /// Exited 0 and the engine will not restart it (a one-shot): finished,
+    /// not failed.
     Done,
     /// Created, exited, dead or paused.
     Stopped,
@@ -78,7 +79,7 @@ pub fn judge(c: &ContainerInspectResponse) -> ContainerReadiness {
             Readiness::Starting
         }
         (Some(ContainerStateStatusEnum::EXITED), _)
-            if state.and_then(|s| s.exit_code) == Some(0) && !restarts(c) =>
+            if state.and_then(|s| s.exit_code) == Some(0) && !restarts_after_clean_exit(c) =>
         {
             Readiness::Done
         }
@@ -96,14 +97,19 @@ pub fn judge(c: &ContainerInspectResponse) -> ContainerReadiness {
     }
 }
 
-/// Whether the engine restarts this container on exit, i.e. it is a service
-/// rather than a one-shot.
-fn restarts(c: &ContainerInspectResponse) -> bool {
+/// Whether the engine restarts this container after it exits 0, i.e. it is a
+/// service rather than a one-shot; `on-failure` does not.
+fn restarts_after_clean_exit(c: &ContainerInspectResponse) -> bool {
     c.host_config
         .as_ref()
         .and_then(|h| h.restart_policy.as_ref())
         .and_then(|p| p.name)
-        .is_some_and(|n| !matches!(n, RestartPolicyNameEnum::EMPTY | RestartPolicyNameEnum::NO))
+        .is_some_and(|n| {
+            matches!(
+                n,
+                RestartPolicyNameEnum::ALWAYS | RestartPolicyNameEnum::UNLESS_STOPPED
+            )
+        })
 }
 
 async fn snapshot(docker: &Docker, stack: &str) -> Result<Vec<ContainerReadiness>> {
@@ -129,14 +135,24 @@ async fn snapshot(docker: &Docker, stack: &str) -> Result<Vec<ContainerReadiness
 
 pub async fn wait(docker: &Docker, stack: &str, timeout: Duration) -> Result<StackHealth> {
     let start = Instant::now();
+    let mut containers = Vec::new();
     loop {
-        let containers = snapshot(docker, stack).await?;
-        let ready = !containers.is_empty()
+        let left = timeout.saturating_sub(start.elapsed());
+        // A slow engine must not run the call past the budget either.
+        let timed_out = match plugin_toolkit::time::timeout(left, snapshot(docker, stack)).await {
+            Some(polled) => {
+                containers = polled?;
+                false
+            }
+            None => true,
+        };
+        let ready = !timed_out
+            && !containers.is_empty()
             && containers
                 .iter()
                 .all(|c| matches!(c.readiness, Readiness::Ready | Readiness::Done));
         let elapsed = start.elapsed();
-        if ready || elapsed >= timeout {
+        if ready || timed_out || elapsed >= timeout {
             return Ok(StackHealth {
                 stack: stack.to_owned(),
                 ready,
@@ -234,6 +250,9 @@ mod tests {
         assert_eq!(exited(0, Some("no")), Readiness::Done);
         assert_eq!(exited(1, None), Readiness::Stopped);
         assert_eq!(exited(0, Some("unless-stopped")), Readiness::Stopped);
+        assert_eq!(exited(0, Some("always")), Readiness::Stopped);
+        assert_eq!(exited(0, Some("on-failure")), Readiness::Done);
+        assert_eq!(exited(1, Some("on-failure")), Readiness::Stopped);
     }
 
     #[test]
@@ -287,7 +306,8 @@ mod tests {
     fn an_unhealthy_stack_times_out_not_ready() {
         let e = engine("unhealthy");
         let out =
-            plugin_toolkit::reactor::block_on(wait(&e.client(), "app", Duration::ZERO)).unwrap();
+            plugin_toolkit::reactor::block_on(wait(&e.client(), "app", Duration::from_millis(300)))
+                .unwrap();
         assert!(!out.ready);
         assert_eq!(out.containers[0].readiness, Readiness::Unhealthy);
     }
@@ -296,7 +316,8 @@ mod tests {
     fn a_stack_with_no_containers_is_not_ready() {
         let e = FakeEngine::routed(vec![Route::new("GET", "/containers/json", 200, "[]")]);
         let out =
-            plugin_toolkit::reactor::block_on(wait(&e.client(), "app", Duration::ZERO)).unwrap();
+            plugin_toolkit::reactor::block_on(wait(&e.client(), "app", Duration::from_millis(300)))
+                .unwrap();
         assert!(!out.ready);
         assert!(out.containers.is_empty());
     }
