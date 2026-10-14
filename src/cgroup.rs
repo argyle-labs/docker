@@ -102,12 +102,11 @@ pub fn assess(root: &Path) -> CgroupAssessment {
 
 #[orca_struct(args)]
 pub struct DockerHostProbeArgs {
-    /// Also pull `debian:stable-slim` if absent and create and run a
-    /// throwaway container with memory/cpu limits, reading its memory limit
-    /// back. Omitted, only files and `docker info` are read.
+    /// Only read files and `docker info`. Omitted, also pulls
+    /// `debian:stable-slim` if absent and runs a throwaway limited container.
     #[arg(long)]
     #[serde(default)]
-    pub execute: bool,
+    pub dry_run: bool,
 }
 
 #[orca_struct]
@@ -119,10 +118,10 @@ pub struct DockerHostProbeOutput {
     /// `docker info` warned about swap limits (`None`: docker unreachable).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub swap_limit_warning: Option<bool>,
-    /// `memory.max` read inside the limited container (execute only).
+    /// `memory.max` read inside the limited container (when executing).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_readback: Option<String>,
-    /// Why the limited container did not run (execute only).
+    /// Why the limited container did not run (when executing).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_error: Option<String>,
     pub problems: Vec<String>,
@@ -177,10 +176,10 @@ async fn docker_stdout(args: &[&str]) -> std::result::Result<String, String> {
 }
 
 /// **Probe whether this docker host can enforce container limits**: cgroup v2
-/// delegation inside an LXC, and `docker info`'s swap-limit warning. With
-/// `execute`, also pulls a small image if absent and creates and runs a
-/// throwaway limited container, reading its memory limit back. Without it,
-/// only reads; use as a health check.
+/// delegation inside an LXC, and `docker info`'s swap-limit warning, then
+/// pulls a small image if absent and creates and runs a throwaway limited
+/// container, reading its memory limit back. With `dry_run`, only reads; use
+/// that as a health check.
 #[orca_tool(
     domain = "docker",
     verb = "host_probe",
@@ -198,7 +197,7 @@ async fn docker_host_probe(
         .await
         .ok()
         .map(|w| w.contains(SWAP_WARNING));
-    let readback = if args.execute {
+    let readback = if !args.dry_run {
         let memory = format!("--memory={PROBE_MEMORY}");
         let swap = format!("--memory-swap={}", PROBE_MEMORY + (32 << 20));
         let run = [
@@ -301,10 +300,10 @@ pub(crate) fn write_files(root: &Path, a: &CgroupAssessment) -> Result<()> {
 
 #[orca_struct(args)]
 pub struct DockerHostPrepareArgs {
-    /// Apply. Omitted, returns the plan and changes nothing.
+    /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
     #[serde(default)]
-    pub execute: bool,
+    pub dry_run: bool,
 }
 
 #[orca_struct]
@@ -317,7 +316,7 @@ pub struct DockerHostPrepareOutput {
     /// Why nothing is planned on a host that still needs delegation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
-    /// Assessment after applying (execute only).
+    /// Assessment after applying (when executing).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<CgroupAssessment>,
 }
@@ -328,7 +327,7 @@ pub struct DockerHostPrepareOutput {
 /// there) into `/init.scope`, then delegates every controller,
 /// and caps docker's `DOCKER_ULIMIT` at the CT's hard open-files limit.
 /// dockerd is not restarted: the ulimit applies on its next start. Verify
-/// with `docker.host_probe`. Without `execute`, returns the plan.
+/// with `docker.host_probe`. With `dry_run`, returns the plan.
 #[orca_tool(
     domain = "docker",
     verb = "host_prepare",
@@ -341,7 +340,6 @@ async fn docker_host_prepare(
     ctx: &ToolCtx,
 ) -> Result<DockerHostPrepareOutput> {
     crate::execute::require_admin(PREPARE_TOOL, ctx)?;
-    crate::execute::guard(PREPARE_TOOL, args.execute, ctx)?;
     let root = Path::new("/");
     let cgroup = assess(root);
     let plan = plan(
@@ -356,9 +354,9 @@ async fn docker_host_prepare(
             cgroup.init
         )
     });
-    if !args.execute || plan.is_empty() {
+    if args.dry_run || plan.is_empty() {
         return Ok(DockerHostPrepareOutput {
-            dry_run: !args.execute,
+            dry_run: args.dry_run,
             cgroup,
             plan,
             note,

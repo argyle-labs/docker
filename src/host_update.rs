@@ -7,7 +7,7 @@
 //! it reports `Unavailable` today and execute refuses unless the caller passes
 //! `skip_backup_gate`.
 //!
-//! Dry run by default. The plan's change targets are `package:<name>` (each
+//! `dry_run` returns the plan. Its's change targets are `package:<name>` (each
 //! upgradable package, from the current package index), `stack:<name>`,
 //! `orphan:<stack>/<container>` (containers of services the compose files no
 //! longer declare) and `image:<id>` (images dangling now). Execute takes those
@@ -416,7 +416,7 @@ pub async fn update_stacks(runner: &dyn StackRunner, jobs: &[StackJob]) -> Vec<S
 #[serde(rename_all = "camelCase")]
 #[derive(Debug, Clone)]
 pub struct HostUpdateApplied {
-    /// Always `false`: changes were applied.
+    /// Return the plan and change nothing. Omitted, applies.
     pub dry_run: bool,
     pub backup_gate: String,
     /// Absent when no package was confirmed.
@@ -667,7 +667,7 @@ pub fn plan<A: Serialize>(
     );
     let mut p = ExecutionPlan::generic(TOOL, inputs.into()).detailed(summary, changes);
     p.how_to_execute = format!(
-        "re-invoke {TOOL} with `execute: true` and `items` set to the change targets to apply (package:*, stack:*, orphan:*, image:*)"
+        "re-invoke {TOOL} without `dry_run`, with `items` set to the change targets to apply (package:*, stack:*, orphan:*, image:*)"
     );
     Ok(p)
 }
@@ -846,22 +846,22 @@ pub struct DockerHostUpdateArgs {
     #[arg(long)]
     #[serde(default)]
     pub skip_backup_gate: bool,
-    /// The plan's change targets to apply (execute only). Comma-separated on
+    /// The plan's change targets to apply (when executing). Comma-separated on
     /// the CLI.
     #[arg(long, value_delimiter = ',')]
     #[serde(default)]
     pub items: Vec<String>,
-    /// Apply. Omitted, returns the plan and changes nothing.
+    /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
     #[serde(default)]
-    pub execute: bool,
+    pub dry_run: bool,
 }
 
 /// **Update this docker host**: upgrade the confirmed OS packages (apk/apt),
 /// then `compose pull -q` + `up -d` for every confirmed running stack
 /// (removing its confirmed orphans by id first), then prune dangling
 /// images. The pre-update backup gate runs first; a failed gate aborts.
-/// Without `execute`, returns the plan and changes nothing.
+/// With `dry_run`, returns the plan and changes nothing.
 #[orca_tool(
     domain = "docker",
     verb = "host_update",
@@ -870,7 +870,6 @@ pub struct DockerHostUpdateArgs {
 )]
 async fn docker_host_update(args: DockerHostUpdateArgs, ctx: &ToolCtx) -> Result<HostUpdateChange> {
     execute::require_admin(TOOL, ctx)?;
-    execute::guard(TOOL, args.execute, ctx)?;
     let pkg = std::fs::read_to_string(OS_RELEASE)
         .ok()
         .and_then(|s| PkgManager::detect(&s));
@@ -879,7 +878,7 @@ async fn docker_host_update(args: DockerHostUpdateArgs, ctx: &ToolCtx) -> Result
         .client()
         .map_err(|e| anyhow!("{e}"))?;
 
-    if !args.execute {
+    if args.dry_run {
         let state = host_state(docker, pkg).await?;
         let dangling = prune::dangling_images(docker).await?;
         return Ok(HostUpdateChange::Plan(plan(
@@ -1341,7 +1340,7 @@ mod tests {
                 DockerHostUpdateArgs {
                     skip_backup_gate: false,
                     items: vec![],
-                    execute: false,
+                    dry_run: true,
                 },
                 &ctx,
             ))

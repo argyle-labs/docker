@@ -294,18 +294,17 @@ pub struct DockerCreateArgs {
     )]
     #[serde(default)]
     pub routes: Vec<Route>,
-    /// Register the runtime. Omitted, validates and returns what would be
-    /// registered, changing nothing.
+    /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
-    #[serde(default)]
-    pub execute: bool,
+    #[serde(default, alias = "dry_run")]
+    pub dry_run: bool,
 }
 
 #[orca_struct]
 #[serde(rename_all = "camelCase")]
 #[derive(Debug)]
 pub struct DockerCreateOutput {
-    /// `true`: nothing was written.
+    /// Return the plan and change nothing. Omitted, applies.
     pub dry_run: bool,
     /// Dry run: what would be stored. Execute: what was read back after the
     /// write.
@@ -315,7 +314,7 @@ pub struct DockerCreateOutput {
 }
 
 /// [MUTATES STATE] Register a new docker runtime. Errors if `name` is already
-/// taken. Without `execute`, returns what would be registered and changes
+/// taken. With `dry_run`, returns what would be registered and changes
 /// nothing.
 #[orca_tool(
     domain = "docker",
@@ -346,11 +345,11 @@ pub(crate) async fn docker_create(
         routes: Routes::from(args.routes),
         enabled: true,
     };
-    if !args.execute {
+    if args.dry_run {
         return Ok(DockerCreateOutput {
             dry_run: true,
             endpoint: rt,
-            how_to_execute: Some(format!("re-invoke {CREATE_TOOL} with `execute: true`")),
+            how_to_execute: Some(format!("re-invoke {CREATE_TOOL} without `dry_run`")),
         });
     }
     endpoint_db::insert(&rt.endpoint_row())
@@ -399,18 +398,17 @@ pub struct DockerUpdateArgs {
     #[arg(long)]
     #[serde(default)]
     pub enabled: Option<bool>,
-    /// Apply the patch. Omitted, returns the patched runtime and changes
-    /// nothing.
+    /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
-    #[serde(default)]
-    pub execute: bool,
+    #[serde(default, alias = "dry_run")]
+    pub dry_run: bool,
 }
 
 #[orca_struct]
 #[serde(rename_all = "camelCase")]
 #[derive(Debug)]
 pub struct DockerUpdateOutput {
-    /// `true`: nothing was written.
+    /// Return the plan and change nothing. Omitted, applies.
     pub dry_run: bool,
     /// Dry run: the patched runtime. Execute: what was read back after the
     /// write.
@@ -421,7 +419,7 @@ pub struct DockerUpdateOutput {
 }
 
 /// [MUTATES STATE] Modify an existing docker runtime. PATCH semantics — must
-/// already exist. Without `execute`, returns the patched runtime and changes
+/// already exist. With `dry_run`, returns the patched runtime and changes
 /// nothing.
 #[orca_tool(
     domain = "docker",
@@ -461,12 +459,12 @@ async fn docker_update(args: DockerUpdateArgs, ctx: &ToolCtx) -> Result<DockerUp
     if applied.is_empty() {
         bail!("no fields to update; pass at least one flag");
     }
-    if !args.execute {
+    if args.dry_run {
         return Ok(DockerUpdateOutput {
             dry_run: true,
             endpoint: rt,
             applied,
-            how_to_execute: Some(format!("re-invoke {UPDATE_TOOL} with `execute: true`")),
+            how_to_execute: Some(format!("re-invoke {UPDATE_TOOL} without `dry_run`")),
         });
     }
     if endpoint_changed && !endpoint_db::update(&rt.endpoint_row())? {
@@ -492,18 +490,17 @@ async fn docker_update(args: DockerUpdateArgs, ctx: &ToolCtx) -> Result<DockerUp
 pub struct DockerDeleteArgs {
     #[arg(long)]
     pub name: String,
-    /// Remove the runtime. Omitted, reports whether it exists and changes
-    /// nothing.
+    /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
-    #[serde(default)]
-    pub execute: bool,
+    #[serde(default, alias = "dry_run")]
+    pub dry_run: bool,
 }
 
 #[orca_struct]
 #[serde(rename_all = "camelCase")]
 #[derive(Debug)]
 pub struct DockerDeleteOutput {
-    /// `true`: nothing was removed.
+    /// Return the plan and change nothing. Omitted, applies.
     pub dry_run: bool,
     pub name: String,
     /// Dry run: whether a runtime would be removed. Execute: whether one was.
@@ -512,8 +509,7 @@ pub struct DockerDeleteOutput {
     pub how_to_execute: Option<String>,
 }
 
-/// [MUTATES STATE] Remove a registered docker runtime. Idempotent. Without
-/// `execute`, reports whether it exists and changes nothing.
+/// [MUTATES STATE] Remove a registered docker runtime. Idempotent. With `dry_run`, reports whether it exists and changes nothing.
 #[orca_tool(
     domain = "docker",
     verb = "delete",
@@ -522,13 +518,13 @@ pub struct DockerDeleteOutput {
 )]
 async fn docker_delete(args: DockerDeleteArgs, ctx: &ToolCtx) -> Result<DockerDeleteOutput> {
     execute::require_admin(DELETE_TOOL, ctx)?;
-    if !args.execute {
+    if args.dry_run {
         let changed = endpoint_db::get(&args.name)?.is_some();
         return Ok(DockerDeleteOutput {
             dry_run: true,
             name: args.name,
             changed,
-            how_to_execute: Some(format!("re-invoke {DELETE_TOOL} with `execute: true`")),
+            how_to_execute: Some(format!("re-invoke {DELETE_TOOL} without `dry_run`")),
         });
     }
     let changed = endpoint_db::remove(&args.name)?;
@@ -626,7 +622,7 @@ mod registry_tests {
             url: None,
             stacks_root: Some("/srv/stacks".into()),
             routes: Vec::new(),
-            execute,
+            dry_run: !execute,
         }
     }
 
@@ -639,7 +635,7 @@ mod registry_tests {
             stacks_root: Some("/srv/other".into()),
             routes: Vec::new(),
             enabled: None,
-            execute,
+            dry_run: !execute,
         }
     }
 
@@ -665,7 +661,7 @@ mod registry_tests {
                         errs.push(docker_update(update_args(execute), &ctx).await.unwrap_err());
                         let args = DockerDeleteArgs {
                             name: "local".into(),
-                            execute,
+                            dry_run: !execute,
                         };
                         errs.push(docker_delete(args, &ctx).await.unwrap_err());
                     });
@@ -727,7 +723,7 @@ mod registry_tests {
 
                 let args = DockerDeleteArgs {
                     name: "local".into(),
-                    execute: false,
+                    dry_run: true,
                 };
                 let out = docker_delete(args, &ctx).await.unwrap();
                 assert!(out.dry_run && out.changed);
@@ -735,7 +731,7 @@ mod registry_tests {
 
                 let args = DockerDeleteArgs {
                     name: "local".into(),
-                    execute: true,
+                    dry_run: false,
                 };
                 assert!(docker_delete(args, &ctx).await.unwrap().changed);
                 assert_eq!(stacks_roots().unwrap(), [DEFAULT_STACKS_ROOT]);

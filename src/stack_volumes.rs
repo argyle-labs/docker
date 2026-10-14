@@ -439,10 +439,10 @@ pub struct DockerStackVolumesExportArgs {
     #[arg(long)]
     #[serde(default)]
     pub allow_running: bool,
-    /// Apply. Omitted, lists what would be exported and writes nothing.
+    /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
     #[serde(default)]
-    pub execute: bool,
+    pub dry_run: bool,
 }
 
 #[orca_struct]
@@ -493,12 +493,12 @@ pub async fn export(
         .then(|| running_refusal(&volumes))
         .flatten();
     let mut out = StackVolumesExportOutput {
-        executed: args.execute,
+        executed: !args.dry_run,
         stack: args.stack.clone(),
         skipped: skipped(&volumes),
         ..Default::default()
     };
-    if !args.execute {
+    if args.dry_run {
         if let Some(why) = &refusal {
             for v in volumes
                 .iter_mut()
@@ -594,7 +594,6 @@ async fn docker_stack_volumes_export(
     ctx: &ToolCtx,
 ) -> Result<StackVolumesExportOutput> {
     crate::execute::require_admin(EXPORT_TOOL, ctx)?;
-    crate::execute::guard(EXPORT_TOOL, args.execute, ctx)?;
     let docker = crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
@@ -811,11 +810,10 @@ pub struct DockerStackVolumesImportArgs {
     #[arg(long)]
     #[serde(default)]
     pub force: bool,
-    /// Apply. Omitted, verifies every checksum, lists what would be done and
-    /// changes nothing.
+    /// Return the plan and change nothing. Omitted, applies.
     #[arg(long)]
     #[serde(default)]
-    pub execute: bool,
+    pub dry_run: bool,
 }
 
 fn action(v: &VolumeEntry, exists: bool, force: bool) -> ImportAction {
@@ -1338,7 +1336,7 @@ pub async fn import(
 ) -> Result<StackVolumesImportOutput> {
     let (manifest, dir) = load(&args.manifest, &args.manifest_sha256, roots)?;
     let mut out = StackVolumesImportOutput {
-        executed: args.execute,
+        executed: !args.dry_run,
         stack: manifest.stack.clone(),
         skipped: skipped(&manifest.volumes),
         ..Default::default()
@@ -1374,7 +1372,7 @@ pub async fn import(
                 message: why,
             });
         }
-        if !args.execute {
+        if args.dry_run {
             if matches!(act, ImportAction::RestoreIfEmpty | ImportAction::Overwrite)
                 && let Err(e) = refuse_in_use(docker, &v.name, act).await
             {
@@ -1423,7 +1421,6 @@ async fn docker_stack_volumes_import(
     ctx: &ToolCtx,
 ) -> Result<StackVolumesImportOutput> {
     crate::execute::require_admin(IMPORT_TOOL, ctx)?;
-    crate::execute::guard(IMPORT_TOOL, args.execute, ctx)?;
     let docker = crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
@@ -1622,7 +1619,7 @@ mod tests {
             destination: dest.to_string_lossy().into_owned(),
             include: vec![],
             allow_running: false,
-            execute,
+            dry_run: !execute,
         }
     }
 
@@ -1781,7 +1778,7 @@ mod tests {
             manifest: manifest.into(),
             manifest_sha256: sha.into(),
             force,
-            execute,
+            dry_run: !execute,
         }
     }
 
