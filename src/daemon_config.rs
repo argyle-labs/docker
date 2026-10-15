@@ -63,11 +63,8 @@ fn refuse_macos(tool: &str) -> Result<()> {
 }
 
 pub fn read_json(root: &Path) -> Result<Map<String, Value>> {
-    let path = root.join(DAEMON_JSON);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
-        Err(e) => return Err(e).with_context(|| format!("failed to read '/{DAEMON_JSON}'")),
+    let Some(text) = read_opt(root, DAEMON_JSON)? else {
+        return Ok(Map::new());
     };
     if text.trim().is_empty() {
         return Ok(Map::new());
@@ -323,9 +320,16 @@ fn sources_cfg(rc: &str) -> bool {
 }
 
 fn read_opt(root: &Path, rel: &str) -> Result<Option<String>> {
-    match std::fs::read_to_string(root.join(rel)) {
-        Ok(t) => Ok(Some(t)),
+    let path = root.join(rel);
+    match read_nofollow(&path) {
+        Ok(b) => String::from_utf8(b)
+            .map(Some)
+            .with_context(|| format!("'/{rel}' is not UTF-8")),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => bail!(
+            "refused: '{}' is a symlink; point it at a real file first",
+            path.display()
+        ),
         Err(e) => Err(e).with_context(|| format!("failed to read '/{rel}'")),
     }
 }
@@ -647,7 +651,7 @@ pub async fn apply<F, Fut>(
     candidate: Option<&str>,
     ts: u128,
     check: F,
-) -> Result<(Vec<String>, Option<String>)>
+) -> Result<(Vec<String>, Option<String>, Vec<String>)>
 where
     F: FnOnce(PathBuf) -> Fut,
     Fut: std::future::Future<Output = Result<String>>,
@@ -689,14 +693,17 @@ where
             );
         }
     }
-    for w in done.iter().filter(|w| w.fresh_bak) {
-        prune_backups(&w.path)?;
-    }
+    let warnings = done
+        .iter()
+        .filter(|w| w.fresh_bak)
+        .filter_map(|w| prune_backups(&w.path).err())
+        .map(|e| format!("backups kept: {e:#}"))
+        .collect();
     let backups = done
         .into_iter()
         .filter_map(|w| w.bak.map(|b| b.display().to_string()))
         .collect();
-    Ok((backups, validated))
+    Ok((backups, validated, warnings))
 }
 
 async fn dockerd_validate(candidate: PathBuf) -> Result<String> {
@@ -937,6 +944,8 @@ pub struct DaemonConfigUpdateOutput {
     /// the previous files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub how_to_execute: Option<String>,
 }
@@ -1001,6 +1010,7 @@ async fn docker_daemon_config_update(
         restart_warning,
         restarted: false,
         restart_error: None,
+        warnings: Vec::new(),
         how_to_execute: None,
     };
     if args.dry_run {
@@ -1016,7 +1026,7 @@ async fn docker_daemon_config_update(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
-    let (backups, validated) = apply(
+    let (backups, validated, warnings) = apply(
         root,
         &plan.writes,
         plan.candidate.as_deref(),
@@ -1032,6 +1042,7 @@ async fn docker_daemon_config_update(
     );
     out.backups = backups;
     out.validated = validated;
+    out.warnings = warnings;
     if let Some(cmd) = restart_cmd {
         match run_restart(&cmd).await {
             Ok(_) => out.restarted = true,
@@ -1209,7 +1220,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         put(t.path(), DAEMON_JSON, NVIDIA);
         let p = plan(t.path(), &mirrors(&["https://m"], &[])).unwrap();
-        let (backups, validated) = block_on(apply(
+        let (backups, validated, _) = block_on(apply(
             t.path(),
             &p.writes,
             p.candidate.as_deref(),
@@ -1340,17 +1351,13 @@ mod tests {
     }
 
     #[test]
-    fn a_symlinked_target_is_refused() {
+    fn a_symlinked_target_is_refused_at_plan_time() {
         let t = tempfile::tempdir().unwrap();
         put(t.path(), "elsewhere.json", NVIDIA);
         std::fs::create_dir_all(t.path().join("etc/docker")).unwrap();
         std::os::unix::fs::symlink(t.path().join("elsewhere.json"), t.path().join(DAEMON_JSON))
             .unwrap();
-        let p = plan(t.path(), &mirrors(&["https://m"], &[])).unwrap();
-        let err = block_on(apply(t.path(), &p.writes, None, 1, |_| async {
-            Ok(String::new())
-        }))
-        .unwrap_err();
+        let err = plan(t.path(), &mirrors(&["https://m"], &[])).unwrap_err();
         assert!(err.to_string().contains("is a symlink"), "{err}");
         assert_eq!(
             std::fs::read_to_string(t.path().join("elsewhere.json")).unwrap(),
@@ -1362,12 +1369,57 @@ mod tests {
         let cfg = t.path().join(UNRAID_CFG);
         std::fs::rename(&cfg, t.path().join("real.cfg")).unwrap();
         std::os::unix::fs::symlink(t.path().join("real.cfg"), &cfg).unwrap();
+        let err = plan(t.path(), &mirrors(&["https://m"], &[])).unwrap_err();
+        assert!(err.to_string().contains("is a symlink"), "{err}");
+    }
+
+    #[test]
+    fn a_symlink_swapped_in_after_planning_is_refused_at_write() {
+        let t = tempfile::tempdir().unwrap();
+        put(t.path(), "elsewhere.json", NVIDIA);
+        put(t.path(), DAEMON_JSON, NVIDIA);
         let p = plan(t.path(), &mirrors(&["https://m"], &[])).unwrap();
+        std::fs::remove_file(t.path().join(DAEMON_JSON)).unwrap();
+        std::os::unix::fs::symlink(t.path().join("elsewhere.json"), t.path().join(DAEMON_JSON))
+            .unwrap();
         let err = block_on(apply(t.path(), &p.writes, None, 1, |_| async {
             Ok(String::new())
         }))
         .unwrap_err();
         assert!(err.to_string().contains("is a symlink"), "{err}");
+    }
+
+    #[test]
+    fn a_failed_prune_is_a_warning_not_an_error() {
+        let t = tempfile::tempdir().unwrap();
+        put(t.path(), DAEMON_JSON, NVIDIA);
+        let json = t.path().join(DAEMON_JSON);
+        std::fs::create_dir(backup_path(&json, 1)).unwrap();
+        for ts in [2, 3] {
+            std::fs::write(backup_path(&json, ts), NVIDIA).unwrap();
+        }
+        let p = plan(t.path(), &mirrors(&["https://m"], &[])).unwrap();
+        let (backups, _, warnings) = block_on(apply(t.path(), &p.writes, None, 10, |_| async {
+            Ok(String::new())
+        }))
+        .unwrap();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("failed to prune"), "{warnings:?}");
+        assert_eq!(
+            read_json(t.path()).unwrap()["registry-mirrors"],
+            json!(["https://m"])
+        );
+    }
+
+    #[test]
+    fn an_exported_docker_opts_line_is_edited_in_place() {
+        let cfg = "DOCKER_ENABLED=\"yes\"\nexport DOCKER_OPTS=\"--dns 10.0.0.1\"\nX=1\n";
+        assert_eq!(opts_of(cfg), "--dns 10.0.0.1");
+        assert_eq!(
+            set_opts(cfg, &["https://m".to_owned()], &[]).unwrap(),
+            "DOCKER_ENABLED=\"yes\"\nexport DOCKER_OPTS=\"--dns 10.0.0.1 --registry-mirror=https://m\"\nX=1\n"
+        );
     }
 
     #[test]
@@ -1645,7 +1697,7 @@ start_docker(){
         assert_eq!(p.effective[MIRRORS], json!(["http://10.0.0.10:5000"]));
         assert_eq!(p.current[MIRRORS], json!(["https://old"]));
 
-        let (_, validated) = block_on(apply(
+        let (_, validated, _) = block_on(apply(
             t.path(),
             &p.writes,
             p.candidate.as_deref(),

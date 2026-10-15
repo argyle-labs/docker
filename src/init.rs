@@ -41,7 +41,12 @@ pub fn detect(root: &Path) -> Init {
 /// no quotes (conf.d files are sourced by sh), the trailer being whatever
 /// follows it, such as ` # comment`.
 pub fn assignment<'a>(line: &'a str, key: &str) -> Option<(&'a str, &'a str)> {
-    let rest = line.trim_start().strip_prefix(key)?.strip_prefix('=')?;
+    let line = line.trim_start();
+    let rest = line
+        .strip_prefix("export ")
+        .map_or(line, str::trim_start)
+        .strip_prefix(key)?
+        .strip_prefix('=')?;
     for q in ['"', '\''] {
         if let Some(inner) = rest.strip_prefix(q) {
             let end = inner.find(q)?;
@@ -65,7 +70,12 @@ pub fn set_var(conf: &str, key: &str, value: &str) -> String {
     for line in conf.lines() {
         if let Some((_, trailer)) = assignment(line, key) {
             if !set {
-                out.push(format!("{key}=\"{value}\"{}", trailer.trim_end()));
+                let export = if line.trim_start().starts_with("export ") {
+                    "export "
+                } else {
+                    ""
+                };
+                out.push(format!("{export}{key}=\"{value}\"{}", trailer.trim_end()));
                 set = true;
             }
         } else {
