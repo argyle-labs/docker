@@ -21,6 +21,10 @@ const INSECURE: &str = "insecure-registries";
 const MIRROR_FLAG: &str = "--registry-mirror";
 const INSECURE_FLAG: &str = "--insecure-registry";
 const MANAGED: [&str; 2] = [MIRRORS, INSECURE];
+const CFG_BACKUP: &str = "docker.cfg.bak";
+const JSON_BACKUPS_KEPT: usize = 3;
+const SHELL_UNSAFE: [char; 6] = ['$', '`', '"', '\'', '\\', ';'];
+const SYSTEMCTL: [&str; 2] = ["/usr/bin/systemctl", "/bin/systemctl"];
 const DOCKERD: [&str; 3] = [
     "/usr/bin/dockerd",
     "/usr/local/bin/dockerd",
@@ -133,17 +137,17 @@ fn strings(config: &Map<String, Value>, key: &str) -> Result<Vec<String>> {
     }
 }
 
-fn plain(value: &str) -> bool {
+fn allowed(value: &str) -> bool {
     !value.is_empty()
-        && !value
+        && value
             .chars()
-            .any(|c| c.is_whitespace() || c.is_control() || c == '"' || c == '\'' || c == '\\')
+            .all(|c| c.is_ascii_alphanumeric() || ".-_:/[]%".contains(c))
 }
 
 pub fn mirror_authority(url: &str) -> Result<(&str, &str)> {
-    if !plain(url) {
+    if !allowed(url) {
         bail!(
-            "mirror '{}' holds whitespace, quotes or control characters",
+            "mirror '{}' may hold only ASCII letters, digits and . - _ : / [ ] %",
             url.escape_debug()
         );
     }
@@ -169,9 +173,9 @@ pub fn mirror_authority(url: &str) -> Result<(&str, &str)> {
 pub fn validate(config: &Map<String, Value>) -> Result<()> {
     let mirrors = strings(config, MIRRORS)?;
     let insecure = strings(config, INSECURE)?;
-    if let Some(bad) = insecure.iter().find(|r| !plain(r)) {
+    if let Some(bad) = insecure.iter().find(|r| !allowed(r)) {
         bail!(
-            "insecure registry '{}' holds whitespace, quotes or control characters",
+            "insecure registry '{}' may hold only ASCII letters, digits and . - _ : / [ ] %",
             bad.escape_debug()
         );
     }
@@ -213,7 +217,7 @@ pub fn diff(before: &Map<String, Value>, after: &Map<String, Value>) -> Vec<KeyC
 
 pub fn parse_opts(opts: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
     let (mut mirrors, mut insecure, mut rest) = (Vec::new(), Vec::new(), Vec::new());
-    let mut words = opts.split_whitespace();
+    let mut words = opts.split_whitespace().peekable();
     while let Some(w) = words.next() {
         let (flag, inline) = match w.split_once('=') {
             Some((f, v)) => (f, Some(v.to_owned())),
@@ -227,7 +231,8 @@ pub fn parse_opts(opts: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
                 continue;
             }
         };
-        if let Some(v) = inline.or_else(|| words.next().map(str::to_owned)) {
+        let next = || words.next_if(|n| !n.starts_with('-')).map(str::to_owned);
+        if let Some(v) = inline.or_else(next) {
             into.push(v);
         }
     }
@@ -236,16 +241,36 @@ pub fn parse_opts(opts: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
 
 fn opts_of(cfg: &str) -> String {
     cfg.lines()
+        .rev()
         .find_map(|l| init::assignment(l, OPTS_KEY))
         .map(|(v, _)| v.to_owned())
         .unwrap_or_default()
 }
 
-pub fn set_opts(cfg: &str, mirrors: &[String], insecure: &[String]) -> String {
+pub fn set_opts(cfg: &str, mirrors: &[String], insecure: &[String]) -> Result<String> {
     let (_, _, mut words) = parse_opts(&opts_of(cfg));
     words.extend(mirrors.iter().map(|m| format!("{MIRROR_FLAG}={m}")));
     words.extend(insecure.iter().map(|r| format!("{INSECURE_FLAG}={r}")));
-    init::set_var(cfg, OPTS_KEY, &words.join(" "))
+    if let Some(bad) = words.iter().find(|w| {
+        w.chars()
+            .any(|c| c.is_whitespace() || SHELL_UNSAFE.contains(&c))
+    }) {
+        bail!(
+            "{UPDATE_TOOL}: refused: {OPTS_KEY} word '{}' would be interpreted by the shell that sources '/{UNRAID_CFG}'",
+            bad.escape_debug()
+        );
+    }
+    Ok(init::set_var(cfg, OPTS_KEY, &words.join(" ")))
+}
+
+fn sources_cfg(rc: &str) -> bool {
+    rc.lines().any(|l| {
+        [". ", "source "].iter().any(|cmd| {
+            ["$DOCKER_CFG", "\"$DOCKER_CFG\"", "${DOCKER_CFG}"]
+                .iter()
+                .any(|v| l.contains(&format!("{cmd}{v}")))
+        })
+    })
 }
 
 fn read_opt(root: &Path, rel: &str) -> Result<Option<String>> {
@@ -258,9 +283,9 @@ fn read_opt(root: &Path, rel: &str) -> Result<Option<String>> {
 
 fn unraid_cfg(root: &Path) -> Result<String> {
     let rc = read_opt(root, UNRAID_RC)?.unwrap_or_default();
-    if !rc.contains(OPTS_KEY) {
+    if !rc.contains(OPTS_KEY) || !sources_cfg(&rc) {
         bail!(
-            "{UPDATE_TOOL}: refused on Unraid: '/{UNRAID_RC}' does not pass {OPTS_KEY} to dockerd, so the change cannot be persisted and '/{DAEMON_JSON}' is rebuilt at boot"
+            "{UPDATE_TOOL}: refused on Unraid: '/{UNRAID_RC}' does not source DOCKER_CFG and pass {OPTS_KEY} to dockerd, so the change cannot be persisted and '/{DAEMON_JSON}' is rebuilt at boot"
         );
     }
     read_opt(root, UNRAID_CFG)?.ok_or_else(|| {
@@ -281,6 +306,35 @@ fn flags_json(mirrors: Vec<String>, insecure: Vec<String>) -> Map<String, Value>
     m
 }
 
+fn conflicts(json: &Map<String, Value>, flags: &Map<String, Value>) -> Vec<String> {
+    MANAGED
+        .iter()
+        .filter_map(|k| match (json.get(*k), flags.get(*k)) {
+            (Some(a), Some(b)) if a != b => Some(format!(
+                "'{k}' differs: /{DAEMON_JSON} has {a}, {OPTS_KEY} in /{UNRAID_CFG} has {b}"
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn merged(base: &Map<String, Value>, patch: &DaemonConfigPatch) -> Map<String, Value> {
+    let mut v = Value::Object(base.clone());
+    deep_merge(&mut v, &patch.to_json());
+    let Value::Object(mut m) = v else {
+        unreachable!()
+    };
+    for k in MANAGED {
+        if m.get(k)
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+        {
+            m.remove(k);
+        }
+    }
+    m
+}
+
 #[orca_struct]
 #[serde(rename_all = "camelCase")]
 #[derive(Debug, Clone, PartialEq)]
@@ -296,6 +350,8 @@ pub struct Plan {
     pub current: Map<String, Value>,
     pub effective: Map<String, Value>,
     pub writes: Vec<FileWrite>,
+    pub candidate: Option<String>,
+    pub conflicts: Vec<String>,
 }
 
 fn pretty(m: &Map<String, Value>) -> Result<String> {
@@ -320,24 +376,22 @@ pub fn plan(root: &Path, patch: &DaemonConfigPatch) -> Result<Plan> {
     let json = read_json(root)?;
     let json_text = read_opt(root, DAEMON_JSON)?.unwrap_or_default();
     let mut writes = Vec::new();
-    let (current, effective) = match host {
+    let (current, effective, candidate, conflicts) = match host {
         Host::Unraid => {
-            let cfg = unraid_cfg(root)?;
-            let (mirrors, insecure, _) = parse_opts(&opts_of(&cfg));
-            let mut current = json.clone();
-            current.extend(flags_json(mirrors, insecure));
-            let mut merged = Value::Object(current.clone());
-            deep_merge(&mut merged, &patch.to_json());
-            let Value::Object(effective) = merged else {
-                unreachable!()
+            let raw = unraid_cfg(root)?;
+            let crlf = raw.contains("\r\n");
+            let cfg = if crlf {
+                raw.replace("\r\n", "\n")
+            } else {
+                raw.clone()
             };
+            let (mirrors, insecure, _) = parse_opts(&opts_of(&cfg));
+            let flags = flags_json(mirrors, insecure);
+            let conflicts = conflicts(&json, &flags);
+            let mut current = json.clone();
+            current.extend(flags.clone());
+            let effective = merged(&current, patch);
             validate(&effective)?;
-            let new_cfg = set_opts(
-                &cfg,
-                &strings(&effective, MIRRORS)?,
-                &strings(&effective, INSECURE)?,
-            );
-            write_if_changed(&mut writes, UNRAID_CFG, cfg, new_cfg);
             let mut stripped = json.clone();
             for k in MANAGED {
                 stripped.remove(k);
@@ -345,26 +399,47 @@ pub fn plan(root: &Path, patch: &DaemonConfigPatch) -> Result<Plan> {
             if stripped != json {
                 write_if_changed(&mut writes, DAEMON_JSON, json_text, pretty(&stripped)?);
             }
-            (current, effective)
+            let wanted = flags_json(
+                strings(&effective, MIRRORS)?,
+                strings(&effective, INSECURE)?,
+            );
+            if wanted != flags {
+                let mut new_cfg = set_opts(
+                    &cfg,
+                    &strings(&effective, MIRRORS)?,
+                    &strings(&effective, INSECURE)?,
+                )?;
+                if crlf {
+                    new_cfg = new_cfg.replace('\n', "\r\n");
+                }
+                write_if_changed(&mut writes, UNRAID_CFG, raw, new_cfg);
+            }
+            let mut candidate = stripped;
+            candidate.extend(wanted);
+            (current, effective, candidate, conflicts)
         }
         Host::Standard(_) => {
-            let mut merged = Value::Object(json.clone());
-            deep_merge(&mut merged, &patch.to_json());
-            let Value::Object(effective) = merged else {
-                unreachable!()
-            };
+            let effective = merged(&json, patch);
             validate(&effective)?;
             if effective != json {
                 write_if_changed(&mut writes, DAEMON_JSON, json_text, pretty(&effective)?);
             }
-            (json, effective)
+            let candidate = effective.clone();
+            (json, effective, candidate, Vec::new())
         }
+    };
+    let candidate = if writes.is_empty() {
+        None
+    } else {
+        Some(plugin_toolkit::serde_json::to_string_pretty(&candidate)? + "\n")
     };
     Ok(Plan {
         host,
         current,
         effective,
         writes,
+        candidate,
+        conflicts,
     })
 }
 
@@ -379,7 +454,8 @@ fn replace(path: &Path, content: &str) -> Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(content.as_bytes())?;
         f.sync_all()?;
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, path)?;
+        std::fs::File::open(dir)?.sync_all()
     })();
     if result.is_err() {
         let _removed = std::fs::remove_file(&tmp);
@@ -392,9 +468,79 @@ fn backup_path(path: &Path, ts: u64) -> PathBuf {
     path.with_file_name(format!("{name}.bak-{ts}"))
 }
 
+fn prune_backups(path: &Path) -> Result<()> {
+    let dir = path.parent().unwrap_or(path);
+    let prefix = format!(
+        "{}.bak-",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    );
+    let mut found: Vec<(u64, PathBuf)> = std::fs::read_dir(dir)?
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let ts = e
+                .file_name()
+                .to_str()?
+                .strip_prefix(&prefix)?
+                .parse()
+                .ok()?;
+            Some((ts, e.path()))
+        })
+        .collect();
+    found.sort();
+    let excess = found.len().saturating_sub(JSON_BACKUPS_KEPT);
+    for (_, old) in found.into_iter().take(excess) {
+        std::fs::remove_file(&old)
+            .with_context(|| format!("failed to prune '{}'", old.display()))?;
+    }
+    Ok(())
+}
+
+type Written = (PathBuf, Option<PathBuf>);
+
+fn write_one(root: &Path, w: &FileWrite, ts: u64, done: &mut Vec<Written>) -> Result<()> {
+    let path = root.join(w.path.trim_start_matches('/'));
+    let is_cfg = w.path == format!("/{UNRAID_CFG}");
+    let bak = if path.exists() {
+        let bak = if is_cfg {
+            path.with_file_name(CFG_BACKUP)
+        } else {
+            backup_path(&path, ts)
+        };
+        std::fs::copy(&path, &bak)
+            .with_context(|| format!("failed to back up '{}'", path.display()))?;
+        Some(bak)
+    } else {
+        None
+    };
+    done.push((path.clone(), bak));
+    if is_cfg {
+        replace(&path, &w.after)
+    } else {
+        init::write_atomic(&path, &w.after, 0o644)?;
+        prune_backups(&path)
+    }
+}
+
+fn rollback(done: &[Written]) -> Vec<String> {
+    done.iter()
+        .rev()
+        .filter_map(|(path, bak)| {
+            let result = match bak {
+                Some(b) => std::fs::copy(b, path).map(|_| ()),
+                None => match std::fs::remove_file(path) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                    _ => Ok(()),
+                },
+            };
+            result.err().map(|e| format!("'{}': {e}", path.display()))
+        })
+        .collect()
+}
+
 pub async fn apply<F, Fut>(
     root: &Path,
     writes: &[FileWrite],
+    candidate: Option<&str>,
     ts: u64,
     check: F,
 ) -> Result<(Vec<String>, Option<String>)>
@@ -402,34 +548,36 @@ where
     F: FnOnce(PathBuf) -> Fut,
     Fut: std::future::Future<Output = Result<String>>,
 {
-    let json_path = format!("/{DAEMON_JSON}");
     let mut validated = None;
-    if let Some(w) = writes.iter().find(|w| w.path == json_path) {
-        let candidate = root
-            .join(DAEMON_JSON)
-            .with_file_name(".daemon.json.orca-candidate");
-        init::write_atomic(&candidate, &w.after, 0o644)?;
-        let checked = check(candidate.clone()).await;
-        let _removed = std::fs::remove_file(&candidate);
+    if let Some(c) = candidate {
+        let path = root.join(DAEMON_JSON).with_file_name(format!(
+            ".daemon.json.orca-candidate-{}",
+            std::process::id()
+        ));
+        init::write_atomic(&path, c, 0o644)?;
+        let checked = check(path.clone()).await;
+        let _removed = std::fs::remove_file(&path);
         validated = Some(checked.with_context(|| {
-            format!("{UPDATE_TOOL}: the new daemon.json failed validation; nothing was written")
+            format!("{UPDATE_TOOL}: the new daemon config failed validation; nothing was written")
         })?);
     }
-    let mut backups = Vec::new();
+    let mut done = Vec::new();
     for w in writes {
-        let path = root.join(w.path.trim_start_matches('/'));
-        if path.exists() {
-            let bak = backup_path(&path, ts);
-            std::fs::copy(&path, &bak)
-                .with_context(|| format!("failed to back up '{}'", path.display()))?;
-            backups.push(bak.display().to_string());
-        }
-        if w.path == json_path {
-            init::write_atomic(&path, &w.after, 0o644)?;
-        } else {
-            replace(&path, &w.after)?;
+        if let Err(e) = write_one(root, w, ts, &mut done) {
+            let failed = rollback(&done);
+            if failed.is_empty() {
+                bail!("{UPDATE_TOOL}: {e:#}; rolled back");
+            }
+            bail!(
+                "{UPDATE_TOOL}: {e:#}; rollback failed for {}",
+                failed.join(", ")
+            );
         }
     }
+    let backups = done
+        .into_iter()
+        .filter_map(|(_, b)| b.map(|b| b.display().to_string()))
+        .collect();
     Ok((backups, validated))
 }
 
@@ -454,10 +602,17 @@ async fn dockerd_validate(candidate: PathBuf) -> Result<String> {
     Ok(format!("dockerd --validate: {}", text.trim()))
 }
 
+fn systemctl() -> &'static str {
+    SYSTEMCTL
+        .into_iter()
+        .find(|p| Path::new(p).exists())
+        .unwrap_or(SYSTEMCTL[1])
+}
+
 pub fn restart_command(host: Host) -> Result<Vec<&'static str>> {
     match host {
         Host::Unraid => Ok(vec!["/etc/rc.d/rc.docker", "restart"]),
-        Host::Standard(Init::Systemd) => Ok(vec!["/bin/systemctl", "restart", "docker"]),
+        Host::Standard(Init::Systemd) => Ok(vec![systemctl(), "restart", "docker"]),
         Host::Standard(Init::OpenRc) => Ok(vec!["/sbin/rc-service", "docker", "restart"]),
         Host::Standard(Init::Other) => {
             bail!(
@@ -520,6 +675,28 @@ fn redacted(m: &Map<String, Value>) -> Value {
     plugin_toolkit::scrub::redact_json(Value::Object(m.clone()))
 }
 
+fn scrubbed(text: &str) -> String {
+    text.split_inclusive('\n')
+        .map(|l| plugin_toolkit::scrub::scrub_line(l).into_owned())
+        .collect()
+}
+
+fn scrub_write(w: &FileWrite) -> FileWrite {
+    FileWrite {
+        path: w.path.clone(),
+        before: scrubbed(&w.before),
+        after: scrubbed(&w.after),
+    }
+}
+
+fn scrub_change(c: KeyChange) -> KeyChange {
+    KeyChange {
+        key: c.key,
+        before: c.before.map(plugin_toolkit::scrub::redact_json),
+        after: c.after.map(plugin_toolkit::scrub::redact_json),
+    }
+}
+
 #[orca_struct(args)]
 pub struct DockerDaemonConfigArgs {}
 
@@ -539,6 +716,9 @@ pub struct DaemonConfigDetail {
     /// `daemonJson` with the persisted flags applied: what dockerd runs with
     /// after its next restart.
     pub effective: Value,
+    /// Unraid: managed keys set in both files with different values.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<String>,
 }
 
 /// **Read the Docker daemon config** (`/etc/docker/daemon.json`), parsed. On
@@ -564,15 +744,17 @@ async fn docker_daemon_config(
 pub fn detail(root: &Path) -> Result<DaemonConfigDetail> {
     let host = detect(root);
     let json = read_json(root)?;
-    let (persisted_in, effective) = match host {
+    let (persisted_in, effective, conflicts) = match host {
         Host::Unraid => {
             let cfg = read_opt(root, UNRAID_CFG)?.unwrap_or_default();
             let (mirrors, insecure, _) = parse_opts(&opts_of(&cfg));
+            let flags = flags_json(mirrors, insecure);
+            let conflicts = conflicts(&json, &flags);
             let mut effective = json.clone();
-            effective.extend(flags_json(mirrors, insecure));
-            (Some(format!("/{UNRAID_CFG}")), effective)
+            effective.extend(flags);
+            (Some(format!("/{UNRAID_CFG}")), effective, conflicts)
         }
-        Host::Standard(_) => (None, json.clone()),
+        Host::Standard(_) => (None, json.clone(), Vec::new()),
     };
     Ok(DaemonConfigDetail {
         host: host.as_str().to_owned(),
@@ -580,6 +762,7 @@ pub fn detail(root: &Path) -> Result<DaemonConfigDetail> {
         daemon_json: redacted(&json),
         persisted_in,
         effective: redacted(&effective),
+        conflicts,
     })
 }
 
@@ -616,17 +799,26 @@ pub struct DaemonConfigUpdateOutput {
     pub host: String,
     /// Effective config keys that change.
     pub changes: Vec<KeyChange>,
-    /// Files written (or to write), with their full before and after text.
+    /// Files written (or to write), with their full before and after text,
+    /// secrets scrubbed.
     pub writes: Vec<FileWrite>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub backups: Vec<String>,
-    /// `dockerd --validate` on the new `daemon.json`, when one is written.
+    /// `dockerd --validate` on the resulting daemon config, whenever anything
+    /// is written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validated: Option<String>,
+    /// Unraid: managed keys set in both files with different values.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<String>,
     /// Restarting stops every container; lists the running ones.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart_warning: Option<String>,
     pub restarted: bool,
+    /// The restart failed after the config was written; `backups` still hold
+    /// the previous files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub how_to_execute: Option<String>,
 }
@@ -634,12 +826,13 @@ pub struct DaemonConfigUpdateOutput {
 /// **Update the Docker daemon config**: deep-merge `registry_mirrors` /
 /// `insecure_registries` into `/etc/docker/daemon.json`, keeping every other
 /// key. Validates the result (mirrors are http(s) URLs; an http mirror's
-/// host:port must be an insecure registry), then backs each file up to
-/// `<file>.bak-<unix secs>`, checks the new `daemon.json` with `dockerd
-/// --validate` when dockerd is present, and writes atomically. On Unraid the
+/// host:port must be an insecure registry), checks the resulting config with
+/// `dockerd --validate` when dockerd is present, then backs each file up
+/// (`daemon.json.bak-<unix secs>`, newest 3 kept; `docker.cfg.bak`) and
+/// writes atomically, rolling every file back if a write fails. On Unraid the
 /// two keys persist as `DOCKER_OPTS` flags in `/boot/config/docker.cfg` and
-/// are removed from `daemon.json`; refused when rc.docker does not pass
-/// `DOCKER_OPTS`. dockerd is restarted only with `restart` (it stops every
+/// are removed from `daemon.json`; refused when rc.docker does not source
+/// `DOCKER_CFG` and pass `DOCKER_OPTS`. dockerd is restarted only with `restart` (it stops every
 /// container). Unsupported on macOS (colima: `colima start --edit`). With
 /// `dryRun`, returns the diff and the running containers a restart stops.
 #[orca_tool(
@@ -669,7 +862,10 @@ async fn docker_daemon_config_update(
     } else {
         None
     };
-    let changes = diff(&plan.current, &plan.effective);
+    let changes = diff(&plan.current, &plan.effective)
+        .into_iter()
+        .map(scrub_change)
+        .collect();
     let changed = !plan.writes.is_empty();
     let restart_warning = if changed {
         Some(restart_warning(&running_containers().await))
@@ -680,11 +876,13 @@ async fn docker_daemon_config_update(
         dry_run: args.dry_run,
         host: plan.host.as_str().to_owned(),
         changes,
-        writes: plan.writes.clone(),
+        writes: plan.writes.iter().map(scrub_write).collect(),
         backups: Vec::new(),
         validated: None,
+        conflicts: plan.conflicts.clone(),
         restart_warning,
         restarted: false,
+        restart_error: None,
         how_to_execute: None,
     };
     if args.dry_run {
@@ -700,7 +898,14 @@ async fn docker_daemon_config_update(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default();
-    let (backups, validated) = apply(root, &plan.writes, ts, dockerd_validate).await?;
+    let (backups, validated) = apply(
+        root,
+        &plan.writes,
+        plan.candidate.as_deref(),
+        ts,
+        dockerd_validate,
+    )
+    .await?;
     plugin_toolkit::tracing::info!(
         target: "docker::daemon_config",
         host = plan.host.as_str(),
@@ -710,8 +915,10 @@ async fn docker_daemon_config_update(
     out.backups = backups;
     out.validated = validated;
     if let Some(cmd) = restart_cmd {
-        run_restart(&cmd).await?;
-        out.restarted = true;
+        match run_restart(&cmd).await {
+            Ok(_) => out.restarted = true,
+            Err(e) => out.restart_error = Some(format!("{e:#}")),
+        }
     }
     Ok(out)
 }
@@ -834,11 +1041,42 @@ mod tests {
         );
 
         let again = plan(t.path(), &mirrors(&[], &[])).unwrap();
-        assert!(
-            diff(&again.current, &again.effective)
-                .iter()
-                .all(|c| c.after == Some(json!([])))
+        assert_eq!(diff(&again.current, &again.effective), []);
+        assert_eq!(again.writes, []);
+    }
+
+    #[test]
+    fn an_empty_list_removes_the_key() {
+        let t = tempfile::tempdir().unwrap();
+        put(
+            t.path(),
+            DAEMON_JSON,
+            r#"{"registry-mirrors":["https://m"]}"#,
         );
+        let p = plan(t.path(), &mirrors(&[], &[])).unwrap();
+        let changes = diff(&p.current, &p.effective);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].key, MIRRORS);
+        assert_eq!(changes[0].after, None);
+        assert_eq!(p.writes[0].after, "");
+    }
+
+    #[test]
+    fn shell_metacharacters_are_refused() {
+        for bad in ["$(x)", "`x`", ";x", "${IFS}x"] {
+            let t = tempfile::tempdir().unwrap();
+            unraid(t.path(), WILLOW_CFG);
+            let url = format!("https://m{bad}");
+            assert!(plan(t.path(), &mirrors(&[&url], &[])).is_err(), "{url}");
+            let reg = format!("m{bad}:5000");
+            assert!(plan(t.path(), &mirrors(&[], &[&reg])).is_err(), "{reg}");
+        }
+        for word in ["$(x)", "`x`", "a;b", "${IFS}", "\"q", "'q", "a\\b", "a b"] {
+            assert!(set_opts("", &[word.into()], &[]).is_err(), "{word}");
+            assert!(set_opts("", &[], &[word.into()]).is_err(), "{word}");
+        }
+        assert!(set_opts("DOCKER_OPTS=\"--x=$(id)\"\n", &[], &[]).is_err());
+        assert!(set_opts("", &["https://m".into()], &["10.0.0.0/8".into()]).is_ok());
     }
 
     #[test]
@@ -853,10 +1091,16 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         put(t.path(), DAEMON_JSON, NVIDIA);
         let p = plan(t.path(), &mirrors(&["https://m"], &[])).unwrap();
-        let (backups, validated) = block_on(apply(t.path(), &p.writes, 42, |c| async move {
-            assert!(c.exists());
-            Ok("ok".into())
-        }))
+        let (backups, validated) = block_on(apply(
+            t.path(),
+            &p.writes,
+            p.candidate.as_deref(),
+            42,
+            |c| async move {
+                assert!(c.exists());
+                Ok("ok".into())
+            },
+        ))
         .unwrap();
         assert_eq!(validated.as_deref(), Some("ok"));
         assert_eq!(backups.len(), 1);
@@ -871,6 +1115,52 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(left.len(), 2, "{left:?}");
+
+        for ts in 43..48 {
+            block_on(apply(t.path(), &p.writes, None, ts, |_| async {
+                Ok(String::new())
+            }))
+            .unwrap();
+        }
+        let mut baks: Vec<_> = std::fs::read_dir(t.path().join("etc/docker"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".bak-"))
+            .collect();
+        baks.sort();
+        assert_eq!(
+            baks,
+            [
+                "daemon.json.bak-45",
+                "daemon.json.bak-46",
+                "daemon.json.bak-47"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_second_write_rolls_back_the_first() {
+        let t = tempfile::tempdir().unwrap();
+        unraid(t.path(), "DOCKER_OPTS=\"\"\n");
+        put(
+            t.path(),
+            DAEMON_JSON,
+            r#"{"registry-mirrors":["https://old"]}"#,
+        );
+        let p = plan(t.path(), &mirrors(&["https://m"], &[])).unwrap();
+        assert_eq!(p.writes.len(), 2);
+        let cfg = t.path().join(UNRAID_CFG);
+        std::fs::remove_file(&cfg).unwrap();
+        std::fs::create_dir(&cfg).unwrap();
+        let err = block_on(apply(t.path(), &p.writes, None, 9, |_| async {
+            Ok(String::new())
+        }))
+        .unwrap_err();
+        assert!(err.to_string().ends_with("rolled back"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(t.path().join(DAEMON_JSON)).unwrap(),
+            r#"{"registry-mirrors":["https://old"]}"#
+        );
     }
 
     #[test]
@@ -878,9 +1168,13 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         put(t.path(), DAEMON_JSON, NVIDIA);
         let p = plan(t.path(), &mirrors(&["https://m"], &[])).unwrap();
-        let err = block_on(apply(t.path(), &p.writes, 1, |_| async {
-            bail!("bad key")
-        }))
+        let err = block_on(apply(
+            t.path(),
+            &p.writes,
+            p.candidate.as_deref(),
+            1,
+            |_| async { bail!("bad key") },
+        ))
         .unwrap_err();
         assert!(format!("{err:#}").contains("bad key"), "{err:#}");
         assert_eq!(
@@ -895,14 +1189,126 @@ mod tests {
         );
     }
 
+    const WILLOW_CFG: &str = r#"DOCKER_ENABLED="yes"
+DOCKER_IMAGE_FILE="/mnt/cache/system/docker/docker-dir"
+DOCKER_IMAGE_SIZE="100"
+DOCKER_APP_CONFIG_PATH="/mnt/user/appdata/"
+DOCKER_APP_UNRAID_PATH=""
+DOCKER_READMORE="no"
+DOCKER_PID_LIMIT=""
+DOCKER_NETWORK_TYPE="1"
+DOCKER_CUSTOM_NETWORKS="br1 br2 wlan0 "
+DOCKER_TIMEOUT="10"
+DOCKER_LOG_ROTATION="yes"
+DOCKER_LOG_SIZE="50m"
+DOCKER_LOG_FILES="1"
+DOCKER_AUTHORING_MODE="no"
+DOCKER_USER_NETWORKS="remove"
+DOCKER_BACKINGFS="native"
+DOCKER_IMAGE_TYPE="folder"
+"#;
+
+    const WILLOW_RC: &str = r#"DOCKER_CFG="/boot/config/docker.cfg"
+DOCKER_TIMEOUT=$(awk -F'"' '/^DOCKER_TIMEOUT=/{print $2}' $DOCKER_CFG 2>/dev/null)
+docker_read_options(){
+  if [[ -f $DOCKER_CFG ]]; then
+    . $DOCKER_CFG
+  fi
+  DOCKER_OPTS="--log-level=fatal $DOCKER_OPTS"
+}
+docker_network_stop(){
+  [[ -f $DOCKER_CFG ]] && . $DOCKER_CFG
+}
+start_docker(){
+  nohup $UNSHARE --propagation slave -- $DOCKER -p $DOCKER_PIDFILE $DOCKER_OPTS >>$DOCKER_LOG 2>&1 &
+}
+"#;
+
     fn unraid(root: &Path, cfg: &str) {
         put(root, UNRAID_VERSION, "version=\"7.0.1\"\n");
-        put(
-            root,
-            UNRAID_RC,
-            "DOCKER_OPTS=\"$DOCKER_OPTS --log-level=fatal\"\n$DOCKER $DOCKER_OPTS\n",
-        );
+        put(root, UNRAID_RC, WILLOW_RC);
         put(root, UNRAID_CFG, cfg);
+    }
+
+    #[test]
+    fn willow_cfg_keeps_every_other_line_byte_for_byte() {
+        let t = tempfile::tempdir().unwrap();
+        unraid(t.path(), WILLOW_CFG);
+        put(t.path(), DAEMON_JSON, NVIDIA);
+        let p = plan(
+            t.path(),
+            &mirrors(&["http://10.0.0.10:5000"], &["10.0.0.10:5000"]),
+        )
+        .unwrap();
+        let paths: Vec<_> = p.writes.iter().map(|w| w.path.as_str()).collect();
+        assert_eq!(paths, ["/boot/config/docker.cfg"]);
+        let after = &p.writes[0].after;
+        let kept: Vec<_> = after
+            .split_inclusive('\n')
+            .filter(|l| !l.starts_with(OPTS_KEY))
+            .collect();
+        assert_eq!(kept.concat(), WILLOW_CFG);
+        assert!(after.ends_with(
+            "DOCKER_OPTS=\"--registry-mirror=http://10.0.0.10:5000 --insecure-registry=10.0.0.10:5000\"\n"
+        ));
+
+        let checked = block_on(apply(
+            t.path(),
+            &p.writes,
+            p.candidate.as_deref(),
+            3,
+            |c| async move {
+                let json: Value =
+                    plugin_toolkit::serde_json::from_str(&std::fs::read_to_string(&c).unwrap())
+                        .unwrap();
+                assert_eq!(json["default-runtime"], "nvidia");
+                assert_eq!(json[MIRRORS], json!(["http://10.0.0.10:5000"]));
+                Ok("ok".into())
+            },
+        ))
+        .unwrap();
+        assert_eq!(checked.1.as_deref(), Some("ok"));
+        assert_eq!(
+            std::fs::read_to_string(t.path().join("boot/config/docker.cfg.bak")).unwrap(),
+            WILLOW_CFG
+        );
+    }
+
+    #[test]
+    fn crlf_cfg_stays_crlf() {
+        let t = tempfile::tempdir().unwrap();
+        unraid(
+            t.path(),
+            "DOCKER_ENABLED=\"yes\"\r\nDOCKER_OPTS=\"--dns 10.0.0.1\"\r\n",
+        );
+        let p = plan(t.path(), &mirrors(&["https://m"], &[])).unwrap();
+        assert_eq!(
+            p.writes[0].after,
+            "DOCKER_ENABLED=\"yes\"\r\nDOCKER_OPTS=\"--dns 10.0.0.1 --registry-mirror=https://m\"\r\n"
+        );
+    }
+
+    #[test]
+    fn differing_values_in_both_files_are_a_conflict() {
+        let t = tempfile::tempdir().unwrap();
+        unraid(t.path(), "DOCKER_OPTS=\"--registry-mirror=https://a\"\n");
+        put(
+            t.path(),
+            DAEMON_JSON,
+            r#"{"registry-mirrors":["https://b"]}"#,
+        );
+        let d = detail(t.path()).unwrap();
+        assert_eq!(d.conflicts.len(), 1);
+        assert!(d.conflicts[0].contains(MIRRORS), "{:?}", d.conflicts);
+        let p = plan(t.path(), &mirrors(&["https://a"], &[])).unwrap();
+        assert_eq!(p.conflicts, d.conflicts);
+
+        put(
+            t.path(),
+            DAEMON_JSON,
+            r#"{"registry-mirrors":["https://a"]}"#,
+        );
+        assert_eq!(detail(t.path()).unwrap().conflicts, Vec::<String>::new());
     }
 
     #[test]
@@ -926,19 +1332,27 @@ mod tests {
         let paths: Vec<_> = p.writes.iter().map(|w| w.path.as_str()).collect();
         assert_eq!(
             paths,
-            ["/boot/config/docker.cfg", "/etc/docker/daemon.json"]
+            ["/etc/docker/daemon.json", "/boot/config/docker.cfg"]
         );
         assert_eq!(
-            p.writes[0].after,
+            p.writes[1].after,
             "DOCKER_ENABLED=\"yes\"\nDOCKER_OPTS=\"--storage-driver=overlay2 --registry-mirror=http://10.0.0.10:5000 --insecure-registry=10.0.0.10:5000\"\n"
         );
-        let json: Value = plugin_toolkit::serde_json::from_str(&p.writes[1].after).unwrap();
+        let json: Value = plugin_toolkit::serde_json::from_str(&p.writes[0].after).unwrap();
         assert_eq!(json, json!({"runtimes": {"nvidia": {}}}));
         assert_eq!(p.effective[MIRRORS], json!(["http://10.0.0.10:5000"]));
         assert_eq!(p.current[MIRRORS], json!(["https://old"]));
 
-        block_on(apply(t.path(), &p.writes, 7, |_| async { Ok("ok".into()) })).unwrap();
-        assert!(t.path().join("boot/config/docker.cfg.bak-7").exists());
+        let (_, validated) = block_on(apply(
+            t.path(),
+            &p.writes,
+            p.candidate.as_deref(),
+            7,
+            |_| async { Ok("ok".into()) },
+        ))
+        .unwrap();
+        assert_eq!(validated.as_deref(), Some("ok"));
+        assert!(t.path().join("boot/config/docker.cfg.bak").exists());
         let d = detail(t.path()).unwrap();
         assert_eq!(d.persisted_in.as_deref(), Some("/boot/config/docker.cfg"));
         assert_eq!(d.effective[INSECURE], json!(["10.0.0.10:5000"]));
@@ -965,6 +1379,13 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         put(t.path(), UNRAID_VERSION, "version=\"7.0.1\"\n");
         put(t.path(), UNRAID_RC, "$DOCKER_OPTS\n");
+        put(t.path(), UNRAID_CFG, "DOCKER_ENABLED=\"yes\"\n");
+        let err = plan(t.path(), &mirrors(&["https://m"], &[])).unwrap_err();
+        assert!(err.to_string().contains("cannot be persisted"), "{err}");
+
+        let t = tempfile::tempdir().unwrap();
+        put(t.path(), UNRAID_VERSION, "version=\"7.0.1\"\n");
+        put(t.path(), UNRAID_RC, WILLOW_RC);
         let err = plan(t.path(), &mirrors(&["https://m"], &[])).unwrap_err();
         assert!(err.to_string().contains("docker.cfg' is missing"), "{err}");
     }
@@ -977,7 +1398,19 @@ mod tests {
         assert_eq!(m, ["https://a", "https://c"]);
         assert_eq!(i, ["b:1"]);
         assert_eq!(rest, ["--dns", "1.1.1.1"]);
-        assert_eq!(set_opts("", &[], &[]), "DOCKER_OPTS=\"\"\n");
+        assert_eq!(set_opts("", &[], &[]).unwrap(), "DOCKER_OPTS=\"\"\n");
+
+        let (m, _, rest) = parse_opts("--registry-mirror --dns 10.0.0.1");
+        assert!(m.is_empty());
+        assert_eq!(rest, ["--dns", "10.0.0.1"]);
+
+        let cfg =
+            "DOCKER_OPTS=\"--registry-mirror=https://a\"\nX=1\nDOCKER_OPTS=\"--dns 10.0.0.1\"\n";
+        assert_eq!(opts_of(cfg), "--dns 10.0.0.1");
+        assert_eq!(
+            set_opts(cfg, &["https://b".into()], &[]).unwrap(),
+            "DOCKER_OPTS=\"--dns 10.0.0.1 --registry-mirror=https://b\"\nX=1\n"
+        );
     }
 
     #[test]
@@ -986,10 +1419,9 @@ mod tests {
             restart_command(Host::Unraid).unwrap()[0],
             "/etc/rc.d/rc.docker"
         );
-        assert_eq!(
-            restart_command(Host::Standard(Init::Systemd)).unwrap(),
-            ["/bin/systemctl", "restart", "docker"]
-        );
+        let systemd = restart_command(Host::Standard(Init::Systemd)).unwrap();
+        assert!(SYSTEMCTL.contains(&systemd[0]), "{systemd:?}");
+        assert_eq!(systemd[1..], ["restart", "docker"]);
         assert!(restart_command(Host::Standard(Init::Other)).is_err());
         assert!(restart_warning(&Ok(vec!["a".into(), "b".into()])).contains("2 running now: a, b"));
     }
