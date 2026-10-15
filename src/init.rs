@@ -41,7 +41,12 @@ pub fn detect(root: &Path) -> Init {
 /// no quotes (conf.d files are sourced by sh), the trailer being whatever
 /// follows it, such as ` # comment`.
 pub fn assignment<'a>(line: &'a str, key: &str) -> Option<(&'a str, &'a str)> {
-    let rest = line.trim_start().strip_prefix(key)?.strip_prefix('=')?;
+    let line = line.trim_start();
+    let rest = line
+        .strip_prefix("export ")
+        .map_or(line, str::trim_start)
+        .strip_prefix(key)?
+        .strip_prefix('=')?;
     for q in ['"', '\''] {
         if let Some(inner) = rest.strip_prefix(q) {
             let end = inner.find(q)?;
@@ -65,7 +70,12 @@ pub fn set_var(conf: &str, key: &str, value: &str) -> String {
     for line in conf.lines() {
         if let Some((_, trailer)) = assignment(line, key) {
             if !set {
-                out.push(format!("{key}=\"{value}\"{}", trailer.trim_end()));
+                let export = if line.trim_start().starts_with("export ") {
+                    "export "
+                } else {
+                    ""
+                };
+                out.push(format!("{export}{key}=\"{value}\"{}", trailer.trim_end()));
                 set = true;
             }
         } else {
@@ -95,6 +105,17 @@ pub fn add_word(conf: &str, key: &str, word: &str) -> String {
     set_var(conf, key, &words.join(" "))
 }
 
+/// A new file at `path` with `mode`, refusing an existing file or a symlink.
+pub fn create_new(path: &Path, mode: u32) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
 /// Replace `path` with `content` via a temp file in the same dir and a
 /// rename, so a crash never leaves it half-written.
 pub fn write_atomic(path: &Path, content: &str, mode: u32) -> Result<()> {
@@ -104,13 +125,20 @@ pub fn write_atomic(path: &Path, content: &str, mode: u32) -> Result<()> {
         .ok_or_else(|| anyhow!("'{}' has no parent", path.display()))?;
     std::fs::create_dir_all(dir)?;
     let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let tmp = dir.join(format!(".{name}.orca-{}", std::process::id()));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let tmp = dir.join(format!(".{name}.orca-{}-{nanos}", std::process::id()));
     let result = (|| -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut f = create_new(&tmp, mode)?;
         f.write_all(content.as_bytes())?;
-        f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        if f.metadata()?.permissions().mode() & 0o7777 != mode {
+            f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
         f.sync_all()?;
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, path)?;
+        std::fs::File::open(dir)?.sync_all()
     })();
     if result.is_err() {
         let _removed = std::fs::remove_file(&tmp);
@@ -192,5 +220,20 @@ mod tests {
             0o755
         );
         assert_eq!(std::fs::read_dir(p.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn create_new_refuses_an_existing_file_and_a_symlink() {
+        let t = tempfile::tempdir().unwrap();
+        let target = t.path().join("target");
+        std::fs::write(&target, "x").unwrap();
+        assert!(create_new(&target, 0o600).is_err());
+        let link = t.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(create_new(&link, 0o600).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "x");
+        let fresh = t.path().join("fresh");
+        drop(create_new(&fresh, 0o600).unwrap());
+        assert!(fresh.exists());
     }
 }
