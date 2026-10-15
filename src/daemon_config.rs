@@ -144,28 +144,39 @@ fn allowed(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || ".-_:/[]%".contains(c))
 }
 
+fn shown(value: &str) -> String {
+    let (scheme, rest) = match value.split_once("://") {
+        Some((s, r)) => (format!("{s}://"), r),
+        None => (String::new(), value),
+    };
+    let host = rest.split('/').next().unwrap_or_default();
+    format!("{scheme}{host}").escape_debug().to_string()
+}
+
+fn no_credentials(what: &str, value: &str) -> Result<()> {
+    if value.contains('@') {
+        bail!("{what} must not carry credentials; use `docker login` for the registry");
+    }
+    Ok(())
+}
+
 pub fn mirror_authority(url: &str) -> Result<(&str, &str)> {
+    no_credentials("a mirror", url)?;
     if !allowed(url) {
         bail!(
             "mirror '{}' may hold only ASCII letters, digits and . - _ : / [ ] %",
-            url.escape_debug()
+            shown(url)
         );
     }
     let (scheme, rest) = url
         .split_once("://")
-        .ok_or_else(|| anyhow!("mirror '{url}' is not a URL"))?;
+        .ok_or_else(|| anyhow!("mirror '{}' is not a URL", shown(url)))?;
     if scheme != "http" && scheme != "https" {
-        bail!("mirror '{url}' must be http or https");
-    }
-    if rest.contains(['?', '#']) {
-        bail!("mirror '{url}' must not carry a query or fragment");
+        bail!("mirror '{}' must be http or https", shown(url));
     }
     let authority = rest.split('/').next().unwrap_or_default();
-    if authority.contains('@') {
-        bail!("mirror '{url}' must not carry credentials; use `docker login` for the mirror");
-    }
     if authority.is_empty() || authority.starts_with(':') {
-        bail!("mirror '{url}' has no host");
+        bail!("mirror '{}' has no host", shown(url));
     }
     Ok((scheme, authority))
 }
@@ -173,17 +184,53 @@ pub fn mirror_authority(url: &str) -> Result<(&str, &str)> {
 pub fn validate(config: &Map<String, Value>) -> Result<()> {
     let mirrors = strings(config, MIRRORS)?;
     let insecure = strings(config, INSECURE)?;
-    if let Some(bad) = insecure.iter().find(|r| !allowed(r)) {
-        bail!(
-            "insecure registry '{}' may hold only ASCII letters, digits and . - _ : / [ ] %",
-            bad.escape_debug()
-        );
+    for r in &insecure {
+        no_credentials("an insecure registry", r)?;
+        if !allowed(r) {
+            bail!(
+                "insecure registry '{}' may hold only ASCII letters, digits and . - _ : / [ ] %",
+                shown(r)
+            );
+        }
     }
     for m in &mirrors {
         let (scheme, authority) = mirror_authority(m)?;
         if scheme == "http" && !insecure.iter().any(|r| r == authority) {
             bail!(
-                "http mirror '{m}' needs '{authority}' in insecure_registries; add it to the same update"
+                "http mirror '{}' needs '{}' in insecure_registries; add it to the same update",
+                shown(m),
+                authority.escape_debug()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn bracketed_ipv6(value: &str) -> bool {
+    let rest = value.split_once("://").map_or(value, |(_, r)| r);
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    if path.contains(['[', ']']) {
+        return false;
+    }
+    let Some((ip, port)) = authority.strip_prefix('[').and_then(|a| a.split_once(']')) else {
+        return false;
+    };
+    ip.parse::<std::net::Ipv6Addr>().is_ok()
+        && (port.is_empty()
+            || port
+                .strip_prefix(':')
+                .is_some_and(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())))
+}
+
+fn unraid_brackets(config: &Map<String, Value>) -> Result<()> {
+    for key in MANAGED {
+        if let Some(bad) = strings(config, key)?
+            .iter()
+            .find(|v| v.contains(['[', ']']) && !bracketed_ipv6(v))
+        {
+            bail!(
+                "{UPDATE_TOOL}: refused on Unraid: '{key}' value '{}' holds '[' or ']' outside a bracketed IPv6 host, which the shell sourcing '/{UNRAID_CFG}' would glob",
+                shown(bad)
             );
         }
     }
@@ -264,13 +311,15 @@ pub fn set_opts(cfg: &str, mirrors: &[String], insecure: &[String]) -> Result<St
 }
 
 fn sources_cfg(rc: &str) -> bool {
-    rc.lines().any(|l| {
-        [". ", "source "].iter().any(|cmd| {
-            ["$DOCKER_CFG", "\"$DOCKER_CFG\"", "${DOCKER_CFG}"]
-                .iter()
-                .any(|v| l.contains(&format!("{cmd}{v}")))
+    rc.lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .any(|l| {
+            [". ", "source "].iter().any(|cmd| {
+                ["$DOCKER_CFG", "\"$DOCKER_CFG\"", "${DOCKER_CFG}"]
+                    .iter()
+                    .any(|v| l.contains(&format!("{cmd}{v}")))
+            })
         })
-    })
 }
 
 fn read_opt(root: &Path, rel: &str) -> Result<Option<String>> {
@@ -385,6 +434,14 @@ pub fn plan(root: &Path, patch: &DaemonConfigPatch) -> Result<Plan> {
             } else {
                 raw.clone()
             };
+            if cfg.lines().any(|l| {
+                l.trim_start().starts_with(&format!("{OPTS_KEY}="))
+                    && init::assignment(l, OPTS_KEY).is_none()
+            }) {
+                bail!(
+                    "{UPDATE_TOOL}: refused on Unraid: a {OPTS_KEY} line in '/{UNRAID_CFG}' spans lines or has an unterminated quote; fix it by hand first"
+                );
+            }
             let (mirrors, insecure, _) = parse_opts(&opts_of(&cfg));
             let flags = flags_json(mirrors, insecure);
             let conflicts = conflicts(&json, &flags);
@@ -392,6 +449,7 @@ pub fn plan(root: &Path, patch: &DaemonConfigPatch) -> Result<Plan> {
             current.extend(flags.clone());
             let effective = merged(&current, patch);
             validate(&effective)?;
+            unraid_brackets(&effective)?;
             let mut stripped = json.clone();
             for k in MANAGED {
                 stripped.remove(k);
@@ -443,27 +501,7 @@ pub fn plan(root: &Path, patch: &DaemonConfigPatch) -> Result<Plan> {
     })
 }
 
-fn replace(path: &Path, content: &str) -> Result<()> {
-    use std::io::Write;
-    let dir = path
-        .parent()
-        .ok_or_else(|| anyhow!("'{}' has no parent", path.display()))?;
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let tmp = dir.join(format!(".{name}.orca-{}", std::process::id()));
-    let result = (|| -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(content.as_bytes())?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, path)?;
-        std::fs::File::open(dir)?.sync_all()
-    })();
-    if result.is_err() {
-        let _removed = std::fs::remove_file(&tmp);
-    }
-    result.with_context(|| format!("failed to write '{}'", path.display()))
-}
-
-fn backup_path(path: &Path, ts: u64) -> PathBuf {
+fn backup_path(path: &Path, ts: u128) -> PathBuf {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     path.with_file_name(format!("{name}.bak-{ts}"))
 }
@@ -474,7 +512,7 @@ fn prune_backups(path: &Path) -> Result<()> {
         "{}.bak-",
         path.file_name().unwrap_or_default().to_string_lossy()
     );
-    let mut found: Vec<(u64, PathBuf)> = std::fs::read_dir(dir)?
+    let mut found: Vec<(u128, PathBuf)> = std::fs::read_dir(dir)?
         .filter_map(|e| {
             let e = e.ok()?;
             let ts = e
@@ -495,44 +533,110 @@ fn prune_backups(path: &Path) -> Result<()> {
     Ok(())
 }
 
-type Written = (PathBuf, Option<PathBuf>);
+fn read_nofollow(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut buf = Vec::new();
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?
+        .read_to_end(&mut buf)?;
+    Ok(buf)
+}
 
-fn write_one(root: &Path, w: &FileWrite, ts: u64, done: &mut Vec<Written>) -> Result<()> {
+struct Written {
+    path: PathBuf,
+    mode: u32,
+    bak: Option<PathBuf>,
+    fresh_bak: bool,
+}
+
+fn write_one(root: &Path, w: &FileWrite, ts: u128, done: &mut Vec<Written>) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
     let path = root.join(w.path.trim_start_matches('/'));
     let is_cfg = w.path == format!("/{UNRAID_CFG}");
-    let bak = if path.exists() {
-        let bak = if is_cfg {
-            path.with_file_name(CFG_BACKUP)
-        } else {
-            backup_path(&path, ts)
-        };
-        std::fs::copy(&path, &bak)
-            .with_context(|| format!("failed to back up '{}'", path.display()))?;
-        Some(bak)
-    } else {
-        None
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(m) => Some(m),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("failed to stat '{}'", path.display())),
     };
-    done.push((path.clone(), bak));
-    if is_cfg {
-        replace(&path, &w.after)
-    } else {
-        init::write_atomic(&path, &w.after, 0o644)?;
-        prune_backups(&path)
+    if meta.as_ref().is_some_and(|m| m.file_type().is_symlink()) {
+        bail!(
+            "refused: '{}' is a symlink; point it at a real file first",
+            path.display()
+        );
     }
+    let mode = meta
+        .as_ref()
+        .map_or(0o644, |m| m.permissions().mode() & 0o7777);
+    match &meta {
+        Some(_) => {
+            let original = read_nofollow(&path)
+                .with_context(|| format!("failed to read '{}'", path.display()))?;
+            if is_cfg {
+                let bak = path.with_file_name(CFG_BACKUP);
+                init::write_atomic(&bak, &String::from_utf8_lossy(&original), mode)?;
+                done.push(Written {
+                    path: path.clone(),
+                    mode,
+                    bak: Some(bak),
+                    fresh_bak: false,
+                });
+            } else {
+                let bak = backup_path(&path, ts);
+                let mut f = init::create_new(&bak, mode)
+                    .with_context(|| format!("failed to create '{}'", bak.display()))?;
+                if let Err(e) = f.write_all(&original).and_then(|()| f.sync_all()) {
+                    let _removed = std::fs::remove_file(&bak);
+                    return Err(e)
+                        .with_context(|| format!("failed to back up '{}'", path.display()));
+                }
+                done.push(Written {
+                    path: path.clone(),
+                    mode,
+                    bak: Some(bak),
+                    fresh_bak: true,
+                });
+            }
+        }
+        None => {
+            done.push(Written {
+                path: path.clone(),
+                mode,
+                bak: None,
+                fresh_bak: false,
+            });
+        }
+    }
+    init::write_atomic(&path, &w.after, mode)
 }
 
 fn rollback(done: &[Written]) -> Vec<String> {
     done.iter()
         .rev()
-        .filter_map(|(path, bak)| {
-            let result = match bak {
-                Some(b) => std::fs::copy(b, path).map(|_| ()),
-                None => match std::fs::remove_file(path) {
-                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        .filter_map(|w| {
+            let result = match &w.bak {
+                Some(b) => std::fs::read_to_string(b)
+                    .context("failed to read the backup")
+                    .and_then(|t: String| init::write_atomic(&w.path, &t, w.mode))
+                    .and_then(|()| {
+                        if w.fresh_bak {
+                            std::fs::remove_file(b)?;
+                        }
+                        Ok(())
+                    }),
+                None => match std::fs::remove_file(&w.path) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        Err(e).context("failed to remove")
+                    }
                     _ => Ok(()),
                 },
             };
-            result.err().map(|e| format!("'{}': {e}", path.display()))
+            result
+                .err()
+                .map(|e| format!("'{}': {e:#}", w.path.display()))
         })
         .collect()
 }
@@ -541,21 +645,32 @@ pub async fn apply<F, Fut>(
     root: &Path,
     writes: &[FileWrite],
     candidate: Option<&str>,
-    ts: u64,
+    ts: u128,
     check: F,
 ) -> Result<(Vec<String>, Option<String>)>
 where
     F: FnOnce(PathBuf) -> Fut,
     Fut: std::future::Future<Output = Result<String>>,
 {
+    use std::io::Write;
     let mut validated = None;
     if let Some(c) = candidate {
         let path = root.join(DAEMON_JSON).with_file_name(format!(
-            ".daemon.json.orca-candidate-{}",
+            ".daemon.json.orca-candidate-{}-{ts}",
             std::process::id()
         ));
-        init::write_atomic(&path, c, 0o644)?;
-        let checked = check(path.clone()).await;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let written = (|| -> std::io::Result<()> {
+            let mut f = init::create_new(&path, 0o600)?;
+            f.write_all(c.as_bytes())?;
+            f.sync_all()
+        })();
+        let checked = match written.context("failed to write the candidate config") {
+            Ok(()) => check(path.clone()).await,
+            Err(e) => Err(e),
+        };
         let _removed = std::fs::remove_file(&path);
         validated = Some(checked.with_context(|| {
             format!("{UPDATE_TOOL}: the new daemon config failed validation; nothing was written")
@@ -574,9 +689,12 @@ where
             );
         }
     }
+    for w in done.iter().filter(|w| w.fresh_bak) {
+        prune_backups(&w.path)?;
+    }
     let backups = done
         .into_iter()
-        .filter_map(|(_, b)| b.map(|b| b.display().to_string()))
+        .filter_map(|w| w.bak.map(|b| b.display().to_string()))
         .collect();
     Ok((backups, validated))
 }
@@ -828,7 +946,7 @@ pub struct DaemonConfigUpdateOutput {
 /// key. Validates the result (mirrors are http(s) URLs; an http mirror's
 /// host:port must be an insecure registry), checks the resulting config with
 /// `dockerd --validate` when dockerd is present, then backs each file up
-/// (`daemon.json.bak-<unix secs>`, newest 3 kept; `docker.cfg.bak`) and
+/// (`daemon.json.bak-<unix nanos>`, newest 3 kept; `docker.cfg.bak`) and
 /// writes atomically, rolling every file back if a write fails. On Unraid the
 /// two keys persist as `DOCKER_OPTS` flags in `/boot/config/docker.cfg` and
 /// are removed from `daemon.json`; refused when rc.docker does not source
@@ -896,7 +1014,7 @@ async fn docker_daemon_config_update(
     }
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_nanos())
         .unwrap_or_default();
     let (backups, validated) = apply(
         root,
@@ -1161,6 +1279,190 @@ mod tests {
             std::fs::read_to_string(t.path().join(DAEMON_JSON)).unwrap(),
             r#"{"registry-mirrors":["https://old"]}"#
         );
+        assert!(!t.path().join("etc/docker/daemon.json.bak-9").exists());
+    }
+
+    #[test]
+    fn writes_keep_the_original_mode_and_the_candidate_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        put(t.path(), DAEMON_JSON, NVIDIA);
+        let json = t.path().join(DAEMON_JSON);
+        std::fs::set_permissions(&json, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let p = plan(t.path(), &mirrors(&["https://m"], &[])).unwrap();
+        block_on(apply(
+            t.path(),
+            &p.writes,
+            p.candidate.as_deref(),
+            1,
+            |c| async move {
+                let mode = std::fs::metadata(&c).unwrap().permissions().mode() & 0o7777;
+                assert_eq!(mode, 0o600);
+                Ok("ok".into())
+            },
+        ))
+        .unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode(&json), 0o640);
+
+        let t = tempfile::tempdir().unwrap();
+        let p = plan(t.path(), &mirrors(&["https://m"], &[])).unwrap();
+        block_on(apply(t.path(), &p.writes, None, 1, |_| async {
+            Ok(String::new())
+        }))
+        .unwrap();
+        assert_eq!(mode(&t.path().join(DAEMON_JSON)), 0o644);
+    }
+
+    #[test]
+    fn credentials_are_refused_without_echoing_them() {
+        for (m, i) in [
+            (vec!["https://u:s3cret@m"], vec![]),
+            (vec![], vec!["u:s3cret@m:5000"]),
+        ] {
+            let err = validate(&obj(
+                json!({"registry-mirrors": m, "insecure-registries": i}),
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("must not carry credentials"), "{err}");
+            assert!(!err.contains("s3cret"), "{err}");
+        }
+        let err = validate(&obj(json!({"registry-mirrors": ["http://m:5000/t0ken"]})))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'http://m:5000'") && !err.contains("t0ken"),
+            "{err}"
+        );
+        let err = mirror_authority("ftp://m/t0ken").unwrap_err().to_string();
+        assert!(!err.contains("t0ken"), "{err}");
+    }
+
+    #[test]
+    fn a_symlinked_target_is_refused() {
+        let t = tempfile::tempdir().unwrap();
+        put(t.path(), "elsewhere.json", NVIDIA);
+        std::fs::create_dir_all(t.path().join("etc/docker")).unwrap();
+        std::os::unix::fs::symlink(t.path().join("elsewhere.json"), t.path().join(DAEMON_JSON))
+            .unwrap();
+        let p = plan(t.path(), &mirrors(&["https://m"], &[])).unwrap();
+        let err = block_on(apply(t.path(), &p.writes, None, 1, |_| async {
+            Ok(String::new())
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("is a symlink"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(t.path().join("elsewhere.json")).unwrap(),
+            NVIDIA
+        );
+
+        let t = tempfile::tempdir().unwrap();
+        unraid(t.path(), "DOCKER_OPTS=\"\"\n");
+        let cfg = t.path().join(UNRAID_CFG);
+        std::fs::rename(&cfg, t.path().join("real.cfg")).unwrap();
+        std::os::unix::fs::symlink(t.path().join("real.cfg"), &cfg).unwrap();
+        let p = plan(t.path(), &mirrors(&["https://m"], &[])).unwrap();
+        let err = block_on(apply(t.path(), &p.writes, None, 1, |_| async {
+            Ok(String::new())
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("is a symlink"), "{err}");
+    }
+
+    #[test]
+    fn an_existing_backup_is_never_overwritten() {
+        let t = tempfile::tempdir().unwrap();
+        put(t.path(), DAEMON_JSON, NVIDIA);
+        put(t.path(), "etc/docker/daemon.json.bak-5", "keep");
+        let p = plan(t.path(), &mirrors(&["https://m"], &[])).unwrap();
+        assert!(
+            block_on(apply(t.path(), &p.writes, None, 5, |_| async {
+                Ok(String::new())
+            }))
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(t.path().join("etc/docker/daemon.json.bak-5")).unwrap(),
+            "keep"
+        );
+        assert_eq!(
+            std::fs::read_to_string(t.path().join(DAEMON_JSON)).unwrap(),
+            NVIDIA
+        );
+    }
+
+    #[test]
+    fn the_cfg_backup_is_replaced_whole_with_no_temp_left() {
+        let t = tempfile::tempdir().unwrap();
+        unraid(t.path(), "DOCKER_OPTS=\"\"\n");
+        put(t.path(), "boot/config/docker.cfg.bak", "older");
+        let p = plan(t.path(), &mirrors(&["https://m"], &[])).unwrap();
+        block_on(apply(t.path(), &p.writes, None, 1, |_| async {
+            Ok(String::new())
+        }))
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(t.path().join("boot/config/docker.cfg.bak")).unwrap(),
+            "DOCKER_OPTS=\"\"\n"
+        );
+        let mut names: Vec<_> = std::fs::read_dir(t.path().join("boot/config"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["docker.cfg", "docker.cfg.bak"]);
+    }
+
+    #[test]
+    fn a_commented_source_line_does_not_count() {
+        assert!(sources_cfg(". $DOCKER_CFG\n"));
+        assert!(!sources_cfg("# . $DOCKER_CFG\n"));
+        assert!(!sources_cfg("   #source \"$DOCKER_CFG\"\n"));
+    }
+
+    #[test]
+    fn an_unparseable_docker_opts_line_is_refused() {
+        for cfg in [
+            "DOCKER_OPTS=\"--dns 10.0.0.1\n--x\"\n",
+            "DOCKER_OPTS='--dns\n",
+            "  DOCKER_OPTS=\"open\n",
+        ] {
+            let t = tempfile::tempdir().unwrap();
+            unraid(t.path(), cfg);
+            let err = plan(t.path(), &mirrors(&["https://m"], &[])).unwrap_err();
+            assert!(
+                err.to_string().contains("unterminated quote"),
+                "{cfg:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn unraid_accepts_brackets_only_around_an_ipv6_host() {
+        for (m, i) in [
+            ("http://[fd00::1]:5000", "[fd00::1]:5000"),
+            ("https://[fd00::1]/v2", "[fd00::1]"),
+        ] {
+            let t = tempfile::tempdir().unwrap();
+            unraid(t.path(), "DOCKER_OPTS=\"\"\n");
+            assert!(plan(t.path(), &mirrors(&[m], &[i])).is_ok(), "{m} {i}");
+        }
+        for (m, i) in [
+            ("https://m[a]", "m:5000"),
+            ("https://m", "[fd00::1"),
+            ("https://m", "[nothex]:5000"),
+            ("https://m", "[fd00::1]x"),
+            ("https://m/[a]", "m:5000"),
+            ("https://m", "[fd00::1]:"),
+        ] {
+            let t = tempfile::tempdir().unwrap();
+            unraid(t.path(), "DOCKER_OPTS=\"\"\n");
+            let err = plan(t.path(), &mirrors(&[m], &[i])).unwrap_err();
+            assert!(err.to_string().contains("bracketed IPv6"), "{m} {i}: {err}");
+        }
+        let t = tempfile::tempdir().unwrap();
+        assert!(plan(t.path(), &mirrors(&["https://m[a]"], &[])).is_ok());
     }
 
     #[test]
