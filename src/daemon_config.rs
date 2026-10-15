@@ -1041,7 +1041,6 @@ async fn docker_daemon_config_update(
 ) -> Result<DaemonConfigUpdateOutput> {
     execute::require_admin(UPDATE_TOOL, ctx)?;
     refuse_macos(UPDATE_TOOL)?;
-    require_patch(&args)?;
     if is_root() {
         return update(Path::new("/"), &args).await;
     }
