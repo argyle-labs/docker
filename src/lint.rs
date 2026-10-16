@@ -74,6 +74,9 @@ pub enum FindingKind {
     BindMissing,
     /// The bind source exists but sits outside every managed mount root.
     BindUnmanaged,
+    /// The bind source is a managed root itself, not the subdirectory the
+    /// service needs.
+    BindWholeRoot,
     /// Data on a named volume, outside the stack's bind-mounted paths.
     NamedVolume,
 }
@@ -194,6 +197,19 @@ pub fn audit(
                         FindingKind::BindMissing,
                         format!("bind source {src} for {} does not exist", m.target),
                         proposed,
+                    )
+                } else if let Some(root) = roots.iter().find(|r| {
+                    Path::new(src)
+                        .components()
+                        .eq(Path::new(r.as_str()).components())
+                }) {
+                    (
+                        FindingKind::BindWholeRoot,
+                        format!(
+                            "bind source {src} for {} is the whole managed root {root}; bind only the subdirectory the service needs",
+                            m.target
+                        ),
+                        None,
                     )
                 } else if !managed && !own {
                     (
@@ -446,7 +462,7 @@ fn set_in_override(lines: &[String], f: &Finding) -> bool {
                     .any(|l| rewrite_volume_source(l, &f.current, "").is_some())
             })
         }
-        FindingKind::NamedVolume => false,
+        FindingKind::NamedVolume | FindingKind::BindWholeRoot => false,
     }
 }
 
@@ -654,6 +670,35 @@ mod tests {
         let f = findings(&["/srv/stacks/media/config"]);
         assert!(!f.iter().any(|f| f.current.starts_with("/var/run")));
         assert!(!f.iter().any(|f| f.current.starts_with("/srv/stacks/media")));
+    }
+
+    #[test]
+    fn binding_a_whole_managed_root_is_flagged_but_a_subdirectory_is_not() {
+        let cfg = ComposeConfig::parse(
+            r#"{"name":"media","services":{"app":{"restart":"unless-stopped","volumes":[
+                {"type":"bind","source":"/mnt/data","target":"/data"},
+                {"type":"bind","source":"/mnt/data/","target":"/data2"},
+                {"type":"bind","source":"/mnt/data/media","target":"/media"}
+            ]}}}"#,
+        )
+        .unwrap();
+        let f = audit(
+            &cfg,
+            "/srv/stacks/media",
+            &roots(),
+            &fs(&["/mnt/data", "/mnt/data/", "/mnt/data/media"]),
+            &|_| false,
+        );
+        assert_eq!(ids(&f), vec!["bind:app:/mnt/data", "bind:app:/mnt/data/"]);
+        assert!(
+            f.iter()
+                .all(|f| f.kind == FindingKind::BindWholeRoot && !f.fixable)
+        );
+        assert!(
+            f[0].detail.contains("whole managed root"),
+            "{}",
+            f[0].detail
+        );
     }
 
     #[test]
