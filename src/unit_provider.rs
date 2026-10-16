@@ -60,10 +60,6 @@ const STACK_KIND: &str = "stack";
 /// forwarded to `docker compose <action>`.
 const STACK_LIFECYCLE: &[&str] = &["up", "down", "start", "stop", "restart", "build", "pull"];
 
-/// Refusal for executing `deploy`/`exec` creates while no caller can be verified.
-const CREATE_NEEDS_CALLER: &str = "execute needs an orca that passes the caller on unit create; \
-     upgrade orca, or re-run with `dryRun` to see the plan";
-
 /// Stack update actions whose payload carries its own `dry_run` and `items`
 /// and plans itself; every other mutating action is gated here.
 const SELF_PLANNING: &[&str] = &["fix", "volume_policy", "label_volumes"];
@@ -893,8 +889,8 @@ impl DockerUnitProvider {
         }
     }
 
-    /// `dry_run` returns the plan; execute is refused (see [`CREATE_NEEDS_CALLER`]).
     async fn do_create(&self, args: CreateArgs) -> Result<VerbOutcome> {
+        require_admin(&format!("docker {}", args.action), args.caller.as_ref())?;
         let (plan_only, payload) = split_dry_run(args.payload.clone())?;
         if plan_only {
             let target = match args.action.as_str() {
@@ -920,10 +916,6 @@ impl DockerUnitProvider {
                 name: target.clone(),
             };
             return Ok(dry_run(id, format!("{} {target}", args.action)));
-        }
-        // orca's `CreateArgs` carries no caller, so an admin-only execute can't be verified.
-        if matches!(args.action.as_str(), "deploy" | "exec") {
-            return Err(anyhow::anyhow!("{}: {CREATE_NEEDS_CALLER}", args.action));
         }
         let args = CreateArgs { payload, ..args };
         match args.action.as_str() {
@@ -3221,6 +3213,7 @@ mod tests {
                 let out = plugin_toolkit::reactor::block_on(provider.do_create(CreateArgs {
                     action: action.into(),
                     payload: Some(payload.into()),
+                    caller: admin.clone(),
                 }))
                 .unwrap();
                 assert_eq!(dry_run_body(out)["dryRun"], true, "{action}");
@@ -3369,26 +3362,30 @@ mod tests {
     }
 
     #[test]
-    fn create_execute_is_refused_without_a_caller_and_dry_run_plans() {
+    fn create_needs_an_admin_caller() {
+        use crate::test_support::caller;
         let provider = DockerUnitProvider::new(crate::registration::adapter());
         for (action, payload) in [
-            ("deploy", r#"{"name":"web","dir":"/nowhere"}"#),
-            ("exec", r#"{"id":"c1","cmd":["true"]}"#),
+            ("deploy", r#"{"name":"web","dir":"/nowhere","dryRun":true}"#),
+            ("exec", r#"{"id":"c1","cmd":["true"],"dryRun":true}"#),
         ] {
-            let err = plugin_toolkit::reactor::block_on(provider.do_create(CreateArgs {
-                action: action.into(),
-                payload: Some(payload.into()),
-            }))
-            .unwrap_err()
-            .to_string();
-            assert!(
-                err.contains("caller") && err.contains("dryRun"),
-                "{action}: {err}"
-            );
-            let planned = payload.replace('}', r#","dryRun":true}"#);
+            for who in [None, Some(caller("member"))] {
+                let err = plugin_toolkit::reactor::block_on(provider.do_create(CreateArgs {
+                    action: action.into(),
+                    payload: Some(payload.into()),
+                    caller: who.clone(),
+                }))
+                .unwrap_err()
+                .to_string();
+                assert!(
+                    err.contains("caller identity") || err.contains("requires role"),
+                    "{action} {who:?}: {err}"
+                );
+            }
             let out = plugin_toolkit::reactor::block_on(provider.do_create(CreateArgs {
                 action: action.into(),
-                payload: Some(planned),
+                payload: Some(payload.into()),
+                caller: Some(caller("admin")),
             }))
             .unwrap();
             assert_eq!(dry_run_body(out)["dryRun"], true, "{action}");
@@ -3404,6 +3401,7 @@ mod tests {
                 r#"{"id":"c1","cmd":["psql","-c","ALTER USER x PASSWORD 's3cr3t'"],"dryRun":true}"#
                     .into(),
             ),
+            caller: Some(crate::test_support::caller("admin")),
         }))
         .unwrap();
         let body = dry_run_body(out).to_string();
