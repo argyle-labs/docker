@@ -61,6 +61,8 @@ pub struct MountConfig {
     pub source: Option<String>,
     #[serde(default)]
     pub target: String,
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

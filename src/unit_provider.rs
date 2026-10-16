@@ -1960,10 +1960,36 @@ fn inspected_id(info: &bollard::models::ContainerInspectResponse, asked: &str) -
 const COMPOSE_WORKING_DIR_LABEL: &str = "com.docker.compose.project.working_dir";
 const COMPOSE_CONFIG_HASH_LABEL: &str = "com.docker.compose.config-hash";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeclaredBind {
+    source: std::path::PathBuf,
+    target: String,
+    read_only: bool,
+}
+
+fn declared_binds(
+    cfg: &ComposeConfig,
+    service: &str,
+    resolve: policy::Resolver<'_>,
+) -> Vec<DeclaredBind> {
+    cfg.services
+        .get(service)
+        .into_iter()
+        .flat_map(|s| &s.volumes)
+        .filter_map(|m| {
+            Some(DeclaredBind {
+                source: resolve(std::path::Path::new(m.bind_source()?)).ok()?,
+                target: m.target.clone(),
+                read_only: m.read_only,
+            })
+        })
+        .collect()
+}
+
 struct ExecScope {
     stack_ids: std::collections::HashSet<String>,
     stack_dir: std::path::PathBuf,
-    managed_roots: Vec<std::path::PathBuf>,
+    declared: std::collections::HashMap<String, Vec<DeclaredBind>>,
     grants: Vec<String>,
     volumes: std::collections::HashMap<String, bollard::models::Volume>,
     peers: std::collections::HashMap<String, bollard::models::ContainerInspectResponse>,
@@ -2118,14 +2144,35 @@ async fn exec_scope(
             volumes.insert(name, v);
         }
     }
-    let managed_roots = lint::managed_roots(None)
-        .iter()
-        .filter_map(|r| std::fs::canonicalize(r).ok())
-        .collect();
+    let cfg = compose
+        .config_json()
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|raw| ComposeConfig::parse(&raw).map_err(|e| e.to_string()))
+        .map_err(|e| format!("cannot read the compose config of stack {}: {e}", row.name))?;
+    let resolve = |p: &std::path::Path| Ok(std::fs::canonicalize(p)?);
+    let mut declared = std::collections::HashMap::new();
+    for container in std::iter::once(info).chain(peers.values()) {
+        let Some(id) = container.id.clone() else {
+            continue;
+        };
+        if members.get(&id).is_none_or(|m| m.name != row.name) {
+            continue;
+        }
+        let Some(svc) = container
+            .config
+            .as_ref()
+            .and_then(|c| c.labels.as_ref())
+            .and_then(|l| l.get(crate::image_update::COMPOSE_SERVICE_LABEL))
+        else {
+            continue;
+        };
+        declared.insert(id, declared_binds(&cfg, svc, &resolve));
+    }
     Ok(ExecScope {
         stack_ids: members.into_keys().collect(),
         stack_dir,
-        managed_roots,
+        declared,
         grants,
         volumes,
         peers,
@@ -2180,7 +2227,9 @@ fn host_tree_refusal(path: &std::path::Path) -> Option<String> {
 
 fn bind_refusal(
     source: &str,
+    mount: Option<(&str, bool)>,
     allowed: &[std::path::PathBuf],
+    declared: &[DeclaredBind],
     resolve: policy::Resolver<'_>,
 ) -> Option<String> {
     use std::path::{Component, Path, PathBuf};
@@ -2208,13 +2257,26 @@ fn bind_refusal(
     if let Some(why) = host_tree_refusal(&canonical) {
         return Some(why);
     }
-    if !allowed.iter().any(|root| canonical.starts_with(root)) {
+    if allowed.iter().any(|root| canonical.starts_with(root)) {
+        return None;
+    }
+    let same: Vec<&DeclaredBind> = declared
+        .iter()
+        .filter(|d| Some(d.target.as_str()) == mount.map(|m| m.0) && d.source == canonical)
+        .collect();
+    let rw = mount.is_some_and(|m| m.1);
+    if same.iter().any(|d| !(rw && d.read_only)) {
+        return None;
+    }
+    if !same.is_empty() {
         return Some(format!(
-            "the container mounts {source} ({}), outside the stack dir",
-            canonical.display()
+            "the container mounts {source} read-write where its compose service declares it read-only"
         ));
     }
-    None
+    Some(format!(
+        "the container mounts {source} ({}), outside the stack dir and not declared by its compose service",
+        canonical.display()
+    ))
 }
 
 fn security_opt_allowed(opt: &str) -> bool {
@@ -2335,7 +2397,6 @@ fn refusal(
         return Some("the container sets a custom cgroup parent".into());
     }
     let mut allowed = vec![scope.stack_dir.clone()];
-    allowed.extend(scope.managed_roots.iter().cloned());
     if !peer {
         allowed.extend(
             scope
@@ -2345,25 +2406,51 @@ fn refusal(
                 .filter_map(|p| resolve(std::path::Path::new(p)).ok()),
         );
     }
-    let sources = info
+    let declared = info
+        .id
+        .as_ref()
+        .and_then(|id| scope.declared.get(id))
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let binds = info
         .mounts
         .iter()
         .flatten()
         .filter(|m| m.typ.as_deref() == Some("bind"))
-        .filter_map(|m| m.source.clone())
+        .filter_map(|m| {
+            Some((
+                m.source.clone()?,
+                m.destination.clone(),
+                m.rw != Some(false),
+            ))
+        })
         .chain(hc.binds.iter().flatten().filter_map(|b| {
-            let source = b.split(':').next().unwrap_or("");
-            source.starts_with('/').then(|| source.to_string())
+            let mut parts = b.split(':');
+            let source = parts.next().unwrap_or("");
+            let target = parts.next().map(str::to_string);
+            let rw = !parts
+                .next()
+                .is_some_and(|o| o.split(',').any(|o| o.trim() == "ro"));
+            source
+                .starts_with('/')
+                .then(|| (source.to_string(), target, rw))
         }))
         .chain(
             hc.mounts
                 .iter()
                 .flatten()
                 .filter(|m| m.typ == Some(MountType::BIND))
-                .filter_map(|m| m.source.clone()),
+                .filter_map(|m| {
+                    Some((
+                        m.source.clone()?,
+                        m.target.clone(),
+                        m.read_only != Some(true),
+                    ))
+                }),
         );
-    for source in sources {
-        if let Some(why) = bind_refusal(&source, &allowed, resolve) {
+    for (source, target, rw) in binds {
+        let mount = target.as_deref().map(|t| (t, rw));
+        if let Some(why) = bind_refusal(&source, mount, &allowed, declared, resolve) {
             return Some(why);
         }
     }
@@ -2381,7 +2468,7 @@ fn refusal(
             return Some(format!("volume {name} binds a host path"));
         }
         if let Some(device) = v.options.get("device").filter(|d| d.starts_with('/'))
-            && let Some(why) = bind_refusal(device, &allowed, resolve)
+            && let Some(why) = bind_refusal(device, None, &allowed, &[], resolve)
         {
             return Some(format!("volume {name}: {why}"));
         }
@@ -2818,7 +2905,7 @@ mod tests {
         ExecScope {
             stack_ids: ["c1".to_string(), "c3".to_string()].into(),
             stack_dir: std::fs::canonicalize(dir).unwrap(),
-            managed_roots: Vec::new(),
+            declared: Default::default(),
             grants: Vec::new(),
             volumes: Default::default(),
             peers: Default::default(),
@@ -2970,31 +3057,96 @@ mod tests {
     }
 
     #[test]
-    fn exec_binds_accept_managed_roots_but_never_the_denied_set() {
+    fn exec_binds_outside_the_stack_dir_must_match_the_services_declared_binds() {
         let dir = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
-        let elsewhere = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("media")).unwrap();
-        std::os::unix::fs::symlink(elsewhere.path(), root.path().join("out")).unwrap();
+        std::fs::create_dir(root.path().join("other")).unwrap();
+        let media = std::fs::canonicalize(root.path().join("media")).unwrap();
+        let shown = root.path().join("media").display().to_string();
+        let other = root.path().join("other").display().to_string();
         let mut s = scope(dir.path());
-        let bind =
-            |src: String| inspected("/x", serde_json::json!({"Binds": [format!("{src}:/m")]}));
-        let media = format!("{}/media", root.path().display());
-        assert!(refused(&bind(media.clone()), &s).contains("outside the stack dir"));
-        s.managed_roots = vec![std::fs::canonicalize(root.path()).unwrap()];
-        assert_eq!(exec_refusal(&bind(media), &s, &canon), None);
-        let out = format!("{}/out", root.path().display());
-        assert!(refused(&bind(out), &s).contains("outside the stack dir"));
-        s.managed_roots.push("/".into());
-        for (src, want) in [
-            ("/", "host root"),
-            ("/proc", "under /proc"),
-            ("/var/run/docker.sock", "socket"),
-            ("/var", "runtime socket"),
-        ] {
-            let why = refused(&bind(src.into()), &s);
-            assert!(why.contains(want), "{src}: {why}");
-        }
+        let bind = |b: String| inspected("/x", serde_json::json!({"Binds": [b]}));
+        assert!(
+            refused(&bind(format!("{shown}:/media:ro")), &s)
+                .contains("not declared by its compose service")
+        );
+        s.declared = [(
+            "c1".to_string(),
+            vec![DeclaredBind {
+                source: media.clone(),
+                target: "/media".into(),
+                read_only: true,
+            }],
+        )]
+        .into();
+        assert_eq!(
+            exec_refusal(&bind(format!("{shown}:/media:ro")), &s, &canon),
+            None
+        );
+        assert_eq!(
+            exec_refusal(&bind(format!("{shown}:/media:ro,z")), &s, &canon),
+            None
+        );
+        assert!(refused(&bind(format!("{shown}:/media")), &s).contains("read-write where"));
+        assert!(refused(&bind(format!("{shown}:/elsewhere:ro")), &s).contains("not declared"));
+        assert!(refused(&bind(format!("{other}:/media:ro")), &s).contains("not declared"));
+        let mut mounted = inspected("/x", serde_json::json!({}));
+        mounted.mounts = Some(vec![bollard::models::MountPoint {
+            typ: Some("bind".into()),
+            source: Some(shown.clone()),
+            destination: Some("/media".into()),
+            rw: Some(true),
+            ..Default::default()
+        }]);
+        assert!(refused(&mounted, &s).contains("read-write where"));
+        s.declared.get_mut("c1").unwrap()[0].read_only = false;
+        assert_eq!(
+            exec_refusal(&bind(format!("{shown}:/media")), &s, &canon),
+            None
+        );
+        assert_eq!(exec_refusal(&mounted, &s, &canon), None);
+        let mut peer_scope = scope(dir.path());
+        peer_scope.declared = [("c9".to_string(), s.declared["c1"].clone())].into();
+        assert!(refused(&bind(format!("{shown}:/media")), &peer_scope).contains("not declared"));
+        s.declared.insert(
+            "c1".into(),
+            vec![DeclaredBind {
+                source: "/var/run/docker.sock".into(),
+                target: "/var/run/docker.sock".into(),
+                read_only: false,
+            }],
+        );
+        assert!(
+            refused(
+                &bind("/var/run/docker.sock:/var/run/docker.sock".into()),
+                &s
+            )
+            .contains("socket")
+        );
+    }
+
+    #[test]
+    fn declared_binds_are_read_from_the_service_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().display();
+        let cfg = ComposeConfig::parse(&format!(
+            r#"{{"name":"m","services":{{"app":{{"volumes":[
+                {{"type":"bind","source":"{d}","target":"/a","read_only":true}},
+                {{"type":"bind","source":"{d}/missing","target":"/b"}},
+                {{"type":"volume","source":"data","target":"/c"}}
+            ]}},"db":{{"volumes":[{{"type":"bind","source":"{d}","target":"/db"}}]}}}}}}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            declared_binds(&cfg, "app", &canon),
+            vec![DeclaredBind {
+                source: std::fs::canonicalize(dir.path()).unwrap(),
+                target: "/a".into(),
+                read_only: true,
+            }]
+        );
+        assert!(declared_binds(&cfg, "nope", &canon).is_empty());
     }
 
     fn volume(driver: &str, opts: &[(&str, &str)]) -> bollard::models::Volume {
