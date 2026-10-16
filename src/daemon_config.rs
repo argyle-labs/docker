@@ -3,12 +3,19 @@
 use std::path::{Path, PathBuf};
 
 use plugin_toolkit::prelude::*;
+use plugin_toolkit::privileged::{self, PrivilegedOps};
 use plugin_toolkit::process::Command;
+use plugin_toolkit::serde::Serialize;
+use plugin_toolkit::serde::de::DeserializeOwned;
 use plugin_toolkit::serde_json::{Map, Value};
 
 use crate::execute;
 use crate::init::{self, Init};
 
+const PLUGIN: &str = "docker";
+const READ_OP: &str = "daemon_config";
+const UPDATE_OP: &str = "daemon_config_update";
+const CALLER_UID_ENV: &str = "ORCA_CALLER_UID";
 const TOOL: &str = "docker.daemon_config";
 const UPDATE_TOOL: &str = "docker.daemon_config_update";
 const DAEMON_JSON: &str = "etc/docker/daemon.json";
@@ -863,7 +870,66 @@ async fn docker_daemon_config(
 ) -> Result<DaemonConfigDetail> {
     execute::require_admin(TOOL, ctx)?;
     refuse_macos(TOOL)?;
-    detail(Path::new("/"))
+    if is_root() {
+        return detail(Path::new("/"));
+    }
+    through_seam::<(), _>(READ_OP, None).await
+}
+
+fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+async fn through_seam<P: Serialize, T: DeserializeOwned>(
+    op: &str,
+    payload: Option<&P>,
+) -> Result<T> {
+    let detail = privileged::apply(PLUGIN, op, payload)
+        .await
+        .with_context(|| format!("{PLUGIN} {op} through `orca admin plugin-apply`"))?;
+    plugin_toolkit::serde_json::from_str(&detail)
+        .with_context(|| format!("decode the {op} privileged reply"))
+}
+
+fn caller_uid(raw: Option<&str>) -> Option<u32> {
+    raw?.parse().ok()
+}
+
+fn authorize_privileged(caller: Option<u32>, euid_root: bool) -> Result<()> {
+    plugin_toolkit::anyhow::ensure!(
+        euid_root,
+        "{} must run as root",
+        privileged::PRIVILEGED_FLAG
+    );
+    plugin_toolkit::anyhow::ensure!(
+        caller.is_some(),
+        "{CALLER_UID_ENV} is missing or invalid; refusing every privileged op"
+    );
+    Ok(())
+}
+
+pub fn privileged_ops() -> PrivilegedOps {
+    PrivilegedOps::new()
+        .op(READ_OP, |(): ()| async {
+            authorize_privileged(
+                caller_uid(std::env::var(CALLER_UID_ENV).ok().as_deref()),
+                is_root(),
+            )?;
+            refuse_macos(TOOL)?;
+            Ok(plugin_toolkit::serde_json::to_string(&detail(Path::new(
+                "/",
+            ))?)?)
+        })
+        .op(UPDATE_OP, |args: DockerDaemonConfigUpdateArgs| async move {
+            authorize_privileged(
+                caller_uid(std::env::var(CALLER_UID_ENV).ok().as_deref()),
+                is_root(),
+            )?;
+            refuse_macos(UPDATE_TOOL)?;
+            Ok(plugin_toolkit::serde_json::to_string(
+                &update(Path::new("/"), &args).await?,
+            )?)
+        })
 }
 
 pub fn detail(root: &Path) -> Result<DaemonConfigDetail> {
@@ -975,14 +1041,28 @@ async fn docker_daemon_config_update(
 ) -> Result<DaemonConfigUpdateOutput> {
     execute::require_admin(UPDATE_TOOL, ctx)?;
     refuse_macos(UPDATE_TOOL)?;
+    if is_root() {
+        return update(Path::new("/"), &args).await;
+    }
+    through_seam(UPDATE_OP, Some(&args)).await
+}
+
+fn require_patch(args: &DockerDaemonConfigUpdateArgs) -> Result<()> {
+    if args.registry_mirrors.is_none() && args.insecure_registries.is_none() {
+        bail!("{UPDATE_TOOL}: pass registry_mirrors and/or insecure_registries");
+    }
+    Ok(())
+}
+
+pub async fn update(
+    root: &Path,
+    args: &DockerDaemonConfigUpdateArgs,
+) -> Result<DaemonConfigUpdateOutput> {
     let patch = DaemonConfigPatch {
         registry_mirrors: args.registry_mirrors.clone(),
         insecure_registries: args.insecure_registries.clone(),
     };
-    if patch.is_empty() {
-        bail!("{UPDATE_TOOL}: pass registry_mirrors and/or insecure_registries");
-    }
-    let root = Path::new("/");
+    require_patch(args)?;
     let plan = plan(root, &patch)?;
     let restart_cmd = if args.restart {
         Some(restart_command(plan.host)?)
@@ -1058,6 +1138,92 @@ mod tests {
     use crate::test_support::{admin, assert_admin_refusal, non_admins};
     use plugin_toolkit::reactor::block_on;
     use plugin_toolkit::serde_json::json;
+
+    #[test]
+    fn privileged_ops_need_root_and_a_caller_uid() {
+        assert!(authorize_privileged(Some(999), true).is_ok());
+        assert!(authorize_privileged(Some(0), true).is_ok());
+        let err = authorize_privileged(Some(999), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must run as root"), "{err}");
+        let err = authorize_privileged(None, true).unwrap_err().to_string();
+        assert!(err.contains(CALLER_UID_ENV), "{err}");
+        assert_eq!(caller_uid(Some("999")), Some(999));
+        for bad in [None, Some(""), Some("-1"), Some("orca"), Some("9 ")] {
+            assert_eq!(caller_uid(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_privileged_op_set_is_closed_and_fails_closed() {
+        let ops = privileged_ops();
+        let r = block_on(ops.dispatch(r#"{"op":"write_file","payload":{"path":"/etc/shadow"}}"#));
+        assert!(!r.ok);
+        assert!(r.error.unwrap().contains("unknown privileged op"));
+        let r = block_on(
+            ops.dispatch(r#"{"op":"daemon_config_update","payload":{"registry_mirrors":"x"}}"#),
+        );
+        assert!(!r.ok);
+        assert!(r.error.unwrap().contains("invalid payload"));
+        if !is_root() {
+            for req in [
+                json!({"plugin": PLUGIN, "op": READ_OP}),
+                json!({"plugin": PLUGIN, "op": UPDATE_OP, "payload": {"registry_mirrors": ["https://m"]}}),
+            ] {
+                let r = block_on(ops.dispatch(&req.to_string()));
+                assert!(
+                    r.error.unwrap_or_default().contains("must run as root"),
+                    "{req}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn update_args_round_trip_across_the_seam() {
+        let args = DockerDaemonConfigUpdateArgs {
+            registry_mirrors: Some(vec!["https://m.example".into()]),
+            insecure_registries: None,
+            restart: true,
+            dry_run: true,
+        };
+        let v = plugin_toolkit::serde_json::to_value(&args).unwrap();
+        let back: DockerDaemonConfigUpdateArgs = plugin_toolkit::serde_json::from_value(v).unwrap();
+        assert_eq!(back.registry_mirrors, args.registry_mirrors);
+        assert!(back.restart && back.dry_run);
+        assert!(require_patch(&back).is_ok());
+        let empty = DockerDaemonConfigUpdateArgs {
+            registry_mirrors: None,
+            insecure_registries: None,
+            restart: false,
+            dry_run: false,
+        };
+        assert!(require_patch(&empty).is_err());
+    }
+
+    #[test]
+    fn update_output_round_trips_across_the_seam() {
+        let t = tempfile::tempdir().unwrap();
+        let out = block_on(update(
+            t.path(),
+            &DockerDaemonConfigUpdateArgs {
+                registry_mirrors: Some(vec!["https://m.example".into()]),
+                insecure_registries: None,
+                restart: false,
+                dry_run: true,
+            },
+        ))
+        .unwrap();
+        let text = plugin_toolkit::serde_json::to_string(&out).unwrap();
+        let back: DaemonConfigUpdateOutput = plugin_toolkit::serde_json::from_str(&text).unwrap();
+        assert!(back.dry_run);
+        assert_eq!(back.writes.len(), out.writes.len());
+        let detail = detail(t.path()).unwrap();
+        let text = plugin_toolkit::serde_json::to_string(&detail).unwrap();
+        let back: DaemonConfigDetail = plugin_toolkit::serde_json::from_str(&text).unwrap();
+        assert_eq!(back.host, detail.host);
+    }
 
     fn obj(v: Value) -> Map<String, Value> {
         match v {
