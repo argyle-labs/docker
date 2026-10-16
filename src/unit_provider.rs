@@ -933,8 +933,8 @@ impl DockerUnitProvider {
                     .inspect_container(&exec.id, None)
                     .await
                     .map_err(|e| anyhow::anyhow!("inspect {}: {e}", exec.id))?;
-                let dirs: Vec<String> = stacks::list()?.into_iter().map(|r| r.dir).collect();
-                if let Some(why) = exec_refusal(&info, &dirs) {
+                let ids = stack_container_ids(docker).await?;
+                if let Some(why) = exec_refusal(&info, &ids) {
                     return Err(anyhow::anyhow!("exec in {} refused: {why}", exec.id));
                 }
                 let target = inspected_id(&info, &exec.id)?;
@@ -947,7 +947,7 @@ impl DockerUnitProvider {
                     UnitId {
                         manager: format!("docker@{}", self.hostname),
                         kind: "exec".into(),
-                        id: exec.id.clone(),
+                        id: target,
                         name: format!("exec:{}", exec.id),
                     },
                     serde_json::to_string(&result).unwrap_or_default(),
@@ -1955,28 +1955,105 @@ fn inspected_id(info: &bollard::models::ContainerInspectResponse, asked: &str) -
 
 const COMPOSE_WORKING_DIR_LABEL: &str = "com.docker.compose.project.working_dir";
 
+/// Ids of the containers compose created for registered stacks, looked up
+/// by each stack's resolved project name and directory.
+async fn stack_container_ids(
+    docker: &bollard::Docker,
+) -> Result<std::collections::HashSet<String>> {
+    use bollard::query_parameters::ListContainersOptionsBuilder;
+    let mut ids = std::collections::HashSet::new();
+    for row in stacks::list()? {
+        let Ok(project) =
+            async { Ok::<_, anyhow::Error>(row.compose()?.project_name().await?) }.await
+        else {
+            continue;
+        };
+        let mut dirs = vec![row.dir.clone()];
+        if let Ok(resolved) = crate::lifecycle::resolve(std::path::Path::new(&row.dir)) {
+            dirs.push(resolved.to_string_lossy().into_owned());
+        }
+        dirs.dedup();
+        for dir in dirs {
+            let filters = std::collections::HashMap::from([(
+                "label",
+                vec![
+                    format!("{}={project}", crate::prune::COMPOSE_PROJECT_LABEL),
+                    format!("{COMPOSE_WORKING_DIR_LABEL}={dir}"),
+                ],
+            )]);
+            let containers = docker
+                .list_containers(Some(
+                    ListContainersOptionsBuilder::new()
+                        .all(true)
+                        .filters(&filters)
+                        .build(),
+                ))
+                .await
+                .map_err(|e| anyhow::anyhow!("list containers: {e}"))?;
+            ids.extend(containers.into_iter().filter_map(|c| c.id));
+        }
+    }
+    Ok(ids)
+}
+
+const DENIED_BIND_TREES: &[&str] = &["/proc", "/sys", "/run", "/var/run", "/dev"];
+
+const KNOWN_SOCKETS: &[&str] = &[
+    "/var/run/docker.sock",
+    "/run/docker.sock",
+    "/run/podman/podman.sock",
+    "/var/run/podman/podman.sock",
+    "/run/containerd/containerd.sock",
+    "/var/run/containerd/containerd.sock",
+];
+
+const DENIED_CAPS: &[&str] = &[
+    "SYS_ADMIN",
+    "ALL",
+    "SYS_MODULE",
+    "SYS_PTRACE",
+    "SYS_RAWIO",
+    "DAC_READ_SEARCH",
+    "BPF",
+    "PERFMON",
+    "NET_ADMIN",
+];
+
+fn bind_refusal(source: &str) -> Option<String> {
+    let trimmed = source.trim_end_matches('/');
+    let path = if trimmed.is_empty() { "/" } else { trimmed };
+    if path == "/" {
+        return Some("the container mounts the host root".into());
+    }
+    if path.ends_with(".sock") {
+        return Some(format!("the container mounts the socket {path}"));
+    }
+    if let Some(tree) = DENIED_BIND_TREES
+        .iter()
+        .find(|t| path == **t || path.starts_with(&format!("{t}/")))
+    {
+        return Some(format!("the container mounts {path} (under {tree})"));
+    }
+    if KNOWN_SOCKETS
+        .iter()
+        .any(|s| s.starts_with(&format!("{path}/")))
+    {
+        return Some(format!(
+            "the container mounts {path}, which holds a runtime socket"
+        ));
+    }
+    None
+}
+
 /// Why `exec` into the inspected container is refused, if it is. Even for an
-/// admin caller, exec is limited to containers of registered stacks, which
-/// the compose policy has checked, and refused in any that holds the host:
-/// privileged, a host namespace, the docker socket or `SYS_ADMIN`.
+/// admin caller, exec is limited to containers of registered stacks and
+/// refused in any that can reach the host.
 fn exec_refusal(
     info: &bollard::models::ContainerInspectResponse,
-    stack_dirs: &[String],
+    stack_ids: &std::collections::HashSet<String>,
 ) -> Option<String> {
     use bollard::models::HostConfigCgroupnsModeEnum;
-    let working_dir = info
-        .config
-        .as_ref()
-        .and_then(|c| c.labels.as_ref())
-        .and_then(|l| l.get(COMPOSE_WORKING_DIR_LABEL));
-    let registered = working_dir.is_some_and(|wd| {
-        let wd = std::path::Path::new(wd);
-        stack_dirs.iter().any(|d| {
-            wd == std::path::Path::new(d)
-                || crate::lifecycle::resolve(std::path::Path::new(d)).is_ok_and(|r| r == wd)
-        })
-    });
-    if !registered {
+    if !info.id.as_ref().is_some_and(|id| stack_ids.contains(id)) {
         return Some("the container is not part of a registered stack".into());
     }
     let hc = info.host_config.clone().unwrap_or_default();
@@ -1997,26 +2074,42 @@ fn exec_refusal(
     if hc.cgroupns_mode == Some(HostConfigCgroupnsModeEnum::HOST) {
         return Some("the container uses the host cgroup namespace".into());
     }
-    if hc.cap_add.iter().flatten().any(|c| {
+    if let Some(cap) = hc.cap_add.iter().flatten().find_map(|c| {
         let c = c.to_ascii_uppercase();
-        matches!(c.strip_prefix("CAP_").unwrap_or(&c), "SYS_ADMIN" | "ALL")
+        let bare = c.strip_prefix("CAP_").unwrap_or(&c).to_string();
+        DENIED_CAPS.contains(&bare.as_str()).then_some(bare)
     }) {
-        return Some("the container has CAP_SYS_ADMIN".into());
+        return Some(format!("the container has CAP_{cap}"));
+    }
+    if hc.devices.as_ref().is_some_and(|d| !d.is_empty()) {
+        return Some("the container maps host devices".into());
+    }
+    if let Some(opt) = hc.security_opt.iter().flatten().find(|o| {
+        let o = o.to_ascii_lowercase().replace(':', "=");
+        o == "apparmor=unconfined" || o == "seccomp=unconfined"
+    }) {
+        return Some(format!("the container runs with {opt}"));
+    }
+    if hc.cgroup_parent.as_ref().is_some_and(|p| !p.is_empty()) {
+        return Some("the container sets a custom cgroup parent".into());
     }
     let sources = info
         .mounts
         .iter()
         .flatten()
         .filter_map(|m| m.source.clone())
-        .chain(hc.binds.iter().flatten().cloned());
+        .chain(
+            hc.binds
+                .iter()
+                .flatten()
+                .map(|b| b.split(':').next().unwrap_or("").to_string()),
+        )
+        .chain(hc.mounts.iter().flatten().filter_map(|m| m.source.clone()));
     for source in sources {
-        if source
-            .split(':')
-            .next()
-            .unwrap_or("")
-            .ends_with("docker.sock")
+        if source.starts_with('/')
+            && let Some(why) = bind_refusal(&source)
         {
-            return Some("the container mounts the docker socket".into());
+            return Some(why);
         }
     }
     None
@@ -2439,6 +2532,7 @@ mod tests {
         host_config: serde_json::Value,
     ) -> bollard::models::ContainerInspectResponse {
         serde_json::from_value(serde_json::json!({
+            "Id": "c1",
             "Config": {"Labels": {COMPOSE_WORKING_DIR_LABEL: dir}},
             "HostConfig": host_config,
             "Mounts": []
@@ -2446,9 +2540,14 @@ mod tests {
         .unwrap()
     }
 
+    fn stack_ids() -> std::collections::HashSet<String> {
+        ["c1".to_string()].into()
+    }
+
     #[test]
     fn exec_targets_the_inspected_id_not_the_requested_name() {
         let mut info = inspected("/opt/stacks/web", serde_json::json!({}));
+        info.id = None;
         assert!(inspected_id(&info, "web").is_err());
         info.id = Some(String::new());
         assert!(inspected_id(&info, "web").is_err());
@@ -2457,22 +2556,25 @@ mod tests {
     }
 
     #[test]
-    fn exec_is_limited_to_unprivileged_containers_of_registered_stacks() {
-        let dirs = vec!["/opt/stacks/web".to_string()];
+    fn exec_membership_is_by_container_id_not_label() {
+        let ids = stack_ids();
         assert_eq!(
-            exec_refusal(&inspected("/opt/stacks/web", serde_json::json!({})), &dirs),
+            exec_refusal(&inspected("/anything", serde_json::json!({})), &ids),
             None
         );
-        let why = exec_refusal(
-            &inspected("/opt/stacks/other", serde_json::json!({})),
-            &dirs,
-        )
-        .unwrap();
+        let mut forged = inspected("/opt/stacks/web", serde_json::json!({}));
+        forged.id = Some("c2".into());
+        let why = exec_refusal(&forged, &ids).unwrap();
         assert!(why.contains("not part of a registered stack"), "{why}");
-        let unlabeled: bollard::models::ContainerInspectResponse =
-            serde_json::from_value(serde_json::json!({"HostConfig": {}})).unwrap();
-        assert!(exec_refusal(&unlabeled, &dirs).is_some());
-        for (hc, want) in [
+        let mut no_id = inspected("/opt/stacks/web", serde_json::json!({}));
+        no_id.id = None;
+        assert!(exec_refusal(&no_id, &ids).is_some());
+    }
+
+    #[test]
+    fn exec_is_refused_in_containers_that_reach_the_host() {
+        let ids = stack_ids();
+        let mut cases = vec![
             (serde_json::json!({"Privileged": true}), "privileged"),
             (serde_json::json!({"PidMode": "host"}), "host pid"),
             (serde_json::json!({"IpcMode": "host"}), "host ipc"),
@@ -2481,16 +2583,45 @@ mod tests {
             (serde_json::json!({"UTSMode": "host"}), "host uts"),
             (serde_json::json!({"CgroupnsMode": "host"}), "host cgroup"),
             (
-                serde_json::json!({"CapAdd": ["CAP_SYS_ADMIN"]}),
-                "CAP_SYS_ADMIN",
+                serde_json::json!({"Devices": [{"PathOnHost": "/dev/sda", "PathInContainer": "/dev/sda", "CgroupPermissions": "rwm"}]}),
+                "devices",
             ),
-            (serde_json::json!({"CapAdd": ["ALL"]}), "CAP_SYS_ADMIN"),
             (
-                serde_json::json!({"Binds": ["/var/run/docker.sock:/var/run/docker.sock"]}),
-                "docker socket",
+                serde_json::json!({"SecurityOpt": ["apparmor=unconfined"]}),
+                "apparmor=unconfined",
             ),
+            (
+                serde_json::json!({"SecurityOpt": ["seccomp:unconfined"]}),
+                "seccomp:unconfined",
+            ),
+            (
+                serde_json::json!({"CgroupParent": "/host"}),
+                "cgroup parent",
+            ),
+        ];
+        for cap in DENIED_CAPS {
+            cases.push((serde_json::json!({"CapAdd": [format!("CAP_{cap}")]}), cap));
+            cases.push((
+                serde_json::json!({"CapAdd": [cap.to_ascii_lowercase()]}),
+                cap,
+            ));
+        }
+        for bind in [
+            "/:/host",
+            "/proc:/hostproc",
+            "/sys/fs/cgroup:/cg",
+            "/run:/run",
+            "/var/run:/var/run",
+            "/dev:/dev",
+            "/var/run/docker.sock:/var/run/docker.sock",
+            "/srv/podman.sock:/p.sock",
+            "/run/containerd/containerd.sock:/c.sock",
+            "/var:/hostvar",
         ] {
-            let why = exec_refusal(&inspected("/opt/stacks/web", hc.clone()), &dirs)
+            cases.push((serde_json::json!({"Binds": [bind]}), "mounts"));
+        }
+        for (hc, want) in cases {
+            let why = exec_refusal(&inspected("/opt/stacks/web", hc.clone()), &ids)
                 .unwrap_or_else(|| panic!("{hc} was allowed"));
             assert!(why.contains(want), "{hc}: {why}");
         }
@@ -2499,11 +2630,16 @@ mod tests {
             source: Some("/run/docker.sock".into()),
             ..Default::default()
         }]);
-        assert!(
-            exec_refusal(&sock, &dirs)
-                .unwrap()
-                .contains("docker socket")
+        assert!(exec_refusal(&sock, &ids).unwrap().contains("socket"));
+        let ok = inspected(
+            "/opt/stacks/web",
+            serde_json::json!({
+                "Binds": ["/opt/stacks/web/data:/data", "/var/lib/app:/app"],
+                "CapAdd": ["NET_BIND_SERVICE"],
+                "SecurityOpt": ["no-new-privileges"]
+            }),
         );
+        assert_eq!(exec_refusal(&ok, &ids), None);
     }
 
     #[test]
