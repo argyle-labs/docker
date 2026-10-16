@@ -188,12 +188,16 @@ pub fn audit(
         }
         for m in &s.volumes {
             if let Some(src) = m.bind_source() {
-                if SYSTEM_PREFIXES.iter().any(|p| under(src, p)) {
+                let present = exists(Path::new(src));
+                let whole_root = roots
+                    .iter()
+                    .find(|r| present && canonical(r).starts_with(canonical(src)));
+                if whole_root.is_none() && SYSTEM_PREFIXES.iter().any(|p| under(src, p)) {
                     continue;
                 }
                 let managed = roots.iter().any(|r| under(src, r));
                 let own = under(src, stack_dir);
-                let (kind, detail, proposed) = if !exists(Path::new(src)) {
+                let (kind, detail, proposed) = if !present {
                     // A missing path under a managed root is a mount that is
                     // down, not a path to move elsewhere.
                     let proposed = (!managed)
@@ -204,10 +208,7 @@ pub fn audit(
                         format!("bind source {src} for {} does not exist", m.target),
                         proposed,
                     )
-                } else if let Some(root) = roots
-                    .iter()
-                    .find(|r| canonical(r).starts_with(canonical(src)))
-                {
+                } else if let Some(root) = whole_root {
                     (
                         FindingKind::BindWholeRoot,
                         format!(
