@@ -1947,13 +1947,10 @@ fn payload_name(payload: Option<&str>) -> String {
 
 const COMPOSE_WORKING_DIR_LABEL: &str = "com.docker.compose.project.working_dir";
 
-/// Why `exec` into the inspected container is refused, if it is. The unit
-/// verbs carry no caller identity (orca#788), so exec is limited to
-/// containers of registered stacks, which the compose policy has checked,
-/// and refused in any that holds the host: privileged, a host namespace,
-/// the docker socket or `SYS_ADMIN`. The gap that remains until the verb
-/// carries the caller: any caller can exec in any such container, reading
-/// its secrets and data.
+/// Why `exec` into the inspected container is refused, if it is. Even for an
+/// admin caller, exec is limited to containers of registered stacks, which
+/// the compose policy has checked, and refused in any that holds the host:
+/// privileged, a host namespace, the docker socket or `SYS_ADMIN`.
 fn exec_refusal(
     info: &bollard::models::ContainerInspectResponse,
     stack_dirs: &[String],
