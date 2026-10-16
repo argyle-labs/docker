@@ -1963,6 +1963,7 @@ const COMPOSE_CONFIG_HASH_LABEL: &str = "com.docker.compose.config-hash";
 struct ExecScope {
     stack_ids: std::collections::HashSet<String>,
     stack_dir: std::path::PathBuf,
+    managed_roots: Vec<std::path::PathBuf>,
     grants: Vec<String>,
     volumes: std::collections::HashMap<String, bollard::models::Volume>,
     peers: std::collections::HashMap<String, bollard::models::ContainerInspectResponse>,
@@ -2117,9 +2118,14 @@ async fn exec_scope(
             volumes.insert(name, v);
         }
     }
+    let managed_roots = lint::managed_roots(None)
+        .iter()
+        .filter_map(|r| std::fs::canonicalize(r).ok())
+        .collect();
     Ok(ExecScope {
         stack_ids: members.into_keys().collect(),
         stack_dir,
+        managed_roots,
         grants,
         volumes,
         peers,
@@ -2329,6 +2335,7 @@ fn refusal(
         return Some("the container sets a custom cgroup parent".into());
     }
     let mut allowed = vec![scope.stack_dir.clone()];
+    allowed.extend(scope.managed_roots.iter().cloned());
     if !peer {
         allowed.extend(
             scope
@@ -2811,6 +2818,7 @@ mod tests {
         ExecScope {
             stack_ids: ["c1".to_string(), "c3".to_string()].into(),
             stack_dir: std::fs::canonicalize(dir).unwrap(),
+            managed_roots: Vec::new(),
             grants: Vec::new(),
             volumes: Default::default(),
             peers: Default::default(),
@@ -2959,6 +2967,34 @@ mod tests {
         assert_eq!(exec_refusal(&bind(format!("{d}/escape")), &s, &canon), None);
         s.grants = vec![format!("{}/run", policy::ALLOW_BIND)];
         assert!(refused(&bind("/run".into()), &s).contains("under /run"));
+    }
+
+    #[test]
+    fn exec_binds_accept_managed_roots_but_never_the_denied_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("media")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), root.path().join("out")).unwrap();
+        let mut s = scope(dir.path());
+        let bind =
+            |src: String| inspected("/x", serde_json::json!({"Binds": [format!("{src}:/m")]}));
+        let media = format!("{}/media", root.path().display());
+        assert!(refused(&bind(media.clone()), &s).contains("outside the stack dir"));
+        s.managed_roots = vec![std::fs::canonicalize(root.path()).unwrap()];
+        assert_eq!(exec_refusal(&bind(media), &s, &canon), None);
+        let out = format!("{}/out", root.path().display());
+        assert!(refused(&bind(out), &s).contains("outside the stack dir"));
+        s.managed_roots.push("/".into());
+        for (src, want) in [
+            ("/", "host root"),
+            ("/proc", "under /proc"),
+            ("/var/run/docker.sock", "socket"),
+            ("/var", "runtime socket"),
+        ] {
+            let why = refused(&bind(src.into()), &s);
+            assert!(why.contains(want), "{src}: {why}");
+        }
     }
 
     fn volume(driver: &str, opts: &[(&str, &str)]) -> bollard::models::Volume {
