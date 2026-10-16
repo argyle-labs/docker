@@ -1941,6 +1941,30 @@ fn validate_grant(grant: &str) -> Result<()> {
 // docker.stack_allow — grant a stack policy exceptions
 // ═══════════════════════════════════════════════════════════════════════════
 
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    plugin_toolkit::serde::Serialize,
+    plugin_toolkit::serde::Deserialize,
+    plugin_toolkit::schemars::JsonSchema,
+    plugin_toolkit::clap::ValueEnum,
+)]
+#[serde(crate = "plugin_toolkit::serde")]
+#[schemars(crate = "plugin_toolkit::schemars")]
+#[serde(rename_all = "lowercase")]
+pub enum AllowMode {
+    /// Add the `allow` grants to the current set.
+    #[default]
+    Add,
+    /// Remove the `allow` grants from the current set.
+    Remove,
+    /// Replace the current set with `allow`.
+    Replace,
+}
+
 #[orca_struct(args)]
 pub struct DockerStackAllowArgs {
     /// Stack name. An unregistered one is adopted: registered at `dir` with
@@ -1957,29 +1981,41 @@ pub struct DockerStackAllowArgs {
     #[arg(long)]
     #[serde(default)]
     pub file: Option<String>,
-    /// The full grant set, replacing the current one, each
-    /// `<service>|<definition>|<grant>`, the definition digest as the
-    /// policy refusal or an `approve_current` dry run shows it. A grant is
-    /// `privileged`, `pid:host`, `pid:shared`, `ipc:host`, `ipc:shared`,
-    /// `network_mode:host`, `network_mode:shared`, `userns_mode:host`,
-    /// `cgroup:host`, `security_opt`, `devices`, `volumes_from`,
-    /// `cap_add:<CAP>`, `external_volume:<name>`, `network:<name>`,
-    /// `network_driver:macvlan|ipvlan` or `bind:<absolute host path>`.
-    /// Repeatable; empty clears every grant.
+    /// Grants to add, remove or replace with (see `mode`), each
+    /// `<service>|<image>|<definition>|<image digest>|<grant>`, the
+    /// definition digest as the policy refusal or an `approve_current` dry
+    /// run shows it. A grant is `privileged`, `pid:host`, `pid:shared`,
+    /// `ipc:host`, `ipc:shared`, `network_mode:host`, `network_mode:shared`,
+    /// `userns_mode:host`, `cgroup:host`, `security_opt`, `devices`,
+    /// `volumes_from`, `cap_add:<CAP>`, `external_volume:<name>`,
+    /// `network:<name>`, `network_driver:macvlan|ipvlan` or
+    /// `bind:<absolute host path>`. Repeatable. Required unless
+    /// `approve_current`; to read a stack's grants use `docker.stack_grants`.
     #[arg(long = "allow")]
     #[serde(default)]
-    pub allow: Vec<String>,
+    pub allow: Option<Vec<String>>,
+    /// How `allow` changes the current grants: `add` (default), `remove`
+    /// or `replace`.
+    #[arg(long, value_enum)]
+    #[serde(default)]
+    pub mode: Option<AllowMode>,
+    /// Confirms leaving the stack with no grants: needed by `replace` with
+    /// an empty `allow` and by any change that removes every grant.
+    #[arg(long)]
+    #[serde(default)]
+    pub revoke_all: bool,
     /// Add a grant for everything the stack's compose files on disk use now
-    /// that needs one, each bound to its service's current definition.
+    /// that needs one, each bound to its service's current definition,
+    /// computed on the host that runs the call.
     #[arg(long)]
     #[serde(default)]
     pub approve_current: bool,
-    /// With `approve_current`, execute needs the dry run's `after` list
-    /// echoed here, and is refused when the grants would differ from it.
+    /// Optional: a dry run's `after` list. When given, execute is refused if
+    /// the result would differ from it.
     #[arg(long = "item")]
     #[serde(default)]
     pub items: Vec<String>,
-    /// Return the plan and change nothing. Omitted, applies.
+    /// Return the plan and change nothing. Omitted, the change is applied.
     #[arg(long)]
     #[serde(default, rename = "dryRun", alias = "dry_run")]
     pub dry_run: bool,
@@ -1997,15 +2033,19 @@ pub struct DockerStackAllowOutput {
     pub adopted: bool,
     pub before: Vec<String>,
     pub after: Vec<String>,
+    /// Items in `after` and not in `before`.
+    pub added: Vec<String>,
+    /// Items in `before` and not in `after`.
+    pub removed: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub how_to_execute: Option<String>,
 }
 
-/// [MUTATES STATE] Set the compose policy grants of a managed stack, each
-/// bound to a service and its resolved definition, or adopt an existing
-/// compose project as a stack together with its grants. Never starts or
-/// changes containers.
-/// With `dry_run`, returns the grants and changes nothing.
+/// [MUTATES STATE] Add, remove or replace the compose policy grants of a
+/// managed stack, each bound to a service and its resolved definition, or
+/// adopt an existing compose project as a stack together with its grants.
+/// Never starts or changes containers. Applies unless `dryRun` is set; the
+/// result always shows the before/after grant diff.
 #[orca_tool(
     domain = "docker",
     verb = "stack_allow",
@@ -2029,11 +2069,21 @@ async fn stack_allow(
     args: DockerStackAllowArgs,
     docker: &bollard::Docker,
 ) -> Result<DockerStackAllowOutput> {
-    let mut after = args
+    if args.allow.is_none() && !args.approve_current {
+        bail!(
+            "{ALLOW_TOOL}: needs `allow` or `approve_current`; to read a stack's grants use docker.stack_grants"
+        );
+    }
+    let mode = args.mode.unwrap_or_default();
+    let given = args
         .allow
         .iter()
+        .flatten()
         .map(|g| g.parse::<Grant>())
         .collect::<Result<Vec<_>>>()?;
+    if mode == AllowMode::Replace && given.is_empty() && !args.revoke_all {
+        bail!("{ALLOW_TOOL}: replacing the grants with an empty `allow` needs `revoke_all`");
+    }
     let (mut row, adopted) = match stacks::get(&args.name)? {
         Some(row) => {
             refuse_move(&row, &args)?;
@@ -2041,11 +2091,27 @@ async fn stack_allow(
         }
         None => (adoptable(&args)?, true),
     };
+    let mut after = match mode {
+        AllowMode::Replace => given,
+        AllowMode::Add => row.allow.iter().cloned().chain(given).collect(),
+        AllowMode::Remove => row
+            .allow
+            .iter()
+            .filter(|g| !given.contains(g))
+            .cloned()
+            .collect(),
+    };
     if args.approve_current {
         after.extend(current_grants(Some(docker), &row).await?);
     }
     after.sort();
     after.dedup();
+    if after.is_empty() && !row.allow.is_empty() && !args.revoke_all {
+        bail!(
+            "{ALLOW_TOOL}: this would remove every grant of stack '{}'; pass `revoke_all` to confirm",
+            args.name
+        );
+    }
     let show = |g: &[Grant]| g.iter().map(Grant::to_string).collect::<Vec<_>>();
     let before = show(&row.allow);
     let mut planned = show(&after);
@@ -2054,27 +2120,31 @@ async fn stack_allow(
     if adopted {
         planned.push(adopt_item(&row));
     }
+    let added = planned
+        .iter()
+        .filter(|g| !before.contains(g))
+        .cloned()
+        .collect();
+    let removed = before
+        .iter()
+        .filter(|g| !planned.contains(g))
+        .cloned()
+        .collect();
     if args.dry_run {
-        let how = if adopted {
-            format!(
-                "re-invoke {ALLOW_TOOL} without `dry_run`, with the same `dir` and `file`, and `items` set to `after`"
-            )
-        } else if args.approve_current {
-            format!("re-invoke {ALLOW_TOOL} without `dry_run`, with `items` set to `after`")
-        } else {
-            format!("re-invoke {ALLOW_TOOL} without `dry_run`")
-        };
         return Ok(DockerStackAllowOutput {
             dry_run: true,
             name: args.name,
             adopted,
             before,
             after: planned,
-            how_to_execute: Some(how),
+            added,
+            removed,
+            how_to_execute: Some(format!(
+                "re-invoke {ALLOW_TOOL} with the same arguments without `dryRun`; optionally pass `after` as `items` to refuse a stack that changed since"
+            )),
         });
     }
-    if args.approve_current {
-        execute::require_confirmed(ALLOW_TOOL, &args.items, &planned)?;
+    if !args.items.is_empty() {
         let mut confirmed = args.items.clone();
         confirmed.sort();
         confirmed.dedup();
@@ -2100,7 +2170,42 @@ async fn stack_allow(
         adopted,
         before,
         after: planned,
+        added,
+        removed,
         how_to_execute: None,
+    })
+}
+
+#[orca_struct(args)]
+pub struct DockerStackGrantsArgs {
+    /// Stack name.
+    #[arg(long)]
+    pub name: String,
+}
+
+#[orca_struct]
+#[serde(rename_all = "camelCase")]
+#[derive(Debug)]
+pub struct DockerStackGrantsOutput {
+    pub name: String,
+    pub grants: Vec<String>,
+}
+
+/// List the compose policy grants of a managed stack. Changes nothing.
+#[orca_tool(domain = "docker", verb = "stack_grants", role = "admin")]
+async fn docker_stack_grants(
+    args: DockerStackGrantsArgs,
+    ctx: &ToolCtx,
+) -> Result<DockerStackGrantsOutput> {
+    execute::require_admin("docker.stack_grants", ctx)?;
+    stack_grants(args)
+}
+
+fn stack_grants(args: DockerStackGrantsArgs) -> Result<DockerStackGrantsOutput> {
+    let row = stacks::require(&args.name)?;
+    Ok(DockerStackGrantsOutput {
+        name: row.name,
+        grants: row.allow.iter().map(Grant::to_string).collect(),
     })
 }
 
@@ -2875,7 +2980,9 @@ mod tests {
             name: "web".into(),
             dir: None,
             file: None,
-            allow: Vec::new(),
+            allow: None,
+            mode: None,
+            revoke_all: false,
             approve_current,
             items,
             dry_run: !execute,
@@ -2967,15 +3074,13 @@ mod tests {
                 "{:?}",
                 plan.after
             );
-            let err = allow(&docker, true, Vec::new(), true)
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("needs the items from the dry run"), "{err}");
             let wrong = vec![plan.after[0].replace("network_mode:host", "privileged")];
             let err = allow(&docker, true, wrong, true).unwrap_err().to_string();
             assert!(err.contains("differ from the confirmed items"), "{err}");
             assert!(stacks::require("web").unwrap().allow.is_empty());
-            allow(&docker, true, plan.after.clone(), true).unwrap();
+            let done = allow(&docker, true, Vec::new(), true).unwrap();
+            assert_eq!(done.after, plan.after);
+            assert_eq!(done.added, plan.after);
             let row = stacks::require("web").unwrap();
             let checked =
                 plugin_toolkit::reactor::block_on(gate(Some(&docker), &row, &compose)).unwrap();
@@ -3032,7 +3137,9 @@ mod tests {
             name: "web".into(),
             dir: dir.map(|d| d.to_string_lossy().into_owned()),
             file: Some("compose.yaml".into()),
-            allow: Vec::new(),
+            allow: None,
+            mode: None,
+            revoke_all: false,
             approve_current: true,
             items,
             dry_run: !execute,
@@ -3069,12 +3176,6 @@ mod tests {
                 stacks::get("web").unwrap().is_none(),
                 "a dry run writes nothing"
             );
-
-            let err = adopt(&docker, Some(&dir), Vec::new(), true)
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("needs the items from the dry run"), "{err}");
-            assert!(stacks::get("web").unwrap().is_none());
 
             let done = adopt(&docker, Some(&dir), plan.after.clone(), true).unwrap();
             assert!(!done.dry_run && done.adopted);
@@ -3123,10 +3224,6 @@ mod tests {
                 plan.after,
                 [format!("adopt:{}", dir.join("compose.yaml").display())]
             );
-            let err = adopt(&docker, Some(&dir), Vec::new(), true)
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("needs the items from the dry run"), "{err}");
             let err = adopt(&docker, Some(&other), plan.after.clone(), true)
                 .unwrap_err()
                 .to_string();
@@ -3150,7 +3247,9 @@ mod tests {
                     name: "other".into(),
                     dir: Some(dir.to_string_lossy().into_owned()),
                     file: Some("compose.yaml".into()),
-                    allow: Vec::new(),
+                    allow: None,
+                    mode: None,
+                    revoke_all: false,
                     approve_current: true,
                     items: Vec::new(),
                     dry_run: true,
@@ -3248,7 +3347,9 @@ mod tests {
                 name: "web".into(),
                 dir: Some(dir.to_string_lossy().into_owned()),
                 file: Some("compose.yaml".into()),
-                allow: Vec::new(),
+                allow: Some(Vec::new()),
+                mode: None,
+                revoke_all: false,
                 approve_current: false,
                 items: Vec::new(),
                 dry_run: false,
@@ -3258,6 +3359,153 @@ mod tests {
                 .to_string();
             assert!(err.contains("needs `approve_current`"), "{err}");
             assert!(stacks::list().unwrap().is_empty());
+        });
+    }
+
+    fn grant_str(allow: &str) -> String {
+        format!("app|x:1|sha256:{}|{IMAGE_DIGEST}|{allow}", "a".repeat(64))
+    }
+
+    fn change(
+        docker: &bollard::Docker,
+        allow: Option<&[&str]>,
+        mode: Option<AllowMode>,
+        revoke_all: bool,
+        execute: bool,
+    ) -> Result<DockerStackAllowOutput> {
+        let args = DockerStackAllowArgs {
+            name: "web".into(),
+            dir: None,
+            file: None,
+            allow: allow.map(|a| a.iter().map(|g| grant_str(g)).collect()),
+            mode,
+            revoke_all,
+            approve_current: false,
+            items: Vec::new(),
+            dry_run: !execute,
+        };
+        plugin_toolkit::reactor::block_on(stack_allow(args, docker))
+    }
+
+    fn granted() -> Vec<String> {
+        stacks::require("web")
+            .unwrap()
+            .allow
+            .iter()
+            .map(Grant::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn stack_allow_never_clears_grants_by_omission() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let fake = engine(&[]);
+        let docker = fake.client();
+        crate::test_support::with_db(|| {
+            registered(&root, "services:\n  app:\n    image: x:1\n");
+            change(
+                &docker,
+                Some(&["privileged", "devices"]),
+                Some(AllowMode::Replace),
+                false,
+                true,
+            )
+            .unwrap();
+            let both = granted();
+            assert_eq!(both.len(), 2);
+            for execute in [false, true] {
+                let err = change(&docker, None, None, false, execute)
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("docker.stack_grants"), "{err}");
+                let err = change(&docker, Some(&[]), Some(AllowMode::Replace), false, execute)
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("revoke_all"), "{err}");
+                let err = change(
+                    &docker,
+                    Some(&["privileged", "devices"]),
+                    Some(AllowMode::Remove),
+                    false,
+                    execute,
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(err.contains("revoke_all"), "{err}");
+            }
+            assert_eq!(granted(), both);
+            let read = stack_grants(DockerStackGrantsArgs { name: "web".into() }).unwrap();
+            assert_eq!(read.grants, both);
+            let done = change(&docker, Some(&[]), Some(AllowMode::Replace), true, true).unwrap();
+            assert_eq!(done.removed, both);
+            assert!(granted().is_empty());
+        });
+    }
+
+    #[test]
+    fn stack_allow_adds_and_removes_single_grants_and_plans_the_diff() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let fake = engine(&[]);
+        let docker = fake.client();
+        crate::test_support::with_db(|| {
+            registered(&root, "services:\n  app:\n    image: x:1\n");
+            change(&docker, Some(&["privileged"]), None, false, true).unwrap();
+            assert_eq!(granted(), [grant_str("privileged")]);
+
+            let plan = change(&docker, Some(&["devices"]), None, false, false).unwrap();
+            assert!(plan.dry_run);
+            assert_eq!(plan.before, [grant_str("privileged")]);
+            assert_eq!(plan.added, [grant_str("devices")]);
+            assert!(plan.removed.is_empty());
+            assert_eq!(
+                granted(),
+                [grant_str("privileged")],
+                "a dry run writes nothing"
+            );
+            change(
+                &docker,
+                Some(&["devices"]),
+                Some(AllowMode::Add),
+                false,
+                true,
+            )
+            .unwrap();
+            assert_eq!(granted().len(), 2);
+
+            let plan = change(
+                &docker,
+                Some(&["privileged"]),
+                Some(AllowMode::Remove),
+                false,
+                false,
+            )
+            .unwrap();
+            assert_eq!(plan.removed, [grant_str("privileged")]);
+            assert_eq!(plan.after, [grant_str("devices")]);
+            assert!(plan.added.is_empty());
+            change(
+                &docker,
+                Some(&["privileged"]),
+                Some(AllowMode::Remove),
+                false,
+                true,
+            )
+            .unwrap();
+            assert_eq!(granted(), [grant_str("devices")]);
+
+            let done = change(
+                &docker,
+                Some(&["security_opt"]),
+                Some(AllowMode::Replace),
+                false,
+                true,
+            )
+            .unwrap();
+            assert_eq!(done.removed, [grant_str("devices")]);
+            assert_eq!(done.added, [grant_str("security_opt")]);
+            assert_eq!(granted(), [grant_str("security_opt")]);
         });
     }
 
@@ -3277,7 +3525,9 @@ mod tests {
                     name: "web".into(),
                     dir: Some(dir.into()),
                     file: Some(file.into()),
-                    allow: Vec::new(),
+                    allow: Some(Vec::new()),
+                    mode: None,
+                    revoke_all: false,
                     approve_current: false,
                     items: Vec::new(),
                     dry_run: false,
@@ -3986,10 +4236,12 @@ mod tests {
                     approve_current: dir.is_some(),
                     dir,
                     file: None,
-                    allow: vec![format!(
+                    allow: Some(vec![format!(
                         "app|x:1|sha256:{}|{IMAGE_DIGEST}|privileged",
                         "a".repeat(64)
-                    )],
+                    )]),
+                    mode: None,
+                    revoke_all: false,
                     items: Vec::new(),
                     dry_run: !execute,
                 };
