@@ -15,6 +15,9 @@ use plugin_toolkit::plugin::Plugin;
 use docker as _;
 
 fn main() -> plugin_toolkit::anyhow::Result<()> {
+    if plugin_toolkit::privileged::requested() {
+        docker::daemon_config::privileged_ops().serve_stdin();
+    }
     Plugin::named("docker")
         .version(env!("CARGO_PKG_VERSION"))
         .tools(["docker."])
