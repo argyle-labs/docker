@@ -933,11 +933,15 @@ impl DockerUnitProvider {
                     .inspect_container(&exec.id, None)
                     .await
                     .map_err(|e| anyhow::anyhow!("inspect {}: {e}", exec.id))?;
-                let ids = stack_container_ids(docker).await?;
-                if let Some(why) = exec_refusal(&info, &ids) {
+                let target = inspected_id(&info, &exec.id)?;
+                let resolve = |p: &std::path::Path| Ok(std::fs::canonicalize(p)?);
+                let why = match exec_scope(docker, &info).await {
+                    Ok(scope) => exec_refusal(&info, &scope, &resolve),
+                    Err(why) => Some(why),
+                };
+                if let Some(why) = why {
                     return Err(anyhow::anyhow!("exec in {} refused: {why}", exec.id));
                 }
-                let target = inspected_id(&info, &exec.id)?;
                 let result = self
                     .adapter
                     .exec(&target, &exec.cmd, exec.stdin)
@@ -1954,46 +1958,172 @@ fn inspected_id(info: &bollard::models::ContainerInspectResponse, asked: &str) -
 }
 
 const COMPOSE_WORKING_DIR_LABEL: &str = "com.docker.compose.project.working_dir";
+const COMPOSE_CONFIG_HASH_LABEL: &str = "com.docker.compose.config-hash";
 
-/// Ids of the containers compose created for registered stacks, looked up
-/// by each stack's resolved project name and directory.
-async fn stack_container_ids(
+struct ExecScope {
+    stack_ids: std::collections::HashSet<String>,
+    stack_dir: std::path::PathBuf,
+    grants: Vec<String>,
+    volumes: std::collections::HashMap<String, bollard::models::Volume>,
+    peers: std::collections::HashMap<String, bollard::models::ContainerInspectResponse>,
+}
+
+fn stack_members(
+    rows: &[StackRow],
+    containers: Vec<bollard::models::ContainerSummary>,
+) -> std::collections::HashMap<String, StackRow> {
+    let dirs: Vec<(std::path::PathBuf, &StackRow)> = rows
+        .iter()
+        .flat_map(|row| {
+            let raw = std::path::PathBuf::from(&row.dir);
+            let resolved = crate::lifecycle::resolve(&raw).ok();
+            std::iter::once((raw, row)).chain(resolved.map(|r| (r, row)))
+        })
+        .collect();
+    containers
+        .into_iter()
+        .filter_map(|c| {
+            let wd = c.labels.as_ref()?.get(COMPOSE_WORKING_DIR_LABEL)?;
+            let (_, row) = dirs
+                .iter()
+                .find(|(d, _)| d.as_path() == std::path::Path::new(wd))?;
+            Some((c.id?, (*row).clone()))
+        })
+        .collect()
+}
+
+async fn list_stack_members(
     docker: &bollard::Docker,
-) -> Result<std::collections::HashSet<String>> {
+) -> Result<std::collections::HashMap<String, StackRow>> {
     use bollard::query_parameters::ListContainersOptionsBuilder;
-    let mut ids = std::collections::HashSet::new();
-    for row in stacks::list()? {
-        let Ok(project) =
-            async { Ok::<_, anyhow::Error>(row.compose()?.project_name().await?) }.await
-        else {
-            continue;
-        };
-        let mut dirs = vec![row.dir.clone()];
-        if let Ok(resolved) = crate::lifecycle::resolve(std::path::Path::new(&row.dir)) {
-            dirs.push(resolved.to_string_lossy().into_owned());
-        }
-        dirs.dedup();
-        for dir in dirs {
-            let filters = std::collections::HashMap::from([(
-                "label",
-                vec![
-                    format!("{}={project}", crate::prune::COMPOSE_PROJECT_LABEL),
-                    format!("{COMPOSE_WORKING_DIR_LABEL}={dir}"),
-                ],
-            )]);
-            let containers = docker
-                .list_containers(Some(
-                    ListContainersOptionsBuilder::new()
-                        .all(true)
-                        .filters(&filters)
-                        .build(),
-                ))
+    let rows = stacks::list()?;
+    let filters =
+        std::collections::HashMap::from([("label", vec![COMPOSE_WORKING_DIR_LABEL.to_string()])]);
+    let containers = docker
+        .list_containers(Some(
+            ListContainersOptionsBuilder::new()
+                .all(true)
+                .filters(&filters)
+                .build(),
+        ))
+        .await
+        .map_err(|e| anyhow::anyhow!("list containers: {e}"))?;
+    Ok(stack_members(&rows, containers))
+}
+
+fn namespace_peers(hc: &bollard::models::HostConfig) -> Vec<String> {
+    [&hc.pid_mode, &hc.ipc_mode, &hc.network_mode]
+        .into_iter()
+        .filter_map(|m| m.as_deref()?.strip_prefix("container:"))
+        .map(str::to_string)
+        .collect()
+}
+
+fn volume_names(info: &bollard::models::ContainerInspectResponse) -> Vec<String> {
+    use bollard::models::MountType;
+    let hc = info.host_config.clone().unwrap_or_default();
+    let mut names: Vec<String> = info
+        .mounts
+        .iter()
+        .flatten()
+        .filter(|m| m.typ.as_deref() == Some("volume"))
+        .filter_map(|m| m.name.clone())
+        .chain(
+            hc.mounts
+                .iter()
+                .flatten()
+                .filter(|m| m.typ == Some(MountType::VOLUME))
+                .filter_map(|m| m.source.clone()),
+        )
+        .chain(hc.binds.iter().flatten().filter_map(|b| {
+            let source = b.split(':').next().unwrap_or("");
+            (!source.is_empty() && !source.starts_with('/')).then(|| source.to_string())
+        }))
+        .filter(|n| !n.is_empty())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+async fn exec_scope(
+    docker: &bollard::Docker,
+    info: &bollard::models::ContainerInspectResponse,
+) -> std::result::Result<ExecScope, String> {
+    let members = list_stack_members(docker)
+        .await
+        .map_err(|e| format!("cannot list the stacks' containers: {e}"))?;
+    let row = info
+        .id
+        .as_ref()
+        .and_then(|id| members.get(id))
+        .ok_or("the container is not part of a registered stack")?;
+    let labels = info
+        .config
+        .as_ref()
+        .and_then(|c| c.labels.clone())
+        .unwrap_or_default();
+    let service = labels
+        .get(crate::image_update::COMPOSE_SERVICE_LABEL)
+        .ok_or("the container has no compose service label")?;
+    let hash = labels
+        .get(COMPOSE_CONFIG_HASH_LABEL)
+        .ok_or("the container has no compose config-hash label")?;
+    let compose = row
+        .compose()
+        .map_err(|e| format!("stack {}: {e}", row.name))?;
+    let compose = if std::path::Path::new(&row.dir).join(ORCA_FILE).is_file() {
+        compose.with_orca()
+    } else {
+        compose
+    };
+    let expected = compose
+        .config_hash(service)
+        .await
+        .map_err(|e| format!("cannot hash service {service} of stack {}: {e}", row.name))?;
+    if &expected != hash {
+        return Err(format!(
+            "its config-hash does not match service {service} of stack {}",
+            row.name
+        ));
+    }
+    let stack_dir = std::fs::canonicalize(&row.dir)
+        .map_err(|e| format!("cannot resolve stack dir {}: {e}", row.dir))?;
+    let grants = row
+        .allow
+        .iter()
+        .filter(|g| &g.service == service)
+        .map(|g| g.allow.clone())
+        .collect();
+    let mut peers = std::collections::HashMap::new();
+    let hc = info.host_config.clone().unwrap_or_default();
+    for peer in namespace_peers(&hc) {
+        let peer_info = docker
+            .inspect_container(&peer, None)
+            .await
+            .map_err(|e| format!("cannot inspect namespace peer {peer}: {e}"))?;
+        peers.insert(peer, peer_info);
+    }
+    let mut volumes = std::collections::HashMap::new();
+    for container in std::iter::once(info).chain(peers.values()) {
+        for name in volume_names(container) {
+            if volumes.contains_key(&name) {
+                continue;
+            }
+            let v = docker
+                .inspect_volume(&name)
                 .await
-                .map_err(|e| anyhow::anyhow!("list containers: {e}"))?;
-            ids.extend(containers.into_iter().filter_map(|c| c.id));
+                .map_err(|e| format!("cannot inspect volume {name}: {e}"))?;
+            volumes.insert(name, v);
         }
     }
-    Ok(ids)
+    Ok(ExecScope {
+        stack_ids: members.into_keys().collect(),
+        stack_dir,
+        grants,
+        volumes,
+        peers,
+    })
 }
 
 const DENIED_BIND_TREES: &[&str] = &["/proc", "/sys", "/run", "/var/run", "/dev"];
@@ -2007,42 +2137,95 @@ const KNOWN_SOCKETS: &[&str] = &[
     "/var/run/containerd/containerd.sock",
 ];
 
-const DENIED_CAPS: &[&str] = &[
-    "SYS_ADMIN",
-    "ALL",
-    "SYS_MODULE",
-    "SYS_PTRACE",
-    "SYS_RAWIO",
-    "DAC_READ_SEARCH",
-    "BPF",
-    "PERFMON",
-    "NET_ADMIN",
+const EXEC_CAPS: &[&str] = &[
+    "NET_BIND_SERVICE",
+    "CHOWN",
+    "SETUID",
+    "SETGID",
+    "KILL",
+    "DAC_OVERRIDE",
+    "FOWNER",
+    "NET_RAW",
 ];
 
-fn bind_refusal(source: &str) -> Option<String> {
-    let trimmed = source.trim_end_matches('/');
-    let path = if trimmed.is_empty() { "/" } else { trimmed };
-    if path == "/" {
+const EXEC_RUNTIMES: &[&str] = &["", "runc", "nvidia"];
+
+fn host_tree_refusal(path: &std::path::Path) -> Option<String> {
+    let shown = path.display();
+    if path == std::path::Path::new("/") {
         return Some("the container mounts the host root".into());
     }
-    if path.ends_with(".sock") {
-        return Some(format!("the container mounts the socket {path}"));
+    if path.extension().is_some_and(|e| e == "sock") {
+        return Some(format!("the container mounts the socket {shown}"));
     }
-    if let Some(tree) = DENIED_BIND_TREES
-        .iter()
-        .find(|t| path == **t || path.starts_with(&format!("{t}/")))
-    {
-        return Some(format!("the container mounts {path} (under {tree})"));
+    if let Some(tree) = DENIED_BIND_TREES.iter().find(|t| path.starts_with(t)) {
+        return Some(format!("the container mounts {shown} (under {tree})"));
     }
     if KNOWN_SOCKETS
         .iter()
-        .any(|s| s.starts_with(&format!("{path}/")))
+        .any(|s| std::path::Path::new(s).starts_with(path))
     {
         return Some(format!(
-            "the container mounts {path}, which holds a runtime socket"
+            "the container mounts {shown}, which holds a runtime socket"
         ));
     }
     None
+}
+
+fn bind_refusal(
+    source: &str,
+    allowed: &[std::path::PathBuf],
+    resolve: policy::Resolver<'_>,
+) -> Option<String> {
+    use std::path::{Component, Path, PathBuf};
+    let raw = Path::new(source);
+    if !raw.is_absolute() {
+        return Some(format!(
+            "the container mounts {source}, not an absolute path"
+        ));
+    }
+    if raw.components().any(|c| c == Component::ParentDir) {
+        return Some(format!("the container mounts {source}, which has '..'"));
+    }
+    let clean: PathBuf = raw.components().collect();
+    if let Some(why) = host_tree_refusal(&clean) {
+        return Some(why);
+    }
+    let canonical = match resolve(&clean) {
+        Ok(p) => p,
+        Err(e) => {
+            return Some(format!(
+                "the container mounts {source}, which cannot be resolved: {e}"
+            ));
+        }
+    };
+    if let Some(why) = host_tree_refusal(&canonical) {
+        return Some(why);
+    }
+    if !allowed.iter().any(|root| canonical.starts_with(root)) {
+        return Some(format!(
+            "the container mounts {source} ({}), outside the stack dir",
+            canonical.display()
+        ));
+    }
+    None
+}
+
+fn security_opt_allowed(opt: &str) -> bool {
+    let opt = opt.trim();
+    if matches!(
+        opt,
+        "no-new-privileges" | "no-new-privileges:true" | "no-new-privileges=true"
+    ) {
+        return true;
+    }
+    opt.strip_prefix("label=")
+        .or_else(|| opt.strip_prefix("label:"))
+        .is_some_and(|l| {
+            ["type:", "level:", "user:", "role:"]
+                .iter()
+                .any(|p| l.strip_prefix(p).is_some_and(|v| !v.is_empty()))
+        })
 }
 
 /// Why `exec` into the inspected container is refused, if it is. Even for an
@@ -2050,15 +2233,34 @@ fn bind_refusal(source: &str) -> Option<String> {
 /// refused in any that can reach the host.
 fn exec_refusal(
     info: &bollard::models::ContainerInspectResponse,
-    stack_ids: &std::collections::HashSet<String>,
+    scope: &ExecScope,
+    resolve: policy::Resolver<'_>,
 ) -> Option<String> {
-    use bollard::models::HostConfigCgroupnsModeEnum;
-    if !info.id.as_ref().is_some_and(|id| stack_ids.contains(id)) {
+    refusal(info, scope, resolve, false)
+}
+
+fn refusal(
+    info: &bollard::models::ContainerInspectResponse,
+    scope: &ExecScope,
+    resolve: policy::Resolver<'_>,
+    peer: bool,
+) -> Option<String> {
+    use bollard::models::{HostConfigCgroupnsModeEnum, MountType};
+    if !info
+        .id
+        .as_ref()
+        .is_some_and(|id| scope.stack_ids.contains(id))
+    {
         return Some("the container is not part of a registered stack".into());
     }
+    let granted = |g: &str| !peer && scope.grants.iter().any(|a| a == g);
     let hc = info.host_config.clone().unwrap_or_default();
     if hc.privileged == Some(true) {
         return Some("the container is privileged".into());
+    }
+    let runtime = hc.runtime.as_deref().unwrap_or("").trim();
+    if !EXEC_RUNTIMES.contains(&runtime) {
+        return Some(format!("the container uses the runtime {runtime}"));
     }
     for (key, mode) in [
         ("pid", &hc.pid_mode),
@@ -2067,49 +2269,114 @@ fn exec_refusal(
         ("userns", &hc.userns_mode),
         ("uts", &hc.uts_mode),
     ] {
-        if mode.as_deref() == Some("host") {
+        let mode = mode.as_deref().unwrap_or("");
+        if mode == "host" {
             return Some(format!("the container uses the host {key} namespace"));
+        }
+        let Some(target) = mode.strip_prefix("container:") else {
+            continue;
+        };
+        if peer {
+            return Some(format!(
+                "its {key} namespace peer itself joins container {target}"
+            ));
+        }
+        let Some(other) = scope.peers.get(target) else {
+            return Some(format!(
+                "the container joins the {key} namespace of {target}, which was not inspected"
+            ));
+        };
+        if let Some(why) = refusal(other, scope, resolve, true) {
+            return Some(format!(
+                "the container joins the {key} namespace of {target}: {why}"
+            ));
         }
     }
     if hc.cgroupns_mode == Some(HostConfigCgroupnsModeEnum::HOST) {
         return Some("the container uses the host cgroup namespace".into());
     }
     if let Some(cap) = hc.cap_add.iter().flatten().find_map(|c| {
-        let c = c.to_ascii_uppercase();
+        let c = c.trim().to_ascii_uppercase();
         let bare = c.strip_prefix("CAP_").unwrap_or(&c).to_string();
-        DENIED_CAPS.contains(&bare.as_str()).then_some(bare)
+        (!EXEC_CAPS.contains(&bare.as_str())).then_some(bare)
     }) {
         return Some(format!("the container has CAP_{cap}"));
     }
-    if hc.devices.as_ref().is_some_and(|d| !d.is_empty()) {
-        return Some("the container maps host devices".into());
+    if !granted(policy::ALLOW_DEVICES) {
+        if hc.devices.as_ref().is_some_and(|d| !d.is_empty()) {
+            return Some("the container maps host devices".into());
+        }
+        if hc
+            .device_cgroup_rules
+            .as_ref()
+            .is_some_and(|d| !d.is_empty())
+        {
+            return Some("the container has device cgroup rules".into());
+        }
+        if hc.device_requests.as_ref().is_some_and(|d| !d.is_empty()) {
+            return Some("the container requests host devices (GPU)".into());
+        }
     }
-    if let Some(opt) = hc.security_opt.iter().flatten().find(|o| {
-        let o = o.to_ascii_lowercase().replace(':', "=");
-        o == "apparmor=unconfined" || o == "seccomp=unconfined"
-    }) {
-        return Some(format!("the container runs with {opt}"));
+    if let Some(opt) = hc
+        .security_opt
+        .iter()
+        .flatten()
+        .find(|o| !security_opt_allowed(o))
+    {
+        return Some(format!("the container runs with security_opt {opt}"));
     }
     if hc.cgroup_parent.as_ref().is_some_and(|p| !p.is_empty()) {
         return Some("the container sets a custom cgroup parent".into());
+    }
+    let mut allowed = vec![scope.stack_dir.clone()];
+    if !peer {
+        allowed.extend(
+            scope
+                .grants
+                .iter()
+                .filter_map(|g| g.strip_prefix(policy::ALLOW_BIND))
+                .filter_map(|p| resolve(std::path::Path::new(p)).ok()),
+        );
     }
     let sources = info
         .mounts
         .iter()
         .flatten()
+        .filter(|m| m.typ.as_deref() == Some("bind"))
         .filter_map(|m| m.source.clone())
+        .chain(hc.binds.iter().flatten().filter_map(|b| {
+            let source = b.split(':').next().unwrap_or("");
+            source.starts_with('/').then(|| source.to_string())
+        }))
         .chain(
-            hc.binds
+            hc.mounts
                 .iter()
                 .flatten()
-                .map(|b| b.split(':').next().unwrap_or("").to_string()),
-        )
-        .chain(hc.mounts.iter().flatten().filter_map(|m| m.source.clone()));
+                .filter(|m| m.typ == Some(MountType::BIND))
+                .filter_map(|m| m.source.clone()),
+        );
     for source in sources {
-        if source.starts_with('/')
-            && let Some(why) = bind_refusal(&source)
-        {
+        if let Some(why) = bind_refusal(&source, &allowed, resolve) {
             return Some(why);
+        }
+    }
+    for name in volume_names(info) {
+        let Some(v) = scope.volumes.get(&name) else {
+            return Some(format!("volume {name} was not inspected"));
+        };
+        if v.driver != "local" {
+            return Some(format!("volume {name} uses the driver {}", v.driver));
+        }
+        if v.options
+            .get("o")
+            .is_some_and(|o| o.split(',').any(|o| matches!(o.trim(), "bind" | "rbind")))
+        {
+            return Some(format!("volume {name} binds a host path"));
+        }
+        if let Some(device) = v.options.get("device").filter(|d| d.starts_with('/'))
+            && let Some(why) = bind_refusal(device, &allowed, resolve)
+        {
+            return Some(format!("volume {name}: {why}"));
         }
     }
     None
@@ -2540,8 +2807,22 @@ mod tests {
         .unwrap()
     }
 
-    fn stack_ids() -> std::collections::HashSet<String> {
-        ["c1".to_string()].into()
+    fn scope(dir: &std::path::Path) -> ExecScope {
+        ExecScope {
+            stack_ids: ["c1".to_string(), "c3".to_string()].into(),
+            stack_dir: std::fs::canonicalize(dir).unwrap(),
+            grants: Vec::new(),
+            volumes: Default::default(),
+            peers: Default::default(),
+        }
+    }
+
+    fn canon(p: &std::path::Path) -> Result<std::path::PathBuf> {
+        Ok(std::fs::canonicalize(p)?)
+    }
+
+    fn refused(info: &bollard::models::ContainerInspectResponse, s: &ExecScope) -> String {
+        exec_refusal(info, s, &canon).unwrap_or_else(|| panic!("{info:?} was allowed"))
     }
 
     #[test]
@@ -2557,24 +2838,53 @@ mod tests {
 
     #[test]
     fn exec_membership_is_by_container_id_not_label() {
-        let ids = stack_ids();
+        let dir = tempfile::tempdir().unwrap();
+        let s = scope(dir.path());
         assert_eq!(
-            exec_refusal(&inspected("/anything", serde_json::json!({})), &ids),
+            exec_refusal(&inspected("/anything", serde_json::json!({})), &s, &canon),
             None
         );
         let mut forged = inspected("/opt/stacks/web", serde_json::json!({}));
         forged.id = Some("c2".into());
-        let why = exec_refusal(&forged, &ids).unwrap();
-        assert!(why.contains("not part of a registered stack"), "{why}");
+        assert!(refused(&forged, &s).contains("not part of a registered stack"));
         let mut no_id = inspected("/opt/stacks/web", serde_json::json!({}));
         no_id.id = None;
-        assert!(exec_refusal(&no_id, &ids).is_some());
+        assert!(exec_refusal(&no_id, &s, &canon).is_some());
+    }
+
+    #[test]
+    fn stack_members_match_working_dir_labels_in_memory() {
+        let row = |name: &str, dir: &str| StackRow {
+            name: name.into(),
+            dir: dir.into(),
+            file: "compose.yaml".into(),
+            enabled: true,
+            allow: Vec::new(),
+        };
+        let summary = |id: &str, wd: Option<&str>| bollard::models::ContainerSummary {
+            id: Some(id.into()),
+            labels: wd.map(|wd| [(COMPOSE_WORKING_DIR_LABEL.to_string(), wd.to_string())].into()),
+            ..Default::default()
+        };
+        let members = stack_members(
+            &[row("web", "/opt/stacks/web"), row("db", "/opt/stacks/db")],
+            vec![
+                summary("a", Some("/opt/stacks/web")),
+                summary("b", Some("/opt/stacks/db")),
+                summary("c", Some("/opt/stacks/other")),
+                summary("d", None),
+            ],
+        );
+        assert_eq!(members.len(), 2);
+        assert_eq!(members["a"].name, "web");
+        assert_eq!(members["b"].name, "db");
     }
 
     #[test]
     fn exec_is_refused_in_containers_that_reach_the_host() {
-        let ids = stack_ids();
-        let mut cases = vec![
+        let dir = tempfile::tempdir().unwrap();
+        let s = scope(dir.path());
+        let cases = vec![
             (serde_json::json!({"Privileged": true}), "privileged"),
             (serde_json::json!({"PidMode": "host"}), "host pid"),
             (serde_json::json!({"IpcMode": "host"}), "host ipc"),
@@ -2587,59 +2897,262 @@ mod tests {
                 "devices",
             ),
             (
-                serde_json::json!({"SecurityOpt": ["apparmor=unconfined"]}),
-                "apparmor=unconfined",
-            ),
-            (
-                serde_json::json!({"SecurityOpt": ["seccomp:unconfined"]}),
-                "seccomp:unconfined",
-            ),
-            (
                 serde_json::json!({"CgroupParent": "/host"}),
                 "cgroup parent",
             ),
+            (serde_json::json!({"Runtime": "kata"}), "runtime kata"),
         ];
-        for cap in DENIED_CAPS {
-            cases.push((serde_json::json!({"CapAdd": [format!("CAP_{cap}")]}), cap));
-            cases.push((
-                serde_json::json!({"CapAdd": [cap.to_ascii_lowercase()]}),
-                cap,
-            ));
-        }
-        for bind in [
-            "/:/host",
-            "/proc:/hostproc",
-            "/sys/fs/cgroup:/cg",
-            "/run:/run",
-            "/var/run:/var/run",
-            "/dev:/dev",
-            "/var/run/docker.sock:/var/run/docker.sock",
-            "/srv/podman.sock:/p.sock",
-            "/run/containerd/containerd.sock:/c.sock",
-            "/var:/hostvar",
-        ] {
-            cases.push((serde_json::json!({"Binds": [bind]}), "mounts"));
-        }
         for (hc, want) in cases {
-            let why = exec_refusal(&inspected("/opt/stacks/web", hc.clone()), &ids)
-                .unwrap_or_else(|| panic!("{hc} was allowed"));
+            let why = refused(&inspected("/opt/stacks/web", hc.clone()), &s);
             assert!(why.contains(want), "{hc}: {why}");
         }
-        let mut sock = inspected("/opt/stacks/web", serde_json::json!({}));
-        sock.mounts = Some(vec![bollard::models::MountPoint {
+        for runtime in ["runc", "nvidia", ""] {
+            let ok = inspected("/opt/stacks/web", serde_json::json!({"Runtime": runtime}));
+            assert_eq!(exec_refusal(&ok, &s, &canon), None, "{runtime}");
+        }
+    }
+
+    #[test]
+    fn exec_binds_are_an_allowlist_of_the_stack_dir_and_granted_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("data")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
+        let mut s = scope(dir.path());
+        let d = dir.path().display();
+        let o = outside.path().display();
+        let bind =
+            |src: String| inspected("/x", serde_json::json!({"Binds": [format!("{src}:/m")]}));
+        assert_eq!(exec_refusal(&bind(format!("{d}/data")), &s, &canon), None);
+        assert_eq!(
+            exec_refusal(&bind(format!("{d}//./data")), &s, &canon),
+            None
+        );
+        for (src, want) in [
+            (format!("{o}"), "outside the stack dir"),
+            (format!("{d}/escape"), "outside the stack dir"),
+            (format!("{d}/missing"), "cannot be resolved"),
+            (format!("{d}/data/../.."), "'..'"),
+            ("/".into(), "host root"),
+            ("/proc".into(), "under /proc"),
+            ("/sys/fs/cgroup".into(), "under /sys"),
+            ("/var/run".into(), "under /var/run"),
+            ("/dev".into(), "under /dev"),
+            ("/srv/podman.sock".into(), "socket"),
+            ("/var/run/docker.sock".into(), "socket"),
+            ("/run/containerd".into(), "under /run"),
+            ("/var".into(), "runtime socket"),
+            ("/etc".into(), "outside the stack dir"),
+        ] {
+            let why = refused(&bind(src.clone()), &s);
+            assert!(why.contains(want), "{src}: {why}");
+        }
+        let mut mount = inspected("/x", serde_json::json!({}));
+        mount.mounts = Some(vec![bollard::models::MountPoint {
+            typ: Some("bind".into()),
             source: Some("/run/docker.sock".into()),
             ..Default::default()
         }]);
-        assert!(exec_refusal(&sock, &ids).unwrap().contains("socket"));
-        let ok = inspected(
-            "/opt/stacks/web",
-            serde_json::json!({
-                "Binds": ["/opt/stacks/web/data:/data", "/var/lib/app:/app"],
-                "CapAdd": ["NET_BIND_SERVICE"],
-                "SecurityOpt": ["no-new-privileges"]
-            }),
+        assert!(refused(&mount, &s).contains("socket"));
+        s.grants = vec![format!("{}{o}", policy::ALLOW_BIND)];
+        assert_eq!(exec_refusal(&bind(format!("{o}")), &s, &canon), None);
+        assert_eq!(exec_refusal(&bind(format!("{d}/escape")), &s, &canon), None);
+        s.grants = vec![format!("{}/run", policy::ALLOW_BIND)];
+        assert!(refused(&bind("/run".into()), &s).contains("under /run"));
+    }
+
+    fn volume(driver: &str, opts: &[(&str, &str)]) -> bollard::models::Volume {
+        bollard::models::Volume {
+            name: "v".into(),
+            driver: driver.into(),
+            options: opts
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn exec_volumes_are_inspected_for_host_paths_and_drivers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = scope(dir.path());
+        let mut info = inspected("/x", serde_json::json!({}));
+        info.mounts = Some(vec![bollard::models::MountPoint {
+            typ: Some("volume".into()),
+            name: Some("v".into()),
+            source: Some("/var/lib/docker/volumes/v/_data".into()),
+            ..Default::default()
+        }]);
+        assert!(refused(&info, &s).contains("not inspected"));
+        let d = dir.path().display().to_string();
+        for (v, want) in [
+            (volume("rexray", &[]), "driver rexray"),
+            (
+                volume("local", &[("o", "bind"), ("device", "/etc")]),
+                "binds a host path",
+            ),
+            (
+                volume("local", &[("o", "ro,rbind"), ("device", &d)]),
+                "binds a host path",
+            ),
+            (
+                volume("local", &[("type", "ext4"), ("device", "/dev/sdb")]),
+                "under /dev",
+            ),
+        ] {
+            s.volumes = [("v".to_string(), v)].into();
+            let why = refused(&info, &s);
+            assert!(why.contains(want), "{why}");
+        }
+        for v in [
+            volume("local", &[]),
+            volume(
+                "local",
+                &[("type", "nfs"), ("device", ":/export"), ("o", "addr=nas")],
+            ),
+            volume("local", &[("type", "tmpfs"), ("device", "tmpfs")]),
+        ] {
+            s.volumes = [("v".to_string(), v)].into();
+            assert_eq!(exec_refusal(&info, &s, &canon), None);
+        }
+        let named = inspected("/x", serde_json::json!({"Binds": ["data:/data"]}));
+        s.volumes = Default::default();
+        assert!(refused(&named, &s).contains("volume data was not inspected"));
+    }
+
+    #[test]
+    fn exec_device_rules_and_requests_need_a_devices_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = scope(dir.path());
+        let rules = inspected("/x", serde_json::json!({"DeviceCgroupRules": ["c 1:3 mr"]}));
+        let gpus = inspected(
+            "/x",
+            serde_json::json!({"DeviceRequests": [{"Driver": "nvidia", "Count": -1, "Capabilities": [["gpu"]]}]}),
         );
-        assert_eq!(exec_refusal(&ok, &ids), None);
+        assert!(refused(&rules, &s).contains("device cgroup rules"));
+        assert!(refused(&gpus, &s).contains("GPU"));
+        assert_eq!(
+            exec_refusal(
+                &inspected("/x", serde_json::json!({"DeviceCgroupRules": []})),
+                &s,
+                &canon
+            ),
+            None
+        );
+        s.grants = vec![policy::ALLOW_DEVICES.into()];
+        assert_eq!(exec_refusal(&rules, &s, &canon), None);
+        assert_eq!(exec_refusal(&gpus, &s, &canon), None);
+    }
+
+    #[test]
+    fn exec_security_opts_are_an_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = scope(dir.path());
+        for opt in [
+            "no-new-privileges",
+            "no-new-privileges:true",
+            "no-new-privileges=true",
+            "label=type:svirt_apache_t",
+            "label:level:s0:c100,c200",
+            "label=user:USER",
+            "label=role:ROLE",
+        ] {
+            let ok = inspected("/x", serde_json::json!({"SecurityOpt": [opt]}));
+            assert_eq!(exec_refusal(&ok, &s, &canon), None, "{opt}");
+        }
+        for opt in [
+            "systempaths=unconfined",
+            "label=disable",
+            "label:disable",
+            "seccomp=unconfined",
+            "seccomp=/tmp/profile.json",
+            "apparmor=unconfined",
+            "apparmor=custom",
+            "no-new-privileges:false",
+            "label=type:",
+        ] {
+            let why = refused(
+                &inspected("/x", serde_json::json!({"SecurityOpt": [opt]})),
+                &s,
+            );
+            assert!(why.contains(opt), "{opt}: {why}");
+        }
+    }
+
+    #[test]
+    fn exec_added_caps_are_an_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = scope(dir.path());
+        for cap in EXEC_CAPS {
+            for name in [
+                cap.to_string(),
+                format!("CAP_{cap}"),
+                format!(" {} ", cap.to_ascii_lowercase()),
+            ] {
+                let ok = inspected("/x", serde_json::json!({"CapAdd": [name]}));
+                assert_eq!(exec_refusal(&ok, &s, &canon), None, "{name}");
+            }
+        }
+        for cap in [
+            "SYS_ADMIN",
+            "ALL",
+            "NET_ADMIN",
+            "SYS_PTRACE",
+            "MKNOD",
+            "SYS_TIME",
+            "BPF",
+        ] {
+            let why = refused(
+                &inspected(
+                    "/x",
+                    serde_json::json!({"CapAdd": [format!(" cap_{cap} ")]}),
+                ),
+                &s,
+            );
+            assert!(why.contains(&format!("CAP_{cap}")), "{why}");
+        }
+    }
+
+    #[test]
+    fn exec_container_namespaces_need_a_vetted_stack_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = scope(dir.path());
+        let joins = |target: &str| {
+            inspected(
+                "/x",
+                serde_json::json!({"NetworkMode": format!("container:{target}")}),
+            )
+        };
+        assert!(refused(&joins("c3"), &s).contains("not inspected"));
+        let peer = |id: &str, hc: serde_json::Value| {
+            let mut p = inspected("/x", hc);
+            p.id = Some(id.into());
+            p
+        };
+        s.peers = [("c3".to_string(), peer("c3", serde_json::json!({})))].into();
+        assert_eq!(exec_refusal(&joins("c3"), &s, &canon), None);
+        s.peers = [("c9".to_string(), peer("c9", serde_json::json!({})))].into();
+        assert!(refused(&joins("c9"), &s).contains("not part of a registered stack"));
+        s.peers = [(
+            "c3".to_string(),
+            peer("c3", serde_json::json!({"Privileged": true})),
+        )]
+        .into();
+        assert!(refused(&joins("c3"), &s).contains("privileged"));
+        s.peers = [(
+            "c3".to_string(),
+            peer("c3", serde_json::json!({"PidMode": "container:c1"})),
+        )]
+        .into();
+        assert!(refused(&joins("c3"), &s).contains("peer itself joins"));
+        s.grants = vec![policy::ALLOW_DEVICES.into()];
+        s.peers = [(
+            "c3".to_string(),
+            peer("c3", serde_json::json!({"DeviceCgroupRules": ["c 1:3 mr"]})),
+        )]
+        .into();
+        assert!(refused(&joins("c3"), &s).contains("device cgroup rules"));
     }
 
     #[test]

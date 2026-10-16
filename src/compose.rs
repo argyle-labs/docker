@@ -251,6 +251,17 @@ impl Compose {
         })
     }
 
+    pub async fn config_hash(&self, service: &str) -> Result<String, ComposeError> {
+        let flag = format!("--hash={service}");
+        let out = self.docker(&["config", &flag]).await?;
+        parse_config_hash(&out, service).ok_or_else(|| {
+            ComposeError::Docker(anyhow::anyhow!(
+                "compose config of {} has no hash for service {service}",
+                self.file.display()
+            ))
+        })
+    }
+
     pub async fn ps(&self) -> Result<HashMap<String, ServiceStatus>, ComposeError> {
         let raw = self.docker(&["ps", "--format", "json"]).await?;
         Ok(parse_compose_ps(&raw))
@@ -353,6 +364,13 @@ fn pull_args<'a>(services: &[&'a str]) -> Vec<&'a str> {
     args
 }
 
+fn parse_config_hash(raw: &str, service: &str) -> Option<String> {
+    raw.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        (parts.next()? == service).then(|| parts.next().map(str::to_string))?
+    })
+}
+
 /// The top-level `name` of `docker compose config --format json` output.
 pub fn parse_project_name(raw: &str) -> Option<String> {
     let v: Value = serde_json::from_str(raw).ok()?;
@@ -429,6 +447,14 @@ pub fn parse_compose_ps(raw: &str) -> HashMap<String, ServiceStatus> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn config_hash_is_read_for_the_named_service_only() {
+        let raw = "db 1111\nweb abcd\n";
+        assert_eq!(parse_config_hash(raw, "web").as_deref(), Some("abcd"));
+        assert_eq!(parse_config_hash(raw, "we"), None);
+        assert_eq!(parse_config_hash("web\n", "web"), None);
+    }
 
     #[test]
     fn find_picks_first_match() {
