@@ -2152,22 +2152,37 @@ async fn exec_scope(
         .map_err(|e| format!("cannot read the compose config of stack {}: {e}", row.name))?;
     let resolve = |p: &std::path::Path| Ok(std::fs::canonicalize(p)?);
     let mut declared = std::collections::HashMap::new();
-    for container in std::iter::once(info).chain(peers.values()) {
-        let Some(id) = container.id.clone() else {
+    if let Some(id) = info.id.clone() {
+        declared.insert(id, declared_binds(&cfg, service, &resolve));
+    }
+    let same_stack: Vec<(&String, &bollard::models::ContainerInspectResponse)> = peers
+        .iter()
+        .filter(|(_, p)| {
+            p.id.as_ref()
+                .and_then(|id| members.get(id))
+                .is_some_and(|m| m.name == row.name)
+        })
+        .collect();
+    let mut hashes = std::collections::HashMap::new();
+    for (_, p) in &same_stack {
+        let Some(svc) = compose_label(p, crate::image_update::COMPOSE_SERVICE_LABEL) else {
             continue;
         };
-        if members.get(&id).is_none_or(|m| m.name != row.name) {
+        if hashes.contains_key(svc) {
             continue;
         }
-        let Some(svc) = container
-            .config
-            .as_ref()
-            .and_then(|c| c.labels.as_ref())
-            .and_then(|l| l.get(crate::image_update::COMPOSE_SERVICE_LABEL))
-        else {
-            continue;
-        };
-        declared.insert(id, declared_binds(&cfg, svc, &resolve));
+        let h = compose
+            .config_hash(svc)
+            .await
+            .map_err(|e| format!("cannot hash service {svc} of stack {}: {e}", row.name))?;
+        hashes.insert(svc.to_string(), h);
+    }
+    for (name, p) in same_stack {
+        let svc = vet_peer(p, &hashes)
+            .map_err(|why| format!("namespace peer {name} of stack {}: {why}", row.name))?;
+        if let Some(id) = p.id.clone() {
+            declared.insert(id, declared_binds(&cfg, &svc, &resolve));
+        }
     }
     Ok(ExecScope {
         stack_ids: members.into_keys().collect(),
@@ -2177,6 +2192,33 @@ async fn exec_scope(
         volumes,
         peers,
     })
+}
+
+fn compose_label<'a>(
+    container: &'a bollard::models::ContainerInspectResponse,
+    key: &str,
+) -> Option<&'a str> {
+    container
+        .config
+        .as_ref()?
+        .labels
+        .as_ref()?
+        .get(key)
+        .map(String::as_str)
+}
+
+fn vet_peer(
+    container: &bollard::models::ContainerInspectResponse,
+    hashes: &std::collections::HashMap<String, String>,
+) -> std::result::Result<String, String> {
+    let service = compose_label(container, crate::image_update::COMPOSE_SERVICE_LABEL)
+        .ok_or("it has no compose service label")?;
+    let hash = compose_label(container, COMPOSE_CONFIG_HASH_LABEL)
+        .ok_or("it has no compose config-hash label")?;
+    if hashes.get(service).map(String::as_str) != Some(hash) {
+        return Err(format!("its config-hash does not match service {service}"));
+    }
+    Ok(service.to_string())
 }
 
 const DENIED_BIND_TREES: &[&str] = &["/proc", "/sys", "/run", "/var/run", "/dev"];
@@ -2262,7 +2304,13 @@ fn bind_refusal(
     }
     let same: Vec<&DeclaredBind> = declared
         .iter()
-        .filter(|d| Some(d.target.as_str()) == mount.map(|m| m.0) && d.source == canonical)
+        .filter(|d| {
+            mount.is_some_and(|m| {
+                Path::new(&d.target)
+                    .components()
+                    .eq(Path::new(m.0).components())
+            }) && d.source == canonical
+        })
         .collect();
     let rw = mount.is_some_and(|m| m.1);
     if same.iter().any(|d| !(rw && d.read_only)) {
@@ -3089,6 +3137,14 @@ mod tests {
             None
         );
         assert!(refused(&bind(format!("{shown}:/media")), &s).contains("read-write where"));
+        assert_eq!(
+            exec_refusal(&bind(format!("{shown}:/media/:ro")), &s, &canon),
+            None
+        );
+        assert_eq!(
+            exec_refusal(&bind(format!("{shown}://./media:ro")), &s, &canon),
+            None
+        );
         assert!(refused(&bind(format!("{shown}:/elsewhere:ro")), &s).contains("not declared"));
         assert!(refused(&bind(format!("{other}:/media:ro")), &s).contains("not declared"));
         let mut mounted = inspected("/x", serde_json::json!({}));
@@ -3300,6 +3356,40 @@ mod tests {
             );
             assert!(why.contains(&format!("CAP_{cap}")), "{why}");
         }
+    }
+
+    #[test]
+    fn namespace_peer_service_is_trusted_only_when_its_config_hash_matches() {
+        let peer = |labels: serde_json::Value| -> bollard::models::ContainerInspectResponse {
+            serde_json::from_value(serde_json::json!({"Id": "c3", "Config": {"Labels": labels}}))
+                .unwrap()
+        };
+        let hashes = [("db".to_string(), "h1".to_string())].into();
+        let ok = peer(serde_json::json!({
+            crate::image_update::COMPOSE_SERVICE_LABEL: "db",
+            COMPOSE_CONFIG_HASH_LABEL: "h1",
+        }));
+        assert_eq!(vet_peer(&ok, &hashes).as_deref(), Ok("db"));
+        let stale = peer(serde_json::json!({
+            crate::image_update::COMPOSE_SERVICE_LABEL: "db",
+            COMPOSE_CONFIG_HASH_LABEL: "h2",
+        }));
+        assert!(
+            vet_peer(&stale, &hashes)
+                .unwrap_err()
+                .contains("does not match")
+        );
+        let unknown = peer(serde_json::json!({
+            crate::image_update::COMPOSE_SERVICE_LABEL: "web",
+            COMPOSE_CONFIG_HASH_LABEL: "h1",
+        }));
+        assert!(vet_peer(&unknown, &hashes).is_err());
+        let unhashed = peer(serde_json::json!({crate::image_update::COMPOSE_SERVICE_LABEL: "db"}));
+        assert!(
+            vet_peer(&unhashed, &hashes)
+                .unwrap_err()
+                .contains("config-hash label")
+        );
     }
 
     #[test]

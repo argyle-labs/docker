@@ -19,6 +19,8 @@ pub const DEFAULT_MANAGED_ROOTS: &[&str] = &[
     "/mnt/data",
     "/mnt/backups",
     "/mnt/downloads",
+    "/mnt/user",
+    "/mnt/cache",
     "/opt/appdata",
 ];
 
@@ -103,6 +105,10 @@ pub struct Finding {
 pub(crate) fn under(path: &str, root: &str) -> bool {
     let p = Path::new(path);
     !p.components().any(|c| c == Component::ParentDir) && p.starts_with(root)
+}
+
+fn canonical(path: &str) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| Path::new(path).components().collect())
 }
 
 /// Whether `candidate` is, contains or sits inside one of `bound`.
@@ -198,15 +204,14 @@ pub fn audit(
                         format!("bind source {src} for {} does not exist", m.target),
                         proposed,
                     )
-                } else if let Some(root) = roots.iter().find(|r| {
-                    Path::new(src)
-                        .components()
-                        .eq(Path::new(r.as_str()).components())
-                }) {
+                } else if let Some(root) = roots
+                    .iter()
+                    .find(|r| canonical(r).starts_with(canonical(src)))
+                {
                     (
                         FindingKind::BindWholeRoot,
                         format!(
-                            "bind source {src} for {} is the whole managed root {root}; bind only the subdirectory the service needs",
+                            "bind source {src} for {} is or contains the whole managed root {root}; bind only the subdirectory the service needs",
                             m.target
                         ),
                         None,
@@ -699,6 +704,51 @@ mod tests {
             "{}",
             f[0].detail
         );
+    }
+
+    #[test]
+    fn binding_a_parent_of_a_managed_root_is_flagged() {
+        let cfg = ComposeConfig::parse(
+            r#"{"name":"media","services":{"app":{"restart":"unless-stopped","volumes":[
+                {"type":"bind","source":"/mnt","target":"/mnt"},
+                {"type":"bind","source":"/mnt/user/media","target":"/media"}
+            ]}}}"#,
+        )
+        .unwrap();
+        let f = audit(
+            &cfg,
+            "/srv/stacks/media",
+            &roots(),
+            &fs(&["/mnt", "/mnt/user/media"]),
+            &|_| false,
+        );
+        assert_eq!(ids(&f), vec!["bind:app:/mnt"]);
+        assert_eq!(f[0].kind, FindingKind::BindWholeRoot);
+    }
+
+    #[test]
+    fn whole_root_check_resolves_symlinks_on_both_sides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let link = link.display().to_string();
+        let cfg = ComposeConfig::parse(&format!(
+            r#"{{"name":"media","services":{{"app":{{"restart":"unless-stopped","volumes":[
+                {{"type":"bind","source":"{link}","target":"/data"}}
+            ]}}}}}}"#
+        ))
+        .unwrap();
+        let f = audit(
+            &cfg,
+            "/srv/stacks/media",
+            &[real.display().to_string()],
+            &|_| true,
+            &|_| false,
+        );
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].kind, FindingKind::BindWholeRoot);
     }
 
     #[test]
