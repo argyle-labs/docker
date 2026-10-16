@@ -937,9 +937,10 @@ impl DockerUnitProvider {
                 if let Some(why) = exec_refusal(&info, &dirs) {
                     return Err(anyhow::anyhow!("exec in {} refused: {why}", exec.id));
                 }
+                let target = inspected_id(&info, &exec.id)?;
                 let result = self
                     .adapter
-                    .exec(&exec.id, &exec.cmd, exec.stdin)
+                    .exec(&target, &exec.cmd, exec.stdin)
                     .await
                     .map_err(adapter_err)?;
                 Ok(VerbOutcome::Item(ItemOutcome::new(
@@ -1945,6 +1946,13 @@ fn payload_name(payload: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
+fn inspected_id(info: &bollard::models::ContainerInspectResponse, asked: &str) -> Result<String> {
+    info.id
+        .clone()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("inspect {asked}: no container id"))
+}
+
 const COMPOSE_WORKING_DIR_LABEL: &str = "com.docker.compose.project.working_dir";
 
 /// Why `exec` into the inspected container is refused, if it is. Even for an
@@ -2436,6 +2444,16 @@ mod tests {
             "Mounts": []
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn exec_targets_the_inspected_id_not_the_requested_name() {
+        let mut info = inspected("/opt/stacks/web", serde_json::json!({}));
+        assert!(inspected_id(&info, "web").is_err());
+        info.id = Some(String::new());
+        assert!(inspected_id(&info, "web").is_err());
+        info.id = Some("abc123".into());
+        assert_eq!(inspected_id(&info, "web").unwrap(), "abc123");
     }
 
     #[test]
