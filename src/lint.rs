@@ -19,6 +19,8 @@ pub const DEFAULT_MANAGED_ROOTS: &[&str] = &[
     "/mnt/data",
     "/mnt/backups",
     "/mnt/downloads",
+    "/mnt/user",
+    "/mnt/cache",
     "/opt/appdata",
 ];
 
@@ -105,6 +107,10 @@ pub(crate) fn under(path: &str, root: &str) -> bool {
     !p.components().any(|c| c == Component::ParentDir) && p.starts_with(root)
 }
 
+fn canonical(path: &str) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| Path::new(path).components().collect())
+}
+
 /// Whether `candidate` is, contains or sits inside one of `bound`.
 pub fn is_taken(candidate: &Path, bound: &[String]) -> bool {
     let c = candidate.to_string_lossy();
@@ -182,12 +188,16 @@ pub fn audit(
         }
         for m in &s.volumes {
             if let Some(src) = m.bind_source() {
-                if SYSTEM_PREFIXES.iter().any(|p| under(src, p)) {
+                let present = exists(Path::new(src));
+                let whole_root = roots
+                    .iter()
+                    .find(|r| present && canonical(r).starts_with(canonical(src)));
+                if whole_root.is_none() && SYSTEM_PREFIXES.iter().any(|p| under(src, p)) {
                     continue;
                 }
                 let managed = roots.iter().any(|r| under(src, r));
                 let own = under(src, stack_dir);
-                let (kind, detail, proposed) = if !exists(Path::new(src)) {
+                let (kind, detail, proposed) = if !present {
                     // A missing path under a managed root is a mount that is
                     // down, not a path to move elsewhere.
                     let proposed = (!managed)
@@ -198,15 +208,11 @@ pub fn audit(
                         format!("bind source {src} for {} does not exist", m.target),
                         proposed,
                     )
-                } else if let Some(root) = roots.iter().find(|r| {
-                    Path::new(src)
-                        .components()
-                        .eq(Path::new(r.as_str()).components())
-                }) {
+                } else if let Some(root) = whole_root {
                     (
                         FindingKind::BindWholeRoot,
                         format!(
-                            "bind source {src} for {} is the whole managed root {root}; bind only the subdirectory the service needs",
+                            "bind source {src} for {} is or contains the whole managed root {root}; bind only the subdirectory the service needs",
                             m.target
                         ),
                         None,
@@ -699,6 +705,51 @@ mod tests {
             "{}",
             f[0].detail
         );
+    }
+
+    #[test]
+    fn binding_a_parent_of_a_managed_root_is_flagged() {
+        let cfg = ComposeConfig::parse(
+            r#"{"name":"media","services":{"app":{"restart":"unless-stopped","volumes":[
+                {"type":"bind","source":"/mnt","target":"/mnt"},
+                {"type":"bind","source":"/mnt/user/media","target":"/media"}
+            ]}}}"#,
+        )
+        .unwrap();
+        let f = audit(
+            &cfg,
+            "/srv/stacks/media",
+            &roots(),
+            &fs(&["/mnt", "/mnt/user/media"]),
+            &|_| false,
+        );
+        assert_eq!(ids(&f), vec!["bind:app:/mnt"]);
+        assert_eq!(f[0].kind, FindingKind::BindWholeRoot);
+    }
+
+    #[test]
+    fn whole_root_check_resolves_symlinks_on_both_sides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let link = link.display().to_string();
+        let cfg = ComposeConfig::parse(&format!(
+            r#"{{"name":"media","services":{{"app":{{"restart":"unless-stopped","volumes":[
+                {{"type":"bind","source":"{link}","target":"/data"}}
+            ]}}}}}}"#
+        ))
+        .unwrap();
+        let f = audit(
+            &cfg,
+            "/srv/stacks/media",
+            &[real.display().to_string()],
+            &|_| true,
+            &|_| false,
+        );
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].kind, FindingKind::BindWholeRoot);
     }
 
     #[test]
