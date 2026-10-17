@@ -34,6 +34,7 @@ pub mod registration;
 pub mod runtime_adapter;
 pub mod stack_health;
 pub mod stack_manifest;
+pub mod stack_move;
 pub mod stack_pull;
 pub mod stack_volumes;
 pub mod stacks;

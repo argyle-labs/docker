@@ -600,7 +600,7 @@ async fn docker_stack_volumes_export(
     export(docker, &args, &engine_state::backup_roots()).await
 }
 
-fn read_capped(file: &mut File, cap: u64, what: &str) -> Result<Vec<u8>> {
+pub(crate) fn read_capped(file: &mut File, cap: u64, what: &str) -> Result<Vec<u8>> {
     if file.metadata()?.len() > cap {
         bail!("{what} is larger than {cap} bytes; refusing it");
     }
