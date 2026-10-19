@@ -1999,21 +1999,17 @@ fn stack_members(
     rows: &[StackRow],
     containers: Vec<bollard::models::ContainerSummary>,
 ) -> std::collections::HashMap<String, StackRow> {
-    let dirs: Vec<(std::path::PathBuf, &StackRow)> = rows
-        .iter()
-        .flat_map(|row| {
-            let raw = std::path::PathBuf::from(&row.dir);
-            let resolved = crate::lifecycle::resolve(&raw).ok();
-            std::iter::once((raw, row)).chain(resolved.map(|r| (r, row)))
-        })
-        .collect();
+    let canonical = |p: &str| {
+        let raw = std::path::PathBuf::from(p);
+        crate::lifecycle::resolve(&raw).unwrap_or(raw)
+    };
+    let dirs: Vec<(std::path::PathBuf, &StackRow)> =
+        rows.iter().map(|row| (canonical(&row.dir), row)).collect();
     containers
         .into_iter()
         .filter_map(|c| {
-            let wd = c.labels.as_ref()?.get(COMPOSE_WORKING_DIR_LABEL)?;
-            let (_, row) = dirs
-                .iter()
-                .find(|(d, _)| d.as_path() == std::path::Path::new(wd))?;
+            let wd = canonical(c.labels.as_ref()?.get(COMPOSE_WORKING_DIR_LABEL)?);
+            let (_, row) = dirs.iter().find(|(d, _)| *d == wd)?;
             Some((c.id?, (*row).clone()))
         })
         .collect()
@@ -3021,6 +3017,54 @@ mod tests {
         assert_eq!(members.len(), 2);
         assert_eq!(members["a"].name, "web");
         assert_eq!(members["b"].name, "db");
+    }
+
+    #[test]
+    fn stack_members_match_symlinked_working_dir_labels_by_canonical_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let canonical = root.join("compose/mylar3");
+        let other = root.join("compose/other");
+        std::fs::create_dir_all(&canonical).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::create_dir_all(root.join("stacks")).unwrap();
+        let link = root.join("stacks/mylar3");
+        let stray = root.join("stacks/other");
+        std::os::unix::fs::symlink(&canonical, &link).unwrap();
+        std::os::unix::fs::symlink(&other, &stray).unwrap();
+        let row = |name: &str, dir: &std::path::Path| StackRow {
+            name: name.into(),
+            dir: dir.to_string_lossy().into_owned(),
+            file: "compose.yaml".into(),
+            enabled: true,
+            allow: Vec::new(),
+        };
+        let summary = |id: &str, wd: &std::path::Path| bollard::models::ContainerSummary {
+            id: Some(id.into()),
+            labels: Some(
+                [(
+                    COMPOSE_WORKING_DIR_LABEL.to_string(),
+                    wd.to_string_lossy().into_owned(),
+                )]
+                .into(),
+            ),
+            ..Default::default()
+        };
+        let members = stack_members(
+            &[row("mylar3", &canonical)],
+            vec![
+                summary("a", &link),
+                summary("b", &canonical),
+                summary("c", &stray),
+                summary("d", &other),
+            ],
+        );
+        assert_eq!(members.len(), 2);
+        assert_eq!(members["a"].name, "mylar3");
+        assert_eq!(members["b"].name, "mylar3");
+
+        let members = stack_members(&[row("mylar3", &link)], vec![summary("a", &canonical)]);
+        assert_eq!(members["a"].name, "mylar3");
     }
 
     #[test]

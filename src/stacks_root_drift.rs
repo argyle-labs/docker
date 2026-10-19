@@ -25,10 +25,15 @@ pub struct StacksRootDrift {
 }
 
 pub fn judge(configured: &[String], working_dirs: &[String]) -> Option<StacksRootDrift> {
+    let canonical = |p: &str| {
+        let raw = std::path::PathBuf::from(p);
+        crate::lifecycle::resolve(&raw).unwrap_or(raw)
+    };
+    let roots: Vec<std::path::PathBuf> = configured.iter().map(|r| canonical(r)).collect();
     let inside = |dir: &str| {
-        configured.iter().any(|root| {
-            Path::new(dir)
-                .strip_prefix(root)
+        let dir = canonical(dir);
+        roots.iter().any(|root| {
+            dir.strip_prefix(root)
                 .is_ok_and(|r| r.components().next().is_some())
         })
     };
@@ -128,6 +133,23 @@ mod tests {
     fn a_sibling_with_a_shared_prefix_is_outside() {
         let d = judge(&s(&["/opt/stacks"]), &s(&["/opt/stacks2/a"])).unwrap();
         assert_eq!(d.outside, s(&["/opt/stacks2/a"]));
+    }
+
+    #[test]
+    fn symlinked_working_dirs_inside_the_root_are_not_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let compose = root.join("compose");
+        std::fs::create_dir_all(compose.join("mylar3")).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere/app")).unwrap();
+        std::fs::create_dir_all(root.join("stacks")).unwrap();
+        std::os::unix::fs::symlink(compose.join("mylar3"), root.join("stacks/mylar3")).unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere/app"), root.join("stacks/app")).unwrap();
+        let s = |p: std::path::PathBuf| p.to_string_lossy().into_owned();
+        let configured = [s(compose)];
+        assert!(judge(&configured, &[s(root.join("stacks/mylar3"))]).is_none());
+        let drift = judge(&configured, &[s(root.join("stacks/app"))]).unwrap();
+        assert_eq!(drift.outside, vec![s(root.join("stacks/app"))]);
     }
 
     #[test]
