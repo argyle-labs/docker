@@ -619,7 +619,11 @@ pub(crate) fn check_sum(got: &str, want: &str, what: &str) -> Result<()> {
     Ok(())
 }
 
-fn load(manifest: &str, sha256: &str, roots: &[String]) -> Result<(VolumeManifest, PathBuf)> {
+pub(crate) fn load(
+    manifest: &str,
+    sha256: &str,
+    roots: &[String],
+) -> Result<(VolumeManifest, PathBuf)> {
     let mut file = open_archive(manifest, roots)?;
     let dir = engine_state::fd_path(&file)?
         .parent()

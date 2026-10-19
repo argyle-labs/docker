@@ -49,7 +49,6 @@ const BUILTIN_NETWORKS: &[&str] = &["bridge", "host", "none", "default"];
 const KEPT_HOST_FIELDS: &[&str] = &[
     "RestartPolicy",
     "PortBindings",
-    "LogConfig",
     "ExtraHosts",
     "Memory",
     "MemoryReservation",
@@ -60,12 +59,33 @@ const KEPT_HOST_FIELDS: &[&str] = &[
     "CpuPeriod",
     "CpusetCpus",
     "PidsLimit",
-    "ShmSize",
+    "ReadonlyRootfs",
     "Init",
     "Dns",
     "DnsSearch",
     "DnsOptions",
-    "Ulimits",
+];
+const MAX_SHM_BYTES: i64 = 2 << 30;
+/// Ulimits a moved container may set, with the highest hard limit each takes.
+const ULIMIT_CAPS: &[(&str, i64)] = &[("nofile", 1 << 20), ("nproc", 1 << 16), ("core", 0)];
+const LOG_DRIVERS: &[&str] = &["json-file", "local", "journald"];
+const LOG_OPTS: &[&str] = &[
+    "max-size",
+    "max-file",
+    "compress",
+    "mode",
+    "max-buffer-size",
+    "labels",
+    "labels-regex",
+    "env",
+    "env-regex",
+    "tag",
+];
+/// Container label prefixes carried to the target; others are dropped.
+const KEPT_LABEL_PREFIXES: &[&str] = &[
+    "com.docker.compose.",
+    "org.opencontainers.",
+    "org.label-schema.",
 ];
 /// Create-body fields carried to the target as they are.
 const KEPT_CONFIG_FIELDS: &[&str] = &[
@@ -298,6 +318,44 @@ pub fn rebuild_host_config(name: &str, h: &HostConfig) -> Result<HostConfig> {
             "OomScoreAdj" => {
                 kept.insert(k, v);
             }
+            "ShmSize" if v.as_i64().is_some_and(|n| n > MAX_SHM_BYTES) => {
+                refused.push(format!("ShmSize {v}"));
+            }
+            "ShmSize" => {
+                kept.insert(k, v);
+            }
+            "Ulimits" => {
+                for u in v.as_array().into_iter().flatten() {
+                    let name = u.get("Name").and_then(Value::as_str).unwrap_or_default();
+                    let cap = ULIMIT_CAPS.iter().find(|(n, _)| *n == name).map(|p| p.1);
+                    let over = |f: &str| {
+                        u.get(f)
+                            .and_then(Value::as_i64)
+                            .is_some_and(|n| cap.is_none_or(|c| n < 0 || n > c))
+                    };
+                    if cap.is_none() || over("Soft") || over("Hard") {
+                        refused.push(format!("Ulimits {name}"));
+                    }
+                }
+                kept.insert(k, v);
+            }
+            "LogConfig" => {
+                let kind = v.get("Type").and_then(Value::as_str).unwrap_or_default();
+                if !kind.is_empty() && !LOG_DRIVERS.contains(&kind) {
+                    refused.push(format!("LogConfig {kind}"));
+                }
+                for opt in v
+                    .get("Config")
+                    .and_then(Value::as_object)
+                    .into_iter()
+                    .flatten()
+                {
+                    if !LOG_OPTS.contains(&opt.0.as_str()) {
+                        refused.push(format!("LogConfig option {}", opt.0));
+                    }
+                }
+                kept.insert(k, v);
+            }
             "CapDrop" | "ConsoleSize" => {}
             _ if is_default(&v) => {}
             _ => refused.push(k),
@@ -330,7 +388,8 @@ pub fn spec_of(
     let mut secret = Vec::new();
     if let Some(env) = create.env.take() {
         let (hidden, plain): (Vec<String>, Vec<String>) = env.into_iter().partition(|e| {
-            plugin_toolkit::scrub::is_sensitive_key(e.split_once('=').map_or(e.as_str(), |p| p.0))
+            let (k, v) = e.split_once('=').unwrap_or((e.as_str(), ""));
+            secret_shaped(k, v)
         });
         secret = hidden
             .into_iter()
@@ -372,13 +431,68 @@ pub fn spec_of(
     ))
 }
 
+/// A URL whose authority carries `user:password@`.
+fn url_has_password(value: &str) -> bool {
+    let Some((_, rest)) = value.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    authority
+        .rsplit_once('@')
+        .is_some_and(|(userinfo, _)| userinfo.contains(':'))
+}
+
+/// Env held as a secret ref: a secret-shaped key, a URL with a password, or
+/// a connection-string key whose value names a password.
+fn secret_shaped(key: &str, value: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    plugin_toolkit::scrub::is_sensitive_key(key)
+        || url_has_password(value)
+        || (["_URL", "_DSN", "_CONN", "_URI"]
+            .iter()
+            .any(|s| upper.ends_with(s))
+            && value.to_ascii_lowercase().contains("password="))
+}
+
 fn secret_name(stack: &str, container: &str, key: &str) -> String {
     secrets::scoped_name("docker", &format!("move.{stack}.{container}"), key)
 }
 
+/// What a container in the bundle may refer to.
+struct Scope<'a> {
+    networks: &'a [String],
+    /// Named volumes of the bundle's manifest; `None` before it is written.
+    volumes: Option<&'a [String]>,
+}
+
+fn kept_label(name: &str, key: &str) -> Result<bool> {
+    if key.starts_with("orca.") {
+        bail!("{name}: refusing orca label '{key}' from the bundle");
+    }
+    Ok(KEPT_LABEL_PREFIXES.iter().any(|p| key.starts_with(p)))
+}
+
+fn network_in_scope(net: &str, scope: &Scope) -> bool {
+    matches!(net, "" | "default" | "bridge" | "none") || scope.networks.iter().any(|n| n == net)
+}
+
+/// Named volumes `h` mounts.
+fn volume_sources(h: &HostConfig) -> Vec<String> {
+    let binds = h
+        .binds
+        .iter()
+        .flatten()
+        .filter_map(|b| bind_volume(b).map(str::to_owned));
+    let mounts = h.mounts.iter().flatten().filter_map(|m| {
+        let named = m.typ == Some(bollard::models::MountType::VOLUME);
+        m.source.clone().filter(|s| named && !s.is_empty())
+    });
+    binds.chain(mounts).collect()
+}
+
 /// The create body the target runs `spec` with, after every check that does
 /// not need the secrets.
-fn checked_body(stack: &str, spec: &ContainerSpec) -> Result<ContainerCreateBody> {
+fn checked_body(stack: &str, spec: &ContainerSpec, scope: &Scope) -> Result<ContainerCreateBody> {
     let refused: Vec<&str> = spec
         .create
         .as_object()
@@ -403,10 +517,60 @@ fn checked_body(stack: &str, spec: &ContainerSpec) -> Result<ContainerCreateBody
             spec.name
         );
     }
-    body.host_config = Some(rebuild_host_config(
-        &spec.name,
-        &body.host_config.unwrap_or_default(),
-    )?);
+    let mut labels = HashMap::new();
+    for (k, v) in body.labels.take().into_iter().flatten() {
+        if kept_label(&spec.name, &k)? {
+            labels.insert(k, v);
+        }
+    }
+    body.labels = Some(labels);
+    let host = rebuild_host_config(&spec.name, &body.host_config.unwrap_or_default())?;
+    let mode = host.network_mode.as_deref().unwrap_or_default();
+    if !network_in_scope(mode, scope) {
+        bail!(
+            "{}: NetworkMode '{mode}' is not a network of the bundle",
+            spec.name
+        );
+    }
+    if let Some(known) = scope.volumes {
+        let foreign: Vec<String> = volume_sources(&host)
+            .into_iter()
+            .filter(|v| !known.contains(v))
+            .collect();
+        if !foreign.is_empty() {
+            bail!(
+                "{}: volumes not in the bundle's manifest: {}",
+                spec.name,
+                foreign.join(", ")
+            );
+        }
+    }
+    body.host_config = Some(host);
+    if let Some(eps) = body
+        .networking_config
+        .take()
+        .and_then(|n| n.endpoints_config)
+    {
+        let mut kept = HashMap::new();
+        for (net, ep) in eps {
+            if !network_in_scope(&net, scope) {
+                bail!(
+                    "{}: endpoint '{net}' is not a network of the bundle",
+                    spec.name
+                );
+            }
+            kept.insert(
+                net,
+                EndpointSettings {
+                    aliases: ep.aliases,
+                    ..Default::default()
+                },
+            );
+        }
+        body.networking_config = Some(NetworkingConfig {
+            endpoints_config: Some(kept),
+        });
+    }
     body.image = Some(spec.pinned.clone());
     Ok(body)
 }
@@ -490,13 +654,18 @@ async fn source_plan(docker: &Docker, stack: &str) -> Result<SourcePlan> {
                 .into_iter()
                 .flat_map(|n| n.keys().cloned()),
         );
-        let spec = spec_of(c, pinned)?;
-        checked_body(stack, &spec.0)?;
-        specs.push(spec);
+        specs.push(spec_of(c, pinned)?);
     }
     specs.sort_by(|a, b| a.0.name.cmp(&b.0.name));
     nets.sort();
     nets.dedup();
+    let scope = Scope {
+        networks: &nets,
+        volumes: None,
+    };
+    for (spec, _) in &specs {
+        checked_body(stack, spec, &scope)?;
+    }
     let mut networks = Vec::new();
     for name in nets
         .iter()
@@ -576,9 +745,9 @@ fn rollback_context(
     failed: &[String],
 ) -> plugin_toolkit::anyhow::Error {
     if failed.is_empty() {
-        cause.context("source restarted")
+        cause.context("source restarted, move secrets deleted")
     } else {
-        cause.context(format!("source restart FAILED: {}", failed.join("; ")))
+        cause.context(format!("source rollback FAILED: {}", failed.join("; ")))
     }
 }
 
@@ -655,6 +824,7 @@ fn write_bundle(dir: &Path, bundle: &MoveBundle) -> Result<(PathBuf, String)> {
 fn store_secrets(
     stack: &str,
     specs: Vec<(ContainerSpec, Vec<(String, String)>)>,
+    stored: &mut Vec<String>,
 ) -> Result<Vec<ContainerSpec>> {
     specs
         .into_iter()
@@ -663,9 +833,22 @@ fn store_secrets(
                 let name = secret_name(stack, &spec.name, &key);
                 let secret = secrets::set(&name, &value, Some("docker stack move env"))
                     .with_context(|| format!("store {key} of {} as a secret", spec.name))?;
+                stored.push(name);
                 spec.secret_env.push(SecretEnv { key, secret });
             }
             Ok(spec)
+        })
+        .collect()
+}
+
+/// Deletes `names`; the failures are the result.
+fn drop_secrets(names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .filter_map(|n| {
+            secrets::delete(n)
+                .err()
+                .map(|e| format!("delete secret {n}: {e:#}"))
         })
         .collect()
 }
@@ -725,11 +908,16 @@ pub async fn export(
         out.volumes = stack_volumes::export(docker, &volume_args, roots).await?;
         return Ok(out);
     }
-    let specs = store_secrets(&args.stack, plan.specs)?;
+    let mut stored = Vec::new();
+    let specs = match store_secrets(&args.stack, plan.specs, &mut stored) {
+        Ok(s) => s,
+        Err(e) => return Err(rollback_context(e, &drop_secrets(&stored))),
+    };
     let mut stopped = Vec::new();
     for n in &stopping {
         if let Err(e) = stop(docker, n).await {
-            let failed = restart_all(docker, &stopped).await;
+            let mut failed = restart_all(docker, &stopped).await;
+            failed.extend(drop_secrets(&stored));
             return Err(rollback_context(e, &failed));
         }
         stopped.push(n.clone());
@@ -764,7 +952,8 @@ pub async fn export(
     let (exported, path, sha) = match written {
         Ok(w) => w,
         Err(e) => {
-            let failed = restart_all(docker, &stopped).await;
+            let mut failed = restart_all(docker, &stopped).await;
+            failed.extend(drop_secrets(&stored));
             return Err(rollback_context(e, &failed));
         }
     };
@@ -933,6 +1122,26 @@ fn with_volumes(
     ))
 }
 
+fn valid_env_key(key: &str) -> bool {
+    !key.is_empty() && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Each secret ref names the secret export stored for this container's key,
+/// never another one.
+fn check_secret_refs(stack: &str, spec: &ContainerSpec) -> Result<()> {
+    for s in &spec.secret_env {
+        if !valid_env_key(&s.key) || s.secret.0 != secret_name(stack, &spec.name, &s.key) {
+            bail!(
+                "{}: secret env {} refers to '{}', not its own move secret",
+                spec.name,
+                s.key,
+                s.secret.0
+            );
+        }
+    }
+    Ok(())
+}
+
 fn resolve_env(spec: &ContainerSpec, dry_run: bool) -> Result<Vec<String>> {
     spec.secret_env
         .iter()
@@ -960,9 +1169,29 @@ pub async fn import(
     for n in &bundle.networks {
         check_network(n)?;
     }
+    let manifest_path = dir.join(&bundle.volumes_manifest);
+    let (manifest, _) = stack_volumes::load(
+        &manifest_path.to_string_lossy(),
+        &bundle.volumes_manifest_sha256,
+        roots,
+    )?;
+    if manifest.stack != bundle.stack {
+        bail!(
+            "volume manifest is for stack '{}', not '{}'",
+            manifest.stack,
+            bundle.stack
+        );
+    }
+    let networks: Vec<String> = bundle.networks.iter().map(|n| n.name.clone()).collect();
+    let volumes: Vec<String> = manifest.volumes.iter().map(|v| v.name.clone()).collect();
+    let scope = Scope {
+        networks: &networks,
+        volumes: Some(&volumes),
+    };
     let mut bodies = Vec::new();
     for c in &bundle.containers {
-        let mut body = checked_body(&bundle.stack, c)?;
+        check_secret_refs(&bundle.stack, c)?;
+        let mut body = checked_body(&bundle.stack, c, &scope)?;
         let env = resolve_env(c, args.dry_run)?;
         if !args.dry_run {
             body.env.get_or_insert_with(Vec::new).extend(env);
@@ -1132,7 +1361,8 @@ async fn docker_stack_move_import(
 #[schemars(crate = "plugin_toolkit::schemars")]
 #[serde(rename_all = "lowercase")]
 pub enum FinishAction {
-    /// Stop the source stack, keeping its containers.
+    /// Stop the source stack, keeping its containers. Needs the move's
+    /// `bundle` and `bundleSha256`.
     Stop,
     /// Stop and remove the source containers; volumes stay. Needs the move's
     /// `bundle` and `bundleSha256`.
@@ -1150,11 +1380,11 @@ pub struct DockerStackMoveFinishArgs {
     #[arg(long, value_enum)]
     #[serde(default)]
     pub action: Option<FinishAction>,
-    /// `remove` only: the `move.json` this host exported for the move.
+    /// `stop` and `remove`: the `move.json` this host exported for the move.
     #[arg(long)]
     #[serde(default)]
     pub bundle: Option<String>,
-    /// `remove` only: the export's `bundleSha256`.
+    /// `stop` and `remove`: the export's `bundleSha256`.
     #[arg(long)]
     #[serde(default, rename = "bundleSha256", alias = "bundle_sha256")]
     pub bundle_sha256: Option<String>,
@@ -1179,14 +1409,15 @@ pub struct StackMoveFinishOutput {
     pub failures: Vec<String>,
 }
 
-/// `remove` acts only on the containers the verified bundle moved.
+/// `stop` and `remove` act only on the containers the verified bundle moved;
+/// the result is the secrets its export stored.
 fn bound_to_move(
     args: &DockerStackMoveFinishArgs,
     names: &[String],
     roots: &[String],
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let (Some(bundle), Some(sha)) = (&args.bundle, &args.bundle_sha256) else {
-        bail!("remove needs the move's bundle and bundleSha256");
+        bail!("stop and remove need the move's bundle and bundleSha256");
     };
     let (bundle, _) = load_bundle(bundle, sha, roots)?;
     if bundle.stack != args.stack {
@@ -1207,7 +1438,18 @@ fn bound_to_move(
             unmoved.join(", ")
         );
     }
-    Ok(())
+    let prefix = format!("docker.move.{}.", args.stack);
+    let mut refs = Vec::new();
+    for c in &bundle.containers {
+        for s in &c.secret_env {
+            if !s.secret.0.starts_with(&prefix) {
+                bail!("bundle names secret '{}' outside '{prefix}'", s.secret.0);
+            }
+            refs.push(s.secret.0.clone());
+        }
+    }
+    refs.sort();
+    Ok(refs)
 }
 
 pub async fn finish(
@@ -1218,8 +1460,8 @@ pub async fn finish(
     let Some(action) = args.action else {
         bail!("action is required: stop, remove or restart");
     };
-    let inspected = inspect_all(docker, &args.stack).await?;
-    let mut names: Vec<String> = inspected
+    let mut names: Vec<String> = inspect_all(docker, &args.stack)
+        .await?
         .iter()
         .map(|c| {
             c.name
@@ -1233,18 +1475,15 @@ pub async fn finish(
     if names.is_empty() {
         bail!("stack '{}' has no containers on this host", args.stack);
     }
-    if action == FinishAction::Remove {
-        bound_to_move(args, &names, roots)?;
-    }
+    let secrets = match action {
+        FinishAction::Restart => Vec::new(),
+        _ => bound_to_move(args, &names, roots)?,
+    };
     let mut out = StackMoveFinishOutput {
         executed: !args.dry_run,
         stack: args.stack.clone(),
         containers: names.clone(),
-        secrets: if action == FinishAction::Restart {
-            Vec::new()
-        } else {
-            move_secrets(&args.stack, &inspected)
-        },
+        secrets,
         ..Default::default()
     };
     if args.dry_run {
@@ -1264,44 +1503,16 @@ pub async fn finish(
         }
     };
     if out.failures.is_empty() {
-        for name in &out.secrets {
-            if let Err(e) = secrets::delete(name) {
-                out.failures.push(format!("delete secret {name}: {e:#}"));
-            }
-        }
+        out.failures = drop_secrets(&out.secrets);
     }
     Ok(out)
 }
 
-/// The secrets export stored for the env of `inspected`.
-fn move_secrets(stack: &str, inspected: &[ContainerInspectResponse]) -> Vec<String> {
-    let mut out: Vec<String> = inspected
-        .iter()
-        .flat_map(|c| {
-            let name = c
-                .name
-                .as_deref()
-                .unwrap_or_default()
-                .trim_start_matches('/');
-            c.config
-                .as_ref()
-                .and_then(|cfg| cfg.env.as_ref())
-                .into_iter()
-                .flatten()
-                .filter_map(|e| e.split_once('=').map(|p| p.0))
-                .filter(|k| plugin_toolkit::scrub::is_sensitive_key(k))
-                .map(move |k| secret_name(stack, name, k))
-        })
-        .collect();
-    out.sort();
-    out
-}
-
 /// **Finish a stack move on the source host**: once the target is healthy,
-/// `stop` the stack or `remove` its containers (volumes stay; only with the
-/// move's verified `bundle`, and only the containers it moved); when the
-/// target failed, `restart` it as the rollback. `stop` and `remove` then
-/// delete the env secrets the export stored; `restart` keeps them for a retry.
+/// `stop` the stack or `remove` its containers (volumes stay), only with the
+/// move's verified `bundle` and only the containers it moved, then delete the
+/// env secrets that bundle records; when the target failed, `restart` it as
+/// the rollback, keeping the secrets for a retry.
 #[orca_tool(
     domain = "docker",
     verb = "stack_move_finish",
@@ -1513,7 +1724,7 @@ mod tests {
         })
         .0;
         assert!(
-            format!("{err:#}").contains("source restart FAILED"),
+            format!("{err:#}").contains("source rollback FAILED"),
             "{err:#}"
         );
         assert!(
@@ -1969,6 +2180,13 @@ mod tests {
         assert!(writes(&e).is_empty(), "{:?}", writes(&e));
     }
 
+    fn open_scope() -> Scope<'static> {
+        Scope {
+            networks: &[],
+            volumes: None,
+        }
+    }
+
     fn refused(host: Value) -> String {
         let h: HostConfig = plugin_toolkit::serde_json::from_value(host).unwrap();
         rebuild_host_config("c", &h).unwrap_err().to_string()
@@ -2138,6 +2356,23 @@ mod tests {
         );
     }
 
+    fn with_secret(mut c: ContainerSpec, name: &str) -> ContainerSpec {
+        c.secret_env.push(SecretEnv {
+            key: "DB_PASSWORD".into(),
+            secret: SecretRef(name.into()),
+        });
+        c
+    }
+
+    const MOVE_SECRET: &str = "docker.move.s.s-cache-1.DB_PASSWORD";
+
+    fn seeded() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (MOVE_SECRET.to_string(), "hunter2".to_string()),
+            ("docker.other".to_string(), "x".to_string()),
+        ])
+    }
+
     #[test]
     fn finish_remove_is_bound_to_the_move() {
         let root = tempfile::tempdir().unwrap();
@@ -2161,19 +2396,26 @@ mod tests {
         assert!(err.to_string().contains("not in the move"), "{err}");
         args.bundle_sha256 = Some("0".repeat(64));
         assert!(block(finish(&e.client(), &args, &r)).is_err());
-        assert!(writes(&e).is_empty(), "{:?}", writes(&e));
 
-        let (bundle, sha) = target_bundle(root.path(), None, spec(json!({})));
+        let (bundle, sha) = target_bundle(
+            root.path(),
+            None,
+            with_secret(spec(json!({})), "docker.other"),
+        );
         args.bundle = Some(bundle);
         args.bundle_sha256 = Some(sha);
-        let seed = BTreeMap::from([(
-            "docker.move.s.s-cache-1.DB_PASSWORD".to_string(),
-            "hunter2".to_string(),
-        )]);
-        let (out, left) = with_secrets(seed, || block(finish(&e.client(), &args, &r)).unwrap());
+        let err = block(finish(&e.client(), &args, &r)).unwrap_err();
+        assert!(err.to_string().contains("outside"), "{err}");
+        assert!(writes(&e).is_empty(), "{:?}", writes(&e));
+
+        let (bundle, sha) =
+            target_bundle(root.path(), None, with_secret(spec(json!({})), MOVE_SECRET));
+        args.bundle = Some(bundle);
+        args.bundle_sha256 = Some(sha);
+        let (out, left) = with_secrets(seeded(), || block(finish(&e.client(), &args, &r)).unwrap());
         assert!(out.failures.is_empty(), "{:?}", out.failures);
-        assert_eq!(out.secrets, ["docker.move.s.s-cache-1.DB_PASSWORD"]);
-        assert!(left.is_empty(), "{left:?}");
+        assert_eq!(out.secrets, [MOVE_SECRET]);
+        assert_eq!(left.keys().collect::<Vec<_>>(), ["docker.other"]);
         assert!(
             e.paths("DELETE")
                 .iter()
@@ -2182,19 +2424,11 @@ mod tests {
     }
 
     #[test]
-    fn finish_stop_deletes_the_move_secrets_and_restart_keeps_them() {
+    fn finish_stop_deletes_the_bundles_secrets_and_restart_keeps_them() {
+        let root = tempfile::tempdir().unwrap();
         let e = source_engine();
-        let r = roots(Path::new("/nonexistent"));
-        let seed = || {
-            BTreeMap::from([
-                (
-                    "docker.move.s.s-cache-1.DB_PASSWORD".to_string(),
-                    "hunter2".to_string(),
-                ),
-                ("docker.other".to_string(), "x".to_string()),
-            ])
-        };
-        let (out, left) = with_secrets(seed(), || {
+        let r = roots(root.path());
+        let (out, left) = with_secrets(seeded(), || {
             block(finish(
                 &e.client(),
                 &finish_args(FinishAction::Restart, false),
@@ -2203,37 +2437,254 @@ mod tests {
             .unwrap()
         });
         assert!(out.secrets.is_empty());
-        assert_eq!(left, seed());
-        let (out, left) = with_secrets(seed(), || {
-            block(finish(
-                &e.client(),
-                &finish_args(FinishAction::Stop, true),
-                &r,
-            ))
-            .unwrap()
-        });
-        assert_eq!(out.secrets, ["docker.move.s.s-cache-1.DB_PASSWORD"]);
-        assert_eq!(left, seed());
-        let (out, left) = with_secrets(seed(), || {
-            block(finish(
-                &e.client(),
-                &finish_args(FinishAction::Stop, false),
-                &r,
-            ))
-            .unwrap()
-        });
+        assert_eq!(left, seeded());
+        let err = block(finish(
+            &e.client(),
+            &finish_args(FinishAction::Stop, true),
+            &r,
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("bundleSha256"), "{err}");
+        let (bundle, sha) =
+            target_bundle(root.path(), None, with_secret(spec(json!({})), MOVE_SECRET));
+        let mut args = finish_args(FinishAction::Stop, true);
+        args.bundle = Some(bundle);
+        args.bundle_sha256 = Some(sha);
+        let (out, left) = with_secrets(seeded(), || block(finish(&e.client(), &args, &r)).unwrap());
+        assert_eq!(out.secrets, [MOVE_SECRET]);
+        assert_eq!(left, seeded());
+        args.dry_run = false;
+        let (out, left) = with_secrets(seeded(), || block(finish(&e.client(), &args, &r)).unwrap());
         assert!(out.failures.is_empty(), "{:?}", out.failures);
         assert_eq!(left.keys().collect::<Vec<_>>(), ["docker.other"]);
     }
 
     #[test]
+    fn import_refuses_a_bundle_naming_a_foreign_secret() {
+        let root = tempfile::tempdir().unwrap();
+        for name in [
+            "docker.other",
+            "docker.move.s.s-db-1.DB_PASSWORD",
+            "proxmox.pve.token",
+        ] {
+            let (bundle, sha) =
+                target_bundle(root.path(), None, with_secret(spec(json!({})), name));
+            let e = target_engine("healthy");
+            let err = with_secrets(seeded(), || {
+                block(import(
+                    &e.client(),
+                    &import_args(&bundle, &sha, false),
+                    &roots(root.path()),
+                ))
+                .unwrap_err()
+            })
+            .0;
+            assert!(err.to_string().contains("not its own move secret"), "{err}");
+            assert!(e.requests().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_failed_export_deletes_the_secrets_it_stored() {
+        let root = tempfile::tempdir().unwrap();
+        let mut routes = vec![Route::new("GET", "/volumes", 500, r#"{"message":"boom"}"#)];
+        routes.extend(source_routes());
+        let e = FakeEngine::routed(routes);
+        let (err, left) = with_secrets(BTreeMap::new(), || {
+            block(export(
+                &e.client(),
+                &export_args(root.path(), false),
+                &roots(root.path()),
+            ))
+            .unwrap_err()
+        });
+        assert!(format!("{err:#}").contains("secrets deleted"), "{err:#}");
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    fn credentials_in_urls_and_dsns_are_secret_shaped() {
+        for (k, v) in [
+            ("DB_PASSWORD", "x"),
+            ("DATABASE_URL", "postgres://app:pw@db/app"),
+            ("UPSTREAM", "https://u:p@example.lan/x"),
+            ("PG_DSN", "host=db user=app password=pw"),
+            ("REDIS_CONN", "Password=pw;Host=r"),
+        ] {
+            assert!(secret_shaped(k, v), "{k}={v}");
+        }
+        for (k, v) in [
+            ("MODE", "fast"),
+            ("SITE_URL", "https://example.lan/x"),
+            ("MAIL", "a@b"),
+            ("SITE_URL", "https://u@example.lan/"),
+            ("LINK", "https://example.lan/x?next=a:b@c"),
+        ] {
+            assert!(!secret_shaped(k, v), "{k}={v}");
+        }
+    }
+
+    #[test]
+    fn endpoints_are_rebuilt_as_aliases_within_the_bundles_networks() {
+        let nets = ["s_default".to_string()];
+        let scope = Scope {
+            networks: &nets,
+            volumes: None,
+        };
+        let mut c = spec(json!({ "NetworkMode": "s_default" }));
+        c.create["NetworkingConfig"] = json!({ "EndpointsConfig": { "s_default": {
+            "Aliases": ["cache"],
+            "IPAMConfig": { "IPv4Address": "10.0.0.9" },
+            "MacAddress": "02:42:ac:11:00:02",
+            "DriverOpts": { "x": "y" }
+        } } });
+        let body =
+            plugin_toolkit::serde_json::to_value(checked_body("s", &c, &scope).unwrap()).unwrap();
+        assert_eq!(
+            body["NetworkingConfig"]["EndpointsConfig"]["s_default"],
+            json!({ "Aliases": ["cache"] })
+        );
+        let mut bad = spec(json!({ "NetworkMode": "s_default" }));
+        bad.create["NetworkingConfig"] = json!({ "EndpointsConfig": { "other_net": {} } });
+        let err = checked_body("s", &bad, &scope).unwrap_err().to_string();
+        assert!(err.contains("endpoint 'other_net'"), "{err}");
+        let err = checked_body("s", &spec(json!({ "NetworkMode": "other_net" })), &scope)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("NetworkMode 'other_net'"), "{err}");
+        assert!(checked_body("s", &spec(json!({ "NetworkMode": "bridge" })), &scope).is_ok());
+    }
+
+    #[test]
+    fn volume_sources_must_be_in_the_manifest() {
+        let vols = ["s_cache".to_string()];
+        let scope = Scope {
+            networks: &[],
+            volumes: Some(&vols),
+        };
+        assert!(checked_body("s", &spec(json!({ "Binds": ["s_cache:/data"] })), &scope).is_ok());
+        for host in [
+            json!({ "Binds": ["other_data:/data"] }),
+            json!({ "Mounts": [{ "Type": "volume", "Source": "other_data", "Target": "/d" }] }),
+        ] {
+            let err = checked_body("s", &spec(host), &scope)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("not in the bundle's manifest: other_data"),
+                "{err}"
+            );
+        }
+        assert!(
+            checked_body(
+                "s",
+                &spec(json!({ "Mounts": [{ "Type": "volume", "Target": "/anon" }] })),
+                &scope
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn import_refuses_a_volume_outside_the_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let (bundle, sha) = target_bundle(
+            root.path(),
+            None,
+            spec(json!({ "Binds": ["victim_data:/data"] })),
+        );
+        let e = target_engine("healthy");
+        let err = block(import(
+            &e.client(),
+            &import_args(&bundle, &sha, false),
+            &roots(root.path()),
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("victim_data"), "{err}");
+        assert!(e.requests().is_empty());
+    }
+
+    #[test]
+    fn labels_keep_the_allowlist_and_refuse_orcas_own() {
+        let mut c = spec(json!({}));
+        c.create["Labels"] = json!({
+            "com.docker.compose.project": "s",
+            "org.opencontainers.image.title": "redis",
+            "traefik.http.routers.x.rule": "Host(`a`)"
+        });
+        let body = checked_body("s", &c, &open_scope()).unwrap();
+        let mut keys: Vec<_> = body.labels.unwrap().into_keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "com.docker.compose.project",
+                "org.opencontainers.image.title"
+            ]
+        );
+        for label in ["orca.owner", "orca.stack", "orca.role"] {
+            let mut bad = spec(json!({}));
+            bad.create["Labels"][label] = json!("x");
+            let err = checked_body("s", &bad, &open_scope())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(label), "{err}");
+        }
+    }
+
+    #[test]
+    fn ulimits_shm_and_log_config_are_bounded() {
+        let ok: HostConfig = plugin_toolkit::serde_json::from_value(json!({
+            "Ulimits": [
+                { "Name": "nofile", "Soft": 65536, "Hard": 1048576 },
+                { "Name": "nproc", "Soft": 4096, "Hard": 65536 },
+                { "Name": "core", "Soft": 0, "Hard": 0 }
+            ],
+            "ShmSize": 2147483648_i64,
+            "ReadonlyRootfs": true,
+            "LogConfig": { "Type": "local", "Config": { "max-size": "10m", "max-file": "3" } }
+        }))
+        .unwrap();
+        let out =
+            plugin_toolkit::serde_json::to_value(rebuild_host_config("c", &ok).unwrap()).unwrap();
+        assert_eq!(out["ReadonlyRootfs"], true);
+        for (host, want) in [
+            (
+                json!({ "Ulimits": [{ "Name": "memlock", "Soft": 1, "Hard": 1 }] }),
+                "Ulimits memlock",
+            ),
+            (
+                json!({ "Ulimits": [{ "Name": "nofile", "Soft": 1, "Hard": 2097152 }] }),
+                "Ulimits nofile",
+            ),
+            (
+                json!({ "Ulimits": [{ "Name": "nofile", "Soft": -1, "Hard": -1 }] }),
+                "Ulimits nofile",
+            ),
+            (
+                json!({ "Ulimits": [{ "Name": "core", "Soft": -1, "Hard": -1 }] }),
+                "Ulimits core",
+            ),
+            (json!({ "ShmSize": 2147483649_i64 }), "ShmSize"),
+            (
+                json!({ "LogConfig": { "Type": "syslog" } }),
+                "LogConfig syslog",
+            ),
+            (json!({ "LogConfig": { "Type": "gelf" } }), "LogConfig gelf"),
+            (
+                json!({ "LogConfig": { "Type": "json-file", "Config": { "syslog-address": "udp://x" } } }),
+                "LogConfig option syslog-address",
+            ),
+        ] {
+            let err = refused(host.clone());
+            assert!(err.contains(want), "{host}: {err}");
+        }
+    }
+
+    #[test]
     fn an_unhealthy_import_keeps_the_secrets_for_a_retry() {
         let root = tempfile::tempdir().unwrap();
-        let mut c = spec(json!({}));
-        c.secret_env.push(SecretEnv {
-            key: "DB_PASSWORD".into(),
-            secret: SecretRef("docker.move.s.s-cache-1.DB_PASSWORD".into()),
-        });
+        let c = with_secret(spec(json!({})), MOVE_SECRET);
         let (bundle, sha) = target_bundle(root.path(), None, c);
         let e = target_engine("unhealthy");
         let seed = BTreeMap::from([(
@@ -2311,7 +2762,9 @@ mod tests {
         ] {
             c.create[k] = v;
         }
-        let body = plugin_toolkit::serde_json::to_value(checked_body("s", &c).unwrap()).unwrap();
+        let body =
+            plugin_toolkit::serde_json::to_value(checked_body("s", &c, &open_scope()).unwrap())
+                .unwrap();
         assert_eq!(body["Hostname"], "cache");
         assert_eq!(body["StopTimeout"], 30);
         assert_eq!(body["Healthcheck"]["Test"], json!(["CMD", "true"]));
@@ -2322,7 +2775,9 @@ mod tests {
         ] {
             let mut bad = spec(json!({}));
             bad.create[k] = v;
-            let err = checked_body("s", &bad).unwrap_err().to_string();
+            let err = checked_body("s", &bad, &open_scope())
+                .unwrap_err()
+                .to_string();
             assert!(err.contains(&format!("refusing Config {k}")), "{err}");
         }
     }
