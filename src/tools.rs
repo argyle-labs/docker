@@ -177,7 +177,7 @@ pub fn stacks_roots() -> Result<Vec<String>> {
     Ok(roots)
 }
 
-fn validate_stacks_root(root: &str) -> Result<()> {
+pub(crate) fn validate_stacks_root(root: &str) -> Result<()> {
     let path = Path::new(root);
     if !path.is_absolute() {
         bail!("stacks_root '{root}' is not an absolute path");
@@ -224,6 +224,9 @@ pub struct DockerListOutput {
     /// Total runtimes across all pages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total: Option<u64>,
+    /// Live compose projects whose working dir lies outside every stacks root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stacks_root_drift: Option<crate::stacks_root_drift::StacksRootDrift>,
 }
 
 /// List registered docker runtimes.
@@ -238,6 +241,7 @@ async fn docker_list(args: DockerListArgs, _ctx: &ToolCtx) -> Result<DockerListO
         endpoints: page.items,
         next_cursor: page.next_cursor,
         total: page.total,
+        stacks_root_drift: crate::stacks_root_drift::observe(&stacks_roots()?).await,
     })
 }
 
@@ -252,6 +256,10 @@ pub struct DockerDetailArgs {
 #[derive(Debug)]
 pub struct DockerDetailOutput {
     pub endpoint: Runtime,
+    /// Live compose projects whose working dir lies outside this runtime's
+    /// stacks root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stacks_root_drift: Option<crate::stacks_root_drift::StacksRootDrift>,
 }
 
 /// Detail for a single docker runtime.
@@ -259,7 +267,14 @@ pub struct DockerDetailOutput {
 async fn docker_detail(args: DockerDetailArgs, _ctx: &ToolCtx) -> Result<DockerDetailOutput> {
     let endpoint = runtime(&args.name)?
         .ok_or_else(|| plugin_toolkit::runtime::missing_row_error("docker", &args.name))?;
-    Ok(DockerDetailOutput { endpoint })
+    let root = endpoint
+        .stacks_root
+        .clone()
+        .unwrap_or_else(|| DEFAULT_STACKS_ROOT.to_string());
+    Ok(DockerDetailOutput {
+        stacks_root_drift: crate::stacks_root_drift::observe(&[root]).await,
+        endpoint,
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
