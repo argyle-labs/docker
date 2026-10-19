@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+echo "==> build"
+cargo build --all-targets -j 2
+
+echo "==> test"
+cargo test -j 2
+
+echo "==> clippy"
+cargo clippy --all-targets -j 2 -- -D warnings
+
+echo "==> rustfmt"
+cargo fmt --all -- --check
