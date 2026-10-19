@@ -83,10 +83,15 @@ const LOG_OPTS: &[&str] = &[
 ];
 /// Container label prefixes carried to the target; others, orca's own
 /// included, are dropped and orca's labels written for this host.
-const KEPT_LABEL_PREFIXES: &[&str] = &[
-    "com.docker.compose.",
-    "org.opencontainers.",
-    "org.label-schema.",
+const KEPT_LABEL_PREFIXES: &[&str] = &["org.opencontainers.", "org.label-schema."];
+/// Compose labels carried to the target; the source's paths are dropped.
+const KEPT_COMPOSE_LABELS: &[&str] = &[
+    "com.docker.compose.project",
+    "com.docker.compose.service",
+    "com.docker.compose.container-number",
+    "com.docker.compose.oneoff",
+    "com.docker.compose.version",
+    "com.docker.compose.config-hash",
 ];
 /// Create-body fields carried to the target as they are.
 const KEPT_CONFIG_FIELDS: &[&str] = &[
@@ -467,7 +472,7 @@ struct Scope<'a> {
 }
 
 fn kept_label(key: &str) -> bool {
-    KEPT_LABEL_PREFIXES.iter().any(|p| key.starts_with(p))
+    KEPT_COMPOSE_LABELS.contains(&key) || KEPT_LABEL_PREFIXES.iter().any(|p| key.starts_with(p))
 }
 
 fn network_in_scope(net: &str, scope: &Scope) -> bool {
@@ -513,6 +518,17 @@ fn checked_body(stack: &str, spec: &ContainerSpec, scope: &Scope) -> Result<Cont
         bail!(
             "{}: labelled for project {project:?}, not '{stack}'; refusing a retarget",
             spec.name
+        );
+    }
+    let service = body
+        .labels
+        .as_ref()
+        .and_then(|l| l.get(crate::image_update::COMPOSE_SERVICE_LABEL));
+    if service.is_some_and(|s| *s != spec.service) {
+        bail!(
+            "{}: labelled for service {service:?}, not '{}'",
+            spec.name,
+            spec.service
         );
     }
     let mut labels: HashMap<String, String> = body
@@ -1446,15 +1462,10 @@ fn bound_to_move(
             unmoved.join(", ")
         );
     }
-    let prefix = format!("docker.move.{}.", args.stack);
     let mut refs = Vec::new();
     for c in &bundle.containers {
-        for s in &c.secret_env {
-            if !s.secret.0.starts_with(&prefix) {
-                bail!("bundle names secret '{}' outside '{prefix}'", s.secret.0);
-            }
-            refs.push(s.secret.0.clone());
-        }
+        check_secret_refs(&bundle.stack, c)?;
+        refs.extend(c.secret_env.iter().map(|s| s.secret.0.clone()));
     }
     refs.sort();
     Ok(refs)
@@ -2413,7 +2424,7 @@ mod tests {
         args.bundle = Some(bundle);
         args.bundle_sha256 = Some(sha);
         let err = block(finish(&e.client(), &args, &r)).unwrap_err();
-        assert!(err.to_string().contains("outside"), "{err}");
+        assert!(err.to_string().contains("not its own move secret"), "{err}");
         assert!(writes(&e).is_empty(), "{:?}", writes(&e));
 
         let (bundle, sha) =
@@ -2640,6 +2651,72 @@ mod tests {
         assert!(!labels.contains_key("orca.role"));
         assert!(!labels.contains_key("traefik.http.routers.x.rule"));
         assert_eq!(labels["org.opencontainers.image.title"], "redis");
+    }
+
+    #[test]
+    fn a_service_label_must_match_the_spec() {
+        let mut c = spec(json!({}));
+        c.create["Labels"]["com.docker.compose.service"] = json!("db");
+        let err = checked_body("s", &c, &open_scope())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("service Some(\"db\")"), "{err}");
+        c.create["Labels"]["com.docker.compose.service"] = json!("cache");
+        assert!(checked_body("s", &c, &open_scope()).is_ok());
+    }
+
+    #[test]
+    fn only_portable_compose_labels_move() {
+        let mut c = spec(json!({}));
+        for (k, v) in [
+            ("com.docker.compose.service", "cache"),
+            ("com.docker.compose.container-number", "1"),
+            ("com.docker.compose.oneoff", "False"),
+            ("com.docker.compose.version", "2.29.0"),
+            ("com.docker.compose.config-hash", "abc"),
+            ("com.docker.compose.project.working_dir", "/srv/s"),
+            (
+                "com.docker.compose.project.config_files",
+                "/srv/s/compose.yml",
+            ),
+            ("com.docker.compose.project.environment_file", "/srv/s/.env"),
+            ("com.docker.compose.image", "sha256:x"),
+        ] {
+            c.create["Labels"][k] = json!(v);
+        }
+        let labels = checked_body("s", &c, &open_scope())
+            .unwrap()
+            .labels
+            .unwrap();
+        let mut compose: Vec<&str> = labels
+            .keys()
+            .map(String::as_str)
+            .filter(|k| k.starts_with("com.docker.compose."))
+            .collect();
+        compose.sort();
+        let mut want = KEPT_COMPOSE_LABELS.to_vec();
+        want.sort();
+        assert_eq!(compose, want);
+    }
+
+    #[test]
+    fn finish_refuses_a_dotted_stack_secret_confusion() {
+        let root = tempfile::tempdir().unwrap();
+        let e = source_engine();
+        let (bundle, sha) = target_bundle(
+            root.path(),
+            None,
+            with_secret(spec(json!({})), "docker.move.s.x.s-cache-1.DB_PASSWORD"),
+        );
+        let mut args = finish_args(FinishAction::Stop, false);
+        args.bundle = Some(bundle);
+        args.bundle_sha256 = Some(sha);
+        let (err, left) = with_secrets(seeded(), || {
+            block(finish(&e.client(), &args, &roots(root.path()))).unwrap_err()
+        });
+        assert!(err.to_string().contains("not its own move secret"), "{err}");
+        assert_eq!(left, seeded());
+        assert!(writes(&e).is_empty(), "{:?}", writes(&e));
     }
 
     #[test]
