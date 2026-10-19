@@ -947,6 +947,18 @@ pub(crate) fn refuse_external_volume(
     Ok(())
 }
 
+/// Refuse restoring into an existing volume whose data lives outside the
+/// engine.
+async fn refuse_existing_external(docker: &Docker, name: &str, act: ImportAction) -> Result<()> {
+    if act != ImportAction::RestoreIfEmpty {
+        return Ok(());
+    }
+    match existing(docker, name).await? {
+        Some(h) => refuse_external_volume(name, &h.driver, &h.options.into_iter().collect()),
+        None => Ok(()),
+    }
+}
+
 /// Refuse anything but a plain local volume: a driver or options may put
 /// its data somewhere removing or recreating the volume does not reach.
 fn plain_local(name: &str, driver: &str, options: usize) -> Result<()> {
@@ -1001,6 +1013,7 @@ async fn apply_one(
         return Ok(());
     }
     if matches!(act, ImportAction::RestoreIfEmpty | ImportAction::Overwrite) {
+        refuse_existing_external(docker, &v.name, act).await?;
         refuse_in_use(docker, &v.name, act).await?;
     }
     // Checked again: the file may have changed since the pre-check.
@@ -1395,7 +1408,11 @@ pub async fn import(
         }
         if args.dry_run {
             if matches!(act, ImportAction::RestoreIfEmpty | ImportAction::Overwrite)
-                && let Err(e) = refuse_in_use(docker, &v.name, act).await
+                && let Err(e) = async {
+                    refuse_existing_external(docker, &v.name, act).await?;
+                    refuse_in_use(docker, &v.name, act).await
+                }
+                .await
             {
                 out.findings.push(ImportFinding {
                     name: v.name.clone(),
@@ -1970,6 +1987,45 @@ mod tests {
         .unwrap();
         assert!(out.created.is_empty());
         assert_eq!(out.restored, ["s_data"]);
+    }
+
+    #[test]
+    fn import_refuses_restoring_into_an_existing_external_volume() {
+        let root = tempfile::tempdir().unwrap();
+        let (manifest, sha) = bundle(root.path(), &[("db", "rows")]);
+        for (driver, opts, want) in [
+            ("local", &[("type", "nfs")][..], "option 'type'"),
+            ("rexray", &[][..], "driver 'rexray'"),
+        ] {
+            let e = FakeEngine::routed(vec![Route::new(
+                "GET",
+                "/volumes/s_data",
+                200,
+                plugin_toolkit::serde_json::to_string(&volume(
+                    "s_data",
+                    Some("data"),
+                    driver,
+                    opts,
+                ))
+                .unwrap(),
+            )]);
+            let dry = block(import(
+                &e.client(),
+                &import_args(&manifest, &sha, false, false),
+                &roots(root.path()),
+            ))
+            .unwrap();
+            assert!(dry.findings[0].message.contains(want), "{:?}", dry.findings);
+            let out = block(import(
+                &e.client(),
+                &import_args(&manifest, &sha, false, true),
+                &roots(root.path()),
+            ))
+            .unwrap();
+            assert!(out.findings[0].message.contains(want), "{:?}", out.findings);
+            assert!(out.restored.is_empty());
+            assert!(e.paths("POST").is_empty() && e.paths("PUT").is_empty());
+        }
     }
 
     #[test]
