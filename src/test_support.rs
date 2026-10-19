@@ -199,3 +199,47 @@ pub fn with_db<R>(body: impl FnOnce() -> R) -> (R, Tables) {
     let left = tables.borrow().clone();
     (out, left)
 }
+
+/// Run `body` with an in-memory `secret.op` store seeded with `seed`,
+/// returning its result and the secrets it left behind.
+pub fn with_secrets<R>(
+    seed: BTreeMap<String, String>,
+    body: impl FnOnce() -> R,
+) -> (R, BTreeMap<String, String>) {
+    use plugin_toolkit::abi::{SecretOp, SecretReply};
+    let store = Rc::new(RefCell::new(seed));
+    let sink_store = Rc::clone(&store);
+    let sink: plugin_toolkit::capsink::CapSink = Box::new(move |cap, op_json| {
+        if cap != "secret.op" {
+            return Err(format!("unexpected capability {cap}"));
+        }
+        let op: SecretOp =
+            plugin_toolkit::serde_json::from_str(op_json).map_err(|e| e.to_string())?;
+        let mut s = sink_store.borrow_mut();
+        let reply = match op {
+            SecretOp::Get { name } => SecretReply {
+                found: s.contains_key(&name),
+                value: s.get(&name).cloned(),
+            },
+            SecretOp::Set { name, value, .. } => {
+                s.insert(name, value);
+                SecretReply {
+                    value: None,
+                    found: true,
+                }
+            }
+            SecretOp::Exists { name } => SecretReply {
+                value: None,
+                found: s.contains_key(&name),
+            },
+            SecretOp::Delete { name } => SecretReply {
+                value: None,
+                found: s.remove(&name).is_some(),
+            },
+        };
+        plugin_toolkit::serde_json::to_string(&reply).map_err(|e| e.to_string())
+    });
+    let out = plugin_toolkit::capsink::with_cap_sink(sink, body);
+    let left = store.borrow().clone();
+    (out, left)
+}
