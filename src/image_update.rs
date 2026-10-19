@@ -84,7 +84,7 @@ pub fn parse_credentials(value: &str) -> Option<DockerCredentials> {
 pub(crate) fn registry_credentials(reference: &str) -> Option<DockerCredentials> {
     let name = auth_secret_name(&registry_host(reference));
     let value = plugin_toolkit::secrets::get(&name).ok().flatten()?;
-    parse_credentials(&value)
+    parse_credentials(value.expose_secret())
 }
 
 /// The digest a reference pins with `@sha256:...`, if any.
