@@ -61,6 +61,38 @@ const KEPT_HOST_FIELDS: &[&str] = &[
     "CpusetCpus",
     "PidsLimit",
     "ShmSize",
+    "Init",
+    "Dns",
+    "DnsSearch",
+    "DnsOptions",
+    "Ulimits",
+];
+/// Create-body fields carried to the target as they are.
+const KEPT_CONFIG_FIELDS: &[&str] = &[
+    "Image",
+    "User",
+    "Env",
+    "Cmd",
+    "Entrypoint",
+    "Labels",
+    "WorkingDir",
+    "ExposedPorts",
+    "Hostname",
+    "Domainname",
+    "Healthcheck",
+    "StopSignal",
+    "StopTimeout",
+    "Volumes",
+    "Shell",
+    "Tty",
+    "OpenStdin",
+    "StdinOnce",
+    "AttachStdin",
+    "AttachStdout",
+    "AttachStderr",
+    "ArgsEscaped",
+    "HostConfig",
+    "NetworkingConfig",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,6 +280,24 @@ pub fn rebuild_host_config(name: &str, h: &HostConfig) -> Result<HostConfig> {
                         Some("no-new-privileges" | "no-new-privileges:true")
                     )
                 }) => {}
+            "Tmpfs" => {
+                for (dst, opts) in v.as_object().into_iter().flatten() {
+                    let opts: Vec<&str> = opts.as_str().unwrap_or_default().split(',').collect();
+                    if opts.iter().any(|o| matches!(*o, "exec" | "suid"))
+                        || !opts.contains(&"noexec")
+                        || !opts.contains(&"nosuid")
+                    {
+                        refused.push(format!("Tmpfs {dst} without noexec,nosuid"));
+                    }
+                }
+                kept.insert(k, v);
+            }
+            "OomScoreAdj" if v.as_i64().is_some_and(|n| n < 0) => {
+                refused.push(format!("OomScoreAdj {v}"));
+            }
+            "OomScoreAdj" => {
+                kept.insert(k, v);
+            }
             "CapDrop" | "ConsoleSize" => {}
             _ if is_default(&v) => {}
             _ => refused.push(k),
@@ -323,12 +373,23 @@ pub fn spec_of(
 }
 
 fn secret_name(stack: &str, container: &str, key: &str) -> String {
-    format!("docker.move.{stack}.{container}.{key}")
+    secrets::scoped_name("docker", &format!("move.{stack}.{container}"), key)
 }
 
 /// The create body the target runs `spec` with, after every check that does
 /// not need the secrets.
 fn checked_body(stack: &str, spec: &ContainerSpec) -> Result<ContainerCreateBody> {
+    let refused: Vec<&str> = spec
+        .create
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(k, v)| !KEPT_CONFIG_FIELDS.contains(&k.as_str()) && !is_default(v))
+        .map(|(k, _)| k.as_str())
+        .collect();
+    if !refused.is_empty() {
+        bail!("{}: refusing Config {}", spec.name, refused.join(", "));
+    }
     let mut body: ContainerCreateBody = serde_json::from_value(spec.create.clone())
         .map_err(|e| anyhow!("spec of {}: {e}", spec.name))?;
     let project = body
@@ -1111,6 +1172,10 @@ pub struct StackMoveFinishOutput {
     pub stack: String,
     /// Containers acted on (execute), or that would be.
     pub containers: Vec<String>,
+    /// Secrets the move's export stored, deleted by `stop` and `remove` once
+    /// every container was acted on (execute), or that would be.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<String>,
     pub failures: Vec<String>,
 }
 
@@ -1153,8 +1218,8 @@ pub async fn finish(
     let Some(action) = args.action else {
         bail!("action is required: stop, remove or restart");
     };
-    let mut names: Vec<String> = inspect_all(docker, &args.stack)
-        .await?
+    let inspected = inspect_all(docker, &args.stack).await?;
+    let mut names: Vec<String> = inspected
         .iter()
         .map(|c| {
             c.name
@@ -1175,6 +1240,11 @@ pub async fn finish(
         executed: !args.dry_run,
         stack: args.stack.clone(),
         containers: names.clone(),
+        secrets: if action == FinishAction::Restart {
+            Vec::new()
+        } else {
+            move_secrets(&args.stack, &inspected)
+        },
         ..Default::default()
     };
     if args.dry_run {
@@ -1193,13 +1263,45 @@ pub async fn finish(
             failed
         }
     };
+    if out.failures.is_empty() {
+        for name in &out.secrets {
+            if let Err(e) = secrets::delete(name) {
+                out.failures.push(format!("delete secret {name}: {e:#}"));
+            }
+        }
+    }
     Ok(out)
+}
+
+/// The secrets export stored for the env of `inspected`.
+fn move_secrets(stack: &str, inspected: &[ContainerInspectResponse]) -> Vec<String> {
+    let mut out: Vec<String> = inspected
+        .iter()
+        .flat_map(|c| {
+            let name = c
+                .name
+                .as_deref()
+                .unwrap_or_default()
+                .trim_start_matches('/');
+            c.config
+                .as_ref()
+                .and_then(|cfg| cfg.env.as_ref())
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.split_once('=').map(|p| p.0))
+                .filter(|k| plugin_toolkit::scrub::is_sensitive_key(k))
+                .map(move |k| secret_name(stack, name, k))
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 /// **Finish a stack move on the source host**: once the target is healthy,
 /// `stop` the stack or `remove` its containers (volumes stay; only with the
 /// move's verified `bundle`, and only the containers it moved); when the
-/// target failed, `restart` it as the rollback.
+/// target failed, `restart` it as the rollback. `stop` and `remove` then
+/// delete the env secrets the export stored; `restart` keeps them for a retry.
 #[orca_tool(
     domain = "docker",
     verb = "stack_move_finish",
@@ -2064,12 +2166,172 @@ mod tests {
         let (bundle, sha) = target_bundle(root.path(), None, spec(json!({})));
         args.bundle = Some(bundle);
         args.bundle_sha256 = Some(sha);
-        let out = block(finish(&e.client(), &args, &r)).unwrap();
+        let seed = BTreeMap::from([(
+            "docker.move.s.s-cache-1.DB_PASSWORD".to_string(),
+            "hunter2".to_string(),
+        )]);
+        let (out, left) = with_secrets(seed, || block(finish(&e.client(), &args, &r)).unwrap());
         assert!(out.failures.is_empty(), "{:?}", out.failures);
+        assert_eq!(out.secrets, ["docker.move.s.s-cache-1.DB_PASSWORD"]);
+        assert!(left.is_empty(), "{left:?}");
         assert!(
             e.paths("DELETE")
                 .iter()
                 .any(|p| p.ends_with("/containers/s-cache-1"))
+        );
+    }
+
+    #[test]
+    fn finish_stop_deletes_the_move_secrets_and_restart_keeps_them() {
+        let e = source_engine();
+        let r = roots(Path::new("/nonexistent"));
+        let seed = || {
+            BTreeMap::from([
+                (
+                    "docker.move.s.s-cache-1.DB_PASSWORD".to_string(),
+                    "hunter2".to_string(),
+                ),
+                ("docker.other".to_string(), "x".to_string()),
+            ])
+        };
+        let (out, left) = with_secrets(seed(), || {
+            block(finish(
+                &e.client(),
+                &finish_args(FinishAction::Restart, false),
+                &r,
+            ))
+            .unwrap()
+        });
+        assert!(out.secrets.is_empty());
+        assert_eq!(left, seed());
+        let (out, left) = with_secrets(seed(), || {
+            block(finish(
+                &e.client(),
+                &finish_args(FinishAction::Stop, true),
+                &r,
+            ))
+            .unwrap()
+        });
+        assert_eq!(out.secrets, ["docker.move.s.s-cache-1.DB_PASSWORD"]);
+        assert_eq!(left, seed());
+        let (out, left) = with_secrets(seed(), || {
+            block(finish(
+                &e.client(),
+                &finish_args(FinishAction::Stop, false),
+                &r,
+            ))
+            .unwrap()
+        });
+        assert!(out.failures.is_empty(), "{:?}", out.failures);
+        assert_eq!(left.keys().collect::<Vec<_>>(), ["docker.other"]);
+    }
+
+    #[test]
+    fn an_unhealthy_import_keeps_the_secrets_for_a_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let mut c = spec(json!({}));
+        c.secret_env.push(SecretEnv {
+            key: "DB_PASSWORD".into(),
+            secret: SecretRef("docker.move.s.s-cache-1.DB_PASSWORD".into()),
+        });
+        let (bundle, sha) = target_bundle(root.path(), None, c);
+        let e = target_engine("unhealthy");
+        let seed = BTreeMap::from([(
+            "docker.move.s.s-cache-1.DB_PASSWORD".to_string(),
+            "hunter2".to_string(),
+        )]);
+        let (out, left) = with_secrets(seed.clone(), || {
+            block(import(
+                &e.client(),
+                &import_args(&bundle, &sha, false),
+                &roots(root.path()),
+            ))
+            .unwrap()
+        });
+        assert!(out.rolled_back);
+        assert_eq!(left, seed);
+    }
+
+    #[test]
+    fn rebuild_keeps_the_safe_runtime_fields() {
+        let h: HostConfig = plugin_toolkit::serde_json::from_value(json!({
+            "Init": true,
+            "Dns": ["10.0.0.1"],
+            "DnsSearch": ["lan"],
+            "DnsOptions": ["ndots:1"],
+            "ShmSize": 67108864,
+            "Tmpfs": { "/run": "rw,noexec,nosuid,size=64m" },
+            "Ulimits": [{ "Name": "nofile", "Soft": 1024, "Hard": 2048 }],
+            "OomScoreAdj": 100,
+            "PidsLimit": 100
+        }))
+        .unwrap();
+        let out =
+            plugin_toolkit::serde_json::to_value(rebuild_host_config("c", &h).unwrap()).unwrap();
+        for k in [
+            "Init",
+            "Dns",
+            "DnsSearch",
+            "DnsOptions",
+            "ShmSize",
+            "Tmpfs",
+            "Ulimits",
+            "OomScoreAdj",
+            "PidsLimit",
+        ] {
+            assert!(out.get(k).is_some_and(|v| !is_default(v)), "{k}: {out}");
+        }
+        for (host, want) in [
+            (
+                json!({ "Tmpfs": { "/run": "rw,exec,nosuid,noexec" } }),
+                "Tmpfs /run",
+            ),
+            (json!({ "Tmpfs": { "/run": "rw,noexec" } }), "Tmpfs /run"),
+            (json!({ "Tmpfs": { "/run": "" } }), "Tmpfs /run"),
+            (json!({ "OomScoreAdj": -500 }), "OomScoreAdj -500"),
+        ] {
+            let err = refused(host.clone());
+            assert!(err.contains(want), "{host}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_create_body_keeps_ordinary_config_and_refuses_the_rest() {
+        let mut c = spec(json!({}));
+        for (k, v) in [
+            ("Init", json!(null)),
+            ("Hostname", json!("cache")),
+            ("WorkingDir", json!("/data")),
+            ("Entrypoint", json!(["/entry"])),
+            ("Cmd", json!(["redis-server"])),
+            ("ExposedPorts", json!({ "6379/tcp": {} })),
+            ("StopSignal", json!("SIGTERM")),
+            ("StopTimeout", json!(30)),
+            ("Healthcheck", json!({ "Test": ["CMD", "true"] })),
+        ] {
+            c.create[k] = v;
+        }
+        let body = plugin_toolkit::serde_json::to_value(checked_body("s", &c).unwrap()).unwrap();
+        assert_eq!(body["Hostname"], "cache");
+        assert_eq!(body["StopTimeout"], 30);
+        assert_eq!(body["Healthcheck"]["Test"], json!(["CMD", "true"]));
+        for (k, v) in [
+            ("MacAddress", json!("02:42:ac:11:00:02")),
+            ("NetworkDisabled", json!(true)),
+            ("OnBuild", json!(["RUN x"])),
+        ] {
+            let mut bad = spec(json!({}));
+            bad.create[k] = v;
+            let err = checked_body("s", &bad).unwrap_err().to_string();
+            assert!(err.contains(&format!("refusing Config {k}")), "{err}");
+        }
+    }
+
+    #[test]
+    fn move_secrets_are_scoped_to_the_plugin() {
+        assert_eq!(
+            secret_name("s", "s-cache-1", "DB_PASSWORD"),
+            "docker.move.s.s-cache-1.DB_PASSWORD"
         );
     }
 
