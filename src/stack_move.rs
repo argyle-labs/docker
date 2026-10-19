@@ -81,7 +81,8 @@ const LOG_OPTS: &[&str] = &[
     "env-regex",
     "tag",
 ];
-/// Container label prefixes carried to the target; others are dropped.
+/// Container label prefixes carried to the target; others, orca's own
+/// included, are dropped and orca's labels written for this host.
 const KEPT_LABEL_PREFIXES: &[&str] = &[
     "com.docker.compose.",
     "org.opencontainers.",
@@ -465,11 +466,8 @@ struct Scope<'a> {
     volumes: Option<&'a [String]>,
 }
 
-fn kept_label(name: &str, key: &str) -> Result<bool> {
-    if key.starts_with("orca.") {
-        bail!("{name}: refusing orca label '{key}' from the bundle");
-    }
-    Ok(KEPT_LABEL_PREFIXES.iter().any(|p| key.starts_with(p)))
+fn kept_label(key: &str) -> bool {
+    KEPT_LABEL_PREFIXES.iter().any(|p| key.starts_with(p))
 }
 
 fn network_in_scope(net: &str, scope: &Scope) -> bool {
@@ -517,12 +515,22 @@ fn checked_body(stack: &str, spec: &ContainerSpec, scope: &Scope) -> Result<Cont
             spec.name
         );
     }
-    let mut labels = HashMap::new();
-    for (k, v) in body.labels.take().into_iter().flatten() {
-        if kept_label(&spec.name, &k)? {
-            labels.insert(k, v);
-        }
-    }
+    let mut labels: HashMap<String, String> = body
+        .labels
+        .take()
+        .into_iter()
+        .flatten()
+        .filter(|(k, _)| kept_label(k))
+        .collect();
+    labels.extend(
+        crate::labels::Labels::for_(
+            crate::labels::OWNER_DOCKER,
+            stack,
+            Some(&spec.service),
+            None,
+        )
+        .to_map(),
+    );
     body.labels = Some(labels);
     let host = rebuild_host_config(&spec.name, &body.host_config.unwrap_or_default())?;
     let mode = host.network_mode.as_deref().unwrap_or_default();
@@ -2605,31 +2613,53 @@ mod tests {
     }
 
     #[test]
-    fn labels_keep_the_allowlist_and_refuse_orcas_own() {
+    fn bundle_orca_labels_are_replaced_by_the_targets() {
         let mut c = spec(json!({}));
         c.create["Labels"] = json!({
             "com.docker.compose.project": "s",
             "org.opencontainers.image.title": "redis",
-            "traefik.http.routers.x.rule": "Host(`a`)"
+            "traefik.http.routers.x.rule": "Host(`a`)",
+            "orca.owner": "evil",
+            "orca.stack": "victim",
+            "orca.role": "gateway"
         });
-        let body = checked_body("s", &c, &open_scope()).unwrap();
-        let mut keys: Vec<_> = body.labels.unwrap().into_keys().collect();
-        keys.sort();
-        assert_eq!(
-            keys,
-            [
-                "com.docker.compose.project",
-                "org.opencontainers.image.title"
-            ]
-        );
-        for label in ["orca.owner", "orca.stack", "orca.role"] {
-            let mut bad = spec(json!({}));
-            bad.create["Labels"][label] = json!("x");
-            let err = checked_body("s", &bad, &open_scope())
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains(label), "{err}");
-        }
+        let labels = checked_body("s", &c, &open_scope())
+            .unwrap()
+            .labels
+            .unwrap();
+        let want =
+            crate::labels::Labels::for_(crate::labels::OWNER_DOCKER, "s", Some("cache"), None)
+                .to_map();
+        let orca: BTreeMap<String, String> = labels
+            .iter()
+            .filter(|(k, _)| k.starts_with("orca."))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        assert_eq!(orca, want);
+        assert_eq!(labels["orca.owner"], "docker");
+        assert!(!labels.contains_key("orca.role"));
+        assert!(!labels.contains_key("traefik.http.routers.x.rule"));
+        assert_eq!(labels["org.opencontainers.image.title"], "redis");
+    }
+
+    #[test]
+    fn import_writes_the_targets_ownership_labels() {
+        let root = tempfile::tempdir().unwrap();
+        let mut c = spec(json!({}));
+        c.create["Labels"]["orca.owner"] = json!("evil");
+        let (bundle, sha) = target_bundle(root.path(), None, c);
+        let e = target_engine("healthy");
+        block(import(
+            &e.client(),
+            &import_args(&bundle, &sha, false),
+            &roots(root.path()),
+        ))
+        .unwrap();
+        let body: Value =
+            plugin_toolkit::serde_json::from_str(&e.bodies("/containers/create")[0]).unwrap();
+        assert_eq!(body["Labels"]["orca.owner"], "docker");
+        assert_eq!(body["Labels"]["orca.stack"], "s");
+        assert_eq!(body["Labels"]["orca.managed"], "true");
     }
 
     #[test]
