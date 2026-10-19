@@ -460,7 +460,7 @@ fn secret_shaped(key: &str, value: &str) -> bool {
             && value.to_ascii_lowercase().contains("password="))
 }
 
-fn secret_name(stack: &str, container: &str, key: &str) -> String {
+fn secret_name(stack: &str, container: &str, key: &str) -> Result<SecretRef> {
     secrets::scoped_name("docker", &format!("move.{stack}.{container}"), key)
 }
 
@@ -854,10 +854,10 @@ fn store_secrets(
         .into_iter()
         .map(|(mut spec, hidden)| {
             for (key, value) in hidden {
-                let name = secret_name(stack, &spec.name, &key);
-                let secret = secrets::set(&name, &value, Some("docker stack move env"))
+                let name = secret_name(stack, &spec.name, &key)?;
+                let secret = secrets::set(name.as_str(), &value, Some("docker stack move env"))
                     .with_context(|| format!("store {key} of {} as a secret", spec.name))?;
-                stored.push(name);
+                stored.push(name.to_string());
                 spec.secret_env.push(SecretEnv { key, secret });
             }
             Ok(spec)
@@ -1154,12 +1154,12 @@ fn valid_env_key(key: &str) -> bool {
 /// never another one.
 fn check_secret_refs(stack: &str, spec: &ContainerSpec) -> Result<()> {
     for s in &spec.secret_env {
-        if !valid_env_key(&s.key) || s.secret.0 != secret_name(stack, &spec.name, &s.key) {
+        if !valid_env_key(&s.key) || s.secret != secret_name(stack, &spec.name, &s.key)? {
             bail!(
                 "{}: secret env {} refers to '{}', not its own move secret",
                 spec.name,
                 s.key,
-                s.secret.0
+                s.secret
             );
         }
     }
@@ -1171,12 +1171,12 @@ fn resolve_env(spec: &ContainerSpec, dry_run: bool) -> Result<Vec<String>> {
         .iter()
         .map(|s| {
             let value = if dry_run {
-                if !secrets::exists(&s.secret.0)? {
-                    bail!("no secret '{}' on this host", s.secret.0);
+                if !secrets::exists(s.secret.as_str())? {
+                    bail!("no secret '{}' on this host", s.secret);
                 }
                 String::new()
             } else {
-                s.secret.resolve()?
+                s.secret.resolve()?.expose_secret().clone()
             };
             Ok(format!("{}={value}", s.key))
         })
@@ -1465,7 +1465,7 @@ fn bound_to_move(
     let mut refs = Vec::new();
     for c in &bundle.containers {
         check_secret_refs(&bundle.stack, c)?;
-        refs.extend(c.secret_env.iter().map(|s| s.secret.0.clone()));
+        refs.extend(c.secret_env.iter().map(|s| s.secret.to_string()));
     }
     refs.sort();
     Ok(refs)
@@ -1894,7 +1894,7 @@ mod tests {
         c.create["User"] = json!("999");
         c.secret_env.push(SecretEnv {
             key: "DB_PASSWORD".into(),
-            secret: SecretRef("docker.move.s.s-cache-1.DB_PASSWORD".into()),
+            secret: SecretRef::parse("docker.move.s.s-cache-1.DB_PASSWORD").unwrap(),
         });
         let (bundle, sha) = target_bundle(root.path(), None, c);
         let e = target_engine("healthy");
@@ -1940,7 +1940,7 @@ mod tests {
         let mut c = spec(json!({}));
         c.secret_env.push(SecretEnv {
             key: "DB_PASSWORD".into(),
-            secret: SecretRef("docker.move.s.s-cache-1.DB_PASSWORD".into()),
+            secret: SecretRef::parse("docker.move.s.s-cache-1.DB_PASSWORD").unwrap(),
         });
         let (bundle, sha) = target_bundle(root.path(), None, c);
         let e = target_engine("healthy");
@@ -2378,7 +2378,7 @@ mod tests {
     fn with_secret(mut c: ContainerSpec, name: &str) -> ContainerSpec {
         c.secret_env.push(SecretEnv {
             key: "DB_PASSWORD".into(),
-            secret: SecretRef(name.into()),
+            secret: SecretRef::parse(name).unwrap(),
         });
         c
     }
@@ -2892,7 +2892,9 @@ mod tests {
     #[test]
     fn move_secrets_are_scoped_to_the_plugin() {
         assert_eq!(
-            secret_name("s", "s-cache-1", "DB_PASSWORD"),
+            secret_name("s", "s-cache-1", "DB_PASSWORD")
+                .unwrap()
+                .as_str(),
             "docker.move.s.s-cache-1.DB_PASSWORD"
         );
     }
