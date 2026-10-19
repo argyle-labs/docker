@@ -8,4 +8,4 @@ cd "$ROOT"
 
 git config core.hooksPath .githooks
 chmod +x .githooks/* 2>/dev/null || true
-echo "git hooks -> .githooks (pre-push runs build, tests, clippy and fmt)"
+echo "git hooks -> .githooks (pre-commit auto-formats; pre-push runs CI-parity fmt+clippy+test)"
