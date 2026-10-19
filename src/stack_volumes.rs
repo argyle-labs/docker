@@ -929,6 +929,24 @@ async fn create(
         .map_err(|e| anyhow!("create volume {name}: {e}"))
 }
 
+/// Refuse a volume whose data may live outside the engine: another driver, or
+/// `local` with any option (an NFS or bind-backed mount).
+pub(crate) fn refuse_external_volume(
+    name: &str,
+    driver: &str,
+    options: &BTreeMap<String, String>,
+) -> Result<()> {
+    if driver != "local" {
+        bail!("volume '{name}' uses driver '{driver}'; only local volumes are imported");
+    }
+    if let Some(k) = options.keys().next() {
+        bail!(
+            "volume '{name}' is a local volume with option '{k}'; only plain local volumes are imported"
+        );
+    }
+    Ok(())
+}
+
 /// Refuse anything but a plain local volume: a driver or options may put
 /// its data somewhere removing or recreating the volume does not reach.
 fn plain_local(name: &str, driver: &str, options: usize) -> Result<()> {
@@ -1344,6 +1362,9 @@ pub async fn import(
     let mut todo = Vec::new();
     // Every archive passes before any volume is created.
     for v in &manifest.volumes {
+        if !is_skipped(v.kind) {
+            refuse_external_volume(&v.name, &v.driver, &v.options)?;
+        }
         match v.kind {
             k if is_skipped(k) => {}
             VolumeKind::Data if v.problem.is_some() => out.findings.push(ImportFinding {
@@ -2218,14 +2239,17 @@ mod tests {
     }
 
     #[test]
-    fn keep_reports_a_driver_or_options_mismatch() {
+    fn import_refuses_external_volumes_before_touching_the_engine() {
         let root = tempfile::tempdir().unwrap();
-        let nfs = VolumeEntry {
+        let entry = |driver: &str, opts: &[(&str, &str)]| VolumeEntry {
             name: "s_nfs".into(),
             key: Some("nfs".into()),
-            driver: "local".into(),
+            driver: driver.into(),
             labels: BTreeMap::new(),
-            options: BTreeMap::from([("type".to_string(), "nfs".to_string())]),
+            options: opts
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
             kind: VolumeKind::External,
             reason: None,
             running: vec![],
@@ -2234,37 +2258,34 @@ mod tests {
             size: None,
             problem: None,
         };
-        let json = plugin_toolkit::serde_json::to_vec(&VolumeManifest {
-            stack: "s".into(),
-            volumes: vec![nfs],
-        })
-        .unwrap();
-        let path = root.path().join(MANIFEST_FILE);
-        std::fs::write(&path, &json).unwrap();
-        let sha = plugin_toolkit::hash::sha256_hex(&json);
-        let run = |opts: &[(&str, &str)]| {
-            let e = FakeEngine::routed(vec![Route::new(
-                "GET",
-                "/volumes/s_nfs",
-                200,
-                plugin_toolkit::serde_json::to_string(&volume("s_nfs", Some("nfs"), "local", opts))
-                    .unwrap(),
-            )]);
-            block(import(
+        for (v, want) in [
+            (entry("local", &[("type", "nfs")]), "option 'type'"),
+            (entry("local", &[("device", "/srv")]), "option 'device'"),
+            (entry("local", &[("o", "bind")]), "option 'o'"),
+            (entry("rexray", &[]), "driver 'rexray'"),
+        ] {
+            let json = plugin_toolkit::serde_json::to_vec(&VolumeManifest {
+                stack: "s".into(),
+                volumes: vec![v],
+            })
+            .unwrap();
+            let path = root.path().join(MANIFEST_FILE);
+            std::fs::write(&path, &json).unwrap();
+            let e = FakeEngine::routed(vec![]);
+            let err = block(import(
                 &e.client(),
-                &import_args(&path.to_string_lossy(), &sha, false, false),
+                &import_args(
+                    &path.to_string_lossy(),
+                    &plugin_toolkit::hash::sha256_hex(&json),
+                    false,
+                    true,
+                ),
                 &roots(root.path()),
             ))
-            .unwrap()
-        };
-        let out = run(&[("type", "nfs4")]);
-        assert_eq!(out.plan[0].action, ImportAction::Keep);
-        assert!(
-            out.findings[0].message.contains("nfs4"),
-            "{:?}",
-            out.findings
-        );
-        assert!(run(&[("type", "nfs")]).findings.is_empty());
+            .unwrap_err();
+            assert!(err.to_string().contains(want), "{err}");
+            assert!(e.requests().is_empty());
+        }
     }
 
     fn volume_archive(build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> File {
