@@ -10,6 +10,7 @@
 pub mod cgroup;
 pub mod compose;
 pub mod compose_config;
+pub mod container_delete;
 pub mod containers;
 pub mod daemon_config;
 pub mod engine;
@@ -28,6 +29,7 @@ pub mod lint;
 pub mod manageability;
 pub mod mounts;
 pub mod ownership;
+pub mod path_writable;
 pub mod policy;
 pub mod prune;
 pub mod registration;
@@ -36,8 +38,10 @@ pub mod stack_health;
 pub mod stack_manifest;
 pub mod stack_move;
 pub mod stack_pull;
+pub mod stack_relocate;
 pub mod stack_volumes;
 pub mod stacks;
+pub mod stacks_root_drift;
 #[cfg(test)]
 mod test_engine;
 #[cfg(test)]

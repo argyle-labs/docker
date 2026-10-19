@@ -198,7 +198,7 @@ async fn docker_stack_wait_healthy(
     wait(docker, &args.stack, timeout(args.timeout_secs)).await
 }
 
-fn timeout(requested: Option<u64>) -> Duration {
+pub(crate) fn timeout(requested: Option<u64>) -> Duration {
     Duration::from_secs(requested.map_or(MAX_TIMEOUT_SECS, |s| s.clamp(1, MAX_TIMEOUT_SECS)))
 }
 
