@@ -862,7 +862,8 @@ pub struct DaemonConfigDetail {
     verb = "daemon_config",
     local_only = true,
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    reaches = ["privileged.apply"]
 )]
 async fn docker_daemon_config(
     _args: DockerDaemonConfigArgs,
@@ -1033,7 +1034,8 @@ pub struct DaemonConfigUpdateOutput {
     verb = "daemon_config_update",
     local_only = true,
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    reaches = ["privileged.apply"]
 )]
 async fn docker_daemon_config_update(
     args: DockerDaemonConfigUpdateArgs,
