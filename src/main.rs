@@ -18,13 +18,16 @@ fn main() -> plugin_toolkit::anyhow::Result<()> {
     if plugin_toolkit::privileged::requested() {
         docker::daemon_config::privileged_ops().serve_stdin();
     }
-    Plugin::named("docker")
+    let mut plugin = Plugin::named("docker")
         .version(env!("CARGO_PKG_VERSION"))
         .tools(["docker."])
         .schema_json(docker::registration::schema_json())
         .container_runtime(docker::runtime_adapter::DockerAdapter::new())
         .unit(docker::registration::unit_provider())
         .topology(docker::registration::DockerTopology)
-        .subprocess_env(docker::registration::DockerEnv)
-        .serve()
+        .subprocess_env(docker::registration::DockerEnv);
+    for def in docker::deploy::backend_defs() {
+        plugin = plugin.backend(def, Box::new(docker::deploy::dispatch));
+    }
+    plugin.serve()
 }

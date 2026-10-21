@@ -173,7 +173,7 @@ impl DockerUnitProvider {
     /// Per-service runtime status for a stack. Absent/unparseable compose file
     /// yields an empty list rather than an error, so a registered-but-not-yet-
     /// written stack still lists.
-    async fn stack_services(row: &StackRow) -> Vec<StackService> {
+    pub(crate) async fn stack_services(row: &StackRow) -> Vec<StackService> {
         let Ok(compose) = row.compose() else {
             return Vec::new();
         };
@@ -299,7 +299,7 @@ impl DockerUnitProvider {
     }
 
     /// **edit** (rewrite YAML/env, no deploy) or a compose lifecycle action.
-    async fn stack_update(&self, args: UpdateArgs) -> Result<VerbOutcome> {
+    pub(crate) async fn stack_update(&self, args: UpdateArgs) -> Result<VerbOutcome> {
         let row = stacks::require(&args.id.id)?;
         match args.action.as_str() {
             "edit" => {
@@ -731,7 +731,11 @@ impl DockerUnitProvider {
 
     /// Shared create/upsert path: register the stack, (optionally) write its
     /// compose/env files, then deploy. `add_only` rejects an existing name.
-    async fn stack_deploy(&self, payload: Option<String>, add_only: bool) -> Result<VerbOutcome> {
+    pub(crate) async fn stack_deploy(
+        &self,
+        payload: Option<String>,
+        add_only: bool,
+    ) -> Result<VerbOutcome> {
         let raw = payload.ok_or_else(|| anyhow::anyhow!("deploy requires a payload"))?;
         let p: StackDeployPayload =
             serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("deploy payload: {e}"))?;
@@ -1009,7 +1013,7 @@ impl DockerUnitProvider {
 }
 
 /// `compose down`, then deregister the stack.
-async fn stack_remove(row: &StackRow) -> Result<VerbOutcome> {
+pub(crate) async fn stack_remove(row: &StackRow) -> Result<VerbOutcome> {
     let secrets = stack_secrets(&row.name, None);
     let teardown = match row.compose() {
         Ok(c) => match c.run_action("down", None, None).await {
