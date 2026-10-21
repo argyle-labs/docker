@@ -29,13 +29,9 @@ impl DockerDeployTarget {
     }
 
     fn local() -> anyhow::Result<Self> {
-        let root = crate::tools::stacks_roots()?
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| crate::tools::DEFAULT_STACKS_ROOT.to_string());
         Ok(Self::new(
             plugin_toolkit::containers::local_hostname().to_string(),
-            root,
+            pick_root(&crate::tools::stacks_roots()?)?,
         ))
     }
 
@@ -44,13 +40,28 @@ impl DockerDeployTarget {
             name: spec.name.clone(),
             dir: format!("{}/{}", self.root.trim_end_matches('/'), spec.name),
             file: None,
-            compose_yaml: Some(compose_yaml(spec)?),
+            compose_yaml: Some(compose_json(spec)?),
             compose_env: None,
             deploy: true,
         })
     }
 
+    async fn observed(
+        &self,
+        workload: &str,
+        detail: Option<String>,
+    ) -> Result<DeployOutcome, DeployError> {
+        let status = self.status(workload).await?;
+        Ok(DeployOutcome {
+            workload: workload.to_string(),
+            id: status.id,
+            state: Some(status.state),
+            detail: detail.or(status.detail),
+        })
+    }
+
     async fn lifecycle(&self, workload: &str, action: &str) -> Result<DeployOutcome, DeployError> {
+        check_name(workload)?;
         require(workload)?;
         let args = UpdateArgs {
             id: UnitId {
@@ -64,7 +75,7 @@ impl DockerDeployTarget {
             caller: None,
         };
         let out = provider().stack_update(args).await.map_err(other)?;
-        Ok(outcome(workload, action, out))
+        self.observed(workload, message(out)).await
     }
 }
 
@@ -76,26 +87,56 @@ fn other(e: impl std::fmt::Display) -> DeployError {
     DeployError::Other(e.to_string())
 }
 
+pub fn pick_root(roots: &[String]) -> Result<String, DeployError> {
+    match roots {
+        [root] => Ok(root.clone()),
+        [] => Ok(crate::tools::DEFAULT_STACKS_ROOT.to_string()),
+        _ => Err(other(format!(
+            "ambiguous stacks roots {roots:?}; configure a single stacks_root for the deploy target"
+        ))),
+    }
+}
+
+fn check_name(name: &str) -> Result<(), DeployError> {
+    if !crate::fsat::is_single_component(name) {
+        return Err(other(format!(
+            "workload name '{name}' must be a single path component"
+        )));
+    }
+    Ok(())
+}
+
+pub fn summarize(services: Result<Vec<bool>, String>) -> (&'static str, String) {
+    match services {
+        Err(e) => ("broken", e),
+        Ok(running) => {
+            let up = running.iter().filter(|r| **r).count();
+            let state = if running.is_empty() || up == 0 {
+                "stopped"
+            } else if up == running.len() {
+                "running"
+            } else {
+                "degraded"
+            };
+            (state, format!("{up}/{} service(s) running", running.len()))
+        }
+    }
+}
+
 fn require(workload: &str) -> Result<stacks::StackRow, DeployError> {
     stacks::get(workload)
         .map_err(other)?
         .ok_or_else(|| DeployError::NotFound(format!("no docker stack '{workload}'")))
 }
 
-fn outcome(workload: &str, state: &str, out: VerbOutcome) -> DeployOutcome {
-    let detail = match out {
+fn message(out: VerbOutcome) -> Option<String> {
+    match out {
         VerbOutcome::Action(a) => Some(a.message),
         _ => None,
-    };
-    DeployOutcome {
-        workload: workload.to_string(),
-        id: Some(workload.to_string()),
-        state: Some(state.to_string()),
-        detail,
     }
 }
 
-pub fn compose_yaml(spec: &WorkloadSpec) -> Result<String, DeployError> {
+pub fn compose_json(spec: &WorkloadSpec) -> Result<String, DeployError> {
     if spec.name.is_empty() {
         return Err(other("docker deploy requires spec.name"));
     }
@@ -172,21 +213,13 @@ impl DeployTarget for DockerDeployTarget {
     }
 
     async fn launch(&self, spec: &WorkloadSpec) -> Result<DeployOutcome, DeployError> {
+        check_name(&spec.name)?;
         let raw = serde_json::to_string(&self.payload(spec)?).map_err(other)?;
-        let out = provider()
-            .stack_deploy(Some(raw), false)
+        provider()
+            .stack_deploy(Some(raw), true)
             .await
             .map_err(other)?;
-        let detail = match out {
-            VerbOutcome::Item(i) => Some(i.payload),
-            _ => None,
-        };
-        Ok(DeployOutcome {
-            workload: spec.name.clone(),
-            id: Some(spec.name.clone()),
-            state: Some("running".into()),
-            detail,
-        })
+        self.observed(&spec.name, None).await
     }
 
     async fn provision(&self, spec: &WorkloadSpec) -> Result<DeployOutcome, DeployError> {
@@ -202,24 +235,30 @@ impl DeployTarget for DockerDeployTarget {
     }
 
     async fn destroy(&self, workload: &str) -> Result<DeployOutcome, DeployError> {
+        check_name(workload)?;
         let row = require(workload)?;
         let out = stack_remove(&row).await.map_err(other)?;
-        Ok(outcome(workload, "destroyed", out))
-    }
-
-    async fn adopt(&self, req: &AdoptRequest) -> Result<DeployOutcome, DeployError> {
-        let row = stacks::get(&req.native_id).map_err(other)?.ok_or_else(|| {
-            DeployError::NotFound(format!("no docker stack '{}' to adopt", req.native_id))
-        })?;
         Ok(DeployOutcome {
-            workload: req.name.clone().unwrap_or_else(|| row.name.clone()),
-            id: Some(row.name.clone()),
-            state: Some("adopted".into()),
-            detail: Some(format!("stack '{}' at {}", row.name, row.dir)),
+            workload: workload.to_string(),
+            id: None,
+            state: Some("absent".into()),
+            detail: message(out),
         })
     }
 
+    async fn adopt(&self, req: &AdoptRequest) -> Result<DeployOutcome, DeployError> {
+        check_name(&req.native_id)?;
+        if req.name.as_deref().is_some_and(|n| n != req.native_id) {
+            return Err(other(
+                "docker stacks are tracked by their stack name; adopt does not rename",
+            ));
+        }
+        require(&req.native_id)?;
+        self.observed(&req.native_id, None).await
+    }
+
     async fn status(&self, workload: &str) -> Result<TargetStatus, DeployError> {
+        check_name(workload)?;
         let Some(row) = stacks::get(workload).map_err(other)? else {
             return Ok(TargetStatus {
                 workload: workload.to_string(),
@@ -229,22 +268,21 @@ impl DeployTarget for DockerDeployTarget {
                 detail: None,
             });
         };
-        let services = DockerUnitProvider::stack_services(&row).await;
-        let state = if services.is_empty() {
-            "stopped"
-        } else if services.iter().all(|s| s.running) {
-            "running"
-        } else if services.iter().any(|s| s.running) {
-            "degraded"
-        } else {
-            "stopped"
+        let services = match row.compose() {
+            Ok(c) => c
+                .services()
+                .await
+                .map(|svcs| svcs.into_iter().map(|s| s.running).collect())
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
         };
+        let (state, detail) = summarize(services);
         Ok(TargetStatus {
             workload: workload.to_string(),
             id: Some(row.name.clone()),
             exists: true,
             state: state.into(),
-            detail: Some(format!("{} service(s) at {}", services.len(), row.dir)),
+            detail: Some(format!("{detail} at {}", row.dir)),
         })
     }
 }
@@ -306,7 +344,7 @@ mod tests {
     }
 
     fn service(spec: &WorkloadSpec) -> Value {
-        let doc: Value = serde_json::from_str(&compose_yaml(spec).unwrap()).unwrap();
+        let doc: Value = serde_json::from_str(&compose_json(spec).unwrap()).unwrap();
         doc["services"][&spec.name].clone()
     }
 
@@ -343,10 +381,10 @@ mod tests {
     fn rejects_missing_image_and_sourceless_bind() {
         let mut s = spec();
         s.image = None;
-        assert!(compose_yaml(&s).is_err());
+        assert!(compose_json(&s).is_err());
         let mut s = spec();
         s.mounts[0].source.clear();
-        assert!(compose_yaml(&s).is_err());
+        assert!(compose_json(&s).is_err());
     }
 
     #[test]
@@ -371,6 +409,93 @@ mod tests {
         for cap in ["launch", "stop", "restart", "destroy", "adopt", "status"] {
             assert!(def.capabilities.iter().any(|c| c == cap), "{cap}");
         }
+    }
+
+    fn run(op: &str, args: Value) -> Result<Value, Value> {
+        crate::test_support::with_db(|| dispatch(&format!("{INVOKE_PREFIX}.{op}"), args).unwrap()).0
+    }
+
+    fn err_text(r: Result<Value, Value>) -> String {
+        r.expect_err("op should fail").to_string()
+    }
+
+    #[test]
+    fn launch_refuses_non_component_names() {
+        for name in ["../x", "a/b", "..", ""] {
+            let mut s = spec();
+            s.name = name.into();
+            let err = err_text(run("launch", json!({"spec": s})));
+            assert!(err.contains("single path component"), "{name}: {err}");
+            let err = err_text(run("provision", json!({"spec": s})));
+            assert!(err.contains("single path component"), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn workload_ops_refuse_non_component_names() {
+        for op in ["stop", "restart", "destroy", "status"] {
+            for name in ["../x", "a/b"] {
+                let err = err_text(run(op, json!({"workload": name})));
+                assert!(err.contains("single path component"), "{op} {name}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_stack_is_not_found_per_op() {
+        for op in ["stop", "restart", "destroy"] {
+            let err = err_text(run(op, json!({"workload": "ghost"})));
+            assert!(err.contains("no docker stack 'ghost'"), "{op}: {err}");
+        }
+        let err = err_text(run("adopt", json!({"req": {"native_id": "ghost"}})));
+        assert!(err.contains("no docker stack 'ghost'"), "{err}");
+    }
+
+    #[test]
+    fn status_of_unknown_stack_is_absent() {
+        let out = run("status", json!({"workload": "ghost"})).unwrap();
+        assert_eq!(out["exists"], false);
+        assert_eq!(out["state"], "absent");
+    }
+
+    #[test]
+    fn adopt_refuses_rename() {
+        let err = err_text(run(
+            "adopt",
+            json!({"req": {"native_id": "web", "name": "other"}}),
+        ));
+        assert!(err.contains("does not rename"), "{err}");
+    }
+
+    #[test]
+    fn unknown_op_is_refused() {
+        let err = err_text(run("teleport", json!({})));
+        assert!(err.contains("no operation 'teleport'"), "{err}");
+    }
+
+    #[test]
+    fn summarize_maps_every_state() {
+        assert_eq!(
+            summarize(Err("bad yaml".into())),
+            ("broken", "bad yaml".into())
+        );
+        assert_eq!(summarize(Ok(vec![])).0, "stopped");
+        assert_eq!(summarize(Ok(vec![false, false])).0, "stopped");
+        assert_eq!(summarize(Ok(vec![true, true])).0, "running");
+        assert_eq!(
+            summarize(Ok(vec![true, false])),
+            ("degraded", "1/2 service(s) running".into())
+        );
+    }
+
+    #[test]
+    fn pick_root_refuses_ambiguity() {
+        assert_eq!(pick_root(&[]).unwrap(), crate::tools::DEFAULT_STACKS_ROOT);
+        assert_eq!(pick_root(&["/srv/stacks".into()]).unwrap(), "/srv/stacks");
+        let err = pick_root(&["/a".into(), "/b".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ambiguous stacks roots"), "{err}");
     }
 
     #[test]
