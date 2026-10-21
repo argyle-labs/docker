@@ -61,6 +61,10 @@ pub struct Runtime {
     /// (`/opt/stacks`) applies unless another runtime sets one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stacks_root: Option<String>,
+    /// Host directories deployed workloads may bind-mount from; empty means
+    /// the stacks root only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data_roots: Vec<String>,
     pub routes: Routes,
     pub enabled: bool,
 }
@@ -114,6 +118,10 @@ fn joined(row: EndpointRow) -> Result<Runtime> {
         host: setting("host")?,
         url: setting("url")?,
         stacks_root: setting("stacks_root")?,
+        data_roots: match setting("data_roots")? {
+            Some(raw) => plugin_toolkit::serde_json::from_str(&raw)?,
+            None => Vec::new(),
+        },
         name: row.name,
         routes: row.routes,
         enabled: row.enabled,
@@ -127,6 +135,14 @@ fn store_settings(rt: &Runtime) -> Result<()> {
     row.insert("host".to_string(), text(&rt.host));
     row.insert("url".to_string(), text(&rt.url));
     row.insert("stacks_root".to_string(), text(&rt.stacks_root));
+    row.insert(
+        "data_roots".to_string(),
+        if rt.data_roots.is_empty() {
+            DbValue::Null
+        } else {
+            DbValue::Text(plugin_toolkit::serde_json::to_string(&rt.data_roots)?)
+        },
+    );
     db_op(&DbOp::Upsert {
         namespace: "docker".to_string(),
         table: SETTINGS_TABLE.to_string(),
@@ -175,6 +191,20 @@ pub fn stacks_roots() -> Result<Vec<String>> {
         roots.push(DEFAULT_STACKS_ROOT.to_string());
     }
     Ok(roots)
+}
+
+pub(crate) fn validate_data_roots(roots: &[String]) -> Result<()> {
+    for root in roots {
+        let path = Path::new(root);
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+        {
+            bail!("data_root '{root}' must be an absolute path without '.' or '..'");
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_stacks_root(root: &str) -> Result<()> {
@@ -300,6 +330,10 @@ pub struct DockerCreateArgs {
     #[arg(long)]
     #[serde(default, alias = "stacks_root")]
     pub stacks_root: Option<String>,
+    /// Host directory deployed workloads may bind-mount from. Repeatable.
+    #[arg(long = "data-root", action = plugin_toolkit::clap::ArgAction::Append)]
+    #[serde(default, alias = "data_roots")]
+    pub data_roots: Vec<String>,
     /// Reachable path(s), tried in order. Repeatable: `--route kind=url`
     /// or a JSON object. e.g. `--route lan=http://10.0.0.5:8989`.
     #[arg(
@@ -345,6 +379,7 @@ pub(crate) async fn docker_create(
     if let Some(root) = &args.stacks_root {
         validate_stacks_root(root)?;
     }
+    validate_data_roots(&args.data_roots)?;
     if endpoint_db::get(&args.name)?.is_some() {
         bail!(
             "docker endpoint '{}' already exists; use docker.update",
@@ -357,6 +392,7 @@ pub(crate) async fn docker_create(
         host: args.host,
         url: args.url,
         stacks_root: args.stacks_root,
+        data_roots: args.data_roots,
         routes: Routes::from(args.routes),
         enabled: true,
     };
@@ -401,6 +437,10 @@ pub struct DockerUpdateArgs {
     #[arg(long)]
     #[serde(default, alias = "stacks_root")]
     pub stacks_root: Option<String>,
+    /// Host directory deployed workloads may bind-mount from. Repeatable.
+    #[arg(long = "data-root", action = plugin_toolkit::clap::ArgAction::Append)]
+    #[serde(default, alias = "data_roots")]
+    pub data_roots: Vec<String>,
     /// Replace the reachable-path set. Repeatable: `--route kind=url`
     /// or a JSON object. Omit to leave routes unchanged.
     #[arg(
@@ -447,6 +487,7 @@ async fn docker_update(args: DockerUpdateArgs, ctx: &ToolCtx) -> Result<DockerUp
     if let Some(root) = &args.stacks_root {
         validate_stacks_root(root)?;
     }
+    validate_data_roots(&args.data_roots)?;
     let mut rt = runtime(&args.name)?
         .ok_or_else(|| plugin_toolkit::runtime::missing_row_error("docker", &args.name))?;
     let mut applied = Vec::new();
@@ -461,6 +502,10 @@ async fn docker_update(args: DockerUpdateArgs, ctx: &ToolCtx) -> Result<DockerUp
     patch(&mut rt.host, args.host, "host");
     patch(&mut rt.url, args.url, "url");
     patch(&mut rt.stacks_root, args.stacks_root, "stacks_root");
+    if !args.data_roots.is_empty() {
+        rt.data_roots = args.data_roots;
+        applied.push("data_roots".to_string());
+    }
     if !args.routes.is_empty() {
         rt.routes = Routes::from(args.routes);
         applied.push("routes".to_string());
@@ -651,6 +696,7 @@ mod registry_tests {
             host: None,
             url: None,
             stacks_root: Some("/srv/stacks".into()),
+            data_roots: Vec::new(),
             routes: Vec::new(),
             dry_run: !execute,
         }
@@ -663,6 +709,7 @@ mod registry_tests {
             host: None,
             url: None,
             stacks_root: Some("/srv/other".into()),
+            data_roots: Vec::new(),
             routes: Vec::new(),
             enabled: None,
             dry_run: !execute,
@@ -777,6 +824,7 @@ mod registry_tests {
             host: None,
             url: None,
             stacks_root: None,
+            data_roots: Vec::new(),
             routes: Routes::from(Vec::new()),
             enabled,
         }
