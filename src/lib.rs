@@ -187,10 +187,13 @@ mod tests {
         )
         .unwrap();
         let file = file.to_string_lossy().into_owned();
-        let out = plugin_toolkit::reactor::block_on(run(
-            &["compose", "-f", &file, "config", "--format", "json"],
-            None,
-        ))
+        let out = crate::test_support::with_db(|| {
+            plugin_toolkit::reactor::block_on(run(
+                &["compose", "-f", &file, "config", "--format", "json"],
+                None,
+            ))
+        })
+        .0
         .unwrap();
         let cfg: plugin_toolkit::serde_json::Value =
             plugin_toolkit::serde_json::from_str(&out).unwrap();

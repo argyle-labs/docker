@@ -555,13 +555,11 @@ async fn docker_delete(args: DockerDeleteArgs, ctx: &ToolCtx) -> Result<DockerDe
 /// The `DOCKER_HOST` of the one enabled socket/tcp runtime; web-only runtimes
 /// (`url` only) are skipped, and more than one enabled engine is an error.
 pub fn active_host() -> Result<Option<String>> {
-    let Ok(all) = runtimes() else {
-        return Ok(None);
-    };
-    one_engine(&all)
+    one_engine(runtimes())
 }
 
-fn one_engine(all: &[Runtime]) -> Result<Option<String>> {
+fn one_engine(read: Result<Vec<Runtime>>) -> Result<Option<String>> {
+    let all = read.map_err(|e| e.context("reading docker runtimes"))?;
     let engines: Vec<&Runtime> = all
         .iter()
         .filter(|r| r.enabled && r.docker_host().is_some())
@@ -791,8 +789,19 @@ mod registry_tests {
             engine("b", Some("/b.sock"), false),
             engine("web", None, true),
         ];
-        assert_eq!(one_engine(&all).unwrap().as_deref(), Some("unix:///a.sock"));
-        assert_eq!(one_engine(&[]).unwrap(), None);
+        assert_eq!(
+            one_engine(Ok(all.to_vec())).unwrap().as_deref(),
+            Some("unix:///a.sock")
+        );
+        assert_eq!(one_engine(Ok(Vec::new())).unwrap(), None);
+    }
+
+    #[test]
+    fn an_unreadable_runtime_table_is_an_error() {
+        let err = one_engine(Err(plugin_toolkit::anyhow::anyhow!("db down")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reading docker runtimes"), "{err}");
     }
 
     #[test]
@@ -801,7 +810,7 @@ mod registry_tests {
             engine("a", Some("/a.sock"), true),
             engine("b", Some("/b.sock"), true),
         ];
-        let err = one_engine(&all).unwrap_err().to_string();
+        let err = one_engine(Ok(all.to_vec())).unwrap_err().to_string();
         assert!(err.contains("a, b"), "{err}");
     }
 

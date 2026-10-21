@@ -755,13 +755,15 @@ mod tests {
 
     #[test]
     fn bollard_and_compose_env_resolve_the_same_host() {
-        use plugin_toolkit::contract::subprocess_env::EnvProvider;
-        let env = crate::registration::DockerEnv.env().expect("env");
-        let compose = env
-            .into_iter()
-            .find(|v| v.key == "DOCKER_HOST")
-            .map(|v| v.value);
-        assert_eq!(DockerAdapter::new().host().unwrap(), compose);
+        crate::test_support::with_db(|| {
+            use plugin_toolkit::contract::subprocess_env::EnvProvider;
+            let env = crate::registration::DockerEnv.env().expect("env");
+            let compose = env
+                .into_iter()
+                .find(|v| v.key == "DOCKER_HOST")
+                .map(|v| v.value);
+            assert_eq!(DockerAdapter::new().host().unwrap(), compose);
+        });
     }
 
     #[test]
