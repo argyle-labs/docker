@@ -502,4 +502,196 @@ mod tests {
     fn dispatch_ignores_foreign_prefix() {
         assert!(dispatch("proxmox.__deploy.x.launch", json!({})).is_none());
     }
+
+    mod live {
+        use super::*;
+        use crate::test_support::{admin, with_db};
+        use crate::tools::{DockerCreateArgs, docker_create};
+        use plugin_toolkit::reactor::block_on;
+        use std::process::Command;
+
+        struct Cleanup {
+            prefix: String,
+            root: std::path::PathBuf,
+        }
+
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for (kind, filter) in [("ps", "name"), ("network", "name")] {
+                    let out = Command::new("docker")
+                        .args([kind, "ls", "-aq", "--filter"])
+                        .arg(format!("{filter}={}", self.prefix))
+                        .output();
+                    let ids = out
+                        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                        .unwrap_or_default();
+                    for id in ids.split_whitespace() {
+                        let rm = if kind == "ps" {
+                            ["rm", "-f"]
+                        } else {
+                            ["network", "rm"]
+                        };
+                        drop(Command::new("docker").args(rm).arg(id).output());
+                    }
+                }
+                drop(std::fs::remove_dir_all(&self.root));
+            }
+        }
+
+        fn docker(args: &[&str]) -> String {
+            let o = Command::new("docker").args(args).output().unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        }
+
+        fn containers(prefix: &str, all: bool) -> Vec<String> {
+            let filter = format!("name={prefix}");
+            let mut args = vec!["ps", "--format", "{{.Names}}", "--filter", &filter];
+            if all {
+                args.push("-a");
+            }
+            docker(&args).lines().map(str::to_string).collect()
+        }
+
+        fn op(name: &str, args: Value) -> Result<Value, Value> {
+            dispatch(&format!("{INVOKE_PREFIX}.{name}"), args).unwrap()
+        }
+
+        #[test]
+        #[ignore = "drives the local docker engine"]
+        fn deploy_lifecycle_against_local_engine() {
+            let home = std::env::var("HOME").unwrap();
+            let base = std::env::var("DOCKER_LIVE_ROOT").unwrap_or_else(|_| home.clone());
+            let root = tempfile::Builder::new()
+                .prefix("orca-deploy-live-")
+                .tempdir_in(&base)
+                .unwrap()
+                .keep();
+            let prefix = root.file_name().unwrap().to_string_lossy().to_lowercase();
+            let _guard = Cleanup {
+                prefix: prefix.clone(),
+                root: root.clone(),
+            };
+            let stacks = root.join("stacks");
+            std::fs::create_dir_all(&stacks).unwrap();
+            let socket = std::env::var("DOCKER_HOST")
+                .ok()
+                .and_then(|h| h.strip_prefix("unix://").map(str::to_string))
+                .unwrap_or_else(|| "/var/run/docker.sock".into());
+            let in_home = root.starts_with(&home);
+            let name = prefix.clone();
+            let ro = format!("{prefix}-ro");
+            let data = stacks.join(&ro).join("data");
+            std::fs::create_dir_all(&data).unwrap();
+            std::fs::write(data.join("hello"), "hi").unwrap();
+
+            let spec = |n: &str, mounts: Vec<plugin_toolkit::deploy_target::Mount>| WorkloadSpec {
+                name: n.into(),
+                image: Some("traefik/whoami".into()),
+                mounts,
+                ..Default::default()
+            };
+
+            ((), _) = with_db(|| {
+                block_on(docker_create(
+                    DockerCreateArgs {
+                        name: "local".into(),
+                        socket_path: Some(socket),
+                        host: None,
+                        url: None,
+                        stacks_root: Some(stacks.to_string_lossy().into_owned()),
+                        routes: Vec::new(),
+                        dry_run: false,
+                    },
+                    &admin(),
+                ))
+                .unwrap();
+
+                let mut s = spec(&name, Vec::new());
+                let launched = op("launch", json!({"spec": s})).expect("launch");
+                eprintln!("launch: {launched}");
+                assert_eq!(launched["state"], "running", "{launched}");
+                assert!(containers(&name, false).iter().any(|c| c.contains(&name)));
+
+                let status = op("status", json!({"workload": name})).unwrap();
+                eprintln!("status: {status}");
+                assert_eq!(status["state"], "running");
+
+                let again = op("launch", json!({"spec": s}));
+                eprintln!("relaunch: {again:?}");
+                assert!(again.is_err(), "{again:?}");
+
+                let c = containers(&name, false).remove(0);
+                let inspect = docker(&[
+                    "inspect",
+                    "--format",
+                    "{{json .HostConfig.CapDrop}} {{json .HostConfig.SecurityOpt}}",
+                    &c,
+                ]);
+                eprintln!("inspect: {inspect}");
+                assert!(inspect.contains("\"ALL\""), "{inspect}");
+                assert!(inspect.contains("no-new-privileges"), "{inspect}");
+
+                let r = op("restart", json!({"workload": name})).expect("restart");
+                eprintln!("restart: {r}");
+                assert_eq!(r["state"], "running");
+
+                let r = op("stop", json!({"workload": name})).expect("stop");
+                eprintln!("stop: {r}");
+                assert_eq!(r["state"], "stopped");
+                assert!(containers(&name, false).is_empty());
+
+                let r = op("adopt", json!({"req": {"native_id": name}})).expect("adopt");
+                eprintln!("adopt: {r}");
+                assert_eq!(r["state"], "stopped");
+
+                let r = op("destroy", json!({"workload": name})).expect("destroy");
+                eprintln!("destroy: {r}");
+                assert_eq!(r["state"], "absent");
+                let r = op("status", json!({"workload": name})).unwrap();
+                assert_eq!(r["state"], "absent");
+                assert!(containers(&name, true).is_empty());
+                assert!(
+                    docker(&[
+                        "network",
+                        "ls",
+                        "--format",
+                        "{{.Name}}",
+                        "--filter",
+                        &format!("name={name}_")
+                    ])
+                    .is_empty()
+                );
+
+                s = spec(
+                    &ro,
+                    vec![plugin_toolkit::deploy_target::Mount {
+                        kind: MountKind::Bind,
+                        source: data.to_string_lossy().into_owned(),
+                        target: "/data".into(),
+                        read_only: true,
+                        size: None,
+                    }],
+                );
+                let r = op("launch", json!({"spec": s}));
+                eprintln!("launch bind: {r:?}");
+                if in_home {
+                    let err = r.expect_err("bind under the daemon's home").to_string();
+                    assert!(err.contains("the daemon's home"), "{err}");
+                } else {
+                    assert_eq!(r.expect("launch bind")["state"], "running");
+                    let c = containers(&ro, false).remove(0);
+                    let mounts = docker(&["inspect", "--format", "{{json .Mounts}}", &c]);
+                    eprintln!("mounts: {mounts}");
+                    assert!(mounts.contains("\"Destination\":\"/data\""), "{mounts}");
+                    assert!(mounts.contains("\"RW\":false"), "{mounts}");
+                    op("destroy", json!({"workload": ro})).expect("destroy bind");
+                }
+
+                let r = op("launch", json!({"spec": spec("../x", Vec::new())}));
+                eprintln!("traversal: {r:?}");
+                assert!(r.is_err());
+            });
+            assert!(containers(&prefix, true).is_empty());
+        }
+    }
 }
