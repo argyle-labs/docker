@@ -1,3 +1,5 @@
+use std::path::{Component, Path, PathBuf};
+
 use plugin_toolkit::abi::BackendDef;
 use plugin_toolkit::anyhow;
 use plugin_toolkit::async_trait::async_trait;
@@ -15,24 +17,81 @@ use crate::unit_provider::{DockerUnitProvider, StackDeployPayload, stack_remove}
 
 const INVOKE_PREFIX: &str = "docker.__deploy";
 
+const DENIED: &[&str] = &[
+    "/etc",
+    "/root",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/boot",
+    "/run",
+    "/var/run",
+    "/var/lib/docker",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/opt",
+    "/var/spool",
+    "/var/lib/containerd",
+    "/var/lib/containers",
+    "/var/lib/lxc",
+    "/var/lib/libvirt",
+    "/var/lib/orca",
+];
+
+const DENIED_SEGMENTS: &[&[&str]] = &[
+    &[".ssh"],
+    &[".gnupg"],
+    &[".orca"],
+    &["Library", "Keychains"],
+];
+
 pub struct DockerDeployTarget {
     host: String,
     root: String,
+    data_roots: Vec<String>,
 }
 
 impl DockerDeployTarget {
     pub fn new(host: impl Into<String>, root: impl Into<String>) -> Self {
+        let root = root.into();
         Self {
             host: host.into(),
-            root: root.into(),
+            data_roots: vec![root.clone()],
+            root,
         }
     }
 
+    pub fn with_data_roots(mut self, roots: Vec<String>) -> Self {
+        if !roots.is_empty() {
+            self.data_roots = roots;
+        }
+        self
+    }
+
     fn local() -> anyhow::Result<Self> {
+        let root = pick_root(&crate::tools::stacks_roots()?)?;
+        let mut roots = Vec::new();
+        for rt in crate::tools::runtimes()? {
+            let rt_root = rt
+                .stacks_root
+                .as_deref()
+                .unwrap_or(crate::tools::DEFAULT_STACKS_ROOT);
+            if rt_root == root {
+                for r in rt.data_roots {
+                    if !roots.contains(&r) {
+                        roots.push(r);
+                    }
+                }
+            }
+        }
         Ok(Self::new(
             plugin_toolkit::containers::local_hostname().to_string(),
-            pick_root(&crate::tools::stacks_roots()?)?,
-        ))
+            root,
+        )
+        .with_data_roots(roots))
     }
 
     fn payload(&self, spec: &WorkloadSpec) -> Result<StackDeployPayload, DeployError> {
@@ -123,6 +182,94 @@ pub fn summarize(services: Result<Vec<bool>, String>) -> (&'static str, String) 
     }
 }
 
+fn is_named_volume(source: &str) -> bool {
+    source
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+        && source
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
+fn orca_home() -> Option<PathBuf> {
+    std::env::var_os("ORCA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".orca")))
+}
+
+fn resolved(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn denied(path: &Path, orca_home: Option<&Path>) -> bool {
+    if path.parent().is_none() {
+        return true;
+    }
+    let mut deny: Vec<PathBuf> = DENIED.iter().map(PathBuf::from).collect();
+    deny.extend(orca_home.map(Path::to_path_buf));
+    let deny_hit = deny
+        .iter()
+        .flat_map(|d| [d.clone(), resolved(d)])
+        .any(|d| path.starts_with(&d));
+    let segments: Vec<&std::ffi::OsStr> = path
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    deny_hit
+        || DENIED_SEGMENTS.iter().any(|pat| {
+            segments
+                .windows(pat.len())
+                .any(|w| w.iter().zip(pat.iter()).all(|(a, b)| *a == *b))
+        })
+}
+
+pub fn check_mounts(
+    spec: &WorkloadSpec,
+    data_roots: &[String],
+    orca_home: Option<&Path>,
+) -> Result<(), DeployError> {
+    let roots: Vec<PathBuf> = data_roots
+        .iter()
+        .filter_map(|r| std::fs::canonicalize(r).ok())
+        .collect();
+    for m in &spec.mounts {
+        if !matches!(m.kind, MountKind::Bind) || is_named_volume(&m.source) {
+            continue;
+        }
+        let source = Path::new(&m.source);
+        if !source.is_absolute() {
+            return Err(other(format!(
+                "bind mount source '{}' must be an absolute path",
+                m.source
+            )));
+        }
+        let real = std::fs::canonicalize(source).map_err(|e| {
+            other(format!(
+                "bind mount source '{}' is unavailable: {e}",
+                m.source
+            ))
+        })?;
+        if !roots.iter().any(|r| real.starts_with(r)) {
+            return Err(other(format!(
+                "bind mount source '{}' is outside the allowed data roots {data_roots:?}",
+                m.source
+            )));
+        }
+        if denied(&real, orca_home) {
+            return Err(other(format!(
+                "bind mount source '{}' resolves to protected path '{}'",
+                m.source,
+                real.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn require(workload: &str) -> Result<stacks::StackRow, DeployError> {
     stacks::get(workload)
         .map_err(other)?
@@ -169,7 +316,11 @@ pub fn compose_json(spec: &WorkloadSpec) -> Result<String, DeployError> {
                     if m.source.is_empty() {
                         return Err(other(format!("bind mount '{}' has no source", m.target)));
                     }
-                    json!({"type": "bind", "source": m.source, "target": m.target, "read_only": m.read_only})
+                    if is_named_volume(&m.source) {
+                        json!({"type": "volume", "source": m.source, "target": m.target, "read_only": m.read_only})
+                    } else {
+                        json!({"type": "bind", "source": m.source, "target": m.target, "read_only": m.read_only, "bind": {"create_host_path": false}})
+                    }
                 }
                 MountKind::Tmpfs => {
                     let mut v = json!({"type": "tmpfs", "target": m.target});
@@ -214,6 +365,7 @@ impl DeployTarget for DockerDeployTarget {
 
     async fn launch(&self, spec: &WorkloadSpec) -> Result<DeployOutcome, DeployError> {
         check_name(&spec.name)?;
+        check_mounts(spec, &self.data_roots, orca_home().as_deref())?;
         let raw = serde_json::to_string(&self.payload(spec)?).map_err(other)?;
         provider()
             .stack_deploy(Some(raw), true)
@@ -359,7 +511,7 @@ mod tests {
         assert_eq!(
             svc["volumes"],
             json!([
-                {"type": "bind", "source": "/opt/stacks/web/data", "target": "/data", "read_only": true},
+                {"type": "bind", "source": "/opt/stacks/web/data", "target": "/data", "read_only": true, "bind": {"create_host_path": false}},
                 {"type": "tmpfs", "target": "/run", "tmpfs": {"size": "64m"}}
             ])
         );
@@ -496,6 +648,119 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("ambiguous stacks roots"), "{err}");
+    }
+
+    fn bind(source: &str) -> WorkloadSpec {
+        WorkloadSpec {
+            name: "web".into(),
+            image: Some("nginx:1".into()),
+            mounts: vec![Mount {
+                kind: MountKind::Bind,
+                source: source.into(),
+                target: "/data".into(),
+                read_only: false,
+                size: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn root_dir() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        (dir, root)
+    }
+
+    #[test]
+    fn symlink_inside_root_to_etc_is_refused() {
+        let (dir, root) = root_dir();
+        let link = dir.path().join("etc");
+        std::os::unix::fs::symlink("/etc", &link).unwrap();
+        let err = check_mounts(&bind(&link.to_string_lossy()), &[root], None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("outside the allowed data roots"), "{err}");
+    }
+
+    #[test]
+    fn path_outside_roots_is_refused() {
+        let (_dir, root) = root_dir();
+        let (other_dir, _) = root_dir();
+        let err = check_mounts(&bind(&other_dir.path().to_string_lossy()), &[root], None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("outside the allowed data roots"), "{err}");
+    }
+
+    #[test]
+    fn deny_set_applies_even_under_slash_root() {
+        let (dir, _) = root_dir();
+        let ssh = dir.path().join(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let roots = ["/".to_string()];
+        for src in [
+            "/".to_string(),
+            "/etc".to_string(),
+            "/usr".to_string(),
+            ssh.to_string_lossy().into_owned(),
+            home.to_string_lossy().into_owned(),
+        ] {
+            let err = check_mounts(&bind(&src), &roots, Some(&home))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("protected path"), "{src}: {err}");
+        }
+    }
+
+    #[test]
+    fn missing_and_relative_sources_are_refused() {
+        let (dir, root) = root_dir();
+        let missing = dir.path().join("nope");
+        let err = check_mounts(
+            &bind(&missing.to_string_lossy()),
+            std::slice::from_ref(&root),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unavailable"), "{err}");
+        let err = check_mounts(&bind("./data"), &[root], None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("absolute path"), "{err}");
+    }
+
+    #[test]
+    fn allowed_path_and_named_volume_pass() {
+        let (dir, root) = root_dir();
+        let data = dir.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        check_mounts(
+            &bind(&data.to_string_lossy()),
+            std::slice::from_ref(&root),
+            None,
+        )
+        .unwrap();
+        check_mounts(&bind("pgdata"), &[root], None).unwrap();
+    }
+
+    #[test]
+    fn named_volume_is_emitted_as_volume() {
+        let svc = service(&bind("pgdata"));
+        assert_eq!(
+            svc["volumes"],
+            json!([{"type": "volume", "source": "pgdata", "target": "/data", "read_only": false}])
+        );
+    }
+
+    #[test]
+    fn data_roots_default_to_stack_root() {
+        let t = DockerDeployTarget::new("host-a", "/opt/stacks");
+        assert_eq!(t.data_roots, ["/opt/stacks"]);
+        let t = t.with_data_roots(vec!["/srv/data".into()]);
+        assert_eq!(t.data_roots, ["/srv/data"]);
     }
 
     #[test]
