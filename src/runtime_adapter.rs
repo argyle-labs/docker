@@ -57,16 +57,17 @@ impl DockerAdapter {
         self.engine().map(|(c, _)| c)
     }
 
-    fn host(&self) -> Option<String> {
-        crate::tools::resolve_docker_host()
+    fn host(&self) -> Result<Option<String>, AdapterError> {
+        crate::tools::resolve_docker_host().map_err(|e| AdapterError::Unavailable(e.to_string()))
     }
 
     fn engine(&self) -> Result<(Docker, String), AdapterError> {
         if let Some(c) = &self.fixed {
             return Ok((c.clone(), "test".into()));
         }
-        let host = self.host();
-        let client = cached(clients(), host.as_deref(), |h| connect(h, &Tls::from_env()))?;
+        let host = self.host()?;
+        let tls = Tls::from_env();
+        let client = cached(clients(), host.as_deref(), &tls, |h| connect(h, &tls))?;
         Ok((client, label(host.as_deref())))
     }
 }
@@ -92,16 +93,18 @@ fn clients() -> &'static Clients {
 fn cached(
     clients: &Clients,
     host: Option<&str>,
+    tls: &Tls,
     build: impl FnOnce(Option<&str>) -> Result<Docker, String>,
 ) -> Result<Docker, AdapterError> {
-    let key = label(host);
+    let name = label(host);
+    let key = format!("{name}|{:?}|{}", tls.cert_path, tls.verify);
     let mut map = clients
         .lock()
-        .map_err(|_| AdapterError::Unavailable(format!("{key}: client cache poisoned")))?;
+        .map_err(|_| AdapterError::Unavailable(format!("{name}: client cache poisoned")))?;
     if let Some(c) = map.get(&key) {
         return Ok(c.clone());
     }
-    let built = build(host).map_err(|e| AdapterError::Unavailable(format!("{key}: {e}")))?;
+    let built = build(host).map_err(|e| AdapterError::Unavailable(format!("{name}: {e}")))?;
     map.insert(key, built.clone());
     Ok(built)
 }
@@ -130,13 +133,21 @@ enum Endpoint<'a> {
 }
 
 fn is_loopback(addr: &str) -> bool {
-    let rest = addr.split_once("://").map_or(addr, |(_, r)| r);
-    let authority = rest.split('/').next().unwrap_or("");
-    let host = if let Some(v6) = authority.strip_prefix('[') {
-        v6.split(']').next().unwrap_or("")
-    } else {
-        authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+    if addr.contains(['@', '?', '#']) {
+        return false;
+    }
+    let Some(authority) = addr
+        .parse::<http::Uri>()
+        .ok()
+        .and_then(|u| u.authority().cloned())
+    else {
+        return false;
     };
+    let host = authority.host();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
     host == "localhost"
         || host
             .parse::<std::net::IpAddr>()
@@ -639,8 +650,17 @@ mod tests {
         ] {
             assert_eq!(endpoint(Some(h), &tls), Ok(Endpoint::Http(h)), "{h}");
         }
-        let err = endpoint(Some("tcp://10.0.0.5:2375"), &tls).unwrap_err();
-        assert!(err.contains("refusing plaintext"), "{err}");
+        for h in [
+            "tcp://10.0.0.5:2375",
+            "tcp://127.0.0.1:2375@evil.com:2375",
+            "tcp://localhost:1@evil",
+            "tcp://127.0.0.1:2375?x=1",
+            "tcp://127.0.0.1:2375#x",
+            "tcp://localhost.evil.com:2375",
+        ] {
+            let err = endpoint(Some(h), &tls).unwrap_err();
+            assert!(err.contains("refusing plaintext"), "{h}: {err}");
+        }
     }
 
     #[test]
@@ -684,7 +704,10 @@ mod tests {
     fn a_bad_socket_path_fails_with_the_host_named() {
         let clients = Clients::default();
         let host = "unix:///nonexistent/orca-test/docker.sock";
-        let err = cached(&clients, Some(host), |h| connect(h, &Tls::default())).unwrap_err();
+        let err = cached(&clients, Some(host), &Tls::default(), |h| {
+            connect(h, &Tls::default())
+        })
+        .unwrap_err();
         match err {
             AdapterError::Unavailable(m) => assert!(m.contains(host), "{m}"),
             other => panic!("{other:?}"),
@@ -720,12 +743,14 @@ mod tests {
             built.borrow_mut().push(h.map(str::to_string));
             connect(h, &Tls::default())
         };
-        cached(&clients, Some(&ha), build).expect("a");
-        cached(&clients, Some(&ha), build).expect("a again");
-        cached(&clients, Some(&hb), build).expect("b");
+        cached(&clients, Some(&ha), &Tls::default(), build).expect("a");
+        cached(&clients, Some(&ha), &Tls::default(), build).expect("a again");
+        cached(&clients, Some(&hb), &Tls::default(), build).expect("b");
         assert_eq!(*built.borrow(), vec![Some(ha.clone()), Some(hb.clone())]);
         let keys: std::collections::BTreeSet<_> = clients.lock().unwrap().keys().cloned().collect();
-        assert_eq!(keys, [ha, hb].into_iter().collect());
+        assert_eq!(keys.len(), 2);
+        cached(&clients, Some(&ha), &certs(), build).expect("a with certs");
+        assert_eq!(built.borrow().len(), 3);
     }
 
     #[test]
@@ -736,7 +761,7 @@ mod tests {
             .into_iter()
             .find(|v| v.key == "DOCKER_HOST")
             .map(|v| v.value);
-        assert_eq!(DockerAdapter::new().host(), compose);
+        assert_eq!(DockerAdapter::new().host().unwrap(), compose);
     }
 
     #[test]

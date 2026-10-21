@@ -51,6 +51,7 @@ plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main",
 bollard = { version = "0.21", default-features = false, features = ["pipe", "http", "ssl"] }
 # bollard's streaming request body: a volume archive is uploaded from its
 # verified file without being held in memory.
+http = "1"
 bytes = "1"
 futures-core = "0.3"
 

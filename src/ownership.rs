@@ -1043,7 +1043,7 @@ pub fn manifest_args(volume: &str) -> Vec<String> {
 
 async fn docker_checked(args: &[String], what: &str) -> Result<String> {
     let out = crate::clean_command(crate::resolve_docker_bin())
-        .await
+        .await?
         .args(args)
         .output()
         .await?;

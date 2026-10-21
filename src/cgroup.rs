@@ -161,6 +161,7 @@ pub(crate) fn problems(
 async fn docker_stdout(args: &[&str]) -> std::result::Result<String, String> {
     let out = crate::clean_command(crate::resolve_docker_bin())
         .await
+        .map_err(|e| e.to_string())?
         .args(args)
         .output()
         .await

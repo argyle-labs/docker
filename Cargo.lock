@@ -365,6 +365,7 @@ dependencies = [
  "bytes",
  "flate2",
  "futures-core",
+ "http",
  "libc",
  "orca-plugin-toolkit",
  "sha2 0.10.9",

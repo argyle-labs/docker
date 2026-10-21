@@ -81,7 +81,7 @@ pub fn resolve_docker_bin() -> &'static str {
 /// enabled socket/tcp registry entry → colima's socket → a docker socket
 /// present at a well-known path (e.g. Unraid's standard socket). Returns None
 /// when nothing is discoverable and the client's own default should be used.
-pub async fn docker_host() -> Option<String> {
+pub async fn docker_host() -> plugin_toolkit::anyhow::Result<Option<String>> {
     tools::resolve_docker_host()
 }
 
@@ -122,18 +122,20 @@ fn passed_env(get: impl Fn(&str) -> Option<String>, host: Option<String>) -> Vec
 /// `program` under `env -i`, with only [`PASSED_ENV`] and the resolved
 /// engine's `DOCKER_HOST`. The toolkit's `Command` cannot clear the
 /// environment itself.
-pub async fn clean_command(program: &str) -> plugin_toolkit::process::Command {
-    let env = passed_env(|k| std::env::var(k).ok(), docker_host().await);
-    plugin_toolkit::process::Command::new("/usr/bin/env")
+pub async fn clean_command(
+    program: &str,
+) -> plugin_toolkit::anyhow::Result<plugin_toolkit::process::Command> {
+    let env = passed_env(|k| std::env::var(k).ok(), docker_host().await?);
+    Ok(plugin_toolkit::process::Command::new("/usr/bin/env")
         .arg("-i")
         .args(env)
-        .arg(program)
+        .arg(program))
 }
 
 /// Run the docker CLI with `args`, optionally in `cwd`, returning stdout,
 /// through [`clean_command`].
 pub async fn run(args: &[&str], cwd: Option<&str>) -> plugin_toolkit::anyhow::Result<String> {
-    let mut cmd = clean_command(resolve_docker_bin()).await.args(args);
+    let mut cmd = clean_command(resolve_docker_bin()).await?.args(args);
     if let Some(dir) = cwd {
         cmd = cmd.current_dir(dir);
     }
