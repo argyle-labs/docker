@@ -60,7 +60,7 @@ impl EnvProvider for DockerEnv {
         "docker"
     }
     fn env(&self) -> plugin_toolkit::anyhow::Result<Vec<EnvVar>> {
-        Ok(match crate::tools::resolve_docker_host() {
+        Ok(match crate::tools::resolve_docker_host()? {
             Some(host) => vec![EnvVar {
                 key: "DOCKER_HOST".to_string(),
                 value: host,

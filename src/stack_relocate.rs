@@ -563,7 +563,7 @@ async fn relocate(args: &DockerStackRelocateArgs) -> Result<RelocateOutput> {
             "compose up at {new_str} failed; the copy is kept there{restored}"
         )));
     }
-    let docker = crate::registration::adapter()
+    let docker = &crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
     let health =

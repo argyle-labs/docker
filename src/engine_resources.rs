@@ -62,7 +62,7 @@ async fn docker_engine_resources(
     ctx: &ToolCtx,
 ) -> Result<EngineResources> {
     crate::execute::require_admin("docker.engine_resources", ctx)?;
-    let docker = crate::registration::adapter()
+    let docker = &crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
     collect(docker).await

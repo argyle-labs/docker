@@ -192,7 +192,7 @@ async fn docker_stack_wait_healthy(
     ctx: &ToolCtx,
 ) -> Result<StackHealth> {
     crate::execute::require_admin(TOOL, ctx)?;
-    let docker = crate::registration::adapter()
+    let docker = &crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
     wait(docker, &args.stack, timeout(args.timeout_secs)).await

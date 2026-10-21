@@ -78,7 +78,7 @@ pub async fn working_dirs(docker: &Docker) -> Result<Vec<String>> {
 
 /// The drift against the active engine; an unreachable engine reports none.
 pub async fn observe(configured: &[String]) -> Option<StacksRootDrift> {
-    let docker = crate::registration::adapter().client().ok()?;
+    let docker = &crate::registration::adapter().client().ok()?;
     let dirs = plugin_toolkit::time::timeout(ENGINE_BUDGET, working_dirs(docker))
         .await?
         .ok()?;

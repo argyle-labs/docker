@@ -874,7 +874,7 @@ async fn docker_host_update(args: DockerHostUpdateArgs, ctx: &ToolCtx) -> Result
         .ok()
         .and_then(|s| PkgManager::detect(&s));
     let gate = backup_gate().await;
-    let docker = crate::registration::adapter()
+    let docker = &crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
 

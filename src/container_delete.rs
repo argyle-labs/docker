@@ -130,7 +130,7 @@ async fn docker_container_delete(
     ctx: &ToolCtx,
 ) -> Result<ContainerDeleteOutput> {
     crate::execute::require_admin(TOOL, ctx)?;
-    let docker = crate::registration::adapter()
+    let docker = &crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
     apply(docker, &args).await

@@ -552,14 +552,29 @@ async fn docker_delete(args: DockerDeleteArgs, ctx: &ToolCtx) -> Result<DockerDe
     })
 }
 
-/// The `DOCKER_HOST` value of the first enabled socket/tcp runtime, for
-/// subprocess injection. Web-only runtimes (`url` only) are skipped.
-pub fn active_host() -> Option<String> {
-    runtimes()
-        .ok()?
-        .into_iter()
-        .filter(|r| r.enabled)
-        .find_map(|r| r.docker_host())
+/// The `DOCKER_HOST` of the one enabled socket/tcp runtime; web-only runtimes
+/// (`url` only) are skipped, and more than one enabled engine is an error.
+pub fn active_host() -> Result<Option<String>> {
+    one_engine(runtimes())
+}
+
+fn one_engine(read: Result<Vec<Runtime>>) -> Result<Option<String>> {
+    let all = read.map_err(|e| e.context("reading docker runtimes"))?;
+    let engines: Vec<&Runtime> = all
+        .iter()
+        .filter(|r| r.enabled && r.docker_host().is_some())
+        .collect();
+    match engines.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(one.docker_host()),
+        many => {
+            let names: Vec<&str> = many.iter().map(|r| r.name.as_str()).collect();
+            plugin_toolkit::anyhow::bail!(
+                "multiple enabled docker runtimes ({}); enable exactly one",
+                names.join(", ")
+            )
+        }
+    }
 }
 
 /// Well-known docker socket locations probed when no runtime is registered.
@@ -585,17 +600,17 @@ fn first_existing_socket(paths: &[&str]) -> Option<String> {
 ///
 /// Returns `None` only when nothing is discoverable, in which case a direct
 /// bollard client falls back to its own compiled-in default.
-pub fn resolve_docker_host() -> Option<String> {
-    if let Some(host) = active_host() {
-        return Some(host);
+pub fn resolve_docker_host() -> Result<Option<String>> {
+    if let Some(host) = active_host()? {
+        return Ok(Some(host));
     }
     if let Ok(home) = std::env::var("HOME") {
         let colima = format!("{home}/.colima/default/docker.sock");
         if std::path::Path::new(&colima).exists() {
-            return Some(format!("unix://{colima}"));
+            return Ok(Some(format!("unix://{colima}")));
         }
     }
-    first_existing_socket(WELL_KNOWN_SOCKETS)
+    Ok(first_existing_socket(WELL_KNOWN_SOCKETS))
 }
 
 #[cfg(test)]
@@ -755,6 +770,50 @@ mod registry_tests {
         assert!(tables.values().all(Vec::is_empty), "{tables:?}");
     }
 
+    fn engine(name: &str, sock: Option<&str>, enabled: bool) -> Runtime {
+        Runtime {
+            name: name.into(),
+            socket_path: sock.map(Into::into),
+            host: None,
+            url: None,
+            stacks_root: None,
+            routes: Routes::from(Vec::new()),
+            enabled,
+        }
+    }
+
+    #[test]
+    fn one_enabled_engine_is_the_active_host() {
+        let all = [
+            engine("a", Some("/a.sock"), true),
+            engine("b", Some("/b.sock"), false),
+            engine("web", None, true),
+        ];
+        assert_eq!(
+            one_engine(Ok(all.to_vec())).unwrap().as_deref(),
+            Some("unix:///a.sock")
+        );
+        assert_eq!(one_engine(Ok(Vec::new())).unwrap(), None);
+    }
+
+    #[test]
+    fn an_unreadable_runtime_table_is_an_error() {
+        let err = one_engine(Err(plugin_toolkit::anyhow::anyhow!("db down")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reading docker runtimes"), "{err}");
+    }
+
+    #[test]
+    fn several_enabled_engines_are_an_error_naming_them() {
+        let all = [
+            engine("a", Some("/a.sock"), true),
+            engine("b", Some("/b.sock"), true),
+        ];
+        let err = one_engine(Ok(all.to_vec())).unwrap_err().to_string();
+        assert!(err.contains("a, b"), "{err}");
+    }
+
     #[test]
     fn a_registered_socket_is_the_active_docker_host() {
         let (host, _) = with_db(|| {
@@ -764,7 +823,7 @@ mod registry_tests {
                 listed.endpoints[0].socket_path.as_deref(),
                 Some("/var/run/test-docker.sock")
             );
-            active_host()
+            active_host().unwrap()
         });
         assert_eq!(host.as_deref(), Some("unix:///var/run/test-docker.sock"));
     }
