@@ -13,6 +13,7 @@ pub mod compose_config;
 pub mod container_delete;
 pub mod containers;
 pub mod daemon_config;
+pub mod deploy;
 pub mod engine;
 pub mod engine_resources;
 pub mod engine_state;
