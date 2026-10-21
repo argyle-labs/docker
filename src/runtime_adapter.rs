@@ -62,11 +62,7 @@ impl DockerAdapter {
         if let Some(c) = self.client.get() {
             return Ok(c);
         }
-        // `connect_with_defaults` honors `DOCKER_HOST` (colima, rootless, remote
-        // engines, TCP) and falls back to the platform default socket/pipe —
-        // strictly more capable than the socket-only default, and what makes the
-        // adapter reachable against a non-default local engine like colima.
-        let built = Docker::connect_with_defaults()
+        let built = connect(crate::tools::active_host().as_deref())
             .map_err(|e| AdapterError::Unavailable(e.to_string()))?;
         // `OnceLock::set` returns `Err(built)` only when another thread won
         // the race; in that case the lock is already populated. Either way
@@ -81,6 +77,30 @@ impl DockerAdapter {
         self.client
             .get()
             .ok_or_else(|| AdapterError::Unavailable("docker client init race lost".into()))
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Endpoint<'a> {
+    Unix(&'a str),
+    Http(&'a str),
+    Defaults,
+}
+
+fn endpoint(host: Option<&str>) -> Endpoint<'_> {
+    match host {
+        Some(h) if h.starts_with("unix://") => Endpoint::Unix(&h["unix://".len()..]),
+        Some(h) if h.starts_with('/') => Endpoint::Unix(h),
+        Some(h) if h.starts_with("tcp://") || h.starts_with("http://") => Endpoint::Http(h),
+        _ => Endpoint::Defaults,
+    }
+}
+
+pub(crate) fn connect(host: Option<&str>) -> Result<Docker, bollard::errors::Error> {
+    match endpoint(host) {
+        Endpoint::Unix(path) => Docker::connect_with_unix(path, 120, bollard::API_DEFAULT_VERSION),
+        Endpoint::Http(addr) => Docker::connect_with_http(addr, 120, bollard::API_DEFAULT_VERSION),
+        Endpoint::Defaults => Docker::connect_with_defaults(),
     }
 }
 
@@ -492,6 +512,52 @@ mod tests {
             name: Some(name),
             maximum_retry_count: None,
         }
+    }
+
+    #[test]
+    fn endpoint_uses_a_configured_unix_socket() {
+        assert_eq!(
+            endpoint(Some("unix:///home/u/.colima/x/docker.sock")),
+            Endpoint::Unix("/home/u/.colima/x/docker.sock")
+        );
+        assert_eq!(
+            endpoint(Some("/run/docker.sock")),
+            Endpoint::Unix("/run/docker.sock")
+        );
+    }
+
+    #[test]
+    fn endpoint_uses_a_configured_tcp_host() {
+        assert_eq!(
+            endpoint(Some("tcp://10.0.0.5:2375")),
+            Endpoint::Http("tcp://10.0.0.5:2375")
+        );
+    }
+
+    #[test]
+    fn endpoint_falls_back_to_defaults_when_unconfigured() {
+        assert_eq!(endpoint(None), Endpoint::Defaults);
+        assert_eq!(endpoint(Some("ssh://u@h")), Endpoint::Defaults);
+    }
+
+    #[test]
+    fn connect_reaches_a_configured_socket() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("engine.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        let host = format!("unix://{}", path.display());
+        assert!(connect(Some(&host)).is_ok());
+    }
+
+    #[test]
+    #[ignore = "needs a live engine socket in ORCA_LIVE_DOCKER_SOCKET"]
+    fn live_lists_through_configured_socket() {
+        let sock = std::env::var("ORCA_LIVE_DOCKER_SOCKET").expect("ORCA_LIVE_DOCKER_SOCKET");
+        let docker = connect(Some(&format!("unix://{sock}"))).expect("connect");
+        let adapter = DockerAdapter::with_client(docker);
+        let listed =
+            plugin_toolkit::reactor::block_on(async { adapter.list(&ListFilter::default()).await });
+        listed.expect("list");
     }
 
     #[test]

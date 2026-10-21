@@ -48,7 +48,7 @@ plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main",
 # docker names no tokio/futures/chrono. This is what "the docker plugin owns
 # bollard" means: the concrete engine client rides with the plugin, orca stays
 # generic.
-bollard = { version = "0.21", default-features = false, features = ["pipe"] }
+bollard = { version = "0.21", default-features = false, features = ["pipe", "http"] }
 # bollard's streaming request body: a volume archive is uploaded from its
 # verified file without being held in memory.
 bytes = "1"
