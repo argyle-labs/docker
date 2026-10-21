@@ -23,60 +23,101 @@ use bollard::query_parameters::{
 };
 use plugin_toolkit::contract::health::Health;
 use plugin_toolkit::orca_async;
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use plugin_toolkit::containers::{
     AdapterError, Container, ContainerMount, ContainerState, ExecOutput, ListFilter, LogTail,
     RestartPolicy, RuntimeAdapter, RuntimeKind, local_hostname,
 };
 
-/// Local docker adapter. Holds a lazily-initialised `bollard::Docker` client
-/// keyed on the standard Unix socket location. The client itself is cheap
-/// to clone (it wraps an `Arc<hyper::Client>` internally) but constructing
-/// it can fail if the docker socket isn't reachable — we surface that as
-/// [`AdapterError::Unavailable`] on the first call rather than at adapter
-/// construction time, mirroring how the lxc adapter behaves when `pct`
-/// isn't on PATH.
+/// Local docker adapter. Each operation resolves the active runtime host and
+/// reuses a process-wide client cached per host, so runtime changes apply
+/// without a restart.
 pub struct DockerAdapter {
-    client: OnceLock<Docker>,
+    fixed: Option<Docker>,
 }
 
 impl DockerAdapter {
-    /// Construct a new docker adapter. Does no network I/O; the underlying
-    /// bollard client is built on first use.
+    /// Construct a new docker adapter. Does no network I/O; clients are built
+    /// on first use per host.
     pub fn new() -> Self {
-        Self {
-            client: OnceLock::new(),
-        }
+        Self { fixed: None }
     }
 
     #[cfg(test)]
     fn with_client(client: Docker) -> Self {
         Self {
-            client: OnceLock::from(client),
+            fixed: Some(client),
         }
     }
 
-    pub(crate) fn client(&self) -> Result<&Docker, AdapterError> {
-        if let Some(c) = self.client.get() {
-            return Ok(c);
+    pub(crate) fn client(&self) -> Result<Docker, AdapterError> {
+        self.engine().map(|(c, _)| c)
+    }
+
+    fn host(&self) -> Option<String> {
+        crate::tools::resolve_docker_host()
+    }
+
+    fn engine(&self) -> Result<(Docker, String), AdapterError> {
+        if let Some(c) = &self.fixed {
+            return Ok((c.clone(), "test".into()));
         }
-        let built = connect(crate::tools::active_host().as_deref())
-            .map_err(|e| AdapterError::Unavailable(e.to_string()))?;
-        // `OnceLock::set` returns `Err(built)` only when another thread won
-        // the race; in that case the lock is already populated. Either way
-        // the next `get()` returns the live client.
-        match self.client.set(built) {
-            Ok(()) => {}
-            Err(_loser) => {
-                // Lost the race — peer thread populated first; their value
-                // is fine, ours gets dropped here.
-            }
+        let host = self.host();
+        let client = cached(clients(), host.as_deref(), |h| connect(h, &Tls::from_env()))?;
+        Ok((client, label(host.as_deref())))
+    }
+}
+
+fn label(host: Option<&str>) -> String {
+    host.unwrap_or("default").to_string()
+}
+
+fn at(host: &str, e: AdapterError) -> AdapterError {
+    match e {
+        AdapterError::Unavailable(m) => AdapterError::Unavailable(format!("{host}: {m}")),
+        other => other,
+    }
+}
+
+type Clients = Mutex<HashMap<String, Docker>>;
+
+fn clients() -> &'static Clients {
+    static CLIENTS: OnceLock<Clients> = OnceLock::new();
+    CLIENTS.get_or_init(Clients::default)
+}
+
+fn cached(
+    clients: &Clients,
+    host: Option<&str>,
+    build: impl FnOnce(Option<&str>) -> Result<Docker, String>,
+) -> Result<Docker, AdapterError> {
+    let key = label(host);
+    let mut map = clients
+        .lock()
+        .map_err(|_| AdapterError::Unavailable(format!("{key}: client cache poisoned")))?;
+    if let Some(c) = map.get(&key) {
+        return Ok(c.clone());
+    }
+    let built = build(host).map_err(|e| AdapterError::Unavailable(format!("{key}: {e}")))?;
+    map.insert(key, built.clone());
+    Ok(built)
+}
+
+#[derive(Debug, Default, Clone)]
+struct Tls {
+    cert_path: Option<PathBuf>,
+    verify: bool,
+}
+
+impl Tls {
+    fn from_env() -> Self {
+        Self {
+            cert_path: std::env::var_os("DOCKER_CERT_PATH").map(PathBuf::from),
+            verify: std::env::var("DOCKER_TLS_VERIFY").is_ok_and(|v| !v.is_empty() && v != "0"),
         }
-        self.client
-            .get()
-            .ok_or_else(|| AdapterError::Unavailable("docker client init race lost".into()))
     }
 }
 
@@ -84,24 +125,70 @@ impl DockerAdapter {
 enum Endpoint<'a> {
     Unix(&'a str),
     Http(&'a str),
+    Ssl(&'a str, PathBuf),
     Defaults,
 }
 
-fn endpoint(host: Option<&str>) -> Endpoint<'_> {
-    match host {
-        Some(h) if h.starts_with("unix://") => Endpoint::Unix(&h["unix://".len()..]),
-        Some(h) if h.starts_with('/') => Endpoint::Unix(h),
-        Some(h) if h.starts_with("tcp://") || h.starts_with("http://") => Endpoint::Http(h),
-        _ => Endpoint::Defaults,
+fn is_loopback(addr: &str) -> bool {
+    let rest = addr.split_once("://").map_or(addr, |(_, r)| r);
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split(']').next().unwrap_or("")
+    } else {
+        authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+    };
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+fn endpoint<'a>(host: Option<&'a str>, tls: &Tls) -> Result<Endpoint<'a>, String> {
+    let Some(h) = host else {
+        return Ok(Endpoint::Defaults);
+    };
+    if let Some(path) = h.strip_prefix("unix://") {
+        return Ok(Endpoint::Unix(path));
+    }
+    if h.starts_with('/') {
+        return Ok(Endpoint::Unix(h));
+    }
+    let https = h.starts_with("https://");
+    let plain = h.starts_with("tcp://") || h.starts_with("http://");
+    if !https && !plain {
+        return Err(format!("unsupported docker host scheme: {h}"));
+    }
+    if https || (h.starts_with("tcp://") && tls.verify) {
+        return match &tls.cert_path {
+            Some(dir) => Ok(Endpoint::Ssl(h, dir.clone())),
+            None => Err(format!("{h} needs TLS material in DOCKER_CERT_PATH")),
+        };
+    }
+    if is_loopback(h) {
+        Ok(Endpoint::Http(h))
+    } else {
+        Err(format!(
+            "refusing plaintext connection to non-loopback {h}; use TLS"
+        ))
     }
 }
 
-pub(crate) fn connect(host: Option<&str>) -> Result<Docker, bollard::errors::Error> {
-    match endpoint(host) {
-        Endpoint::Unix(path) => Docker::connect_with_unix(path, 120, bollard::API_DEFAULT_VERSION),
-        Endpoint::Http(addr) => Docker::connect_with_http(addr, 120, bollard::API_DEFAULT_VERSION),
+fn connect(host: Option<&str>, tls: &Tls) -> Result<Docker, String> {
+    let v = bollard::API_DEFAULT_VERSION;
+    match endpoint(host, tls)? {
+        Endpoint::Unix(path) => Docker::connect_with_unix(path, 120, v),
+        Endpoint::Http(addr) => Docker::connect_with_http(addr, 120, v),
+        Endpoint::Ssl(addr, dir) => Docker::connect_with_ssl(
+            addr,
+            &dir.join("key.pem"),
+            &dir.join("cert.pem"),
+            &dir.join("ca.pem"),
+            120,
+            v,
+        ),
         Endpoint::Defaults => Docker::connect_with_defaults(),
     }
+    .map_err(|e| e.to_string())
 }
 
 impl Default for DockerAdapter {
@@ -117,12 +204,10 @@ impl RuntimeAdapter for DockerAdapter {
     }
 
     async fn list(&self, filter: &ListFilter) -> Result<Vec<Container>, AdapterError> {
-        let client = self.client()?;
+        let (client, host) = self.engine()?;
+        let err = |e: bollard::errors::Error| at(&host, map_bollard_err(e));
         let opts = ListContainersOptionsBuilder::new().all(filter.all).build();
-        let summaries = client
-            .list_containers(Some(opts))
-            .await
-            .map_err(map_bollard_err)?;
+        let summaries = client.list_containers(Some(opts)).await.map_err(err)?;
 
         let mut out = Vec::with_capacity(summaries.len());
         for summary in summaries {
@@ -160,12 +245,13 @@ impl RuntimeAdapter for DockerAdapter {
     }
 
     async fn inspect(&self, id: &str) -> Result<Container, AdapterError> {
-        let client = self.client()?;
+        let (client, host) = self.engine()?;
+        let err = |e: bollard::errors::Error| at(&host, map_bollard_err(e));
         let opts = InspectContainerOptionsBuilder::new().build();
         let resp = client
             .inspect_container(id, Some(opts))
             .await
-            .map_err(map_bollard_err)?;
+            .map_err(err)?;
 
         Ok(container_from_inspect(resp))
     }
@@ -176,44 +262,48 @@ impl RuntimeAdapter for DockerAdapter {
         // that raced us into `running` must not be an error. Docker answers
         // 304 Not Modified for an already-started container, which bollard
         // reports as a server error; treat it as success.
-        let client = self.client()?;
+        let (client, host) = self.engine()?;
+        let err = |e: bollard::errors::Error| at(&host, map_bollard_err(e));
         match client
             .start_container(id, None::<bollard::query_parameters::StartContainerOptions>)
             .await
         {
             Ok(()) => Ok(()),
             Err(e) if is_not_modified(&e) => Ok(()),
-            Err(e) => Err(map_bollard_err(e)),
+            Err(e) => Err(err(e)),
         }
     }
 
     async fn stop(&self, id: &str) -> Result<(), AdapterError> {
         // Same idempotence argument in reverse: already-stopped is 304.
-        let client = self.client()?;
+        let (client, host) = self.engine()?;
+        let err = |e: bollard::errors::Error| at(&host, map_bollard_err(e));
         match client
             .stop_container(id, None::<bollard::query_parameters::StopContainerOptions>)
             .await
         {
             Ok(()) => Ok(()),
             Err(e) if is_not_modified(&e) => Ok(()),
-            Err(e) => Err(map_bollard_err(e)),
+            Err(e) => Err(err(e)),
         }
     }
 
     async fn restart(&self, id: &str) -> Result<(), AdapterError> {
         // No 304 case: docker restarts a stopped container happily.
-        let client = self.client()?;
+        let (client, host) = self.engine()?;
+        let err = |e: bollard::errors::Error| at(&host, map_bollard_err(e));
         client
             .restart_container(
                 id,
                 None::<bollard::query_parameters::RestartContainerOptions>,
             )
             .await
-            .map_err(map_bollard_err)
+            .map_err(err)
     }
 
     async fn logs(&self, id: &str, tail: LogTail) -> Result<String, AdapterError> {
-        let client = self.client()?;
+        let (client, host) = self.engine()?;
+        let err = |e: bollard::errors::Error| at(&host, map_bollard_err(e));
         let opts = LogsOptionsBuilder::new()
             .stdout(true)
             .stderr(true)
@@ -222,7 +312,7 @@ impl RuntimeAdapter for DockerAdapter {
         let mut stream = client.logs(id, Some(opts));
         let mut out = String::new();
         while let Some(chunk) = plugin_toolkit::stream::next(&mut stream).await {
-            let line = chunk.map_err(map_bollard_err)?;
+            let line = chunk.map_err(err)?;
             // `LogOutput`'s `Display`/`to_string` would re-frame; we want the
             // raw bytes (stdout+stderr interleaved as docker delivers them).
             out.push_str(&String::from_utf8_lossy(line.into_bytes().as_ref()));
@@ -236,7 +326,8 @@ impl RuntimeAdapter for DockerAdapter {
         cmd: &[String],
         stdin: Option<String>,
     ) -> Result<ExecOutput, AdapterError> {
-        let client = self.client()?;
+        let (client, host) = self.engine()?;
+        let err = |e: bollard::errors::Error| at(&host, map_bollard_err(e));
         let exec = client
             .create_exec(
                 id,
@@ -249,12 +340,9 @@ impl RuntimeAdapter for DockerAdapter {
                 },
             )
             .await
-            .map_err(map_bollard_err)?;
+            .map_err(err)?;
 
-        let started = client
-            .start_exec(&exec.id, None)
-            .await
-            .map_err(map_bollard_err)?;
+        let started = client.start_exec(&exec.id, None).await.map_err(err)?;
 
         let mut stdout = String::new();
         let mut stderr = String::new();
@@ -270,7 +358,7 @@ impl RuntimeAdapter for DockerAdapter {
             }
             drop(input);
             while let Some(chunk) = plugin_toolkit::stream::next(&mut output).await {
-                match chunk.map_err(map_bollard_err)? {
+                match chunk.map_err(err)? {
                     LogOutput::StdOut { message } => {
                         stdout.push_str(&String::from_utf8_lossy(message.as_ref()))
                     }
@@ -287,11 +375,7 @@ impl RuntimeAdapter for DockerAdapter {
 
         // Exit code is only known after the process finishes — inspect once the
         // attached stream has drained.
-        let exit_code = client
-            .inspect_exec(&exec.id)
-            .await
-            .map_err(map_bollard_err)?
-            .exit_code;
+        let exit_code = client.inspect_exec(&exec.id).await.map_err(err)?.exit_code;
 
         Ok(ExecOutput {
             exit_code,
@@ -514,46 +598,152 @@ mod tests {
         }
     }
 
+    fn certs() -> Tls {
+        Tls {
+            cert_path: Some(PathBuf::from("/certs")),
+            verify: false,
+        }
+    }
+
     #[test]
     fn endpoint_uses_a_configured_unix_socket() {
+        let tls = Tls::default();
         assert_eq!(
-            endpoint(Some("unix:///home/u/.colima/x/docker.sock")),
-            Endpoint::Unix("/home/u/.colima/x/docker.sock")
+            endpoint(Some("unix:///home/u/.colima/x/docker.sock"), &tls),
+            Ok(Endpoint::Unix("/home/u/.colima/x/docker.sock"))
         );
         assert_eq!(
-            endpoint(Some("/run/docker.sock")),
-            Endpoint::Unix("/run/docker.sock")
-        );
-    }
-
-    #[test]
-    fn endpoint_uses_a_configured_tcp_host() {
-        assert_eq!(
-            endpoint(Some("tcp://10.0.0.5:2375")),
-            Endpoint::Http("tcp://10.0.0.5:2375")
+            endpoint(Some("/run/docker.sock"), &tls),
+            Ok(Endpoint::Unix("/run/docker.sock"))
         );
     }
 
     #[test]
-    fn endpoint_falls_back_to_defaults_when_unconfigured() {
-        assert_eq!(endpoint(None), Endpoint::Defaults);
-        assert_eq!(endpoint(Some("ssh://u@h")), Endpoint::Defaults);
+    fn endpoint_falls_back_to_defaults_only_when_unconfigured() {
+        assert_eq!(endpoint(None, &Tls::default()), Ok(Endpoint::Defaults));
     }
 
     #[test]
-    fn connect_reaches_a_configured_socket() {
+    fn endpoint_rejects_unsupported_schemes() {
+        let err = endpoint(Some("ssh://u@h"), &Tls::default()).unwrap_err();
+        assert!(err.contains("unsupported"), "{err}");
+    }
+
+    #[test]
+    fn endpoint_allows_plain_tcp_only_on_loopback() {
+        let tls = Tls::default();
+        for h in [
+            "tcp://127.0.0.1:2375",
+            "tcp://localhost:2375",
+            "http://[::1]:2375",
+        ] {
+            assert_eq!(endpoint(Some(h), &tls), Ok(Endpoint::Http(h)), "{h}");
+        }
+        let err = endpoint(Some("tcp://10.0.0.5:2375"), &tls).unwrap_err();
+        assert!(err.contains("refusing plaintext"), "{err}");
+    }
+
+    #[test]
+    fn endpoint_https_requires_cert_material() {
+        let err = endpoint(Some("https://10.0.0.5:2376"), &Tls::default()).unwrap_err();
+        assert!(err.contains("DOCKER_CERT_PATH"), "{err}");
+        assert_eq!(
+            endpoint(Some("https://10.0.0.5:2376"), &certs()),
+            Ok(Endpoint::Ssl(
+                "https://10.0.0.5:2376",
+                PathBuf::from("/certs")
+            ))
+        );
+    }
+
+    #[test]
+    fn endpoint_tcp_with_tls_verify_uses_certs() {
+        let tls = Tls {
+            verify: true,
+            ..certs()
+        };
+        assert_eq!(
+            endpoint(Some("tcp://10.0.0.5:2376"), &tls),
+            Ok(Endpoint::Ssl(
+                "tcp://10.0.0.5:2376",
+                PathBuf::from("/certs")
+            ))
+        );
+        let err = endpoint(
+            Some("tcp://10.0.0.5:2376"),
+            &Tls {
+                verify: true,
+                cert_path: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("DOCKER_CERT_PATH"), "{err}");
+    }
+
+    #[test]
+    fn a_bad_socket_path_fails_with_the_host_named() {
+        let clients = Clients::default();
+        let host = "unix:///nonexistent/orca-test/docker.sock";
+        let err = cached(&clients, Some(host), |h| connect(h, &Tls::default())).unwrap_err();
+        match err {
+            AdapterError::Unavailable(m) => assert!(m.contains(host), "{m}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_vanished_socket_fails_a_real_request() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("engine.sock");
-        let _listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
         let host = format!("unix://{}", path.display());
-        assert!(connect(Some(&host)).is_ok());
+        let docker = connect(Some(&host), &Tls::default()).expect("connect");
+        drop(listener);
+        std::fs::remove_file(&path).expect("remove");
+        let adapter = DockerAdapter::with_client(docker);
+        let res = plugin_toolkit::reactor::block_on(adapter.list(&ListFilter::default()));
+        assert!(matches!(res, Err(AdapterError::Unavailable(_))), "{res:?}");
+    }
+
+    #[test]
+    fn cache_builds_once_per_host_and_selects_by_host() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = dir.path().join("a.sock");
+        let b = dir.path().join("b.sock");
+        let _la = std::os::unix::net::UnixListener::bind(&a).expect("bind");
+        let _lb = std::os::unix::net::UnixListener::bind(&b).expect("bind");
+        let ha = format!("unix://{}", a.display());
+        let hb = format!("unix://{}", b.display());
+        let clients = Clients::default();
+        let built = std::cell::RefCell::new(Vec::new());
+        let build = |h: Option<&str>| {
+            built.borrow_mut().push(h.map(str::to_string));
+            connect(h, &Tls::default())
+        };
+        cached(&clients, Some(&ha), build).expect("a");
+        cached(&clients, Some(&ha), build).expect("a again");
+        cached(&clients, Some(&hb), build).expect("b");
+        assert_eq!(*built.borrow(), vec![Some(ha.clone()), Some(hb.clone())]);
+        let keys: std::collections::BTreeSet<_> = clients.lock().unwrap().keys().cloned().collect();
+        assert_eq!(keys, [ha, hb].into_iter().collect());
+    }
+
+    #[test]
+    fn bollard_and_compose_env_resolve_the_same_host() {
+        use plugin_toolkit::contract::subprocess_env::EnvProvider;
+        let env = crate::registration::DockerEnv.env().expect("env");
+        let compose = env
+            .into_iter()
+            .find(|v| v.key == "DOCKER_HOST")
+            .map(|v| v.value);
+        assert_eq!(DockerAdapter::new().host(), compose);
     }
 
     #[test]
     #[ignore = "needs a live engine socket in ORCA_LIVE_DOCKER_SOCKET"]
     fn live_lists_through_configured_socket() {
         let sock = std::env::var("ORCA_LIVE_DOCKER_SOCKET").expect("ORCA_LIVE_DOCKER_SOCKET");
-        let docker = connect(Some(&format!("unix://{sock}"))).expect("connect");
+        let docker = connect(Some(&format!("unix://{sock}")), &Tls::default()).expect("connect");
         let adapter = DockerAdapter::with_client(docker);
         let listed =
             plugin_toolkit::reactor::block_on(async { adapter.list(&ListFilter::default()).await });

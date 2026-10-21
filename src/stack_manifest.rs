@@ -226,7 +226,7 @@ async fn docker_stack_manifest(
     ctx: &ToolCtx,
 ) -> Result<StackManifest> {
     crate::execute::require_admin(TOOL, ctx)?;
-    let docker = crate::registration::adapter()
+    let docker = &crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
     collect(docker, &args.stack).await

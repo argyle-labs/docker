@@ -2057,7 +2057,7 @@ async fn docker_stack_allow(
     ctx: &ToolCtx,
 ) -> Result<DockerStackAllowOutput> {
     execute::require_admin(ALLOW_TOOL, ctx)?;
-    let docker = crate::registration::adapter()
+    let docker = &crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
     stack_allow(args, docker).await

@@ -241,7 +241,7 @@ impl DockerUnitProvider {
                 .await
                 .map_err(anyhow::Error::from)?;
             let cfg = ComposeConfig::parse(&raw)?;
-            let docker = self.adapter.client().map_err(adapter_err)?;
+            let docker = &self.adapter.client().map_err(adapter_err)?;
             let containers = ownership::project_containers(docker, &project).await?;
             let engine = ownership::engine_volumes(docker).await?;
             let report = volume_coverage::coverage(&row.name, &project, volumes, &policies)
@@ -317,7 +317,7 @@ impl DockerUnitProvider {
                     p.compose_yaml.as_deref(),
                     p.compose_env.as_deref(),
                     &crate::tools::stacks_roots()?,
-                    self.adapter.client().ok(),
+                    self.adapter.client().ok().as_ref(),
                 )
                 .await?;
                 // A stale orca override naming a removed service breaks every
@@ -353,7 +353,9 @@ impl DockerUnitProvider {
                 // start and restart act on containers that already exist.
                 let checked = match action {
                     "down" | "stop" => None,
-                    _ => Some(policy::gate(self.adapter.client().ok(), &row, &compose).await?),
+                    _ => Some(
+                        policy::gate(self.adapter.client().ok().as_ref(), &row, &compose).await?,
+                    ),
                 };
                 let out = match (action, checked) {
                     ("build", Some(checked)) => checked.build().await?,
@@ -406,7 +408,7 @@ impl DockerUnitProvider {
                 &new_yaml,
                 &yaml,
                 &crate::tools::stacks_roots()?,
-                self.adapter.client().ok(),
+                self.adapter.client().ok().as_ref(),
             )
             .await?;
         }
@@ -429,7 +431,7 @@ impl DockerUnitProvider {
             .await
             .map_err(anyhow::Error::from)?;
         let cfg = ComposeConfig::parse(&raw)?;
-        let docker = self.adapter.client().map_err(adapter_err)?;
+        let docker = &self.adapter.client().map_err(adapter_err)?;
         let engine = volume_coverage::engine_volumes(docker, &cfg.name).await?;
         let mut volumes = volume_coverage::detect(&cfg, &engine);
         volume_coverage::mark_existing(docker, &mut volumes).await?;
@@ -455,7 +457,7 @@ impl DockerUnitProvider {
             },
         };
         let (_, cfg) = ownership::user_config(row).await?;
-        let docker = self.adapter.client().map_err(adapter_err)?;
+        let docker = &self.adapter.client().map_err(adapter_err)?;
         let containers = ownership::project_containers(docker, &cfg.name).await?;
         let converted = ownership::read_conversions(std::path::Path::new(&row.dir))?;
         let planned = ownership::plan(&cfg, &containers, &converted);
@@ -551,7 +553,7 @@ impl DockerUnitProvider {
         } else {
             self.stack_volumes(row).await?
         };
-        let docker = self.adapter.client().map_err(adapter_err)?;
+        let docker = &self.adapter.client().map_err(adapter_err)?;
         let root = volume_coverage::staging_root(&dest, &row.name)?;
         let ts = plugin_toolkit::time::now().unix_seconds();
         let archive = dest.join(format!("{}-{ts}.tar.gz", row.name));
@@ -643,7 +645,8 @@ impl DockerUnitProvider {
                 return Ok(());
             };
             // Definition digests come from the user's files alone, the first set.
-            let docker = self.adapter.client().ok();
+            let client = self.adapter.client().ok();
+            let docker = client.as_ref();
             // Env files are read from the staging dir, where the paths will
             // be once it is swapped in.
             let dir = staged.dir()?;
@@ -682,7 +685,7 @@ impl DockerUnitProvider {
                 None
             } else {
                 Some(
-                    stack_volumes::preflight(docker, &project, &members, staged.path(), &exports)
+                    stack_volumes::preflight(&docker, &project, &members, staged.path(), &exports)
                         .await?,
                 )
             };
@@ -698,7 +701,7 @@ impl DockerUnitProvider {
         let with_volumes = preflight.is_some();
         let mut steps = EngineRestore {
             row,
-            docker,
+            docker: &docker,
             project: &project,
             staged: Some(staged),
             preflight,
@@ -771,7 +774,7 @@ impl DockerUnitProvider {
             p.compose_yaml.as_deref(),
             p.compose_env.as_deref(),
             &roots,
-            self.adapter.client().ok(),
+            self.adapter.client().ok().as_ref(),
         )
         .await?;
         stacks::put(&row)?;
@@ -932,7 +935,7 @@ impl DockerUnitProvider {
                 let raw = args.payload.unwrap_or_default();
                 let exec: ExecPayload =
                     serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("exec payload: {e}"))?;
-                let docker = self.adapter.client().map_err(adapter_err)?;
+                let docker = &self.adapter.client().map_err(adapter_err)?;
                 let info = docker
                     .inspect_container(&exec.id, None)
                     .await
@@ -1542,7 +1545,7 @@ async fn stack_findings(row: &StackRow, roots: &[String]) -> Result<Vec<Finding>
         .map_err(anyhow::Error::from)?;
     let cfg = ComposeConfig::parse(&raw)?;
     let bound = bound_sources(
-        crate::registration::adapter()
+        &crate::registration::adapter()
             .client()
             .map_err(adapter_err)?,
     )

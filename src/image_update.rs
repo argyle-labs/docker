@@ -452,7 +452,7 @@ async fn docker_image_status(args: DockerImageStatusArgs, _ctx: &ToolCtx) -> Res
         Some(s) => vec![crate::stacks::require(s)?],
         None => crate::stacks::list()?,
     };
-    let docker = crate::registration::adapter()
+    let docker = &crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
     let mut remote = RemoteCache::new();

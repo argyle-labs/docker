@@ -594,7 +594,7 @@ async fn docker_stack_volumes_export(
     ctx: &ToolCtx,
 ) -> Result<StackVolumesExportOutput> {
     crate::execute::require_admin(EXPORT_TOOL, ctx)?;
-    let docker = crate::registration::adapter()
+    let docker = &crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
     export(docker, &args, &engine_state::backup_roots()).await
@@ -1463,7 +1463,7 @@ async fn docker_stack_volumes_import(
     ctx: &ToolCtx,
 ) -> Result<StackVolumesImportOutput> {
     crate::execute::require_admin(IMPORT_TOOL, ctx)?;
-    let docker = crate::registration::adapter()
+    let docker = &crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
     import(docker, &args, &engine_state::backup_roots()).await

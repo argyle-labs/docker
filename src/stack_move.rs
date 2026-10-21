@@ -1006,7 +1006,7 @@ async fn docker_stack_move_export(
     ctx: &ToolCtx,
 ) -> Result<StackMoveExportOutput> {
     crate::execute::require_admin(EXPORT_TOOL, ctx)?;
-    let docker = crate::registration::adapter()
+    let docker = &crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
     export(docker, &args, &engine_state::backup_roots()).await
@@ -1365,7 +1365,7 @@ async fn docker_stack_move_import(
     ctx: &ToolCtx,
 ) -> Result<StackMoveImportOutput> {
     crate::execute::require_admin(IMPORT_TOOL, ctx)?;
-    let docker = crate::registration::adapter()
+    let docker = &crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
     import(docker, &args, &engine_state::backup_roots()).await
@@ -1543,7 +1543,7 @@ async fn docker_stack_move_finish(
     ctx: &ToolCtx,
 ) -> Result<StackMoveFinishOutput> {
     crate::execute::require_admin(FINISH_TOOL, ctx)?;
-    let docker = crate::registration::adapter()
+    let docker = &crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
     finish(docker, &args, &engine_state::backup_roots()).await

@@ -246,7 +246,7 @@ async fn docker_manageability_audit(
     ctx: &ToolCtx,
 ) -> Result<ManageabilityAudit> {
     crate::execute::require_admin(TOOL, ctx)?;
-    let docker = crate::registration::adapter()
+    let docker = &crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
     let containers = inspect_running(docker).await?;

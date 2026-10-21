@@ -195,7 +195,7 @@ pub struct DockerLabelAuditArgs {}
 )]
 async fn docker_label_audit(_args: DockerLabelAuditArgs, ctx: &ToolCtx) -> Result<LabelAudit> {
     crate::execute::require_admin("docker.label_audit", ctx)?;
-    let docker = crate::registration::adapter()
+    let docker = &crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
     collect(docker).await

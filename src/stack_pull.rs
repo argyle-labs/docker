@@ -225,7 +225,7 @@ async fn docker_stack_pull_pinned(
             ..Default::default()
         });
     }
-    let docker = crate::registration::adapter()
+    let docker = &crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
     Ok(apply(docker, &pins).await)

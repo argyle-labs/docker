@@ -476,7 +476,7 @@ pub async fn write_with(
     Ok((compose.with_orca(), rendered.notes))
 }
 
-fn client() -> Result<&'static Docker> {
+fn client() -> Result<Docker> {
     crate::registration::adapter()
         .client()
         .map_err(|e| anyhow::anyhow!("{e}"))
@@ -484,15 +484,16 @@ fn client() -> Result<&'static Docker> {
 
 /// Regenerate [`ORCA_FILE`] and return the project to run compose with.
 pub async fn refresh(row: &StackRow) -> Result<Compose> {
-    Ok(write_with(row, client()?, None).await?.0)
+    Ok(write_with(row, &client()?, None).await?.0)
 }
 
 /// `compose up -d` (for `services`, or all) with a fresh [`ORCA_FILE`], run
 /// from the config [`crate::policy::gate`] checked. The output leads with
 /// what was left unlabeled.
 pub async fn up(row: &StackRow, services: &[&str]) -> Result<String> {
-    let (compose, notes) = write_with(row, client()?, None).await?;
-    let out = crate::policy::gate(Some(client()?), row, &compose)
+    let docker = client()?;
+    let (compose, notes) = write_with(row, &docker, None).await?;
+    let out = crate::policy::gate(Some(&docker), row, &compose)
         .await?
         .up(services)
         .await?;

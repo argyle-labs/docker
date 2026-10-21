@@ -771,7 +771,7 @@ async fn run_restart(cmd: &[&str]) -> Result<String> {
 }
 
 async fn running_containers() -> std::result::Result<Vec<String>, String> {
-    let docker = crate::registration::adapter()
+    let docker = &crate::registration::adapter()
         .client()
         .map_err(|e| e.to_string())?;
     let list = docker

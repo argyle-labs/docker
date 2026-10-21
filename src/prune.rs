@@ -499,7 +499,7 @@ async fn docker_prune(args: DockerPruneArgs, ctx: &ToolCtx) -> Result<PruneChang
         Some(s) => Some(project_for(s).await?),
         None => None,
     };
-    let docker = crate::registration::adapter()
+    let docker = &crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
     let external = external_networks().await?;
