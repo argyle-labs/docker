@@ -3752,6 +3752,7 @@ mod tests {
             url: None,
             stacks_root: Some(path(root)),
             data_roots: Vec::new(),
+            registries: Vec::new(),
             routes: Vec::new(),
             dry_run: false,
         };
@@ -4101,6 +4102,7 @@ mod tests {
                 url: None,
                 stacks_root: Some(root_s.clone()),
                 data_roots: Vec::new(),
+                registries: Vec::new(),
                 routes: Vec::new(),
                 dry_run: false,
             };

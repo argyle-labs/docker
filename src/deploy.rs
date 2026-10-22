@@ -9,6 +9,7 @@ use plugin_toolkit::deploy_target::{
     AdoptRequest, DeployCapability, DeployError, DeployOutcome, DeployTarget, MountKind, Runtime,
     TargetKind, TargetStatus, WorkloadSpec, dispatch_op,
 };
+use plugin_toolkit::serde;
 use plugin_toolkit::serde_json::{self, Map, Value, json};
 
 use crate::registration::unit_provider;
@@ -65,6 +66,7 @@ pub struct DockerDeployTarget {
     host: String,
     root: String,
     data_roots: Vec<String>,
+    registries: Vec<String>,
 }
 
 impl DockerDeployTarget {
@@ -73,8 +75,30 @@ impl DockerDeployTarget {
         Self {
             host: host.into(),
             data_roots: vec![root.clone()],
+            registries: Vec::new(),
             root,
         }
+    }
+
+    pub fn with_registries(mut self, registries: Vec<String>) -> Self {
+        self.registries = registries;
+        self
+    }
+
+    fn recheck(&self, row: &stacks::StackRow) -> Result<(), DeployError> {
+        check_stack_dir(Path::new(&row.dir), &row.compose_name())?;
+        let compose = std::fs::read_to_string(row.compose_path()).map_err(other)?;
+        recheck_compose(&compose, &self.data_roots, orca_home().as_deref())?;
+        let doc: Value = serde_json::from_str(&compose).map_err(other)?;
+        for svc in doc["services"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(_, s)| s)
+        {
+            check_image(svc["image"].as_str().unwrap_or_default(), &self.registries)?;
+        }
+        Ok(())
     }
 
     pub fn with_data_roots(mut self, roots: Vec<String>) -> Self {
@@ -87,6 +111,7 @@ impl DockerDeployTarget {
     fn local() -> anyhow::Result<Self> {
         let root = pick_root(&crate::tools::stacks_roots()?)?;
         let mut roots = Vec::new();
+        let mut registries = Vec::new();
         for rt in crate::tools::runtimes()? {
             let rt_root = rt
                 .stacks_root
@@ -98,13 +123,19 @@ impl DockerDeployTarget {
                         roots.push(r);
                     }
                 }
+                for r in rt.registries {
+                    if !registries.contains(&r) {
+                        registries.push(r);
+                    }
+                }
             }
         }
         Ok(Self::new(
             plugin_toolkit::containers::local_hostname().to_string(),
             root,
         )
-        .with_data_roots(roots))
+        .with_data_roots(roots)
+        .with_registries(registries))
     }
 
     fn payload(&self, spec: &WorkloadSpec) -> Result<StackDeployPayload, DeployError> {
@@ -136,8 +167,7 @@ impl DockerDeployTarget {
         check_name(workload)?;
         let row = require(workload)?;
         if action != "stop" {
-            let compose = std::fs::read_to_string(row.compose_path()).map_err(other)?;
-            recheck_compose(&compose, &self.data_roots, orca_home().as_deref())?;
+            self.recheck(&row)?;
         }
         let args = UpdateArgs {
             id: UnitId {
@@ -441,12 +471,9 @@ fn check_top_volumes(doc: &Map<String, Value>) -> Result<Vec<String>, DeployErro
             }
             return Err(other(format!("{what} is not a mapping")));
         };
-        only_keys(obj, &["driver", "name"], &what)?;
+        only_keys(obj, &["driver"], &what)?;
         if obj.get("driver").is_some_and(|d| d != "local") {
             return Err(other(format!("{what} sets a non-local driver")));
-        }
-        if obj.get("name").is_some_and(|n| n != name.as_str()) {
-            return Err(other(format!("{what} sets a name other than its key")));
         }
     }
     Ok(vols.keys().cloned().collect())
@@ -469,8 +496,15 @@ fn check_service_keys(name: &str, svc: &Value) -> Result<(), DeployError> {
             "{what} security_opt must be [\"no-new-privileges:true\"]"
         )));
     }
-    if obj.get("restart").is_some_and(|r| !r.is_string()) {
-        return Err(other(format!("{what} restart is not a string")));
+    if let Some(r) = obj.get("restart")
+        && !r.as_str().is_some_and(valid_restart)
+    {
+        return Err(other(format!(
+            "{what} restart must be no, always, on-failure[:N] or unless-stopped"
+        )));
+    }
+    if let Some(image) = obj.get("image") {
+        check_image(image.as_str().unwrap_or_default(), &[])?;
     }
     if obj.get("environment").is_some_and(|e| {
         !e.as_object()
@@ -484,7 +518,188 @@ fn check_service_keys(name: &str, svc: &Value) -> Result<(), DeployError> {
     {
         return Err(other(format!("{what} ports is not a list of strings")));
     }
+    for p in obj
+        .get("ports")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        check_port(p.as_str().unwrap_or_default())?;
+    }
     Ok(())
+}
+
+fn valid_restart(r: &str) -> bool {
+    matches!(r, "no" | "always" | "unless-stopped")
+        || r == "on-failure"
+        || r.strip_prefix("on-failure:")
+            .is_some_and(|n| !n.is_empty() && n.len() <= 4 && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn image_registry(image: &str) -> &str {
+    match image.split_once('/') {
+        Some((head, _)) if head.contains(['.', ':']) || head == "localhost" => head,
+        _ => "docker.io",
+    }
+}
+
+fn check_image(image: &str, registries: &[String]) -> Result<(), DeployError> {
+    if image.is_empty() || image.contains('$') || image.chars().any(char::is_whitespace) {
+        return Err(other(format!(
+            "image '{image}' is empty or contains '$' or whitespace"
+        )));
+    }
+    let registry = image_registry(image);
+    if !registries.is_empty() && !registries.iter().any(|r| r == registry) {
+        return Err(other(format!(
+            "image '{image}' registry '{registry}' is not in the allowed registries {registries:?}"
+        )));
+    }
+    Ok(())
+}
+
+const PORT_IPS: &[&str] = &["127.0.0.1", "0.0.0.0", "::1", "::"];
+const MAX_PORT_RANGE: u32 = 100;
+
+fn port_range(s: &str) -> Option<(u32, u32)> {
+    let num = |n: &str| {
+        (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| n.parse::<u32>().ok())
+            .flatten()
+            .filter(|n| (1..=65535).contains(n))
+    };
+    let (lo, hi) = match s.split_once('-') {
+        Some((a, b)) => (num(a)?, num(b)?),
+        None => (num(s)?, num(s)?),
+    };
+    (lo <= hi && hi - lo < MAX_PORT_RANGE).then_some((lo, hi))
+}
+
+fn check_port(port: &str) -> Result<(), DeployError> {
+    let bad = || {
+        other(format!(
+            "port '{port}' must be [ip:]hostport:containerport[/tcp|udp] with ip in {PORT_IPS:?}"
+        ))
+    };
+    let mapping = match port.rsplit_once('/') {
+        Some((m, p)) if p == "tcp" || p == "udp" => m,
+        Some(_) => return Err(bad()),
+        None => port,
+    };
+    let (ip, rest) = match mapping.strip_prefix('[') {
+        Some(r) => {
+            let (ip, rest) = r.split_once("]:").ok_or_else(bad)?;
+            (Some(ip), rest)
+        }
+        None => match mapping.matches(':').count() {
+            1 => (None, mapping),
+            2 => {
+                let (ip, rest) = mapping.split_once(':').ok_or_else(bad)?;
+                (Some(ip), rest)
+            }
+            _ => return Err(bad()),
+        },
+    };
+    if ip.is_some_and(|ip| !PORT_IPS.contains(&ip)) {
+        return Err(bad());
+    }
+    let (host, container) = rest.split_once(':').ok_or_else(bad)?;
+    let (h, c) = (
+        port_range(host).ok_or_else(bad)?,
+        port_range(container).ok_or_else(bad)?,
+    );
+    if h.1 - h.0 != c.1 - c.0 {
+        return Err(bad());
+    }
+    Ok(())
+}
+
+fn check_no_interpolation(v: &Value) -> Result<(), DeployError> {
+    match v {
+        Value::String(s) => {
+            let mut chars = s.chars();
+            while let Some(c) = chars.next() {
+                if c == '$' && chars.next() != Some('$') {
+                    return Err(other(format!("value '{s}' contains an unescaped '$'")));
+                }
+            }
+            Ok(())
+        }
+        Value::Array(a) => a.iter().try_for_each(check_no_interpolation),
+        Value::Object(m) => m.values().try_for_each(check_no_interpolation),
+        _ => Ok(()),
+    }
+}
+
+fn check_stack_dir(dir: &Path, compose_name: &str) -> Result<(), DeployError> {
+    for entry in std::fs::read_dir(dir).map_err(other)? {
+        let name = entry
+            .map_err(other)?
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+        if name == compose_name || name == crate::compose::ORCA_FILE {
+            continue;
+        }
+        let lower = name.to_ascii_lowercase();
+        if lower == ".env" || lower.ends_with(".yml") || lower.ends_with(".yaml") {
+            return Err(other(format!(
+                "stack dir '{}' holds '{name}', which compose could load beyond the checked file",
+                dir.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+struct NoDuplicateKeys;
+
+impl<'de> serde::Deserialize<'de> for NoDuplicateKeys {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(NoDuplicateKeysVisitor)
+    }
+}
+
+struct NoDuplicateKeysVisitor;
+
+impl<'de> serde::de::Visitor<'de> for NoDuplicateKeysVisitor {
+    type Value = NoDuplicateKeys;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a JSON value")
+    }
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(NoDuplicateKeys)
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(NoDuplicateKeys)
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(NoDuplicateKeys)
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(NoDuplicateKeys)
+    }
+    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(NoDuplicateKeys)
+    }
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(NoDuplicateKeys)
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        while seq.next_element::<NoDuplicateKeys>()?.is_some() {}
+        Ok(NoDuplicateKeys)
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut seen = std::collections::HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !seen.insert(key.clone()) {
+                return Err(serde::de::Error::custom(format!("duplicate key '{key}'")));
+            }
+            map.next_value::<NoDuplicateKeys>()?;
+        }
+        Ok(NoDuplicateKeys)
+    }
 }
 
 fn check_mount_shape(svc: &str, vol: &Value, declared: &[String]) -> Result<bool, DeployError> {
@@ -555,10 +770,22 @@ fn check_mount_shape(svc: &str, vol: &Value, declared: &[String]) -> Result<bool
 fn check_not_shared_writable(real: &Path, root: &Path) -> Result<(), DeployError> {
     use std::os::unix::fs::MetadataExt;
     let euid = unsafe { libc::geteuid() };
-    for dir in real.ancestors().filter(|d| d.starts_with(root)) {
+    let egid = unsafe { libc::getegid() };
+    for dir in real
+        .ancestors()
+        .skip(1)
+        .filter(|d| d.starts_with(root) && *d != root)
+    {
         let meta = std::fs::metadata(dir).map_err(other)?;
         if meta.mode() & 0o002 != 0 {
             return Err(other(format!("'{}' is writable by others", dir.display())));
+        }
+        if meta.mode() & 0o020 != 0 && meta.gid() != egid {
+            return Err(other(format!(
+                "'{}' is writable by group {}, not orca's",
+                dir.display(),
+                meta.gid()
+            )));
         }
         if meta.uid() != 0 && meta.uid() != euid {
             return Err(other(format!(
@@ -576,8 +803,11 @@ pub fn recheck_compose(
     data_roots: &[String],
     orca_home: Option<&Path>,
 ) -> Result<(), DeployError> {
+    serde_json::from_str::<NoDuplicateKeys>(compose)
+        .map_err(|e| other(format!("stored compose does not parse: {e}")))?;
     let doc = serde_json::from_str::<Value>(compose)
         .map_err(|e| other(format!("stored compose does not parse: {e}")))?;
+    check_no_interpolation(&doc)?;
     let top = doc
         .as_object()
         .ok_or_else(|| other("stored compose is not a mapping"))?;
@@ -640,6 +870,10 @@ pub fn compose_json(spec: &WorkloadSpec) -> Result<String, DeployError> {
         .as_deref()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| other("docker deploy requires spec.image"))?;
+    check_image(image, &[])?;
+    for p in &spec.ports {
+        check_port(p)?;
+    }
     let mut svc = Map::new();
     svc.insert("image".into(), json!(image));
     svc.insert("restart".into(), json!("unless-stopped"));
@@ -649,7 +883,7 @@ pub fn compose_json(spec: &WorkloadSpec) -> Result<String, DeployError> {
         let env: Map<String, Value> = spec
             .env
             .iter()
-            .map(|e| (e.key.clone(), json!(e.value)))
+            .map(|e| (e.key.clone(), json!(e.value.replace('$', "$$"))))
             .collect();
         svc.insert("environment".into(), Value::Object(env));
     }
@@ -727,6 +961,7 @@ impl DeployTarget for DockerDeployTarget {
 
     async fn launch(&self, spec: &WorkloadSpec) -> Result<DeployOutcome, DeployError> {
         check_name(&spec.name)?;
+        check_image(spec.image.as_deref().unwrap_or_default(), &self.registries)?;
         let spec = check_mounts(spec, &self.data_roots, orca_home().as_deref())?;
         let raw = serde_json::to_string(&self.payload(&spec)?).map_err(other)?;
         provider()
@@ -767,7 +1002,8 @@ impl DeployTarget for DockerDeployTarget {
                 "docker stacks are tracked by their stack name; adopt does not rename",
             ));
         }
-        require(&req.native_id)?;
+        let row = require(&req.native_id)?;
+        self.recheck(&row)?;
         self.observed(&req.native_id, None).await
     }
 
@@ -1280,7 +1516,7 @@ mod tests {
     fn recheck_refuses_unsafe_top_level_volumes() {
         for (vol, needle) in [
             (json!({"external": true}), "key 'external'"),
-            (json!({"name": "other"}), "name other than its key"),
+            (json!({"name": "pg"}), "key 'name'"),
             (json!({"driver": "nfs"}), "non-local driver"),
             (
                 json!({"driver_opts": {"device": "/etc", "o": "bind"}}),
@@ -1291,7 +1527,7 @@ mod tests {
             let err = recheck_err(json!({"services": {}, "volumes": {"pg": vol}}));
             assert!(err.contains(needle), "{needle}: {err}");
         }
-        recheck_doc(json!({"services": {}, "volumes": {"pg": {"driver": "local", "name": "pg"}, "q": null}}))
+        recheck_doc(json!({"services": {}, "volumes": {"pg": {"driver": "local"}, "q": null}}))
             .unwrap();
     }
 
@@ -1367,17 +1603,211 @@ mod tests {
     fn recheck_refuses_shared_writable_data_root() {
         use std::os::unix::fs::PermissionsExt;
         let (dir, root) = root_dir();
-        let data = std::fs::canonicalize(dir.path()).unwrap().join("data");
-        std::fs::create_dir(&data).unwrap();
+        let mid = std::fs::canonicalize(dir.path()).unwrap().join("mid");
+        let data = mid.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
         let compose = compose_json(&bind(&lossy(&data))).unwrap();
         recheck_compose(&compose, std::slice::from_ref(&root), None).unwrap();
-        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::set_permissions(&mid, std::fs::Permissions::from_mode(0o777)).unwrap();
         let err = recheck_compose(&compose, std::slice::from_ref(&root), None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("writable by others"), "{err}");
-        let err = refused(&bind(&lossy(&data)), &[root], None);
+        let err = refused(&bind(&lossy(&data)), std::slice::from_ref(&root), None);
         assert!(err.contains("writable by others"), "{err}");
+        let foreign_gid = unsafe { libc::getegid() } + 1;
+        if unsafe {
+            libc::chown(
+                std::ffi::CString::new(lossy(&mid)).unwrap().as_ptr(),
+                u32::MAX,
+                foreign_gid,
+            )
+        } == 0
+        {
+            std::fs::set_permissions(&mid, std::fs::Permissions::from_mode(0o775)).unwrap();
+            let err = recheck_compose(&compose, &[root], None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("writable by group"), "{err}");
+        }
+    }
+
+    #[test]
+    fn env_values_are_escaped_and_pass_recheck() {
+        let mut s = spec();
+        s.mounts.clear();
+        s.env[0].value = "a$HOME${X}".into();
+        let compose = compose_json(&s).unwrap();
+        let doc: Value = serde_json::from_str(&compose).unwrap();
+        assert_eq!(doc["services"]["web"]["environment"]["A"], "a$$HOME$${X}");
+        recheck_doc(doc).unwrap();
+    }
+
+    #[test]
+    fn recheck_refuses_unescaped_dollar_anywhere() {
+        for (key, value) in [
+            ("environment", json!({"A": "a$HOME"})),
+            ("environment", json!({"A": "x$$$Y"})),
+            ("image", json!("nginx:${TAG}")),
+            ("image", json!("nginx:$$1")),
+            ("ports", json!(["${P}:80"])),
+        ] {
+            assert!(
+                recheck_doc(with_svc(key, value.clone())).is_err(),
+                "{key} {value}"
+            );
+        }
+        recheck_doc(with_svc("environment", json!({"A": "x$$$$Y"}))).unwrap();
+    }
+
+    #[test]
+    fn ports_are_single_or_bounded_ranges_on_allowed_ips() {
+        for ok in [
+            "8080:80",
+            "127.0.0.1:8080:80",
+            "0.0.0.0:53:53/udp",
+            "[::1]:8443:443/tcp",
+            "7000-7009:7000-7009",
+        ] {
+            check_port(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+            recheck_doc(with_svc("ports", json!([ok]))).unwrap();
+        }
+        for bad in [
+            "80",
+            "10.0.0.5:8080:80",
+            "8080:80/sctp",
+            "1-65535:1-65535",
+            "7000-7009:7000-7008",
+            "0:80",
+            "a:80",
+            "8080:80:90:1",
+            "[fe80::1]:80:80",
+        ] {
+            assert!(check_port(bad).is_err(), "{bad}");
+            assert!(
+                recheck_doc(with_svc("ports", json!([bad]))).is_err(),
+                "{bad}"
+            );
+        }
+        let mut s = spec();
+        s.ports = vec!["10.0.0.5:80:80".into()];
+        assert!(compose_json(&s).is_err());
+    }
+
+    #[test]
+    fn restart_is_a_known_policy() {
+        for ok in [
+            "no",
+            "always",
+            "on-failure",
+            "on-failure:5",
+            "unless-stopped",
+        ] {
+            recheck_doc(with_svc("restart", json!(ok))).unwrap();
+        }
+        for bad in ["sometimes", "on-failure:", "on-failure:x", ""] {
+            let err = recheck_err(with_svc("restart", json!(bad)));
+            assert!(err.contains("restart must be"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn images_are_checked_against_the_registry_allowlist() {
+        assert_eq!(image_registry("nginx:1"), "docker.io");
+        assert_eq!(image_registry("library/nginx"), "docker.io");
+        assert_eq!(image_registry("ghcr.io/a/b:1"), "ghcr.io");
+        assert_eq!(image_registry("localhost:5000/x"), "localhost:5000");
+        check_image("nginx:1", &[]).unwrap();
+        let allow = ["ghcr.io".to_string()];
+        check_image("ghcr.io/a/b:1", &allow).unwrap();
+        let err = check_image("nginx:1", &allow).unwrap_err().to_string();
+        assert!(err.contains("not in the allowed registries"), "{err}");
+        assert!(check_image("nginx:$X", &[]).is_err());
+        let mut s = spec();
+        s.image = Some("nginx:${TAG}".into());
+        assert!(compose_json(&s).is_err());
+    }
+
+    #[test]
+    fn recheck_refuses_duplicate_keys() {
+        let (_dir, root) = root_dir();
+        for doc in [
+            r#"{"services": {"web": {"image": "nginx:1", "image": "evil:1"}}}"#,
+            r#"{"services": {"web": {"image": "nginx:1"}}, "services": {}}"#,
+        ] {
+            let err = recheck_compose(doc, std::slice::from_ref(&root), None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("duplicate key"), "{doc}: {err}");
+        }
+    }
+
+    #[test]
+    fn stack_dir_with_extra_compose_inputs_is_refused() {
+        let (dir, _) = root_dir();
+        std::fs::write(dir.path().join("docker-compose.yml"), "{}").unwrap();
+        std::fs::write(dir.path().join(crate::compose::ORCA_FILE), "{}").unwrap();
+        std::fs::create_dir(dir.path().join("data")).unwrap();
+        check_stack_dir(dir.path(), "docker-compose.yml").unwrap();
+        for extra in [".env", "compose.override.yml", "other.YAML"] {
+            let path = dir.path().join(extra);
+            std::fs::write(&path, "").unwrap();
+            let err = check_stack_dir(dir.path(), "docker-compose.yml")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(extra), "{extra}: {err}");
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn adopt_refuses_a_stack_failing_recheck() {
+        let (dir, root) = root_dir();
+        let stack = dir.path().join("web");
+        std::fs::create_dir(&stack).unwrap();
+        let write = |body: &str| std::fs::write(stack.join("docker-compose.yml"), body).unwrap();
+        let row = stacks::StackRow {
+            name: "web".into(),
+            dir: lossy(&stack),
+            file: "docker-compose.yml".into(),
+            enabled: true,
+            allow: Vec::new(),
+        };
+        let target = DockerDeployTarget::new("host-a", root);
+        let adopt = || {
+            crate::test_support::with_db(|| {
+                stacks::insert(&row).unwrap();
+                plugin_toolkit::reactor::block_on(dispatch_op(
+                    &target,
+                    "adopt",
+                    json!({"req": {"native_id": "web"}}),
+                ))
+            })
+            .0
+        };
+        write("services:\n  web:\n    image: nginx\n    privileged: true\n");
+        let err = err_text(adopt());
+        assert!(err.contains("does not parse"), "{err}");
+        write(&json!({"services": {"web": {"image": "nginx:1", "privileged": true}}}).to_string());
+        let err = err_text(adopt());
+        assert!(err.contains("key 'privileged' is not allowed"), "{err}");
+        write(&json!({"services": {"web": {"image": "nginx:1"}}}).to_string());
+        std::fs::write(stack.join(".env"), "X=1").unwrap();
+        let err = err_text(adopt());
+        assert!(err.contains("'.env'"), "{err}");
+    }
+
+    #[test]
+    fn source_dir_itself_may_be_foreign_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, root) = root_dir();
+        let data = std::fs::canonicalize(dir.path()).unwrap().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let compose = compose_json(&bind(&lossy(&data))).unwrap();
+        recheck_compose(&compose, &[root], None).unwrap();
     }
 
     #[test]
