@@ -104,6 +104,7 @@ pub struct Compose {
     file: PathBuf,
     override_file: Option<PathBuf>,
     orca_file: Option<PathBuf>,
+    isolated: bool,
 }
 
 impl Compose {
@@ -131,6 +132,7 @@ impl Compose {
             file: file.to_path_buf(),
             override_file,
             orca_file: None,
+            isolated: false,
         })
     }
 
@@ -164,6 +166,18 @@ impl Compose {
             orca_file: self.file.parent().map(|d| d.join(ORCA_FILE)),
             ..self.clone()
         }
+    }
+
+    pub fn isolated(&self) -> Compose {
+        Compose {
+            override_file: None,
+            isolated: true,
+            ..self.clone()
+        }
+    }
+
+    pub fn env_file(&self) -> Option<&Path> {
+        self.isolated.then_some(Path::new("/dev/null"))
     }
 
     /// The compose files in `-f` order: the compose file, its override, then
@@ -343,9 +357,18 @@ impl Compose {
     }
 
     async fn docker(&self, sub: &[&str]) -> Result<String, anyhow::Error> {
-        let files = self.file_args();
-        let mut args: Vec<&str> = vec!["compose"];
-        args.extend(files.iter().map(String::as_str));
+        let mut args: Vec<String> = vec!["compose".into()];
+        if self.isolated {
+            let dir = self.file.parent().unwrap_or(Path::new("/"));
+            args.extend([
+                "--project-directory".into(),
+                dir.to_string_lossy().into_owned(),
+                "--env-file".into(),
+                "/dev/null".into(),
+            ]);
+        }
+        args.extend(self.file_args());
+        let mut args: Vec<&str> = args.iter().map(String::as_str).collect();
         args.extend_from_slice(sub);
         super::run(&args, None).await
     }
@@ -495,6 +518,22 @@ mod tests {
         assert!(files[1].ends_with("compose.override.yaml"));
         assert!(files[2].ends_with(ORCA_FILE));
         assert_eq!(c.with_orca().without_orca().files().len(), 2);
+    }
+
+    #[test]
+    fn isolated_passes_only_explicit_inputs() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("compose.yaml"), "services: {}").unwrap();
+        std::fs::write(dir.path().join("compose.override.yaml"), "").unwrap();
+        let c = Compose::find(dir.path()).unwrap();
+        assert_eq!(c.env_file(), None);
+        let iso = c.isolated().with_orca();
+        assert_eq!(iso.env_file(), Some(Path::new("/dev/null")));
+        let files = iso.files();
+        assert_eq!(files.len(), 2);
+        assert!(files[0].ends_with("compose.yaml"));
+        assert!(files[1].ends_with(ORCA_FILE));
+        assert_eq!(iso.without_orca().env_file(), Some(Path::new("/dev/null")));
     }
 
     #[test]

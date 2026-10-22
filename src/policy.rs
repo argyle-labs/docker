@@ -1756,13 +1756,13 @@ async fn resolved(
         .ok_or_else(|| anyhow!("stack dir {} does not exist", row.dir))?;
     let files =
         |c: &Compose| -> Vec<PathBuf> { c.files().into_iter().map(Path::to_path_buf).collect() };
-    let raw = stacks::resolved_config(dir.path(), &files(compose), None).await?;
+    let raw = stacks::resolved_config(dir.path(), &files(compose), compose.env_file()).await?;
     let cfg = prepare(&raw, dir.path(), &dir)?;
     let user = compose.without_orca();
     let user_cfg = if user.files() == compose.files() {
         cfg.clone()
     } else {
-        let raw = stacks::resolved_config(dir.path(), &files(&user), None).await?;
+        let raw = stacks::resolved_config(dir.path(), &files(&user), user.env_file()).await?;
         prepare(&raw, dir.path(), &dir)?
     };
     Ok((dir, roots, cfg, user_cfg))

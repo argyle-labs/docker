@@ -86,10 +86,17 @@ impl DockerDeployTarget {
     }
 
     fn recheck(&self, row: &stacks::StackRow) -> Result<(), DeployError> {
-        check_stack_dir(Path::new(&row.dir), &row.compose_name())?;
-        let compose = std::fs::read_to_string(row.compose_path()).map_err(other)?;
-        recheck_compose(&compose, &self.data_roots, orca_home().as_deref())?;
-        let doc: Value = serde_json::from_str(&compose).map_err(other)?;
+        let dir = stacks::StackDir::open(&row.dir, std::slice::from_ref(&self.root), false)
+            .map_err(other)?
+            .ok_or_else(|| other(format!("stack dir {} does not exist", row.dir)))?;
+        check_stack_dir(dir.path(), &row.compose_name())?;
+        let compose = dir.read(&row.compose_name()).map_err(other)?;
+        self.recheck_generated(&compose)
+    }
+
+    fn recheck_generated(&self, compose: &str) -> Result<(), DeployError> {
+        recheck_compose(compose, &self.data_roots, orca_home().as_deref())?;
+        let doc: Value = serde_json::from_str(compose).map_err(other)?;
         for svc in doc["services"]
             .as_object()
             .into_iter()
@@ -124,6 +131,7 @@ impl DockerDeployTarget {
                     }
                 }
                 for r in rt.registries {
+                    let r = crate::tools::normalize_registry(&r);
                     if !registries.contains(&r) {
                         registries.push(r);
                     }
@@ -536,10 +544,12 @@ fn valid_restart(r: &str) -> bool {
             .is_some_and(|n| !n.is_empty() && n.len() <= 4 && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
-fn image_registry(image: &str) -> &str {
+fn image_registry(image: &str) -> String {
     match image.split_once('/') {
-        Some((head, _)) if head.contains(['.', ':']) || head == "localhost" => head,
-        _ => "docker.io",
+        Some((head, _)) if head.contains(['.', ':']) || head == "localhost" => {
+            crate::tools::normalize_registry(head)
+        }
+        _ => "docker.io".to_string(),
     }
 }
 
@@ -550,7 +560,7 @@ fn check_image(image: &str, registries: &[String]) -> Result<(), DeployError> {
         )));
     }
     let registry = image_registry(image);
-    if !registries.is_empty() && !registries.iter().any(|r| r == registry) {
+    if !registries.is_empty() && !registries.contains(&registry) {
         return Err(other(format!(
             "image '{image}' registry '{registry}' is not in the allowed registries {registries:?}"
         )));
@@ -874,6 +884,19 @@ pub fn compose_json(spec: &WorkloadSpec) -> Result<String, DeployError> {
     for p in &spec.ports {
         check_port(p)?;
     }
+    let literal = std::iter::once(("service name", spec.name.as_str()))
+        .chain(spec.env.iter().map(|e| ("env key", e.key.as_str())))
+        .chain(spec.mounts.iter().flat_map(|m| {
+            [
+                ("mount source", m.source.as_str()),
+                ("mount target", m.target.as_str()),
+            ]
+        }));
+    for (what, value) in literal {
+        if value.contains('$') {
+            return Err(other(format!("{what} '{value}' contains '$'")));
+        }
+    }
     let mut svc = Map::new();
     svc.insert("image".into(), json!(image));
     svc.insert("restart".into(), json!("unless-stopped"));
@@ -963,9 +986,10 @@ impl DeployTarget for DockerDeployTarget {
         check_name(&spec.name)?;
         check_image(spec.image.as_deref().unwrap_or_default(), &self.registries)?;
         let spec = check_mounts(spec, &self.data_roots, orca_home().as_deref())?;
-        let raw = serde_json::to_string(&self.payload(&spec)?).map_err(other)?;
+        let payload = self.payload(&spec)?;
+        self.recheck_generated(payload.compose_yaml.as_deref().unwrap_or_default())?;
         provider()
-            .stack_deploy(Some(raw), true)
+            .stack_deploy_isolated(payload, true)
             .await
             .map_err(other)?;
         self.observed(&spec.name, None).await
@@ -1882,6 +1906,43 @@ mod tests {
         let out = check_mounts(&bind(&lossy(&created)), std::slice::from_ref(&root), None).unwrap();
         let canon_root = std::fs::canonicalize(&root).unwrap();
         assert!(Path::new(&out.mounts[0].source).starts_with(&canon_root));
+    }
+
+    #[test]
+    fn a_data_root_named_like_a_variable_is_refused() {
+        let (dir, _) = root_dir();
+        let root = std::fs::canonicalize(dir.path()).unwrap().join("${HOME}");
+        std::fs::create_dir(&root).unwrap();
+        let data = root.join("data");
+        let spec = check_mounts(&bind(&lossy(&data)), &[lossy(&root)], None).unwrap();
+        let err = compose_json(&spec).unwrap_err().to_string();
+        assert!(err.contains("contains '$'"), "{err}");
+        let t = DockerDeployTarget::new("host-a", lossy(dir.path()))
+            .with_data_roots(vec![lossy(&root)]);
+        let err = plugin_toolkit::reactor::block_on(t.launch(&bind(&lossy(&data))))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("contains '$'"), "{err}");
+        for (key, target) in [("A$B", "/d"), ("A", "/d${X}")] {
+            let mut s = bind(&lossy(&data));
+            s.env = vec![EnvVar {
+                key: key.into(),
+                value: "1".into(),
+            }];
+            s.mounts[0].target = target.into();
+            assert!(compose_json(&s).is_err(), "{key} {target}");
+        }
+        let mut s = bind(&lossy(&data));
+        s.name = "w$x".into();
+        assert!(compose_json(&s).is_err());
+    }
+
+    #[test]
+    fn registry_aliases_match_docker_io() {
+        assert_eq!(image_registry("index.docker.io/library/nginx"), "docker.io");
+        assert_eq!(image_registry("registry-1.docker.io/x/y"), "docker.io");
+        let allow = ["docker.io".to_string()];
+        check_image("index.docker.io/library/nginx:1", &allow).unwrap();
     }
 
     #[test]

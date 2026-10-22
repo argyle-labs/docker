@@ -222,6 +222,55 @@ pub(crate) fn validate_data_roots(roots: &[String]) -> Result<()> {
     Ok(())
 }
 
+const DOCKER_IO_ALIASES: &[&str] = &["index.docker.io", "registry-1.docker.io"];
+
+pub(crate) fn normalize_registry(registry: &str) -> String {
+    let lower = registry.to_ascii_lowercase();
+    if DOCKER_IO_ALIASES.contains(&lower.as_str()) {
+        "docker.io".to_string()
+    } else {
+        lower
+    }
+}
+
+pub(crate) fn normalize_registries(registries: Vec<String>) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for raw in registries {
+        let trimmed = raw.trim();
+        let bare = trimmed
+            .strip_prefix("https://")
+            .or_else(|| trimmed.strip_prefix("http://"))
+            .unwrap_or(trimmed)
+            .trim_end_matches('/');
+        let (host, port) = match bare.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (bare, None),
+        };
+        let host_ok = !host.is_empty()
+            && host.split('.').all(|label| {
+                !label.is_empty()
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            });
+        let port_ok = port.is_none_or(|p| {
+            !p.is_empty()
+                && p.bytes().all(|b| b.is_ascii_digit())
+                && p.parse::<u16>().is_ok_and(|n| n > 0)
+        });
+        if !host_ok || !port_ok {
+            bail!("registry '{raw}' must be a bare host[:port], e.g. ghcr.io or localhost:5000");
+        }
+        let registry = normalize_registry(bare);
+        if !out.contains(&registry) {
+            out.push(registry);
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) fn validate_stacks_root(root: &str) -> Result<()> {
     let path = Path::new(root);
     if !path.is_absolute() {
@@ -349,8 +398,10 @@ pub struct DockerCreateArgs {
     #[arg(long = "data-root", action = plugin_toolkit::clap::ArgAction::Append)]
     #[serde(default, alias = "data_roots")]
     pub data_roots: Vec<String>,
-    /// Image registry deployed workloads may pull from (e.g. `docker.io`,
-    /// `ghcr.io`). Repeatable; none allows any.
+    /// Image registry deployed workloads may pull from: a bare host[:port]
+    /// (e.g. `docker.io`, `ghcr.io`, `localhost:5000`). A scheme or trailing
+    /// slash is stripped; `index.docker.io` and `registry-1.docker.io` mean
+    /// `docker.io`. Repeatable; none allows any.
     #[arg(long = "registry", action = plugin_toolkit::clap::ArgAction::Append)]
     #[serde(default)]
     pub registries: Vec<String>,
@@ -400,6 +451,7 @@ pub(crate) async fn docker_create(
         validate_stacks_root(root)?;
     }
     validate_data_roots(&args.data_roots)?;
+    let registries = normalize_registries(args.registries)?;
     if endpoint_db::get(&args.name)?.is_some() {
         bail!(
             "docker endpoint '{}' already exists; use docker.update",
@@ -413,7 +465,7 @@ pub(crate) async fn docker_create(
         url: args.url,
         stacks_root: args.stacks_root,
         data_roots: args.data_roots,
-        registries: args.registries,
+        registries,
         routes: Routes::from(args.routes),
         enabled: true,
     };
@@ -462,11 +514,17 @@ pub struct DockerUpdateArgs {
     #[arg(long = "data-root", action = plugin_toolkit::clap::ArgAction::Append)]
     #[serde(default, alias = "data_roots")]
     pub data_roots: Vec<String>,
-    /// Image registry deployed workloads may pull from (e.g. `docker.io`,
-    /// `ghcr.io`). Repeatable; none allows any.
+    /// Image registry deployed workloads may pull from: a bare host[:port]
+    /// (e.g. `docker.io`, `ghcr.io`, `localhost:5000`). A scheme or trailing
+    /// slash is stripped; `index.docker.io` and `registry-1.docker.io` mean
+    /// `docker.io`. Repeatable; none allows any.
     #[arg(long = "registry", action = plugin_toolkit::clap::ArgAction::Append)]
     #[serde(default)]
     pub registries: Vec<String>,
+    /// Remove every registry, allowing any. Conflicts with `--registry`.
+    #[arg(long)]
+    #[serde(default, alias = "clear_registries")]
+    pub clear_registries: bool,
     /// Replace the reachable-path set. Repeatable: `--route kind=url`
     /// or a JSON object. Omit to leave routes unchanged.
     #[arg(
@@ -514,6 +572,10 @@ async fn docker_update(args: DockerUpdateArgs, ctx: &ToolCtx) -> Result<DockerUp
         validate_stacks_root(root)?;
     }
     validate_data_roots(&args.data_roots)?;
+    if args.clear_registries && !args.registries.is_empty() {
+        bail!("pass --registry or --clear-registries, not both");
+    }
+    let registries = normalize_registries(args.registries)?;
     let mut rt = runtime(&args.name)?
         .ok_or_else(|| plugin_toolkit::runtime::missing_row_error("docker", &args.name))?;
     let mut applied = Vec::new();
@@ -532,8 +594,8 @@ async fn docker_update(args: DockerUpdateArgs, ctx: &ToolCtx) -> Result<DockerUp
         rt.data_roots = args.data_roots;
         applied.push("data_roots".to_string());
     }
-    if !args.registries.is_empty() {
-        rt.registries = args.registries;
+    if !registries.is_empty() || args.clear_registries {
+        rt.registries = registries;
         applied.push("registries".to_string());
     }
     if !args.routes.is_empty() {
@@ -742,6 +804,7 @@ mod registry_tests {
             stacks_root: Some("/srv/other".into()),
             data_roots: Vec::new(),
             registries: Vec::new(),
+            clear_registries: false,
             routes: Vec::new(),
             enabled: None,
             dry_run: !execute,
@@ -847,6 +910,102 @@ mod registry_tests {
             })
         });
         assert!(tables.values().all(Vec::is_empty), "{tables:?}");
+    }
+
+    #[test]
+    fn registries_are_bare_hosts_normalized_and_clearable() {
+        assert_eq!(
+            normalize_registries(vec![
+                "https://GHCR.io/".into(),
+                "index.docker.io".into(),
+                "registry-1.docker.io".into(),
+                "docker.io".into(),
+                "localhost:5000".into(),
+            ])
+            .unwrap(),
+            ["ghcr.io", "docker.io", "localhost:5000"]
+        );
+        for bad in [
+            "",
+            "ghcr.io/org",
+            "ftp://ghcr.io",
+            "host:0",
+            "host:99999",
+            "host:",
+            "-bad.io",
+            "a..b",
+            "ghcr.io?x",
+            "user@ghcr.io",
+        ] {
+            assert!(normalize_registries(vec![bad.into()]).is_err(), "{bad}");
+        }
+        let ((), _) = with_db(|| {
+            block_on(async {
+                let ctx = admin();
+                let mut create = create_args(true);
+                create.registries = vec!["ghcr.io".into()];
+                docker_create(create, &ctx).await.unwrap();
+                assert_eq!(runtime("local").unwrap().unwrap().registries, ["ghcr.io"]);
+
+                let mut both = update_args(true);
+                both.registries = vec!["docker.io".into()];
+                both.clear_registries = true;
+                assert!(docker_update(both, &ctx).await.is_err());
+
+                let mut clear = update_args(true);
+                clear.stacks_root = None;
+                clear.clear_registries = true;
+                let out = docker_update(clear, &ctx).await.unwrap();
+                assert_eq!(out.applied, ["registries"]);
+                assert!(runtime("local").unwrap().unwrap().registries.is_empty());
+            })
+        });
+    }
+
+    #[test]
+    fn a_settings_row_from_before_registries_reads_back_empty() {
+        let schema: plugin_toolkit::serde_json::Value =
+            plugin_toolkit::serde_json::from_str(&crate::registration::schema_json()).unwrap();
+        let column = schema["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["table"] == SETTINGS_TABLE)
+            .and_then(|t| {
+                t["columns"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|c| c["name"] == "registries")
+                    .cloned()
+            })
+            .unwrap();
+        assert!(
+            column["not_null"] != true && column.get("default").is_none(),
+            "core adds a column to an existing table only when it is nullable or has a default"
+        );
+        let (rt, _) = with_db(|| {
+            block_on(docker_create(create_args(true), &admin())).unwrap();
+            let mut old = DbRow::new();
+            old.insert("name".to_string(), DbValue::Text("local".into()));
+            old.insert(
+                "socket_path".to_string(),
+                DbValue::Text("/var/run/test-docker.sock".into()),
+            );
+            old.insert(
+                "stacks_root".to_string(),
+                DbValue::Text("/srv/stacks".into()),
+            );
+            db_op(&DbOp::Upsert {
+                namespace: "docker".to_string(),
+                table: SETTINGS_TABLE.to_string(),
+                row: old,
+            })
+            .unwrap();
+            runtime("local").unwrap().unwrap()
+        });
+        assert!(rt.registries.is_empty());
+        assert_eq!(rt.stacks_root.as_deref(), Some("/srv/stacks"));
     }
 
     fn engine(name: &str, sock: Option<&str>, enabled: bool) -> Runtime {

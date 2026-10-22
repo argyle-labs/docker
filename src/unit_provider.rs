@@ -459,7 +459,7 @@ impl DockerUnitProvider {
         let (_, cfg) = ownership::user_config(row).await?;
         let docker = &self.adapter.client().map_err(adapter_err)?;
         let containers = ownership::project_containers(docker, &cfg.name).await?;
-        let converted = ownership::read_conversions(std::path::Path::new(&row.dir))?;
+        let converted = ownership::checked_conversions(row, &cfg, docker).await?;
         let planned = ownership::plan(&cfg, &containers, &converted);
         let warnings = ownership::relabel_warning(&containers)
             .into_iter()
@@ -742,6 +742,23 @@ impl DockerUnitProvider {
         let raw = payload.ok_or_else(|| anyhow::anyhow!("deploy requires a payload"))?;
         let p: StackDeployPayload =
             serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("deploy payload: {e}"))?;
+        self.deploy_payload(p, add_only, false).await
+    }
+
+    pub(crate) async fn stack_deploy_isolated(
+        &self,
+        p: StackDeployPayload,
+        add_only: bool,
+    ) -> Result<VerbOutcome> {
+        self.deploy_payload(p, add_only, true).await
+    }
+
+    async fn deploy_payload(
+        &self,
+        p: StackDeployPayload,
+        add_only: bool,
+        isolated: bool,
+    ) -> Result<VerbOutcome> {
         let file = p
             .file
             .clone()
@@ -779,7 +796,11 @@ impl DockerUnitProvider {
         .await?;
         stacks::put(&row)?;
         if p.deploy {
-            ownership::up(&row, &[]).await?;
+            if isolated {
+                ownership::up_isolated(&row).await?;
+            } else {
+                ownership::up(&row, &[]).await?;
+            }
         }
         Ok(VerbOutcome::Item(ItemOutcome::new(
             self.stack_unit_id(&row),

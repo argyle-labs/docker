@@ -448,9 +448,54 @@ pub async fn project_containers(docker: &Docker, project: &str) -> Result<Vec<Co
 
 /// The user's resolved config (without [`ORCA_FILE`]).
 pub async fn user_config(row: &StackRow) -> Result<(Compose, ComposeConfig)> {
-    let compose = row.compose()?.without_orca();
+    config_of(row.compose()?).await
+}
+
+async fn config_of(compose: Compose) -> Result<(Compose, ComposeConfig)> {
+    let compose = compose.without_orca();
     let raw = compose.config_json().await?;
     Ok((compose, ComposeConfig::parse(&raw)?))
+}
+
+pub fn check_conversions(
+    cfg: &ComposeConfig,
+    stack: &str,
+    conversions: &[Conversion],
+    engine: &EngineVolumes,
+) -> Result<()> {
+    for c in conversions {
+        if *c != Conversion::new(&cfg.name, &c.service, &c.target) {
+            anyhow::bail!(
+                "{ORCA_FILE} records conversion {} as volume '{}', not this stack's own; refusing it",
+                c.key(),
+                c.name
+            );
+        }
+        if let Some(have) = engine.get(&c.name) {
+            let owned = have.get(labels::STACK).map(String::as_str) == Some(cfg.name.as_str())
+                && have.get(labels::UNIT).map(String::as_str) == Some(stack);
+            if !owned {
+                anyhow::bail!(
+                    "{ORCA_FILE} records conversion {} onto volume '{}', which is not labeled as stack '{stack}''s; refusing it",
+                    c.key(),
+                    c.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+pub async fn checked_conversions(
+    row: &StackRow,
+    cfg: &ComposeConfig,
+    docker: &Docker,
+) -> Result<Vec<Conversion>> {
+    let recorded = read_conversions(Path::new(&row.dir))?;
+    if !recorded.is_empty() {
+        check_conversions(cfg, &row.name, &recorded, &engine_volumes(docker).await?)?;
+    }
+    Ok(recorded)
 }
 
 /// Regenerate [`ORCA_FILE`] with `conversions` (default: the ones it
@@ -460,16 +505,26 @@ pub async fn write_with(
     docker: &Docker,
     conversions: Option<&[Conversion]>,
 ) -> Result<(Compose, Vec<String>)> {
-    let (compose, cfg) = user_config(row).await?;
+    write_from(row, row.compose()?, docker, conversions).await
+}
+
+async fn write_from(
+    row: &StackRow,
+    base: Compose,
+    docker: &Docker,
+    conversions: Option<&[Conversion]>,
+) -> Result<(Compose, Vec<String>)> {
+    let (compose, cfg) = config_of(base).await?;
+    let engine = engine_volumes(docker).await?;
     let recorded;
     let conversions = match conversions {
         Some(c) => c,
         None => {
             recorded = read_conversions(Path::new(&row.dir))?;
+            check_conversions(&cfg, &row.name, &recorded, &engine)?;
             &recorded
         }
     };
-    let engine = engine_volumes(docker).await?;
     let networks = engine_networks(docker, &cfg).await?;
     let rendered = render(&cfg, &row.name, conversions, &engine, &networks);
     write_orca(row, &rendered.text)?;
@@ -491,8 +546,16 @@ pub async fn refresh(row: &StackRow) -> Result<Compose> {
 /// from the config [`crate::policy::gate`] checked. The output leads with
 /// what was left unlabeled.
 pub async fn up(row: &StackRow, services: &[&str]) -> Result<String> {
+    up_from(row, row.compose()?, services).await
+}
+
+pub async fn up_isolated(row: &StackRow) -> Result<String> {
+    up_from(row, row.compose()?.isolated(), &[]).await
+}
+
+async fn up_from(row: &StackRow, base: Compose, services: &[&str]) -> Result<String> {
     let docker = client()?;
-    let (compose, notes) = write_with(row, &docker, None).await?;
+    let (compose, notes) = write_from(row, base, &docker, None).await?;
     let out = crate::policy::gate(Some(&docker), row, &compose)
         .await?
         .up(services)
@@ -1294,6 +1357,51 @@ mod tests {
         let recorded: Vec<Conversion> =
             serde_json::from_value(v["x-orca"]["conversions"].clone()).unwrap();
         assert_eq!(recorded, vec![keep]);
+    }
+
+    #[test]
+    fn a_tampered_conversion_onto_a_foreign_volume_is_refused() {
+        let own = Conversion::new("media", "app", "/cache");
+        let ours = HashMap::from([(
+            own.name.clone(),
+            Labels::for_(OWNER_DOCKER, "media", Some("app"), Some("media-stack"))
+                .with_mount("/cache")
+                .to_map()
+                .into_iter()
+                .collect(),
+        )]);
+        check_conversions(&cfg(), "media-stack", std::slice::from_ref(&own), &ours).unwrap();
+        check_conversions(
+            &cfg(),
+            "media-stack",
+            std::slice::from_ref(&own),
+            &EngineVolumes::new(),
+        )
+        .unwrap();
+        let mut foreign_name = own.clone();
+        foreign_name.name = "other_db_data".into();
+        let mut foreign_key = own.clone();
+        foreign_key.volume = "db_data".into();
+        for c in [foreign_name, foreign_key] {
+            let err = check_conversions(&cfg(), "media-stack", &[c], &ours)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("not this stack's own"), "{err}");
+        }
+        let squatted = HashMap::from([(
+            own.name.clone(),
+            Labels::for_(OWNER_DOCKER, "media", Some("app"), Some("other-stack"))
+                .to_map()
+                .into_iter()
+                .collect(),
+        )]);
+        let unlabeled = HashMap::from([(own.name.clone(), HashMap::new())]);
+        for engine in [squatted, unlabeled] {
+            let err = check_conversions(&cfg(), "media-stack", std::slice::from_ref(&own), &engine)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("not labeled as stack"), "{err}");
+        }
     }
 
     #[test]
