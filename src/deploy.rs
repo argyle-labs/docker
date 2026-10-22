@@ -384,19 +384,191 @@ pub fn check_mounts(
         check_resolved(&m.source, Path::new(&m.source), orca_home)?;
         let real = resolve_source(&m.source, &roots)?;
         check_resolved(&m.source, &real, orca_home)?;
+        if let Some(root) = roots.iter().find(|r| real.starts_with(r)) {
+            check_not_shared_writable(&real, root)?;
+        }
         m.source = real.to_string_lossy().into_owned();
     }
     Ok(out)
 }
 
 fn plain_volume_name(name: &str) -> bool {
-    !name.is_empty() && !name.contains(['/', '\\', '~']) && !name.starts_with('.')
+    !name.is_empty() && !name.contains(['/', '\\', '~', '$']) && !name.starts_with('.')
 }
 
 fn refuse_volume(svc: &str, vol: &Value) -> DeployError {
     other(format!(
-        "service '{svc}' volume {vol} is not a long-form bind or plain named volume"
+        "service '{svc}' volume {vol} is not a long-form bind or declared named volume"
     ))
+}
+
+const TOP_LEVEL_KEYS: &[&str] = &["services", "volumes"];
+const SERVICE_KEYS: &[&str] = &[
+    "image",
+    "restart",
+    "cap_drop",
+    "security_opt",
+    "environment",
+    "ports",
+    "volumes",
+];
+const MOUNT_KEYS: &[&str] = &["type", "source", "target", "read_only", "bind", "tmpfs"];
+
+fn only_keys(obj: &Map<String, Value>, allowed: &[&str], what: &str) -> Result<(), DeployError> {
+    match obj.keys().find(|k| !allowed.contains(&k.as_str())) {
+        Some(k) => Err(other(format!("{what} key '{k}' is not allowed"))),
+        None => Ok(()),
+    }
+}
+
+fn check_top_volumes(doc: &Map<String, Value>) -> Result<Vec<String>, DeployError> {
+    let Some(vols) = doc.get("volumes") else {
+        return Ok(Vec::new());
+    };
+    let vols = vols
+        .as_object()
+        .ok_or_else(|| other("top-level volumes is not a mapping"))?;
+    for (name, vol) in vols {
+        if !plain_volume_name(name) {
+            return Err(other(format!(
+                "top-level volume '{name}' is not a plain name"
+            )));
+        }
+        let what = format!("top-level volume '{name}'");
+        let Some(obj) = vol.as_object() else {
+            if vol.is_null() {
+                continue;
+            }
+            return Err(other(format!("{what} is not a mapping")));
+        };
+        only_keys(obj, &["driver", "name"], &what)?;
+        if obj.get("driver").is_some_and(|d| d != "local") {
+            return Err(other(format!("{what} sets a non-local driver")));
+        }
+        if obj.get("name").is_some_and(|n| n != name.as_str()) {
+            return Err(other(format!("{what} sets a name other than its key")));
+        }
+    }
+    Ok(vols.keys().cloned().collect())
+}
+
+fn check_service_keys(name: &str, svc: &Value) -> Result<(), DeployError> {
+    let what = format!("service '{name}'");
+    let obj = svc
+        .as_object()
+        .ok_or_else(|| other(format!("{what} is not a mapping")))?;
+    only_keys(obj, SERVICE_KEYS, &what)?;
+    if obj.get("cap_drop").is_some_and(|c| c != &json!(["ALL"])) {
+        return Err(other(format!("{what} cap_drop must be [\"ALL\"]")));
+    }
+    if obj
+        .get("security_opt")
+        .is_some_and(|s| s != &json!(["no-new-privileges:true"]))
+    {
+        return Err(other(format!(
+            "{what} security_opt must be [\"no-new-privileges:true\"]"
+        )));
+    }
+    if obj.get("restart").is_some_and(|r| !r.is_string()) {
+        return Err(other(format!("{what} restart is not a string")));
+    }
+    if obj.get("environment").is_some_and(|e| {
+        !e.as_object()
+            .is_some_and(|m| m.values().all(Value::is_string))
+    }) {
+        return Err(other(format!("{what} environment is not a string mapping")));
+    }
+    if obj
+        .get("ports")
+        .is_some_and(|p| !p.as_array().is_some_and(|a| a.iter().all(Value::is_string)))
+    {
+        return Err(other(format!("{what} ports is not a list of strings")));
+    }
+    Ok(())
+}
+
+fn check_mount_shape(svc: &str, vol: &Value, declared: &[String]) -> Result<bool, DeployError> {
+    let obj = vol.as_object().ok_or_else(|| refuse_volume(svc, vol))?;
+    only_keys(obj, MOUNT_KEYS, &format!("service '{svc}' volume"))?;
+    let target = vol["target"].as_str().unwrap_or_default();
+    if !target.starts_with('/') || target.contains('$') {
+        return Err(other(format!(
+            "service '{svc}' volume target '{target}' must be an absolute path without '$'"
+        )));
+    }
+    if vol["source"].as_str().is_some_and(|s| s.contains('$')) {
+        return Err(other(format!("service '{svc}' volume source contains '$'")));
+    }
+    if !vol["read_only"].is_null() && !vol["read_only"].is_boolean() {
+        return Err(refuse_volume(svc, vol));
+    }
+    let kind = vol["type"].as_str();
+    if !vol["bind"].is_null() && kind != Some("bind")
+        || !vol["tmpfs"].is_null() && kind != Some("tmpfs")
+    {
+        return Err(refuse_volume(svc, vol));
+    }
+    match kind {
+        Some("tmpfs") => {
+            if !vol["source"].is_null() {
+                return Err(refuse_volume(svc, vol));
+            }
+            if let Some(t) = vol.get("tmpfs") {
+                let t = t.as_object().ok_or_else(|| refuse_volume(svc, vol))?;
+                only_keys(t, &["size"], &format!("service '{svc}' tmpfs"))?;
+            }
+            Ok(false)
+        }
+        Some("volume") => {
+            let name = vol["source"].as_str().unwrap_or_default();
+            if plain_volume_name(name) && declared.iter().any(|d| d == name) {
+                Ok(false)
+            } else {
+                Err(refuse_volume(svc, vol))
+            }
+        }
+        Some("bind") => {
+            if let Some(b) = vol.get("bind") {
+                let b = b.as_object().ok_or_else(|| refuse_volume(svc, vol))?;
+                only_keys(
+                    b,
+                    &["create_host_path", "propagation"],
+                    &format!("service '{svc}' bind"),
+                )?;
+                if b.get("create_host_path").is_some_and(|c| c != false) {
+                    return Err(other(format!("service '{svc}' bind sets create_host_path")));
+                }
+                if b.get("propagation")
+                    .is_some_and(|p| p != "private" && p != "rprivate")
+                {
+                    return Err(other(format!(
+                        "service '{svc}' bind propagation must be private or rprivate"
+                    )));
+                }
+            }
+            Ok(true)
+        }
+        _ => Err(refuse_volume(svc, vol)),
+    }
+}
+
+fn check_not_shared_writable(real: &Path, root: &Path) -> Result<(), DeployError> {
+    use std::os::unix::fs::MetadataExt;
+    let euid = unsafe { libc::geteuid() };
+    for dir in real.ancestors().filter(|d| d.starts_with(root)) {
+        let meta = std::fs::metadata(dir).map_err(other)?;
+        if meta.mode() & 0o002 != 0 {
+            return Err(other(format!("'{}' is writable by others", dir.display())));
+        }
+        if meta.uid() != 0 && meta.uid() != euid {
+            return Err(other(format!(
+                "'{}' is owned by uid {}, not orca or root",
+                dir.display(),
+                meta.uid()
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub fn recheck_compose(
@@ -406,32 +578,20 @@ pub fn recheck_compose(
 ) -> Result<(), DeployError> {
     let doc = serde_json::from_str::<Value>(compose)
         .map_err(|e| other(format!("stored compose does not parse: {e}")))?;
-    for (name, vol) in doc["volumes"].as_object().into_iter().flatten() {
-        if !vol["driver_opts"].is_null() {
-            return Err(other(format!("top-level volume '{name}' sets driver_opts")));
-        }
-    }
+    let top = doc
+        .as_object()
+        .ok_or_else(|| other("stored compose is not a mapping"))?;
+    only_keys(top, TOP_LEVEL_KEYS, "top-level")?;
+    let declared = check_top_volumes(top)?;
     let roots = canonical_roots(data_roots);
     for (svc_name, svc) in doc["services"].as_object().into_iter().flatten() {
+        check_service_keys(svc_name, svc)?;
+        if !svc["volumes"].is_null() && !svc["volumes"].is_array() {
+            return Err(other(format!("service '{svc_name}' volumes is not a list")));
+        }
         for vol in svc["volumes"].as_array().into_iter().flatten() {
-            if let Some(short) = vol.as_str() {
-                let source = short.split(':').next().unwrap_or_default();
-                if short.contains(':') && plain_volume_name(source) {
-                    continue;
-                }
-                return Err(refuse_volume(svc_name, vol));
-            }
-            match vol["type"].as_str() {
-                Some("tmpfs") => continue,
-                Some("volume") => {
-                    let name = vol["source"].as_str().unwrap_or_default();
-                    if plain_volume_name(name) && vol["volume"]["driver_opts"].is_null() {
-                        continue;
-                    }
-                    return Err(refuse_volume(svc_name, vol));
-                }
-                Some("bind") => {}
-                _ => return Err(refuse_volume(svc_name, vol)),
+            if !check_mount_shape(svc_name, vol, &declared)? {
+                continue;
             }
             let source = vol["source"]
                 .as_str()
@@ -446,12 +606,13 @@ pub fn recheck_compose(
                     "bind mount source '{source}' no longer resolves to itself"
                 )));
             }
-            if !roots.iter().any(|r| real.starts_with(r)) {
-                return Err(other(format!(
+            let root = roots.iter().find(|r| real.starts_with(r)).ok_or_else(|| {
+                other(format!(
                     "bind mount source '{source}' is outside the allowed data roots {data_roots:?}"
-                )));
-            }
+                ))
+            })?;
             check_resolved(source, &real, orca_home)?;
+            check_not_shared_writable(&real, root)?;
         }
     }
     Ok(())
@@ -522,7 +683,16 @@ pub fn compose_json(spec: &WorkloadSpec) -> Result<String, DeployError> {
         }
         svc.insert("volumes".into(), Value::Array(volumes));
     }
-    let doc = json!({"services": {spec.name.clone(): Value::Object(svc)}});
+    let named: Map<String, Value> = spec
+        .mounts
+        .iter()
+        .filter(|m| matches!(m.kind, MountKind::Volume))
+        .map(|m| (m.source.clone(), json!({})))
+        .collect();
+    let mut doc = json!({"services": {spec.name.clone(): Value::Object(svc)}});
+    if !named.is_empty() {
+        doc["volumes"] = Value::Object(named);
+    }
     serde_json::to_string_pretty(&doc).map_err(other)
 }
 
@@ -1040,37 +1210,194 @@ mod tests {
         }
     }
 
+    fn recheck_doc(doc: Value) -> Result<(), DeployError> {
+        let (_dir, root) = root_dir();
+        recheck_compose(&doc.to_string(), &[root], None)
+    }
+
+    fn recheck_err(doc: Value) -> String {
+        recheck_doc(doc.clone())
+            .expect_err(&doc.to_string())
+            .to_string()
+    }
+
+    fn with_svc(key: &str, value: Value) -> Value {
+        json!({"services": {"web": {"image": "nginx:1", key: value}}})
+    }
+
     #[test]
     fn recheck_refuses_non_bind_host_mounts() {
-        let (_dir, root) = root_dir();
-        let roots = std::slice::from_ref(&root);
         for vol in [
             json!("/etc:/x"),
             json!("./data:/x"),
             json!("~/data:/x"),
             json!("/x"),
+            json!("pg:/x"),
             json!({"type": "volume", "source": "/etc", "target": "/x"}),
-            json!({"type": "volume", "source": "v", "target": "/x", "volume": {"driver_opts": {"device": "/etc", "o": "bind"}}}),
+            json!({"type": "volume", "source": "undeclared", "target": "/x"}),
             json!({"type": "npipe", "source": "x", "target": "/x"}),
             json!({"source": "/etc", "target": "/x"}),
         ] {
-            let doc = json!({"services": {"web": {"volumes": [vol.clone()]}}}).to_string();
-            let err = recheck_compose(&doc, roots, None).unwrap_err().to_string();
+            let doc =
+                json!({"services": {"web": {"volumes": [vol.clone()]}}, "volumes": {"pg": {}}});
+            let err = recheck_err(doc);
             assert!(err.contains("not a long-form bind"), "{vol}: {err}");
         }
         let doc = json!({
-            "services": {"web": {"volumes": ["pg:/x", {"type": "volume", "source": "pg", "target": "/y"}, {"type": "tmpfs", "target": "/t"}]}},
+            "services": {"web": {"volumes": [{"type": "volume", "source": "pg", "target": "/y"}, {"type": "tmpfs", "target": "/t", "tmpfs": {"size": "1m"}}]}},
             "volumes": {"pg": {}}
-        })
-        .to_string();
-        recheck_compose(&doc, roots, None).unwrap();
-        let doc = json!({
-            "services": {"web": {"volumes": ["pg:/x"]}},
-            "volumes": {"pg": {"driver_opts": {"type": "none", "o": "bind", "device": "/etc"}}}
-        })
-        .to_string();
-        let err = recheck_compose(&doc, roots, None).unwrap_err().to_string();
-        assert!(err.contains("driver_opts"), "{err}");
+        });
+        recheck_doc(doc).unwrap();
+    }
+
+    #[test]
+    fn recheck_refuses_dollar_and_relative_targets() {
+        for vol in [
+            json!({"type": "volume", "source": "p$X", "target": "/x"}),
+            json!({"type": "bind", "source": "/srv/${X}", "target": "/x"}),
+            json!({"type": "volume", "source": "pg", "target": "/x/$Y"}),
+            json!({"type": "volume", "source": "pg", "target": "x"}),
+            json!({"type": "tmpfs", "target": "rel"}),
+        ] {
+            let doc =
+                json!({"services": {"web": {"volumes": [vol.clone()]}}, "volumes": {"pg": {}}});
+            assert!(recheck_doc(doc).is_err(), "{vol}");
+        }
+        let err = recheck_err(json!({"services": {}, "volumes": {"$X": {}}}));
+        assert!(err.contains("not a plain name"), "{err}");
+    }
+
+    #[test]
+    fn recheck_refuses_secrets_configs_and_unknown_top_level() {
+        for key in ["secrets", "configs", "networks", "include", "x-any", "name"] {
+            let doc = json!({"services": {}, key: {"s": {"file": "/etc/shadow"}}});
+            let err = recheck_err(doc);
+            assert!(err.contains(&format!("top-level key '{key}'")), "{err}");
+        }
+    }
+
+    #[test]
+    fn recheck_refuses_unsafe_top_level_volumes() {
+        for (vol, needle) in [
+            (json!({"external": true}), "key 'external'"),
+            (json!({"name": "other"}), "name other than its key"),
+            (json!({"driver": "nfs"}), "non-local driver"),
+            (
+                json!({"driver_opts": {"device": "/etc", "o": "bind"}}),
+                "key 'driver_opts'",
+            ),
+            (json!({"labels": {}}), "key 'labels'"),
+        ] {
+            let err = recheck_err(json!({"services": {}, "volumes": {"pg": vol}}));
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
+        recheck_doc(json!({"services": {}, "volumes": {"pg": {"driver": "local", "name": "pg"}, "q": null}}))
+            .unwrap();
+    }
+
+    #[test]
+    fn recheck_refuses_bind_options() {
+        for (bind, ok) in [
+            (json!({"propagation": "rshared"}), false),
+            (json!({"propagation": "shared"}), false),
+            (json!({"propagation": "slave"}), false),
+            (json!({"create_host_path": true}), false),
+            (json!({"selinux": "z"}), false),
+            (json!({"propagation": "rprivate"}), true),
+            (json!({"propagation": "private"}), true),
+        ] {
+            let (dir, root) = root_dir();
+            let data = std::fs::canonicalize(dir.path()).unwrap();
+            let vol = json!({"type": "bind", "source": lossy(&data), "target": "/d", "bind": bind});
+            let doc = json!({"services": {"web": {"volumes": [vol]}}}).to_string();
+            assert_eq!(recheck_compose(&doc, &[root], None).is_ok(), ok, "{bind}");
+        }
+        let vol =
+            json!({"type": "volume", "source": "pg", "target": "/d", "volume": {"nocopy": true}});
+        let err =
+            recheck_err(json!({"services": {"web": {"volumes": [vol]}}, "volumes": {"pg": {}}}));
+        assert!(err.contains("key 'volume'"), "{err}");
+    }
+
+    #[test]
+    fn recheck_refuses_host_reaching_service_keys() {
+        for (key, value) in [
+            ("privileged", json!(true)),
+            ("devices", json!(["/dev/ttyUSB0:/dev/ttyUSB0"])),
+            ("cap_add", json!(["NET_ADMIN"])),
+            ("pid", json!("host")),
+            ("ipc", json!("host")),
+            ("userns_mode", json!("host")),
+            ("cgroup", json!("host")),
+            ("network_mode", json!("host")),
+            ("volumes_from", json!(["other"])),
+            ("build", json!({"context": "/"})),
+            ("env_file", json!(["/etc/shadow"])),
+            ("secrets", json!(["s"])),
+            ("configs", json!(["c"])),
+            ("extends", json!({"service": "x"})),
+            ("mystery", json!(1)),
+        ] {
+            let err = recheck_err(with_svc(key, value));
+            assert!(
+                err.contains(&format!("key '{key}' is not allowed")),
+                "{key}: {err}"
+            );
+        }
+        for (key, value) in [
+            ("cap_drop", json!([])),
+            ("security_opt", json!(["seccomp:unconfined"])),
+            (
+                "security_opt",
+                json!(["apparmor:unconfined", "no-new-privileges:true"]),
+            ),
+            ("security_opt", json!(["label:disable"])),
+            ("environment", json!(["A=1"])),
+            ("ports", json!([80])),
+            ("restart", json!(1)),
+        ] {
+            assert!(
+                recheck_doc(with_svc(key, value.clone())).is_err(),
+                "{key} {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn recheck_refuses_shared_writable_data_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, root) = root_dir();
+        let data = std::fs::canonicalize(dir.path()).unwrap().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let compose = compose_json(&bind(&lossy(&data))).unwrap();
+        recheck_compose(&compose, std::slice::from_ref(&root), None).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = recheck_compose(&compose, std::slice::from_ref(&root), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("writable by others"), "{err}");
+        let err = refused(&bind(&lossy(&data)), &[root], None);
+        assert!(err.contains("writable by others"), "{err}");
+    }
+
+    #[test]
+    fn compose_json_output_passes_recheck() {
+        let (dir, root) = root_dir();
+        let data = std::fs::canonicalize(dir.path()).unwrap().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let mut s = spec();
+        s.mounts[0].source = lossy(&data);
+        s.mounts.push(Mount {
+            kind: MountKind::Volume,
+            source: "pgdata".into(),
+            target: "/var/lib/pg".into(),
+            read_only: false,
+            size: None,
+        });
+        let compose = compose_json(&s).unwrap();
+        let doc: Value = serde_json::from_str(&compose).unwrap();
+        assert_eq!(doc["volumes"], json!({"pgdata": {}}));
+        recheck_compose(&compose, &[root], None).unwrap();
     }
 
     #[test]
