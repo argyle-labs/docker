@@ -218,6 +218,11 @@ fn folded_segments(path: &Path) -> Vec<String> {
         .collect()
 }
 
+fn folded_starts_with(path: &Path, prefix: &Path) -> bool {
+    let (p, pre) = (folded_segments(path), folded_segments(prefix));
+    p.len() >= pre.len() && p.iter().zip(pre.iter()).all(|(a, b)| a == b)
+}
+
 fn has_denied_segment(path: &Path) -> bool {
     let segments = folded_segments(path);
     DENIED_SEGMENTS.iter().any(|pat| {
@@ -255,7 +260,7 @@ fn denied(path: &Path, orca_home: Option<&Path>) -> bool {
     let deny_hit = deny
         .iter()
         .flat_map(|d| [d.clone(), resolved(d)])
-        .any(|d| path.starts_with(&d) || d.starts_with(path));
+        .any(|d| folded_starts_with(path, &d) || folded_starts_with(&d, path));
     let bare_home = HOME_PARENTS
         .iter()
         .flat_map(|h| [PathBuf::from(h), resolved(Path::new(h))])
@@ -263,9 +268,16 @@ fn denied(path: &Path, orca_home: Option<&Path>) -> bool {
     deny_hit || bare_home || has_denied_segment(path) || shadows_denied_segment(path)
 }
 
-fn create_under(existing: &Path, rest: &[String]) -> Result<PathBuf, DeployError> {
-    let mut dir = crate::fsat::open_dir(existing).map_err(other)?;
-    let mut path = existing.to_path_buf();
+fn create_under(root: &Path, existing: &Path, rest: &[String]) -> Result<PathBuf, DeployError> {
+    let mut dir = crate::fsat::open_dir(root).map_err(other)?;
+    let mut path = root.to_path_buf();
+    let below = existing.strip_prefix(root).map_err(other)?;
+    for c in below.components() {
+        let name = c.as_os_str().to_string_lossy();
+        dir = crate::fsat::open_dir_at(&dir, &name)
+            .map_err(|e| other(format!("opening {}: {e}", path.join(&*name).display())))?;
+        path.push(&*name);
+    }
     for name in rest {
         match crate::fsat::mkdir_at(&dir, name, 0o755) {
             Ok(()) => {}
@@ -326,11 +338,17 @@ fn resolve_source(source: &str, roots: &[PathBuf]) -> Result<PathBuf, DeployErro
             }
             rest.reverse();
             let base = std::fs::canonicalize(existing).map_err(other)?;
-            if !roots.iter().any(|r| base.starts_with(r)) {
-                return Err(outside());
+            let root = roots
+                .iter()
+                .find(|r| base.starts_with(r))
+                .ok_or_else(outside)?;
+            let created = create_under(root, &base, &rest)?;
+            let real = std::fs::canonicalize(created).map_err(other)?;
+            if real.starts_with(root) {
+                Ok(real)
+            } else {
+                Err(outside())
             }
-            let created = create_under(&base, &rest)?;
-            std::fs::canonicalize(created).map_err(other)
         }
     }
 }
@@ -371,25 +389,54 @@ pub fn check_mounts(
     Ok(out)
 }
 
+fn plain_volume_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains(['/', '\\', '~']) && !name.starts_with('.')
+}
+
+fn refuse_volume(svc: &str, vol: &Value) -> DeployError {
+    other(format!(
+        "service '{svc}' volume {vol} is not a long-form bind or plain named volume"
+    ))
+}
+
 pub fn recheck_compose(
     compose: &str,
     data_roots: &[String],
     orca_home: Option<&Path>,
 ) -> Result<(), DeployError> {
-    let Ok(doc) = serde_json::from_str::<Value>(compose) else {
-        return Ok(());
-    };
+    let doc = serde_json::from_str::<Value>(compose)
+        .map_err(|e| other(format!("stored compose does not parse: {e}")))?;
+    for (name, vol) in doc["volumes"].as_object().into_iter().flatten() {
+        if !vol["driver_opts"].is_null() {
+            return Err(other(format!("top-level volume '{name}' sets driver_opts")));
+        }
+    }
     let roots = canonical_roots(data_roots);
-    let services = doc["services"]
-        .as_object()
-        .into_iter()
-        .flat_map(|m| m.values());
-    for svc in services {
+    for (svc_name, svc) in doc["services"].as_object().into_iter().flatten() {
         for vol in svc["volumes"].as_array().into_iter().flatten() {
-            if vol["type"] != "bind" {
-                continue;
+            if let Some(short) = vol.as_str() {
+                let source = short.split(':').next().unwrap_or_default();
+                if short.contains(':') && plain_volume_name(source) {
+                    continue;
+                }
+                return Err(refuse_volume(svc_name, vol));
             }
-            let source = vol["source"].as_str().unwrap_or_default();
+            match vol["type"].as_str() {
+                Some("tmpfs") => continue,
+                Some("volume") => {
+                    let name = vol["source"].as_str().unwrap_or_default();
+                    if plain_volume_name(name) && vol["volume"]["driver_opts"].is_null() {
+                        continue;
+                    }
+                    return Err(refuse_volume(svc_name, vol));
+                }
+                Some("bind") => {}
+                _ => return Err(refuse_volume(svc_name, vol)),
+            }
+            let source = vol["source"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| other(format!("service '{svc_name}' bind mount has no source")))?;
             let path = Path::new(source);
             let meta = std::fs::symlink_metadata(path)
                 .map_err(|e| other(format!("bind mount source '{source}' is unavailable: {e}")))?;
@@ -973,6 +1020,111 @@ mod tests {
         assert_eq!(DeployTarget::data_roots(&t), ["/opt/stacks"]);
         let t = t.with_data_roots(vec!["/srv/data".into()]);
         assert_eq!(DeployTarget::data_roots(&t), ["/srv/data"]);
+    }
+
+    #[test]
+    fn recheck_refuses_unparseable_and_sourceless() {
+        let (_dir, root) = root_dir();
+        let roots = std::slice::from_ref(&root);
+        let err = recheck_compose("not json", roots, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not parse"), "{err}");
+        for vol in [
+            json!({"type": "bind", "target": "/d"}),
+            json!({"type": "bind", "source": "", "target": "/d"}),
+        ] {
+            let doc = json!({"services": {"web": {"volumes": [vol]}}}).to_string();
+            let err = recheck_compose(&doc, roots, None).unwrap_err().to_string();
+            assert!(err.contains("has no source"), "{err}");
+        }
+    }
+
+    #[test]
+    fn recheck_refuses_non_bind_host_mounts() {
+        let (_dir, root) = root_dir();
+        let roots = std::slice::from_ref(&root);
+        for vol in [
+            json!("/etc:/x"),
+            json!("./data:/x"),
+            json!("~/data:/x"),
+            json!("/x"),
+            json!({"type": "volume", "source": "/etc", "target": "/x"}),
+            json!({"type": "volume", "source": "v", "target": "/x", "volume": {"driver_opts": {"device": "/etc", "o": "bind"}}}),
+            json!({"type": "npipe", "source": "x", "target": "/x"}),
+            json!({"source": "/etc", "target": "/x"}),
+        ] {
+            let doc = json!({"services": {"web": {"volumes": [vol.clone()]}}}).to_string();
+            let err = recheck_compose(&doc, roots, None).unwrap_err().to_string();
+            assert!(err.contains("not a long-form bind"), "{vol}: {err}");
+        }
+        let doc = json!({
+            "services": {"web": {"volumes": ["pg:/x", {"type": "volume", "source": "pg", "target": "/y"}, {"type": "tmpfs", "target": "/t"}]}},
+            "volumes": {"pg": {}}
+        })
+        .to_string();
+        recheck_compose(&doc, roots, None).unwrap();
+        let doc = json!({
+            "services": {"web": {"volumes": ["pg:/x"]}},
+            "volumes": {"pg": {"driver_opts": {"type": "none", "o": "bind", "device": "/etc"}}}
+        })
+        .to_string();
+        let err = recheck_compose(&doc, roots, None).unwrap_err().to_string();
+        assert!(err.contains("driver_opts"), "{err}");
+    }
+
+    #[test]
+    fn denied_paths_match_case_variants() {
+        assert!(denied(Path::new("/PRIVATE/ETC"), None));
+        assert!(denied(Path::new("/Etc/passwd"), None));
+        assert!(denied(Path::new("/library/keychains/x"), None));
+        assert!(denied(Path::new("/etc/"), None));
+        assert!(!denied(Path::new("/etcetera"), None));
+    }
+
+    #[test]
+    fn sibling_prefix_root_is_refused() {
+        let (dir, _) = root_dir();
+        let data = dir.path().join("data");
+        let data2 = dir.path().join("data2");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&data2).unwrap();
+        let err = refused(&bind(&lossy(&data2)), &[lossy(&data)], None);
+        assert!(err.contains("outside the allowed data roots"), "{err}");
+        let err = refused(&bind(&lossy(&data2.join("new"))), &[lossy(&data)], None);
+        assert!(err.contains("outside the allowed data roots"), "{err}");
+        assert!(!data2.join("new").exists());
+    }
+
+    #[test]
+    fn trailing_slashes_are_normalized() {
+        let (dir, root) = root_dir();
+        let data = dir.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let real = lossy(&std::fs::canonicalize(&data).unwrap());
+        let out = check_mounts(
+            &bind(&format!("{}/", lossy(&data))),
+            &[format!("{root}/")],
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.mounts[0].source, real);
+        let out = check_mounts(
+            &bind(&format!("{}/new/", lossy(&data))),
+            &[format!("{root}/")],
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.mounts[0].source, format!("{real}/new"));
+    }
+
+    #[test]
+    fn created_path_stays_under_its_root() {
+        let (dir, root) = root_dir();
+        let created = dir.path().join("x/y/z");
+        let out = check_mounts(&bind(&lossy(&created)), std::slice::from_ref(&root), None).unwrap();
+        let canon_root = std::fs::canonicalize(&root).unwrap();
+        assert!(Path::new(&out.mounts[0].source).starts_with(&canon_root));
     }
 
     #[test]
