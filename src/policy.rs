@@ -2957,6 +2957,7 @@ mod tests {
             url: None,
             stacks_root: Some(root.to_string_lossy().into_owned()),
             data_roots: Vec::new(),
+            registries: Vec::new(),
             routes: Vec::new(),
             dry_run: false,
         };
