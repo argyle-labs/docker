@@ -32,21 +32,34 @@ const DENIED: &[&str] = &[
     "/sbin",
     "/lib",
     "/lib64",
-    "/opt",
+    "/opt/orca",
     "/var/spool",
     "/var/lib/containerd",
     "/var/lib/containers",
     "/var/lib/lxc",
     "/var/lib/libvirt",
     "/var/lib/orca",
+    "/private/etc",
+    "/private/var/root",
+    "/private/var/db",
+    "/Library/Keychains",
 ];
 
 const DENIED_SEGMENTS: &[&[&str]] = &[
     &[".ssh"],
     &[".gnupg"],
     &[".orca"],
-    &["Library", "Keychains"],
+    &[".aws"],
+    &[".docker"],
+    &[".kube"],
+    &[".config", "gcloud"],
+    &[".netrc"],
+    &[".password-store"],
+    &[".local", "share", "keyrings"],
+    &["library", "keychains"],
 ];
+
+const HOME_PARENTS: &[&str] = &["/home", "/Users"];
 
 pub struct DockerDeployTarget {
     host: String,
@@ -121,7 +134,11 @@ impl DockerDeployTarget {
 
     async fn lifecycle(&self, workload: &str, action: &str) -> Result<DeployOutcome, DeployError> {
         check_name(workload)?;
-        require(workload)?;
+        let row = require(workload)?;
+        if action != "stop" {
+            let compose = std::fs::read_to_string(row.compose_path()).map_err(other)?;
+            recheck_compose(&compose, &self.data_roots, orca_home().as_deref())?;
+        }
         let args = UpdateArgs {
             id: UnitId {
                 manager: format!("docker@{}", self.host),
@@ -182,16 +199,6 @@ pub fn summarize(services: Result<Vec<bool>, String>) -> (&'static str, String) 
     }
 }
 
-fn is_named_volume(source: &str) -> bool {
-    source
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphanumeric())
-        && source
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
-}
-
 fn orca_home() -> Option<PathBuf> {
     std::env::var_os("ORCA_HOME")
         .map(PathBuf::from)
@@ -200,6 +207,43 @@ fn orca_home() -> Option<PathBuf> {
 
 fn resolved(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn folded_segments(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_string_lossy().to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn has_denied_segment(path: &Path) -> bool {
+    let segments = folded_segments(path);
+    DENIED_SEGMENTS.iter().any(|pat| {
+        segments
+            .windows(pat.len())
+            .any(|w| w.iter().zip(pat.iter()).all(|(a, b)| a == b))
+    })
+}
+
+fn shadows_denied_segment(path: &Path) -> bool {
+    DENIED_SEGMENTS
+        .iter()
+        .any(|pat| folded_child_exists(path, pat))
+}
+
+fn folded_child_exists(dir: &Path, rest: &[&str]) -> bool {
+    let Some((head, tail)) = rest.split_first() else {
+        return true;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.filter_map(|e| e.ok()).any(|e| {
+        e.file_name().to_string_lossy().eq_ignore_ascii_case(head)
+            && folded_child_exists(&e.path(), tail)
+    })
 }
 
 fn denied(path: &Path, orca_home: Option<&Path>) -> bool {
@@ -211,60 +255,156 @@ fn denied(path: &Path, orca_home: Option<&Path>) -> bool {
     let deny_hit = deny
         .iter()
         .flat_map(|d| [d.clone(), resolved(d)])
-        .any(|d| path.starts_with(&d));
-    let segments: Vec<&std::ffi::OsStr> = path
+        .any(|d| path.starts_with(&d) || d.starts_with(path));
+    let bare_home = HOME_PARENTS
+        .iter()
+        .flat_map(|h| [PathBuf::from(h), resolved(Path::new(h))])
+        .any(|h| path == h || path.parent() == Some(h.as_path()));
+    deny_hit || bare_home || has_denied_segment(path) || shadows_denied_segment(path)
+}
+
+fn create_under(existing: &Path, rest: &[String]) -> Result<PathBuf, DeployError> {
+    let mut dir = crate::fsat::open_dir(existing).map_err(other)?;
+    let mut path = existing.to_path_buf();
+    for name in rest {
+        match crate::fsat::mkdir_at(&dir, name, 0o755) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(other(format!(
+                    "creating {}: {e}",
+                    path.join(name).display()
+                )));
+            }
+        }
+        dir = crate::fsat::open_dir_at(&dir, name)
+            .map_err(|e| other(format!("opening {}: {e}", path.join(name).display())))?;
+        path.push(name);
+    }
+    Ok(path)
+}
+
+fn resolve_source(source: &str, roots: &[PathBuf]) -> Result<PathBuf, DeployError> {
+    let path = Path::new(source);
+    if !path.is_absolute() {
+        return Err(other(format!(
+            "bind mount source '{source}' must be an absolute path"
+        )));
+    }
+    if path
         .components()
-        .filter_map(|c| match c {
-            Component::Normal(s) => Some(s),
-            _ => None,
-        })
-        .collect();
-    deny_hit
-        || DENIED_SEGMENTS.iter().any(|pat| {
-            segments
-                .windows(pat.len())
-                .any(|w| w.iter().zip(pat.iter()).all(|(a, b)| *a == *b))
-        })
+        .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return Err(other(format!(
+            "bind mount source '{source}' contains '.' or '..'"
+        )));
+    }
+    let outside = || {
+        other(format!(
+            "bind mount source '{source}' is outside the allowed data roots"
+        ))
+    };
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            Err(other(format!("bind mount source '{source}' is a symlink")))
+        }
+        Ok(_) => {
+            let real = std::fs::canonicalize(path).map_err(other)?;
+            if roots.iter().any(|r| real.starts_with(r)) {
+                Ok(real)
+            } else {
+                Err(outside())
+            }
+        }
+        Err(_) => {
+            let mut rest = Vec::new();
+            let mut existing = path;
+            while std::fs::symlink_metadata(existing).is_err() {
+                let name = existing.file_name().ok_or_else(outside)?;
+                rest.push(name.to_string_lossy().into_owned());
+                existing = existing.parent().ok_or_else(outside)?;
+            }
+            rest.reverse();
+            let base = std::fs::canonicalize(existing).map_err(other)?;
+            if !roots.iter().any(|r| base.starts_with(r)) {
+                return Err(outside());
+            }
+            let created = create_under(&base, &rest)?;
+            std::fs::canonicalize(created).map_err(other)
+        }
+    }
+}
+
+fn canonical_roots(data_roots: &[String]) -> Vec<PathBuf> {
+    data_roots
+        .iter()
+        .filter_map(|r| std::fs::canonicalize(r).ok())
+        .collect()
+}
+
+fn check_resolved(source: &str, real: &Path, orca_home: Option<&Path>) -> Result<(), DeployError> {
+    if denied(real, orca_home) {
+        return Err(other(format!(
+            "bind mount source '{source}' resolves to protected path '{}'",
+            real.display()
+        )));
+    }
+    Ok(())
 }
 
 pub fn check_mounts(
     spec: &WorkloadSpec,
     data_roots: &[String],
     orca_home: Option<&Path>,
-) -> Result<(), DeployError> {
-    let roots: Vec<PathBuf> = data_roots
-        .iter()
-        .filter_map(|r| std::fs::canonicalize(r).ok())
-        .collect();
-    for m in &spec.mounts {
-        if !matches!(m.kind, MountKind::Bind) || is_named_volume(&m.source) {
+) -> Result<WorkloadSpec, DeployError> {
+    let roots = canonical_roots(data_roots);
+    let mut out = spec.clone();
+    for m in out.mounts.iter_mut() {
+        if !matches!(m.kind, MountKind::Bind) {
             continue;
         }
-        let source = Path::new(&m.source);
-        if !source.is_absolute() {
-            return Err(other(format!(
-                "bind mount source '{}' must be an absolute path",
-                m.source
-            )));
-        }
-        let real = std::fs::canonicalize(source).map_err(|e| {
-            other(format!(
-                "bind mount source '{}' is unavailable: {e}",
-                m.source
-            ))
-        })?;
-        if !roots.iter().any(|r| real.starts_with(r)) {
-            return Err(other(format!(
-                "bind mount source '{}' is outside the allowed data roots {data_roots:?}",
-                m.source
-            )));
-        }
-        if denied(&real, orca_home) {
-            return Err(other(format!(
-                "bind mount source '{}' resolves to protected path '{}'",
-                m.source,
-                real.display()
-            )));
+        check_resolved(&m.source, Path::new(&m.source), orca_home)?;
+        let real = resolve_source(&m.source, &roots)?;
+        check_resolved(&m.source, &real, orca_home)?;
+        m.source = real.to_string_lossy().into_owned();
+    }
+    Ok(out)
+}
+
+pub fn recheck_compose(
+    compose: &str,
+    data_roots: &[String],
+    orca_home: Option<&Path>,
+) -> Result<(), DeployError> {
+    let Ok(doc) = serde_json::from_str::<Value>(compose) else {
+        return Ok(());
+    };
+    let roots = canonical_roots(data_roots);
+    let services = doc["services"]
+        .as_object()
+        .into_iter()
+        .flat_map(|m| m.values());
+    for svc in services {
+        for vol in svc["volumes"].as_array().into_iter().flatten() {
+            if vol["type"] != "bind" {
+                continue;
+            }
+            let source = vol["source"].as_str().unwrap_or_default();
+            let path = Path::new(source);
+            let meta = std::fs::symlink_metadata(path)
+                .map_err(|e| other(format!("bind mount source '{source}' is unavailable: {e}")))?;
+            let real = std::fs::canonicalize(path).map_err(other)?;
+            if meta.file_type().is_symlink() || real != path {
+                return Err(other(format!(
+                    "bind mount source '{source}' no longer resolves to itself"
+                )));
+            }
+            if !roots.iter().any(|r| real.starts_with(r)) {
+                return Err(other(format!(
+                    "bind mount source '{source}' is outside the allowed data roots {data_roots:?}"
+                )));
+            }
+            check_resolved(source, &real, orca_home)?;
         }
     }
     Ok(())
@@ -316,11 +456,13 @@ pub fn compose_json(spec: &WorkloadSpec) -> Result<String, DeployError> {
                     if m.source.is_empty() {
                         return Err(other(format!("bind mount '{}' has no source", m.target)));
                     }
-                    if is_named_volume(&m.source) {
-                        json!({"type": "volume", "source": m.source, "target": m.target, "read_only": m.read_only})
-                    } else {
-                        json!({"type": "bind", "source": m.source, "target": m.target, "read_only": m.read_only, "bind": {"create_host_path": false}})
+                    json!({"type": "bind", "source": m.source, "target": m.target, "read_only": m.read_only, "bind": {"create_host_path": false}})
+                }
+                MountKind::Volume => {
+                    if m.source.is_empty() {
+                        return Err(other(format!("volume mount '{}' has no name", m.target)));
                     }
+                    json!({"type": "volume", "source": m.source, "target": m.target, "read_only": m.read_only})
                 }
                 MountKind::Tmpfs => {
                     let mut v = json!({"type": "tmpfs", "target": m.target});
@@ -362,11 +504,14 @@ impl DeployTarget for DockerDeployTarget {
     fn endpoint(&self) -> String {
         format!("docker:compose@{}:{}", self.host, self.root)
     }
+    fn data_roots(&self) -> Vec<String> {
+        self.data_roots.clone()
+    }
 
     async fn launch(&self, spec: &WorkloadSpec) -> Result<DeployOutcome, DeployError> {
         check_name(&spec.name)?;
-        check_mounts(spec, &self.data_roots, orca_home().as_deref())?;
-        let raw = serde_json::to_string(&self.payload(spec)?).map_err(other)?;
+        let spec = check_mounts(spec, &self.data_roots, orca_home().as_deref())?;
+        let raw = serde_json::to_string(&self.payload(&spec)?).map_err(other)?;
         provider()
             .stack_deploy(Some(raw), true)
             .await
@@ -441,7 +586,11 @@ impl DeployTarget for DockerDeployTarget {
 
 pub fn backend_defs() -> Vec<BackendDef> {
     match DockerDeployTarget::local() {
-        Ok(t) => vec![deploy_backend_def(&t, INVOKE_PREFIX)],
+        Ok(t) => {
+            let mut def = deploy_backend_def(&t, INVOKE_PREFIX);
+            def.data_roots = t.data_roots.clone();
+            vec![def]
+        }
         Err(e) => {
             plugin_toolkit::tracing::warn!(error = %e, "docker deploy: target unavailable; none advertised");
             Vec::new()
@@ -573,13 +722,18 @@ mod tests {
 
     #[test]
     fn launch_refuses_non_component_names() {
+        let (_dir, root) = root_dir();
+        let target = DockerDeployTarget::new("host-a", root);
         for name in ["../x", "a/b", "..", ""] {
             let mut s = spec();
             s.name = name.into();
-            let err = err_text(run("launch", json!({"spec": s})));
-            assert!(err.contains("single path component"), "{name}: {err}");
-            let err = err_text(run("provision", json!({"spec": s})));
-            assert!(err.contains("single path component"), "{name}: {err}");
+            s.mounts.clear();
+            for op in ["launch", "provision"] {
+                let r =
+                    plugin_toolkit::reactor::block_on(dispatch_op(&target, op, json!({"spec": s})));
+                let err = err_text(r);
+                assert!(err.contains("single path component"), "{op} {name}: {err}");
+            }
         }
     }
 
@@ -671,14 +825,23 @@ mod tests {
         (dir, root)
     }
 
+    fn refused(spec: &WorkloadSpec, roots: &[String], home: Option<&Path>) -> String {
+        check_mounts(spec, roots, home).unwrap_err().to_string()
+    }
+
+    fn lossy(p: &Path) -> String {
+        p.to_string_lossy().into_owned()
+    }
+
     #[test]
     fn symlink_inside_root_to_etc_is_refused() {
         let (dir, root) = root_dir();
         let link = dir.path().join("etc");
         std::os::unix::fs::symlink("/etc", &link).unwrap();
-        let err = check_mounts(&bind(&link.to_string_lossy()), &[root], None)
-            .unwrap_err()
-            .to_string();
+        let err = refused(&bind(&lossy(&link)), std::slice::from_ref(&root), None);
+        assert!(err.contains("is a symlink"), "{err}");
+        let nested = dir.path().join("etc/ssh");
+        let err = refused(&bind(&lossy(&nested)), &[root], None);
         assert!(err.contains("outside the allowed data roots"), "{err}");
     }
 
@@ -686,16 +849,14 @@ mod tests {
     fn path_outside_roots_is_refused() {
         let (_dir, root) = root_dir();
         let (other_dir, _) = root_dir();
-        let err = check_mounts(&bind(&other_dir.path().to_string_lossy()), &[root], None)
-            .unwrap_err()
-            .to_string();
+        let err = refused(&bind(&lossy(other_dir.path())), &[root], None);
         assert!(err.contains("outside the allowed data roots"), "{err}");
     }
 
     #[test]
     fn deny_set_applies_even_under_slash_root() {
         let (dir, _) = root_dir();
-        let ssh = dir.path().join(".ssh");
+        let ssh = dir.path().join(".SSH");
         std::fs::create_dir(&ssh).unwrap();
         let home = dir.path().join("home");
         std::fs::create_dir(&home).unwrap();
@@ -704,51 +865,102 @@ mod tests {
             "/".to_string(),
             "/etc".to_string(),
             "/usr".to_string(),
-            ssh.to_string_lossy().into_owned(),
-            home.to_string_lossy().into_owned(),
+            "/var".to_string(),
+            lossy(&ssh),
+            lossy(&home),
         ] {
-            let err = check_mounts(&bind(&src), &roots, Some(&home))
-                .unwrap_err()
-                .to_string();
+            let err = refused(&bind(&src), &roots, Some(&home));
             assert!(err.contains("protected path"), "{src}: {err}");
         }
     }
 
     #[test]
-    fn missing_and_relative_sources_are_refused() {
-        let (dir, root) = root_dir();
-        let missing = dir.path().join("nope");
-        let err = check_mounts(
-            &bind(&missing.to_string_lossy()),
-            std::slice::from_ref(&root),
-            None,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("unavailable"), "{err}");
-        let err = check_mounts(&bind("./data"), &[root], None)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("absolute path"), "{err}");
+    fn deny_paths_and_segments_are_matched() {
+        assert!(denied(Path::new("/opt/orca/bin"), None));
+        assert!(!denied(Path::new("/opt/stacks/web/data"), None));
+        assert!(denied(Path::new("/private/etc"), None));
+        assert!(denied(Path::new("/Library/Keychains"), None));
+        assert!(denied(Path::new("/srv/x/.Config/GCloud/creds"), None));
+        assert!(denied(Path::new("/srv/x/.local/share/keyrings"), None));
+        assert!(denied(Path::new("/srv/x/.aws"), None));
+        assert!(denied(Path::new("/home"), None));
+        assert!(denied(Path::new("/home/alice"), None));
+        assert!(denied(Path::new("/Users/alice"), None));
+        assert!(!denied(Path::new("/srv/x/config"), None));
     }
 
     #[test]
-    fn allowed_path_and_named_volume_pass() {
+    fn bind_above_a_denied_segment_is_refused() {
+        let (dir, root) = root_dir();
+        let user = dir.path().join("alice");
+        std::fs::create_dir_all(user.join(".Kube")).unwrap();
+        let err = refused(&bind(&lossy(&user)), std::slice::from_ref(&root), None);
+        assert!(err.contains("protected path"), "{err}");
+        let nested = dir.path().join("bob");
+        std::fs::create_dir_all(nested.join(".config/gcloud")).unwrap();
+        let err = refused(&bind(&lossy(&nested)), &[root], None);
+        assert!(err.contains("protected path"), "{err}");
+    }
+
+    #[test]
+    fn missing_source_is_created_and_relative_refused() {
+        let (dir, root) = root_dir();
+        let missing = dir.path().join("a/b");
+        let out = check_mounts(&bind(&lossy(&missing)), std::slice::from_ref(&root), None).unwrap();
+        let real = std::fs::canonicalize(&missing).unwrap();
+        assert!(real.is_dir());
+        assert_eq!(out.mounts[0].source, lossy(&real));
+        let err = refused(&bind("./data"), std::slice::from_ref(&root), None);
+        assert!(err.contains("absolute path"), "{err}");
+        let err = refused(&bind(&format!("{root}/../x")), &[root], None);
+        assert!(err.contains("'..'"), "{err}");
+    }
+
+    #[test]
+    fn missing_source_under_a_symlinked_parent_is_refused() {
+        let (dir, root) = root_dir();
+        let (outside, _) = root_dir();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+        let err = refused(&bind(&lossy(&dir.path().join("link/new"))), &[root], None);
+        assert!(err.contains("outside the allowed data roots"), "{err}");
+        assert!(!outside.path().join("new").exists());
+    }
+
+    #[test]
+    fn allowed_path_is_rewritten_canonical_and_volume_passes() {
         let (dir, root) = root_dir();
         let data = dir.path().join("data");
         std::fs::create_dir(&data).unwrap();
-        check_mounts(
-            &bind(&data.to_string_lossy()),
-            std::slice::from_ref(&root),
-            None,
-        )
-        .unwrap();
-        check_mounts(&bind("pgdata"), &[root], None).unwrap();
+        let out = check_mounts(&bind(&lossy(&data)), std::slice::from_ref(&root), None).unwrap();
+        assert_eq!(
+            out.mounts[0].source,
+            lossy(&std::fs::canonicalize(&data).unwrap())
+        );
+        let mut vol = bind("pgdata");
+        vol.mounts[0].kind = MountKind::Volume;
+        check_mounts(&vol, &[root], None).unwrap();
+    }
+
+    #[test]
+    fn recheck_refuses_a_swapped_source() {
+        let (dir, root) = root_dir();
+        let data = std::fs::canonicalize(dir.path()).unwrap().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let compose = compose_json(&bind(&lossy(&data))).unwrap();
+        recheck_compose(&compose, std::slice::from_ref(&root), None).unwrap();
+        std::fs::remove_dir(&data).unwrap();
+        std::os::unix::fs::symlink("/etc", &data).unwrap();
+        let err = recheck_compose(&compose, &[root], None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no longer resolves to itself"), "{err}");
     }
 
     #[test]
     fn named_volume_is_emitted_as_volume() {
-        let svc = service(&bind("pgdata"));
+        let mut vol = bind("pgdata");
+        vol.mounts[0].kind = MountKind::Volume;
+        let svc = service(&vol);
         assert_eq!(
             svc["volumes"],
             json!([{"type": "volume", "source": "pgdata", "target": "/data", "read_only": false}])
@@ -758,9 +970,9 @@ mod tests {
     #[test]
     fn data_roots_default_to_stack_root() {
         let t = DockerDeployTarget::new("host-a", "/opt/stacks");
-        assert_eq!(t.data_roots, ["/opt/stacks"]);
+        assert_eq!(DeployTarget::data_roots(&t), ["/opt/stacks"]);
         let t = t.with_data_roots(vec!["/srv/data".into()]);
-        assert_eq!(t.data_roots, ["/srv/data"]);
+        assert_eq!(DeployTarget::data_roots(&t), ["/srv/data"]);
     }
 
     #[test]
