@@ -1,5 +1,8 @@
 #![allow(clippy::disallowed_types)]
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
 use bollard::Docker;
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::serde_json::{Map, Value};
@@ -13,6 +16,7 @@ pub const WEBUI_LABEL: &str = "net.unraid.docker.webui";
 const CONTAINER_NAME: &str = "container_name";
 const ICON_BASE: &str = "https://gitea.scottkey.me/argyle-labs";
 const ICON_PATH: &str = "raw/branch/main/assets/icon-256.png";
+const PROBE_ATTEMPTS: usize = 3;
 const ALIASES: &[(&str, &str)] = &[
     ("act_runner", "gitea"),
     ("gitea-runner", "gitea"),
@@ -42,7 +46,18 @@ pub struct Plan {
     pub before: String,
     pub after: String,
     pub changes: Vec<Change>,
+    pub warnings: Vec<String>,
     cfg: Value,
+}
+
+impl Plan {
+    pub fn report(&self) -> Vec<String> {
+        self.changes
+            .iter()
+            .map(ToString::to_string)
+            .chain(self.warnings.iter().map(|w| format!("warning: {w}")))
+            .collect()
+    }
 }
 
 fn str_at<'a>(svc: &'a Value, key: &str) -> Option<&'a str> {
@@ -62,6 +77,19 @@ fn has_label(svc: &Value, key: &str) -> bool {
     }
 }
 
+fn many(v: Option<&Value>) -> bool {
+    match v {
+        None | Some(Value::Null) => false,
+        Some(Value::Number(n)) => n.as_u64().is_none_or(|n| n > 1),
+        Some(Value::String(s)) => s.trim().parse::<u64>().map_or(true, |n| n > 1),
+        Some(_) => true,
+    }
+}
+
+fn replicated(svc: &Value) -> bool {
+    many(svc.get("scale")) || many(svc.pointer("/deploy/replicas"))
+}
+
 fn first_port(svc: &Value) -> Option<u64> {
     svc.get("ports")?.as_array()?.iter().find_map(|p| match p {
         Value::Object(m) => m
@@ -75,6 +103,14 @@ fn first_port(svc: &Value) -> Option<u64> {
         }
         _ => None,
     })
+}
+
+fn valid_app(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains("..")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
 }
 
 pub fn candidates(stack: &str, service: &str, image: Option<&str>) -> Vec<String> {
@@ -97,7 +133,7 @@ pub fn candidates(stack: &str, service: &str, image: Option<&str>) -> Vec<String
             .iter()
             .find(|(from, _)| *from == c)
             .map_or(c.clone(), |(_, to)| (*to).to_string());
-        if !c.is_empty() && !out.contains(&c) {
+        if valid_app(&c) && !out.contains(&c) {
             out.push(c);
         }
     }
@@ -108,7 +144,7 @@ pub fn icon_url(app: &str) -> String {
     format!("{ICON_BASE}/{app}/{ICON_PATH}")
 }
 
-fn exists(url: &str) -> bool {
+fn probe(url: &str) -> bool {
     let req = plugin_toolkit::abi::HttpRequest {
         method: "HEAD".into(),
         url: url.into(),
@@ -120,11 +156,37 @@ fn exists(url: &str) -> bool {
         body_b64: true,
         follow_redirects: None,
     };
-    plugin_toolkit::capsink::http_request(&req).is_ok_and(|r| r.status == 200)
+    for _ in 0..PROBE_ATTEMPTS {
+        match plugin_toolkit::capsink::http_request(&req) {
+            Ok(r) if r.status < 500 => return r.status == 200,
+            Err(e) if e.to_string().contains("capability unavailable") => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn icon_cache() -> &'static Mutex<HashMap<String, bool>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    CACHE.get_or_init(Mutex::default)
+}
+
+fn has_icon(app: &str, probe: &dyn Fn(&str) -> bool) -> bool {
+    if let Some(hit) = icon_cache().lock().ok().and_then(|c| c.get(app).copied()) {
+        return hit;
+    }
+    let found = probe(&icon_url(app));
+    if let Ok(mut c) = icon_cache().lock() {
+        c.insert(app.to_string(), found);
+    }
+    found
 }
 
 pub fn icon_for(candidates: &[String]) -> Option<String> {
-    candidates.iter().map(|c| icon_url(c)).find(|u| exists(u))
+    candidates
+        .iter()
+        .find(|c| has_icon(c, &probe))
+        .map(|c| icon_url(c))
 }
 
 pub fn is_unraid() -> bool {
@@ -134,14 +196,16 @@ pub fn is_unraid() -> bool {
 pub fn plan(
     stack: &str,
     cfg: &Value,
+    naming: bool,
     unraid: bool,
     icon: &dyn Fn(&[String]) -> Option<String>,
-) -> Vec<Change> {
+) -> (Vec<Change>, Vec<String>) {
     let Some(services) = cfg.get("services").and_then(Value::as_object) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let single = services.len() == 1;
     let mut out = Vec::new();
+    let mut warnings = Vec::new();
     for (name, svc) in services {
         let change = |key: &str, value: String| Change {
             service: name.clone(),
@@ -149,8 +213,18 @@ pub fn plan(
             value,
         };
         if str_at(svc, CONTAINER_NAME).is_none() {
-            let value = if single { stack } else { name };
-            out.push(change(CONTAINER_NAME, value.to_string()));
+            if !naming {
+                warnings.push(format!(
+                    "{name}: container_name not set: no engine connection to check the name is free"
+                ));
+            } else if replicated(svc) {
+                warnings.push(format!(
+                    "{name}: container_name not set: the service runs replicas"
+                ));
+            } else {
+                let value = if single { stack } else { name };
+                out.push(change(CONTAINER_NAME, value.to_string()));
+            }
         }
         if !unraid {
             continue;
@@ -166,11 +240,36 @@ pub fn plan(
             out.push(change(WEBUI_LABEL, format!("http://[IP]:[PORT:{port}]/")));
         }
     }
-    out
+    (out, warnings)
 }
 
-fn quoted(v: &str) -> String {
-    format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
+fn quoted(v: &str) -> Result<String> {
+    if v.chars().any(char::is_control) {
+        bail!("value holds a control character");
+    }
+    Ok(format!(
+        "\"{}\"",
+        v.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
+}
+
+fn set_name(lines: &mut Vec<String>, c: &Change) -> Result<()> {
+    let (header, end, child) = block_service(lines, &c.service).map_err(|e| anyhow!(e))?;
+    let line = format!(
+        "{}{CONTAINER_NAME}: {}",
+        " ".repeat(child),
+        quoted(&c.value)?
+    );
+    match (header + 1..end).find(|&i| {
+        indent_of(&lines[i]) == child
+            && lines[i]
+                .trim_start()
+                .starts_with(&format!("{CONTAINER_NAME}:"))
+    }) {
+        Some(i) => lines[i] = line,
+        None => lines.insert(header + 1, line),
+    }
+    Ok(())
 }
 
 fn set_label(lines: &mut Vec<String>, c: &Change) -> Result<()> {
@@ -179,11 +278,9 @@ fn set_label(lines: &mut Vec<String>, c: &Change) -> Result<()> {
     let at = (header + 1..end)
         .find(|&i| indent_of(&lines[i]) == child && lines[i].trim_start().starts_with("labels:"));
     let Some(at) = at else {
+        let line = format!("{pad}  {}: {}", c.key, quoted(&c.value)?);
         lines.insert(header + 1, format!("{pad}labels:"));
-        lines.insert(
-            header + 2,
-            format!("{pad}  {}: {}", c.key, quoted(&c.value)),
-        );
+        lines.insert(header + 2, line);
         return Ok(());
     };
     let rest = lines[at]
@@ -194,11 +291,7 @@ fn set_label(lines: &mut Vec<String>, c: &Change) -> Result<()> {
         .unwrap_or_default()
         .trim();
     if !rest.is_empty() {
-        bail!(
-            "service '{}' writes its labels in flow style; set {} by hand",
-            c.service,
-            c.key
-        );
+        bail!("labels are written in flow style");
     }
     let next = lines[at + 1..end].iter().find(|l| is_content(l));
     let (inner, list) = match next {
@@ -207,36 +300,38 @@ fn set_label(lines: &mut Vec<String>, c: &Change) -> Result<()> {
     };
     let pad = " ".repeat(inner);
     let line = if list {
-        format!("{pad}- {}", quoted(&format!("{}={}", c.key, c.value)))
+        format!("{pad}- {}", quoted(&format!("{}={}", c.key, c.value))?)
     } else {
-        format!("{pad}{}: {}", c.key, quoted(&c.value))
+        format!("{pad}{}: {}", c.key, quoted(&c.value)?)
     };
     lines.insert(at + 1, line);
     Ok(())
 }
 
-pub fn apply(yaml: &str, changes: &[Change]) -> Result<String> {
+pub fn apply(yaml: &str, changes: &[Change]) -> (String, Vec<Change>, Vec<String>) {
     let mut lines: Vec<String> = yaml.lines().map(str::to_string).collect();
+    let mut applied = Vec::new();
+    let mut warnings = Vec::new();
     for c in changes {
-        if c.key == CONTAINER_NAME {
-            let (header, _, child) = block_service(&lines, &c.service).map_err(|e| anyhow!(e))?;
-            lines.insert(
-                header + 1,
-                format!(
-                    "{}{CONTAINER_NAME}: {}",
-                    " ".repeat(child),
-                    quoted(&c.value)
-                ),
-            );
+        let mut next = lines.clone();
+        let done = if c.key == CONTAINER_NAME {
+            set_name(&mut next, c)
         } else {
-            set_label(&mut lines, c)?;
+            set_label(&mut next, c)
+        };
+        match done {
+            Ok(()) => {
+                lines = next;
+                applied.push(c.clone());
+            }
+            Err(e) => warnings.push(format!("{}: {} skipped: {e}", c.service, c.key)),
         }
     }
     let mut out = lines.join("\n");
     if yaml.ends_with('\n') {
         out.push('\n');
     }
-    Ok(out)
+    (out, applied, warnings)
 }
 
 pub fn rebind(allow: &mut [Grant], before: &Value, changes: &[Change]) {
@@ -264,41 +359,52 @@ pub fn rebind(allow: &mut [Grant], before: &Value, changes: &[Change]) {
     }
 }
 
-pub async fn collisions(docker: &Docker, project: &str, changes: &[Change]) -> Result<()> {
-    for c in changes.iter().filter(|c| c.key == CONTAINER_NAME) {
-        match docker.inspect_container(&c.value, None).await {
-            Ok(info) => {
-                let owner = info
-                    .config
-                    .as_ref()
-                    .and_then(|c| c.labels.as_ref())
-                    .and_then(|l| l.get(crate::prune::COMPOSE_PROJECT_LABEL));
-                if owner.map(String::as_str) != Some(project) {
-                    bail!(
-                        "container name '{}' for service '{}' is already used on this host outside stack project '{project}'; set container_name in the compose file",
-                        c.value,
-                        c.service
-                    );
-                }
-            }
-            Err(bollard::errors::Error::DockerResponseServerError {
-                status_code: 404, ..
-            }) => {}
-            Err(e) => bail!("check container name '{}': {e}", c.value),
+pub async fn collision(docker: &Docker, project: &str, name: &str) -> Option<String> {
+    match docker.inspect_container(name, None).await {
+        Ok(info) => {
+            let owner = info
+                .config
+                .as_ref()
+                .and_then(|c| c.labels.as_ref())
+                .and_then(|l| l.get(crate::prune::COMPOSE_PROJECT_LABEL));
+            (owner.map(String::as_str) != Some(project)).then(|| {
+                format!("container name '{name}' is already used on this host outside stack project '{project}'; set container_name in the compose file")
+            })
         }
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => None,
+        Err(e) => Some(format!("check container name '{name}': {e}")),
     }
-    Ok(())
 }
 
-pub async fn plan_stack(row: &StackRow) -> Result<Plan> {
+pub async fn plan_stack(row: &StackRow, docker: Option<&Docker>) -> Result<Plan> {
     let cfg = policy::user_cfg(row).await?;
     let before = row.read_compose()?;
-    let changes = plan(&row.name, &cfg, is_unraid(), &icon_for);
-    let after = apply(&before, &changes)?;
+    let (planned, mut warnings) = plan(&row.name, &cfg, docker.is_some(), is_unraid(), &icon_for);
+    let project = cfg
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or(&row.name)
+        .to_string();
+    let mut free = Vec::new();
+    for c in planned {
+        if c.key == CONTAINER_NAME
+            && let Some(docker) = docker
+            && let Some(why) = collision(docker, &project, &c.value).await
+        {
+            warnings.push(format!("{}: {why}", c.service));
+            continue;
+        }
+        free.push(c);
+    }
+    let (after, changes, skipped) = apply(&before, &free);
+    warnings.extend(skipped);
     Ok(Plan {
         before,
         after,
         changes,
+        warnings,
         cfg,
     })
 }
@@ -306,15 +412,6 @@ pub async fn plan_stack(row: &StackRow) -> Result<Plan> {
 pub async fn write(row: &mut StackRow, plan: &Plan, docker: Option<&Docker>) -> Result<()> {
     if plan.changes.is_empty() {
         return Ok(());
-    }
-    if let Some(docker) = docker {
-        let project = plan
-            .cfg
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or(&row.name)
-            .to_string();
-        collisions(docker, &project, &plan.changes).await?;
     }
     let mut allow = row.allow.clone();
     rebind(&mut allow, &plan.cfg, &plan.changes);
@@ -337,10 +434,15 @@ pub async fn write(row: &mut StackRow, plan: &Plan, docker: Option<&Docker>) -> 
     Ok(())
 }
 
-pub async fn normalize(row: &mut StackRow, docker: Option<&Docker>) -> Result<Vec<Change>> {
-    let plan = plan_stack(row).await?;
-    write(row, &plan, docker).await?;
-    Ok(plan.changes)
+pub async fn normalize(row: &mut StackRow, docker: Option<&Docker>) -> Vec<String> {
+    let plan = match plan_stack(row, docker).await {
+        Ok(p) => p,
+        Err(e) => return vec![format!("warning: normalize skipped: {e:#}")],
+    };
+    match write(row, &plan, docker).await {
+        Ok(()) => plan.report(),
+        Err(e) => vec![format!("warning: normalize not written: {e:#}")],
+    }
 }
 
 #[cfg(test)]
@@ -352,28 +454,55 @@ mod tests {
         None
     }
 
+    fn ch(service: &str, key: &str, value: &str) -> Change {
+        Change {
+            service: service.into(),
+            key: key.into(),
+            value: value.into(),
+        }
+    }
+
     #[test]
     fn every_service_without_a_name_gets_one() {
         let cfg = json!({"services": {
             "app": {"image": "x:1"},
             "db": {"image": "postgres:16", "container_name": "pg"}
         }});
-        let changes = plan("web", &cfg, false, &no_icon);
-        assert_eq!(
-            changes,
-            [Change {
-                service: "app".into(),
-                key: CONTAINER_NAME.into(),
-                value: "app".into()
-            }]
-        );
+        let (changes, warnings) = plan("web", &cfg, true, false, &no_icon);
+        assert_eq!(changes, [ch("app", CONTAINER_NAME, "app")]);
+        assert!(warnings.is_empty());
     }
 
     #[test]
     fn a_single_service_stack_is_named_after_the_stack() {
         let cfg = json!({"services": {"server": {"image": "dxflrs/garage:v1"}}});
-        let changes = plan("garage", &cfg, false, &no_icon);
+        let (changes, _) = plan("garage", &cfg, true, false, &no_icon);
         assert_eq!(changes[0].value, "garage");
+    }
+
+    #[test]
+    fn replicated_services_get_no_name() {
+        let cfg = json!({"services": {
+            "a": {"image": "x:1", "scale": 2},
+            "b": {"image": "x:1", "deploy": {"replicas": 3}},
+            "c": {"image": "x:1", "deploy": {"replicas": "${N}"}},
+            "d": {"image": "x:1", "deploy": {"replicas": "1"}, "scale": 1}
+        }});
+        let (changes, warnings) = plan("web", &cfg, true, false, &no_icon);
+        assert_eq!(changes, [ch("d", CONTAINER_NAME, "d")]);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(
+            warnings.iter().all(|w| w.contains("replicas")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn without_an_engine_no_name_is_added() {
+        let cfg = json!({"services": {"app": {"image": "x:1"}}});
+        let (changes, warnings) = plan("web", &cfg, false, false, &no_icon);
+        assert!(changes.is_empty());
+        assert!(warnings[0].contains("no engine connection"), "{warnings:?}");
     }
 
     #[test]
@@ -386,7 +515,7 @@ mod tests {
                     "ports": [{"target": 80, "published": "8080"}]}
         }});
         let icon = |c: &[String]| (c[0] == "zot").then(|| icon_url(&c[0]));
-        let changes = plan("registry", &cfg, true, &icon);
+        let (changes, _) = plan("registry", &cfg, true, true, &icon);
         let shown: Vec<String> = changes.iter().map(ToString::to_string).collect();
         assert_eq!(
             shown,
@@ -395,7 +524,7 @@ mod tests {
                 format!("zot: {WEBUI_LABEL}=http://[IP]:[PORT:5000]/"),
             ]
         );
-        assert!(plan("registry", &cfg, false, &icon).is_empty());
+        assert!(plan("registry", &cfg, true, false, &icon).0.is_empty());
     }
 
     #[test]
@@ -413,25 +542,36 @@ mod tests {
             ["pbs", "s"]
         );
         assert_eq!(
+            candidates("My Stack", "a..b", Some("x/Bad$Name:1")),
+            Vec::<String>::new()
+        );
+        assert_eq!(
             icon_url("garage"),
             "https://gitea.scottkey.me/argyle-labs/garage/raw/branch/main/assets/icon-256.png"
         );
     }
 
     #[test]
+    fn icon_probes_are_cached_per_app() {
+        let calls = std::cell::Cell::new(0);
+        let probe = |_: &str| {
+            calls.set(calls.get() + 1);
+            true
+        };
+        assert!(has_icon("cache-test-app", &probe));
+        assert!(has_icon("cache-test-app", &probe));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
     fn icon_lookup_outside_orca_finds_nothing() {
-        assert_eq!(icon_for(&["garage".into()]), None);
+        assert_eq!(icon_for(&["no-sink-app".into()]), None);
     }
 
     #[test]
     fn apply_inserts_names_and_labels_in_both_label_styles() {
         let yaml = "services:\n  app:\n    image: x:1\n    labels:\n      a: b\n  db:\n    image: y:1\n    labels:\n      - c=d\n  web:\n    image: z:1\n";
-        let ch = |service: &str, key: &str, value: &str| Change {
-            service: service.into(),
-            key: key.into(),
-            value: value.into(),
-        };
-        let out = apply(
+        let (out, applied, warnings) = apply(
             yaml,
             &[
                 ch("app", CONTAINER_NAME, "app"),
@@ -439,16 +579,53 @@ mod tests {
                 ch("db", WEBUI_LABEL, "w"),
                 ch("web", ICON_LABEL, "j"),
             ],
-        )
-        .unwrap();
+        );
+        assert_eq!(applied.len(), 4);
+        assert!(warnings.is_empty());
         assert_eq!(
             out,
             format!(
                 "services:\n  app:\n    container_name: \"app\"\n    image: x:1\n    labels:\n      {ICON_LABEL}: \"i\"\n      a: b\n  db:\n    image: y:1\n    labels:\n      - \"{WEBUI_LABEL}=w\"\n      - c=d\n  web:\n    labels:\n      {ICON_LABEL}: \"j\"\n    image: z:1\n"
             )
         );
-        let flow = "services:\n  app:\n    labels: {a: b}\n";
-        assert!(apply(flow, &[ch("app", ICON_LABEL, "i")]).is_err());
+    }
+
+    #[test]
+    fn an_empty_container_name_is_replaced_not_duplicated() {
+        let yaml = "services:\n  app:\n    image: x:1\n    container_name: \"\"\n";
+        let (out, _, _) = apply(yaml, &[ch("app", CONTAINER_NAME, "app")]);
+        assert_eq!(
+            out,
+            "services:\n  app:\n    image: x:1\n    container_name: \"app\"\n"
+        );
+    }
+
+    #[test]
+    fn services_the_file_text_cannot_take_are_skipped_with_a_warning() {
+        let yaml = "x-base: &base\n  image: x:1\nservices:\n  anchored: *base\n  merged:\n    <<: *base\n  child:\n    extends:\n      service: merged\n  flow:\n    image: y:1\n    labels: {a: b}\n";
+        let (out, applied, warnings) = apply(
+            yaml,
+            &[
+                ch("anchored", CONTAINER_NAME, "anchored"),
+                ch("merged", CONTAINER_NAME, "merged"),
+                ch("child", CONTAINER_NAME, "child"),
+                ch("included", CONTAINER_NAME, "included"),
+                ch("flow", ICON_LABEL, "i"),
+                ch("merged", ICON_LABEL, "bad\nvalue"),
+            ],
+        );
+        let names: Vec<&str> = applied.iter().map(|c| c.service.as_str()).collect();
+        assert_eq!(names, ["merged", "child"]);
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
+        for skipped in ["anchored", "included", "flow", "control character"] {
+            assert!(
+                warnings.iter().any(|w| w.contains(skipped)),
+                "{skipped}: {warnings:?}"
+            );
+        }
+        assert!(out.contains("  anchored: *base\n"));
+        assert!(out.contains("  merged:\n    container_name: \"merged\"\n    <<: *base\n"));
+        assert!(out.contains("  child:\n    container_name: \"child\"\n    extends:\n"));
     }
 
     #[test]
@@ -463,12 +640,7 @@ mod tests {
             allow: "privileged".into(),
         };
         let mut allow = vec![grant(&old), grant("sha256:stale")];
-        let changes = [Change {
-            service: "app".into(),
-            key: CONTAINER_NAME.into(),
-            value: "app".into(),
-        }];
-        rebind(&mut allow, &cfg, &changes);
+        rebind(&mut allow, &cfg, &[ch("app", CONTAINER_NAME, "app")]);
         assert_ne!(allow[0].definition, old);
         assert_eq!(allow[1].definition, "sha256:stale");
         let mut expected = cfg.clone();
@@ -477,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn a_name_taken_outside_the_stack_is_refused() {
+    fn a_name_taken_outside_the_stack_is_reported() {
         use crate::test_engine::{FakeEngine, Route};
         let engine = FakeEngine::routed(vec![
             Route::new(
@@ -496,15 +668,9 @@ mod tests {
             ),
         ]);
         let docker = engine.client();
-        let ch = |value: &str| Change {
-            service: "s".into(),
-            key: CONTAINER_NAME.into(),
-            value: value.into(),
-        };
-        let run = |c: Change| plugin_toolkit::reactor::block_on(collisions(&docker, "web", &[c]));
-        let err = run(ch("app")).unwrap_err().to_string();
-        assert!(err.contains("already used on this host"), "{err}");
-        run(ch("mine")).unwrap();
-        run(ch("free")).unwrap();
+        let run = |name: &str| plugin_toolkit::reactor::block_on(collision(&docker, "web", name));
+        assert!(run("app").unwrap().contains("already used on this host"));
+        assert_eq!(run("mine"), None);
+        assert_eq!(run("free"), None);
     }
 }

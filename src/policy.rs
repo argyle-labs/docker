@@ -2138,14 +2138,15 @@ async fn stack_allow(
         .cloned()
         .collect();
     let normalize = if adopted {
-        Some(crate::normalize::plan_stack(&row).await?)
+        Some(crate::normalize::plan_stack(&row, Some(docker)).await)
     } else {
         None
     };
-    let normalized: Vec<String> = normalize
-        .iter()
-        .flat_map(|n| n.changes.iter().map(ToString::to_string))
-        .collect();
+    let mut normalized = match &normalize {
+        Some(Ok(plan)) => plan.report(),
+        Some(Err(e)) => vec![format!("warning: normalize skipped: {e:#}")],
+        None => Vec::new(),
+    };
     if args.dry_run {
         return Ok(DockerStackAllowOutput {
             dry_run: true,
@@ -2181,8 +2182,10 @@ async fn stack_allow(
     } else {
         stacks::put(&row)?;
     }
-    if let Some(plan) = &normalize {
-        crate::normalize::write(&mut row, plan, Some(docker)).await?;
+    if let Some(Ok(plan)) = &normalize
+        && let Err(e) = crate::normalize::write(&mut row, plan, Some(docker)).await
+    {
+        normalized.push(format!("warning: normalize not written: {e:#}"));
     }
     Ok(DockerStackAllowOutput {
         dry_run: false,
