@@ -183,7 +183,11 @@ impl GroupGuard {
             )
         };
         if rc != 0 {
-            return Err(std::io::Error::last_os_error());
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ECHILD) {
+                return Ok(true);
+            }
+            return Err(err);
         }
         Ok(info.si_signo != 0)
     }
@@ -202,18 +206,46 @@ impl Drop for GroupGuard {
     }
 }
 
+struct StopOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 fn drain(
-    pipe: Option<impl std::io::Read + Send + 'static>,
+    pipe: Option<impl std::io::Read + std::os::fd::AsRawFd + Send + 'static>,
     slot: usize,
     tx: std::sync::mpsc::Sender<(usize, Vec<u8>)>,
-) {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(mut p) = pipe {
-            p.read_to_end(&mut buf).ok();
+            let fd = p.as_raw_fd();
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+            let mut chunk = [0u8; 65536];
+            loop {
+                match p.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                            break;
+                        }
+                        std::thread::sleep(POLL_MIN);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
         }
         tx.send((slot, buf)).ok();
-    });
+    })
 }
 
 async fn collect(
@@ -248,8 +280,16 @@ async fn collect(
 }
 
 async fn run_within(
+    cmd: std::process::Command,
+    budget: std::time::Duration,
+) -> plugin_toolkit::anyhow::Result<String> {
+    run_tracked(cmd, budget, &mut Vec::new()).await
+}
+
+async fn run_tracked(
     mut cmd: std::process::Command,
     budget: std::time::Duration,
+    drains: &mut Vec<std::thread::JoinHandle<()>>,
 ) -> plugin_toolkit::anyhow::Result<String> {
     use std::os::unix::process::CommandExt;
     let mut child = cmd
@@ -259,8 +299,9 @@ async fn run_within(
         .stderr(std::process::Stdio::piped())
         .spawn()?;
     let (tx, rx) = std::sync::mpsc::channel();
-    drain(child.stdout.take(), 0, tx.clone());
-    drain(child.stderr.take(), 1, tx);
+    let stop = StopOnDrop(Default::default());
+    drains.push(drain(child.stdout.take(), 0, tx.clone(), stop.0.clone()));
+    drains.push(drain(child.stderr.take(), 1, tx, stop.0.clone()));
     let mut guard = GroupGuard {
         pgid: child.id() as libc::pid_t,
         child: Some(child),
@@ -279,9 +320,7 @@ async fn run_within(
         pause = (pause * 2).min(POLL_MAX);
     }
     guard.kill_group();
-    let Some(mut leader) = guard.child.take() else {
-        unreachable!()
-    };
+    let mut leader = guard.child.take().expect("leader present");
     let status = leader.wait()?;
     let [out, err] = collect(rx).await?;
     let stdout = String::from_utf8_lossy(&out).to_string();
@@ -424,16 +463,26 @@ mod tests {
             "perl -e 'use POSIX; exit if fork; POSIX::setsid(); open F, \">{}\"; print F $$; close F; sleep 30' & echo ok; wait",
             pidfile.display()
         );
-        let err = plugin_toolkit::reactor::block_on(run_within(
+        let mut drains = Vec::new();
+        let err = plugin_toolkit::reactor::block_on(run_tracked(
             sh(&script),
             std::time::Duration::from_secs(20),
+            &mut drains,
         ))
         .unwrap_err();
+        let finished = (0..100).any(|_| {
+            if drains.iter().all(|h| h.is_finished()) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            false
+        });
         let pid = read_pid(&pidfile);
         unsafe {
             libc::kill(pid, libc::SIGKILL);
         }
         assert!(err.to_string().contains("drain exceeded budget"), "{err}");
+        assert!(finished, "drain threads still running after the budget");
     }
 
     #[test]
