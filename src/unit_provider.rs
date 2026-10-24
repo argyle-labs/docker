@@ -2708,7 +2708,7 @@ async fn exec_scope(
     vet_image(docker, &cfg_value, service, info)
         .await
         .map_err(|b| match b {
-            ExecBlock::Refused(why) => ExecBlock::Refused(format!("{why} of stack {}", row.name)),
+            ExecBlock::Refused(why) => ExecBlock::Refused(format!("stack {}: {why}", row.name)),
             failed => failed,
         })?;
     let mut peers = std::collections::HashMap::new();
@@ -2764,18 +2764,14 @@ async fn exec_scope(
     }
     for (name, p) in same_stack {
         let svc = vet_peer(p, &hashes).map_err(|why| {
-            ExecBlock::Refused(format!(
-                "namespace peer {name} of stack {}: {why}",
-                row.name
-            ))
+            ExecBlock::Refused(format!("stack {}: namespace peer {name}: {why}", row.name))
         })?;
         vet_image(docker, &cfg_value, &svc, p)
             .await
             .map_err(|b| match b {
-                ExecBlock::Refused(why) => ExecBlock::Refused(format!(
-                    "namespace peer {name} of stack {}: {why}",
-                    row.name
-                )),
+                ExecBlock::Refused(why) => {
+                    ExecBlock::Refused(format!("stack {}: namespace peer {name}: {why}", row.name))
+                }
                 failed => failed,
             })?;
         if let Some(id) = p.id.clone() {
@@ -2857,6 +2853,8 @@ async fn vet_image(
         .map_err(|why| ExecBlock::Refused(format!("{why} for service {service}")))
 }
 
+const NO_REGISTRY_DIGEST: &str = "locally built or loaded images cannot be exec-vetted (no registry digest); use a registry image to enable exec";
+
 fn image_matches(
     declared: &str,
     expected: &[String],
@@ -2866,14 +2864,21 @@ fn image_matches(
         Some(d) => vec![d.to_string()],
         None => crate::image_update::local_digests(expected, declared),
     };
-    if want.is_empty() {
-        return Err(format!("image {declared} has no registry digest"));
-    }
     let have = crate::image_update::local_digests(actual, declared);
+    if want.is_empty() {
+        return Err(NO_REGISTRY_DIGEST.into());
+    }
+    if have.is_empty() {
+        return Err(format!(
+            "running container's image digest is unknown; cannot vet it against {declared}"
+        ));
+    }
     if have.iter().any(|d| want.contains(d)) {
         Ok(())
     } else {
-        Err(format!("the running image is not {declared}"))
+        Err(format!(
+            "container runs an older image than {declared} resolves to now; recreate the service"
+        ))
     }
 }
 
@@ -3671,6 +3676,18 @@ mod tests {
         assert!(image_matches("nginx:1", &at(&a), &[format!("evil@{a}")]).is_err());
         assert!(image_matches(&format!("nginx@{a}"), &[], &at(&a)).is_ok());
         assert!(image_matches(&format!("nginx@{a}"), &[], &at(&b)).is_err());
+        assert_eq!(
+            image_matches("nginx:1", &at(&a), &at(&b)).unwrap_err(),
+            "container runs an older image than nginx:1 resolves to now; recreate the service"
+        );
+        assert_eq!(
+            image_matches("nginx:1", &[], &at(&a)).unwrap_err(),
+            NO_REGISTRY_DIGEST
+        );
+        assert_eq!(
+            image_matches("nginx:1", &at(&a), &[]).unwrap_err(),
+            "running container's image digest is unknown; cannot vet it against nginx:1"
+        );
     }
 
     #[test]

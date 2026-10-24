@@ -120,42 +120,151 @@ fn passed_env(get: impl Fn(&str) -> Option<String>, host: Option<String>) -> Vec
         .collect()
 }
 
+async fn clean_argv(program: &str) -> plugin_toolkit::anyhow::Result<Vec<String>> {
+    let env = passed_env(|k| std::env::var(k).ok(), docker_host().await?);
+    Ok(env_argv(env, program))
+}
+
+fn env_argv(env: Vec<String>, program: &str) -> Vec<String> {
+    std::iter::once("-i".to_string())
+        .chain(env)
+        .chain(std::iter::once(program.to_string()))
+        .collect()
+}
+
 /// `program` under `env -i`, with only [`PASSED_ENV`] and the resolved
 /// engine's `DOCKER_HOST`. The toolkit's `Command` cannot clear the
 /// environment itself.
 pub async fn clean_command(
     program: &str,
 ) -> plugin_toolkit::anyhow::Result<plugin_toolkit::process::Command> {
-    let env = passed_env(|k| std::env::var(k).ok(), docker_host().await?);
-    Ok(plugin_toolkit::process::Command::new("/usr/bin/env")
-        .arg("-i")
-        .args(env)
-        .arg(program))
+    Ok(plugin_toolkit::process::Command::new("/usr/bin/env").args(clean_argv(program).await?))
 }
 
 /// Run the docker CLI with `args`, optionally in `cwd`, returning stdout,
-/// through [`clean_command`].
+/// under the same environment as [`clean_command`]. The child leads its own
+/// process group so a timeout also kills the compose plugin it spawns; the
+/// toolkit's `Command` cannot set a process group or expose the pid.
 pub async fn run(args: &[&str], cwd: Option<&str>) -> plugin_toolkit::anyhow::Result<String> {
-    let mut cmd = clean_command(resolve_docker_bin()).await?.args(args);
+    let mut cmd = std::process::Command::new("/usr/bin/env");
+    cmd.args(clean_argv(resolve_docker_bin()).await?).args(args);
     if let Some(dir) = cwd {
-        cmd = cmd.current_dir(dir);
+        cmd.current_dir(dir);
     }
     run_within(cmd, CLI_BUDGET).await
 }
 
 const CLI_BUDGET: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+const POLL_MIN: std::time::Duration = std::time::Duration::from_millis(20);
+const POLL_MAX: std::time::Duration = std::time::Duration::from_millis(250);
+
+struct GroupGuard {
+    child: Option<std::process::Child>,
+    pgid: libc::pid_t,
+}
+
+impl GroupGuard {
+    fn kill_group(&self) {
+        unsafe {
+            libc::killpg(self.pgid, libc::SIGKILL);
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.child.take();
+    }
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            self.kill_group();
+            child.wait().ok();
+        }
+    }
+}
+
+fn drain(
+    pipe: Option<impl std::io::Read + Send + 'static>,
+    slot: usize,
+    tx: std::sync::mpsc::Sender<(usize, Vec<u8>)>,
+) {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut p) = pipe {
+            p.read_to_end(&mut buf).ok();
+        }
+        tx.send((slot, buf)).ok();
+    });
+}
+
+async fn collect(rx: std::sync::mpsc::Receiver<(usize, Vec<u8>)>) -> [Vec<u8>; 2] {
+    let mut bufs = [Vec::new(), Vec::new()];
+    let mut pending = 2;
+    let deadline = std::time::Instant::now() + DRAIN_BUDGET;
+    let mut pause = POLL_MIN;
+    while pending > 0 && std::time::Instant::now() < deadline {
+        match rx.try_recv() {
+            Ok((slot, buf)) => {
+                bufs[slot] = buf;
+                pending -= 1;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                plugin_toolkit::time::sleep(pause).await;
+                pause = (pause * 2).min(POLL_MAX);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+        }
+    }
+    bufs
+}
 
 async fn run_within(
-    cmd: plugin_toolkit::process::Command,
+    mut cmd: std::process::Command,
     budget: std::time::Duration,
 ) -> plugin_toolkit::anyhow::Result<String> {
-    let Some(out) = plugin_toolkit::time::timeout(budget, cmd.output()).await else {
-        plugin_toolkit::anyhow::bail!("docker CLI timed out after {:?}", budget);
+    use std::os::unix::process::CommandExt;
+    let mut child = cmd
+        .process_group(0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    drain(child.stdout.take(), 0, tx.clone());
+    drain(child.stderr.take(), 1, tx);
+    let mut guard = GroupGuard {
+        pgid: child.id() as libc::pid_t,
+        child: Some(child),
     };
-    let out = out?;
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-    if !out.status.success {
+    let deadline = std::time::Instant::now() + budget;
+    let mut pause = POLL_MIN;
+    let status = loop {
+        if let Some(status) = guard
+            .child
+            .as_mut()
+            .and_then(|c| c.try_wait().transpose())
+            .transpose()?
+        {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            drop(guard);
+            plugin_toolkit::anyhow::bail!(
+                "docker CLI timed out after {:?} and was killed; the daemon-side operation may still be running",
+                budget
+            );
+        }
+        plugin_toolkit::time::sleep(pause).await;
+        pause = (pause * 2).min(POLL_MAX);
+    };
+    guard.kill_group();
+    guard.disarm();
+    let [out, err] = collect(rx).await;
+    let stdout = String::from_utf8_lossy(&out).to_string();
+    let stderr = String::from_utf8_lossy(&err).to_string();
+    if !status.success() {
         let why = if stderr.trim().is_empty() {
             &stdout
         } else {
@@ -170,8 +279,10 @@ async fn run_within(
 mod tests {
     use super::*;
 
-    fn sh(script: &str) -> plugin_toolkit::process::Command {
-        plugin_toolkit::process::Command::new("/bin/sh").args(["-c", script])
+    fn sh(script: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", script]);
+        cmd
     }
 
     #[test]
@@ -202,6 +313,109 @@ mod tests {
         ))
         .unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(err.to_string().contains("may still be running"), "{err}");
+    }
+
+    #[test]
+    fn a_timeout_kills_the_whole_process_group() {
+        let pidfile = std::env::temp_dir().join(format!("docker-pg-{}.pid", std::process::id()));
+        std::fs::remove_file(&pidfile).ok();
+        let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
+        plugin_toolkit::reactor::block_on(run_within(
+            sh(&script),
+            std::time::Duration::from_millis(300),
+        ))
+        .unwrap_err();
+        let pid: libc::pid_t = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        std::fs::remove_file(&pidfile).ok();
+        let gone = (0..50).any(|_| {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            false
+        });
+        assert!(gone, "grandchild {pid} survived the timeout");
+    }
+
+    fn grandchild_dead(pidfile: &std::path::Path) -> bool {
+        let pid: libc::pid_t = std::fs::read_to_string(pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        std::fs::remove_file(pidfile).ok();
+        (0..50).any(|_| {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            false
+        })
+    }
+
+    #[test]
+    fn large_output_on_both_pipes_does_not_deadlock() {
+        let out = plugin_toolkit::reactor::block_on(run_within(
+            sh("head -c 200000 /dev/zero | tr '\\0' a; head -c 200000 /dev/zero | tr '\\0' b >&2"),
+            std::time::Duration::from_secs(20),
+        ))
+        .unwrap();
+        assert_eq!(out.len(), 200000);
+    }
+
+    #[test]
+    fn a_grandchild_holding_the_pipe_does_not_stall_the_return() {
+        let started = std::time::Instant::now();
+        let out = plugin_toolkit::reactor::block_on(run_within(
+            sh("sleep 30 & echo ok"),
+            std::time::Duration::from_secs(20),
+        ))
+        .unwrap();
+        assert_eq!(out, "ok\n");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn cancelling_the_future_kills_the_group() {
+        let pidfile =
+            std::env::temp_dir().join(format!("docker-cancel-{}.pid", std::process::id()));
+        std::fs::remove_file(&pidfile).ok();
+        let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
+        let done = plugin_toolkit::reactor::block_on(plugin_toolkit::time::timeout(
+            std::time::Duration::from_millis(300),
+            run_within(sh(&script), std::time::Duration::from_secs(60)),
+        ));
+        assert!(done.is_none());
+        assert!(
+            grandchild_dead(&pidfile),
+            "grandchild survived cancellation"
+        );
+    }
+
+    #[test]
+    fn the_argv_clears_the_environment_and_passes_only_the_allowlist() {
+        let env = passed_env(
+            |k| match k {
+                "PATH" => Some("/usr/bin".to_string()),
+                "AWS_SECRET_ACCESS_KEY" => Some("leak".to_string()),
+                _ => None,
+            },
+            Some("unix:///d.sock".into()),
+        );
+        assert_eq!(
+            env_argv(env, "docker"),
+            [
+                "-i",
+                "PATH=/usr/bin",
+                "DOCKER_HOST=unix:///d.sock",
+                "docker"
+            ]
+        );
     }
 
     #[test]
