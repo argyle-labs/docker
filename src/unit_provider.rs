@@ -1126,7 +1126,7 @@ impl DockerUnitProvider {
                     Err(why) => Some(why),
                 };
                 if let Some(why) = why {
-                    return Err(anyhow::anyhow!("exec in {} refused: {why}", exec.id));
+                    return Err(exec_refused(&exec.id, &why));
                 }
                 let result = self
                     .adapter
@@ -2623,6 +2623,10 @@ fn volume_names(info: &bollard::models::ContainerInspectResponse) -> Vec<String>
     names
 }
 
+fn exec_refused(id: &str, why: &str) -> anyhow::Error {
+    plugin_toolkit::contract::OrcaError::forbidden(format!("exec in {id} refused: {why}")).into()
+}
+
 async fn exec_scope(
     docker: &bollard::Docker,
     info: &bollard::models::ContainerInspectResponse,
@@ -3530,6 +3534,44 @@ mod tests {
         assert!(inspected_id(&info, "web").is_err());
         info.id = Some("abc123".into());
         assert_eq!(inspected_id(&info, "web").unwrap(), "abc123");
+    }
+
+    fn refusal_kind(e: &anyhow::Error) -> plugin_toolkit::contract::ErrorKind {
+        e.downcast_ref::<plugin_toolkit::contract::OrcaError>()
+            .unwrap_or_else(|| panic!("{e} is untyped"))
+            .kind
+    }
+
+    #[test]
+    fn exec_outside_a_registered_stack_is_a_typed_forbidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut forged = inspected("/opt/stacks/web", serde_json::json!({}));
+        forged.id = Some("c2".into());
+        let err = exec_refused("web", &refused(&forged, &scope(dir.path())));
+        assert_eq!(
+            refusal_kind(&err),
+            plugin_toolkit::contract::ErrorKind::Forbidden
+        );
+        assert!(
+            err.to_string().contains("not part of a registered stack"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn exec_with_a_config_hash_mismatch_is_a_typed_forbidden() {
+        let err = exec_refused(
+            "web",
+            "its config-hash does not match service web of stack site",
+        );
+        assert_eq!(
+            refusal_kind(&err),
+            plugin_toolkit::contract::ErrorKind::Forbidden
+        );
+        assert!(
+            err.to_string().contains("config-hash does not match"),
+            "{err}"
+        );
     }
 
     #[test]

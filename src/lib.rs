@@ -11,6 +11,7 @@ pub mod cgroup;
 pub mod compose;
 pub mod compose_config;
 pub mod container_delete;
+pub mod container_inspect;
 pub mod containers;
 pub mod daemon_config;
 pub mod deploy;
