@@ -414,12 +414,19 @@ mod tests {
     fn grandchild_dead(pidfile: &std::path::Path) -> bool {
         let pid = read_pid(pidfile);
         (0..50).any(|_| {
-            if unsafe { libc::kill(pid, 0) } != 0 {
+            if unsafe { libc::kill(pid, 0) } != 0 || is_zombie(pid) {
                 return true;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
             false
         })
+    }
+
+    fn is_zombie(pid: libc::pid_t) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|s| s.rsplit_once(") ").map(|(_, rest)| rest.starts_with('Z')))
+            .unwrap_or(false)
     }
 
     #[test]
