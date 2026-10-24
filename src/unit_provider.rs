@@ -2680,7 +2680,12 @@ async fn exec_scope(
     } else {
         compose
     };
-    let expected = compose
+    let checked = policy::gate(Some(docker), row, &compose)
+        .await
+        .map_err(|e| {
+            ExecBlock::Refused(format!("stack {} fails its policy check: {e}", row.name))
+        })?;
+    let expected = checked
         .config_hash(service)
         .await
         .map_err(|e| format!("cannot hash service {service} of stack {}: {e}", row.name))?;
@@ -2720,11 +2725,7 @@ async fn exec_scope(
             volumes.insert(name, v);
         }
     }
-    let cfg = compose
-        .config_json()
-        .await
-        .map_err(|e| e.to_string())
-        .and_then(|raw| ComposeConfig::parse(&raw).map_err(|e| e.to_string()))
+    let cfg = ComposeConfig::parse(checked.config())
         .map_err(|e| format!("cannot read the compose config of stack {}: {e}", row.name))?;
     let resolve = |p: &std::path::Path| Ok(std::fs::canonicalize(p)?);
     let mut declared = std::collections::HashMap::new();
@@ -2747,7 +2748,7 @@ async fn exec_scope(
         if hashes.contains_key(svc) {
             continue;
         }
-        let h = compose
+        let h = checked
             .config_hash(svc)
             .await
             .map_err(|e| format!("cannot hash service {svc} of stack {}: {e}", row.name))?;
