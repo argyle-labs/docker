@@ -11,6 +11,7 @@ const SECRET_MARKERS: [&str; 9] = [
     "TOKEN", "SECRET", "PASSWORD", "KEY", "PASS", "CRED", "AUTH", "CLAIM", "PRIVATE",
 ];
 const COMPOSE_LABEL_PREFIX: &str = "com.docker.compose.";
+const DEFAULT_SHM_SIZE: i64 = 64 * 1024 * 1024;
 
 #[orca_struct(args)]
 pub struct DockerContainerInspectArgs {
@@ -99,6 +100,15 @@ pub struct HealthcheckInfo {
 #[orca_struct]
 #[serde(rename_all = "camelCase")]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UlimitInfo {
+    pub name: String,
+    pub soft: i64,
+    pub hard: i64,
+}
+
+#[orca_struct]
+#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ContainerInspectOutput {
     pub id: String,
     pub name: String,
@@ -124,6 +134,30 @@ pub struct ContainerInspectOutput {
     pub working_dir: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub healthcheck: Option<HealthcheckInfo>,
+    pub tmpfs: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shm_size: Option<i64>,
+    pub sysctls: BTreeMap<String, String>,
+    pub ulimits: Vec<UlimitInfo>,
+    pub security_opt: Vec<String>,
+    pub extra_hosts: Vec<String>,
+    pub pid_mode: String,
+    pub ipc_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nano_cpus: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pids_limit: Option<i64>,
+    pub log_driver: String,
+    pub log_options: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redacted_log_options: Vec<String>,
+    pub stop_signal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_timeout: Option<i64>,
+    pub hostname: String,
+    pub dns: Vec<String>,
 }
 
 #[orca_struct]
@@ -268,6 +302,22 @@ pub fn describe(c: &ContainerInspectResponse) -> ContainerInspectOutput {
         .collect();
     redacted_labels.sort();
     let masked = |a: Vec<String>| redact_args(&a, |_| REDACTED.to_owned());
+    let log = host.log_config.clone().unwrap_or_default();
+    let mut redacted_log_options = Vec::new();
+    let log_options = log
+        .config
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(k, v)| {
+            if is_secret(&k, &v) {
+                redacted_log_options.push(k.clone());
+                (k, REDACTED.to_owned())
+            } else {
+                (k, v)
+            }
+        })
+        .collect();
+    redacted_log_options.sort();
     ContainerInspectOutput {
         id: c.id.clone().unwrap_or_default(),
         name: c
@@ -343,6 +393,33 @@ pub fn describe(c: &ContainerInspectResponse) -> ContainerInspectOutput {
                 start_period_ns: h.start_period.filter(|n| *n > 0),
             })
         }),
+        tmpfs: host.tmpfs.unwrap_or_default().into_iter().collect(),
+        shm_size: host.shm_size.filter(|n| *n > 0),
+        sysctls: host.sysctls.unwrap_or_default().into_iter().collect(),
+        ulimits: host
+            .ulimits
+            .unwrap_or_default()
+            .into_iter()
+            .map(|u| UlimitInfo {
+                name: u.name.unwrap_or_default(),
+                soft: u.soft.unwrap_or_default(),
+                hard: u.hard.unwrap_or_default(),
+            })
+            .collect(),
+        security_opt: host.security_opt.unwrap_or_default(),
+        extra_hosts: host.extra_hosts.unwrap_or_default(),
+        pid_mode: host.pid_mode.unwrap_or_default(),
+        ipc_mode: host.ipc_mode.unwrap_or_default(),
+        nano_cpus: host.nano_cpus.filter(|n| *n > 0),
+        memory: host.memory.filter(|n| *n > 0),
+        pids_limit: host.pids_limit.filter(|n| *n > 0),
+        log_driver: log.typ.unwrap_or_default(),
+        log_options,
+        redacted_log_options,
+        stop_signal: config.stop_signal.unwrap_or_default(),
+        stop_timeout: config.stop_timeout.filter(|n| *n >= 0),
+        hostname: config.hostname.unwrap_or_default(),
+        dns: host.dns.unwrap_or_default(),
     }
 }
 
@@ -425,8 +502,108 @@ pub fn service_value(c: &ContainerInspectOutput) -> Value {
     let mode = c.network_mode.as_str();
     if matches!(mode, "host" | "none") || mode.starts_with("container:") {
         svc.insert("network_mode".into(), json!(mode));
-    } else if !c.networks.is_empty() && c.networks != ["bridge"] {
-        svc.insert("networks".into(), json!(c.networks));
+    } else if c.networks == ["bridge"] {
+        svc.insert("network_mode".into(), json!("bridge"));
+    } else if !c.networks.is_empty() {
+        let mut nets: Vec<&str> = c
+            .networks
+            .iter()
+            .map(|n| if n == "bridge" { "default" } else { n.as_str() })
+            .collect();
+        nets.sort();
+        svc.insert("networks".into(), json!(nets));
+    }
+    if !c.hostname.is_empty() && !c.id.starts_with(&c.hostname) {
+        svc.insert("hostname".into(), json!(lit(&c.hostname)));
+    }
+    if !c.dns.is_empty() {
+        svc.insert("dns".into(), json!(c.dns));
+    }
+    if !c.extra_hosts.is_empty() {
+        svc.insert("extra_hosts".into(), json!(c.extra_hosts));
+    }
+    if !c.tmpfs.is_empty() {
+        let tmpfs: Vec<String> = c
+            .tmpfs
+            .iter()
+            .map(|(path, opts)| {
+                if opts.is_empty() {
+                    lit(path)
+                } else {
+                    format!("{}:{}", lit(path), lit(opts))
+                }
+            })
+            .collect();
+        svc.insert("tmpfs".into(), json!(tmpfs));
+    }
+    if let Some(n) = c.shm_size.filter(|n| *n != DEFAULT_SHM_SIZE) {
+        svc.insert("shm_size".into(), json!(n));
+    }
+    if !c.sysctls.is_empty() {
+        svc.insert("sysctls".into(), json!(c.sysctls));
+    }
+    if !c.ulimits.is_empty() {
+        let ulimits: serde_json::Map<String, Value> = c
+            .ulimits
+            .iter()
+            .map(|u| {
+                let v = if u.soft == u.hard {
+                    json!(u.soft)
+                } else {
+                    json!({ "soft": u.soft, "hard": u.hard })
+                };
+                (u.name.clone(), v)
+            })
+            .collect();
+        svc.insert("ulimits".into(), Value::Object(ulimits));
+    }
+    if !c.security_opt.is_empty() {
+        svc.insert("security_opt".into(), json!(c.security_opt));
+    }
+    if !c.pid_mode.is_empty() {
+        svc.insert("pid".into(), json!(c.pid_mode));
+    }
+    if !matches!(c.ipc_mode.as_str(), "" | "private" | "shareable") {
+        svc.insert("ipc".into(), json!(c.ipc_mode));
+    }
+    if let Some(n) = c.nano_cpus {
+        let cpus = format!("{}", n as f64 / 1e9);
+        svc.insert("cpus".into(), json!(cpus));
+    }
+    if let Some(n) = c.memory {
+        svc.insert("mem_limit".into(), json!(n));
+    }
+    if let Some(n) = c.pids_limit {
+        svc.insert("pids_limit".into(), json!(n));
+    }
+    if !c.log_driver.is_empty() && (c.log_driver != "json-file" || !c.log_options.is_empty()) {
+        let mut logging = serde_json::Map::new();
+        logging.insert("driver".into(), json!(c.log_driver));
+        if !c.log_options.is_empty() {
+            let opts: serde_json::Map<String, Value> = c
+                .log_options
+                .iter()
+                .map(|(k, v)| {
+                    let v = if c.redacted_log_options.contains(k) {
+                        env_ref(k)
+                    } else {
+                        lit(v)
+                    };
+                    (k.clone(), json!(v))
+                })
+                .collect();
+            logging.insert("options".into(), Value::Object(opts));
+        }
+        svc.insert("logging".into(), Value::Object(logging));
+    }
+    if !c.stop_signal.is_empty() {
+        svc.insert("stop_signal".into(), json!(c.stop_signal));
+    }
+    if let Some(s) = c.stop_timeout {
+        svc.insert(
+            "stop_grace_period".into(),
+            json!(duration(s * 1_000_000_000)),
+        );
     }
     if !c.ports.is_empty() {
         let ports: Vec<String> = c
@@ -664,10 +841,16 @@ pub fn compose_yaml(c: &ContainerInspectOutput) -> ContainerComposeOutput {
     let external: Vec<&String> = c.networks.iter().filter(|n| is_named_network(n)).collect();
     let mode = c.network_mode.as_str();
     if !external.is_empty() && !matches!(mode, "host" | "none") && !mode.starts_with("container:") {
-        let nets: serde_json::Map<String, Value> = external
+        let mut nets: serde_json::Map<String, Value> = external
             .iter()
             .map(|n| ((*n).clone(), json!({ "external": true })))
             .collect();
+        if c.networks.iter().any(|n| n == "bridge") {
+            nets.insert(
+                "default".into(),
+                json!({ "name": "bridge", "external": true }),
+            );
+        }
         doc.insert("networks".into(), Value::Object(nets));
     }
     let vols: serde_json::Map<String, Value> = c
@@ -1014,6 +1197,194 @@ mod tests {
         let y = compose_yaml(&c).yaml;
         assert!(y.contains("network_mode: \"host\""), "{y}");
         assert!(!y.contains("networks"), "{y}");
+    }
+
+    fn tuned() -> (ContainerInspectOutput, String) {
+        let e = FakeEngine::routed(vec![Route::new(
+            "GET",
+            "/containers/tuned/json",
+            200,
+            json!({
+                "Id": "f00dfeed",
+                "Name": "/tuned",
+                "Config": {
+                    "Image": "app:1",
+                    "Hostname": "apphost",
+                    "StopSignal": "SIGINT",
+                    "StopTimeout": 30
+                },
+                "HostConfig": {
+                    "NetworkMode": "bridge",
+                    "Tmpfs": { "/run": "rw,size=65536k", "/tmp": "" },
+                    "ShmSize": 268435456i64,
+                    "Sysctls": { "net.core.somaxconn": "1024" },
+                    "Ulimits": [
+                        { "Name": "nofile", "Soft": 1024, "Hard": 4096 },
+                        { "Name": "nproc", "Soft": 512, "Hard": 512 }
+                    ],
+                    "SecurityOpt": ["no-new-privileges:true"],
+                    "ExtraHosts": ["db:10.0.0.9"],
+                    "PidMode": "host",
+                    "IpcMode": "host",
+                    "NanoCpus": 1_500_000_000i64,
+                    "Memory": 536870912i64,
+                    "PidsLimit": 200,
+                    "LogConfig": { "Type": "syslog", "Config": { "tag": "app", "splunk-token": "s3cr3t" } },
+                    "Dns": ["10.0.0.1"]
+                },
+                "NetworkSettings": { "Networks": { "bridge": {}, "media": {} } }
+            })
+            .to_string(),
+        )]);
+        let out = plugin_toolkit::reactor::block_on(inspect(&e.client(), "tuned")).unwrap();
+        let y = compose_yaml(&out).yaml;
+        (out, y)
+    }
+
+    #[test]
+    fn bridge_plus_other_networks_uses_the_default_network() {
+        let (out, y) = tuned();
+        assert_eq!(out.networks, vec!["bridge", "media"]);
+        assert!(
+            y.contains("    networks:\n      - \"default\"\n      - \"media\"\n"),
+            "{y}"
+        );
+        assert!(
+            y.contains("\nnetworks:\n  default:\n    external: true\n    name: \"bridge\"\n  media:\n    external: true\n"),
+            "{y}"
+        );
+        assert!(!y.contains("network_mode"), "{y}");
+    }
+
+    #[test]
+    fn bridge_only_uses_network_mode() {
+        let mut c = inspected();
+        c.network_mode = "bridge".into();
+        c.networks = vec!["bridge".into()];
+        let y = compose_yaml(&c).yaml;
+        assert!(y.contains("    network_mode: \"bridge\"\n"), "{y}");
+        assert!(!y.contains("networks"), "{y}");
+    }
+
+    #[test]
+    fn tmpfs_keeps_its_options() {
+        let (out, y) = tuned();
+        assert_eq!(out.tmpfs["/run"], "rw,size=65536k");
+        assert!(
+            y.contains("    tmpfs:\n      - \"/run:rw,size=65536k\"\n      - \"/tmp\"\n"),
+            "{y}"
+        );
+    }
+
+    #[test]
+    fn shm_size_is_kept_unless_default() {
+        let (out, y) = tuned();
+        assert_eq!(out.shm_size, Some(268435456));
+        assert!(y.contains("    shm_size: 268435456\n"), "{y}");
+        let mut c = out;
+        c.shm_size = Some(DEFAULT_SHM_SIZE);
+        assert!(!compose_yaml(&c).yaml.contains("shm_size"));
+    }
+
+    #[test]
+    fn sysctls_are_reproduced() {
+        let (out, y) = tuned();
+        assert_eq!(out.sysctls["net.core.somaxconn"], "1024");
+        assert!(
+            y.contains("    sysctls:\n      net.core.somaxconn: \"1024\"\n"),
+            "{y}"
+        );
+    }
+
+    #[test]
+    fn ulimits_are_reproduced() {
+        let (out, y) = tuned();
+        assert_eq!(out.ulimits[0].hard, 4096);
+        assert!(y.contains("    ulimits:\n      nofile:\n        hard: 4096\n        soft: 1024\n      nproc: 512\n"), "{y}");
+    }
+
+    #[test]
+    fn security_opt_is_reproduced() {
+        let (out, y) = tuned();
+        assert_eq!(out.security_opt, vec!["no-new-privileges:true"]);
+        assert!(
+            y.contains("    security_opt:\n      - \"no-new-privileges:true\"\n"),
+            "{y}"
+        );
+    }
+
+    #[test]
+    fn extra_hosts_are_reproduced() {
+        let (out, y) = tuned();
+        assert_eq!(out.extra_hosts, vec!["db:10.0.0.9"]);
+        assert!(
+            y.contains("    extra_hosts:\n      - \"db:10.0.0.9\"\n"),
+            "{y}"
+        );
+    }
+
+    #[test]
+    fn pid_and_ipc_modes_are_reproduced() {
+        let (out, y) = tuned();
+        assert_eq!(
+            (out.pid_mode.as_str(), out.ipc_mode.as_str()),
+            ("host", "host")
+        );
+        assert!(y.contains("    pid: \"host\"\n"), "{y}");
+        assert!(y.contains("    ipc: \"host\"\n"), "{y}");
+        let mut c = out;
+        c.ipc_mode = "private".into();
+        assert!(!compose_yaml(&c).yaml.contains("ipc:"));
+    }
+
+    #[test]
+    fn resource_limits_are_reproduced() {
+        let (out, y) = tuned();
+        assert_eq!(out.nano_cpus, Some(1_500_000_000));
+        assert_eq!(out.memory, Some(536870912));
+        assert_eq!(out.pids_limit, Some(200));
+        assert!(y.contains("    cpus: \"1.5\"\n"), "{y}");
+        assert!(y.contains("    mem_limit: 536870912\n"), "{y}");
+        assert!(y.contains("    pids_limit: 200\n"), "{y}");
+    }
+
+    #[test]
+    fn logging_driver_and_options_are_reproduced_with_secrets_redacted() {
+        let (out, y) = tuned();
+        assert_eq!(out.log_driver, "syslog");
+        assert_eq!(out.log_options["splunk-token"], REDACTED);
+        assert_eq!(out.redacted_log_options, vec!["splunk-token"]);
+        assert!(
+            y.contains("    logging:\n      driver: \"syslog\"\n      options:\n        splunk-token: \"${SECRET_SPLUNK_TOKEN}\"\n        tag: \"app\"\n"),
+            "{y}"
+        );
+        assert!(!y.contains("s3cr3t"), "{y}");
+    }
+
+    #[test]
+    fn stop_signal_and_grace_period_are_reproduced() {
+        let (out, y) = tuned();
+        assert_eq!(out.stop_signal, "SIGINT");
+        assert_eq!(out.stop_timeout, Some(30));
+        assert!(y.contains("    stop_signal: \"SIGINT\"\n"), "{y}");
+        assert!(y.contains("    stop_grace_period: \"30s\"\n"), "{y}");
+    }
+
+    #[test]
+    fn hostname_is_reproduced_unless_it_is_the_id() {
+        let (out, y) = tuned();
+        assert_eq!(out.hostname, "apphost");
+        assert!(y.contains("    hostname: \"apphost\"\n"), "{y}");
+        let mut c = out;
+        c.hostname = "f00dfeed".into();
+        assert!(!compose_yaml(&c).yaml.contains("hostname"));
+    }
+
+    #[test]
+    fn dns_is_reproduced() {
+        let (out, y) = tuned();
+        assert_eq!(out.dns, vec!["10.0.0.1"]);
+        assert!(y.contains("    dns:\n      - \"10.0.0.1\"\n"), "{y}");
     }
 
     #[test]
