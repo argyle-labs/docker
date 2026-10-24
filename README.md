@@ -118,7 +118,7 @@ vocabulary spans both). Every operation is available through `unit` list / detai
 | **convert anonymous volumes** to labeled named volumes, copying and verifying the data (`dryRun` plans) | `update` | `action = "label_volumes"`, `{ dryRun?, items? }` |
 | **declare** how a named volume is backed up (`dryRun` plans) | `update` | `action = "volume_policy"`, `{ volume, strategy?: export\|dump, service?, command?, dryRun? }` |
 | **deploy / lifecycle** | `update` | `action = up`\|`down`\|`start`\|`stop`\|`restart`\|`build`\|`pull` |
-| **update**: back up, pull the pinned images, `up`, wait healthy; on a failed `up` or an unhealthy stack, restore that backup (`dryRun` plans). On a container, `backup`, `restore` and `update` run on its owning stack | `update` | `action = "update"`, `{ dryRun? }` |
+| **update**: back up, pull the pinned images, `up`, wait healthy; on a failed `up` or an unhealthy stack, re-tag the previous images and restore that backup. The health wait follows the services' healthchecks (30 s to 10 min) unless `timeoutSecs` is set. `dryRun` checks the policy and reports the backup dir and, per service, local vs registry digests without pulling, flagging granted services that would need re-approval. On a container, `backup`, `restore` and `update` run on its owning stack | `update` | `action = "update"`, `{ dryRun?, timeoutSecs? }` |
 | **register + deploy** (add-only) | `create` | `action = "deploy"`, deploy payload |
 | **register-or-replace + deploy** | `upsert` | `action = "set"`, deploy payload |
 | **tear down + deregister** (`compose down`, then remove the registration) | `delete` | `id.kind = "stack"`, `id.id = <name>` |
