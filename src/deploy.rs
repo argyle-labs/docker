@@ -1272,8 +1272,29 @@ mod tests {
         }
     }
 
+    fn mkdir(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let first = path
+            .ancestors()
+            .take_while(|a| !a.exists())
+            .last()
+            .map(Path::to_path_buf);
+        std::fs::create_dir_all(path).unwrap();
+        let Some(first) = first else {
+            return;
+        };
+        for a in path.ancestors() {
+            std::fs::set_permissions(a, std::fs::Permissions::from_mode(0o755)).unwrap();
+            if a == first {
+                break;
+            }
+        }
+    }
+
     fn root_dir() -> (tempfile::TempDir, String) {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         let root = dir.path().to_string_lossy().into_owned();
         (dir, root)
     }
@@ -1310,9 +1331,9 @@ mod tests {
     fn deny_set_applies_even_under_slash_root() {
         let (dir, _) = root_dir();
         let ssh = dir.path().join(".SSH");
-        std::fs::create_dir(&ssh).unwrap();
+        mkdir(&ssh);
         let home = dir.path().join("home");
-        std::fs::create_dir(&home).unwrap();
+        mkdir(&home);
         let roots = ["/".to_string()];
         for src in [
             "/".to_string(),
@@ -1346,11 +1367,11 @@ mod tests {
     fn bind_above_a_denied_segment_is_refused() {
         let (dir, root) = root_dir();
         let user = dir.path().join("alice");
-        std::fs::create_dir_all(user.join(".Kube")).unwrap();
+        mkdir(&user.join(".Kube"));
         let err = refused(&bind(&lossy(&user)), std::slice::from_ref(&root), None);
         assert!(err.contains("protected path"), "{err}");
         let nested = dir.path().join("bob");
-        std::fs::create_dir_all(nested.join(".config/gcloud")).unwrap();
+        mkdir(&nested.join(".config/gcloud"));
         let err = refused(&bind(&lossy(&nested)), &[root], None);
         assert!(err.contains("protected path"), "{err}");
     }
@@ -1383,7 +1404,7 @@ mod tests {
     fn allowed_path_is_rewritten_canonical_and_volume_passes() {
         let (dir, root) = root_dir();
         let data = dir.path().join("data");
-        std::fs::create_dir(&data).unwrap();
+        mkdir(&data);
         let out = check_mounts(&bind(&lossy(&data)), std::slice::from_ref(&root), None).unwrap();
         assert_eq!(
             out.mounts[0].source,
@@ -1398,7 +1419,7 @@ mod tests {
     fn recheck_refuses_a_swapped_source() {
         let (dir, root) = root_dir();
         let data = std::fs::canonicalize(dir.path()).unwrap().join("data");
-        std::fs::create_dir(&data).unwrap();
+        mkdir(&data);
         let compose = compose_json(&bind(&lossy(&data))).unwrap();
         recheck_compose(&compose, std::slice::from_ref(&root), None).unwrap();
         std::fs::remove_dir(&data).unwrap();
@@ -1605,7 +1626,7 @@ mod tests {
         let (dir, root) = root_dir();
         let mid = std::fs::canonicalize(dir.path()).unwrap().join("mid");
         let data = mid.join("data");
-        std::fs::create_dir_all(&data).unwrap();
+        mkdir(&data);
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o777)).unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
         let compose = compose_json(&bind(&lossy(&data))).unwrap();
@@ -1749,7 +1770,7 @@ mod tests {
         let (dir, _) = root_dir();
         std::fs::write(dir.path().join("docker-compose.yml"), "{}").unwrap();
         std::fs::write(dir.path().join(crate::compose::ORCA_FILE), "{}").unwrap();
-        std::fs::create_dir(dir.path().join("data")).unwrap();
+        mkdir(&dir.path().join("data"));
         check_stack_dir(dir.path(), "docker-compose.yml").unwrap();
         for extra in [".env", "compose.override.yml", "other.YAML"] {
             let path = dir.path().join(extra);
@@ -1766,7 +1787,7 @@ mod tests {
     fn adopt_refuses_a_stack_failing_recheck() {
         let (dir, root) = root_dir();
         let stack = dir.path().join("web");
-        std::fs::create_dir(&stack).unwrap();
+        mkdir(&stack);
         let write = |body: &str| std::fs::write(stack.join("docker-compose.yml"), body).unwrap();
         let row = stacks::StackRow {
             name: "web".into(),
@@ -1804,7 +1825,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let (dir, root) = root_dir();
         let data = std::fs::canonicalize(dir.path()).unwrap().join("data");
-        std::fs::create_dir(&data).unwrap();
+        mkdir(&data);
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o777)).unwrap();
         let compose = compose_json(&bind(&lossy(&data))).unwrap();
         recheck_compose(&compose, &[root], None).unwrap();
@@ -1814,7 +1835,7 @@ mod tests {
     fn compose_json_output_passes_recheck() {
         let (dir, root) = root_dir();
         let data = std::fs::canonicalize(dir.path()).unwrap().join("data");
-        std::fs::create_dir(&data).unwrap();
+        mkdir(&data);
         let mut s = spec();
         s.mounts[0].source = lossy(&data);
         s.mounts.push(Mount {
@@ -1844,8 +1865,8 @@ mod tests {
         let (dir, _) = root_dir();
         let data = dir.path().join("data");
         let data2 = dir.path().join("data2");
-        std::fs::create_dir(&data).unwrap();
-        std::fs::create_dir(&data2).unwrap();
+        mkdir(&data);
+        mkdir(&data2);
         let err = refused(&bind(&lossy(&data2)), &[lossy(&data)], None);
         assert!(err.contains("outside the allowed data roots"), "{err}");
         let err = refused(&bind(&lossy(&data2.join("new"))), &[lossy(&data)], None);
@@ -1857,7 +1878,7 @@ mod tests {
     fn trailing_slashes_are_normalized() {
         let (dir, root) = root_dir();
         let data = dir.path().join("data");
-        std::fs::create_dir(&data).unwrap();
+        mkdir(&data);
         let real = lossy(&std::fs::canonicalize(&data).unwrap());
         let out = check_mounts(
             &bind(&format!("{}/", lossy(&data))),

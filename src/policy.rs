@@ -1,6 +1,6 @@
 //! Compose content policy for managed stacks, checked before a compose file
 //! is written (`deploy`, `set`, `edit`, `fix`, `restore`) and before compose
-//! runs it (`up`, the lifecycle actions, `host_update`).
+//! runs it (`up` and the lifecycle actions).
 //!
 //! `deploy` is a unit create, which reaches the plugin without a caller
 //! identity (orca#788), so the plugin cannot require admin on every stack

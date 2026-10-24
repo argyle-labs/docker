@@ -27,6 +27,8 @@
 //! - [`Verb::Upsert`] → action `set`: register-or-replace, then deploy
 //! - [`Verb::Delete`] → deregister the stack (leaves containers running)
 
+use std::time::Duration;
+
 use plugin_toolkit::anyhow::{self, Result};
 use plugin_toolkit::containers::{AdapterError, Container, ListFilter, LogTail, RuntimeAdapter};
 use plugin_toolkit::contract::BoxFuture;
@@ -62,7 +64,7 @@ const STACK_LIFECYCLE: &[&str] = &["up", "down", "start", "stop", "restart", "bu
 
 /// Stack update actions whose payload carries its own `dry_run` and `items`
 /// and plans itself; every other mutating action is gated here.
-const SELF_PLANNING: &[&str] = &["fix", "volume_policy", "label_volumes"];
+const SELF_PLANNING: &[&str] = &["fix", "volume_policy", "label_volumes", ACTION_UPDATE];
 
 /// Tears the stack down and deregisters it: the executable form of `delete`,
 /// whose args carry no payload for an opt-in.
@@ -70,6 +72,13 @@ const ACTION_REMOVE: &str = "remove";
 
 /// Container update actions; they take only the opt-in.
 const CONTAINER_ACTIONS: &[&str] = &["start", "stop", "restart"];
+
+const ACTION_UPDATE: &str = "update";
+
+const CONTAINER_VIA_STACK: &[&str] = &[ACTION_BACKUP, ACTION_RESTORE, ACTION_UPDATE];
+
+const HEALTH_FLOOR: Duration = Duration::from_secs(30);
+const HEALTH_CAP: Duration = Duration::from_secs(600);
 
 /// Payload for an action that takes nothing but the opt-in.
 #[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
@@ -338,6 +347,7 @@ impl DockerUnitProvider {
             "volume_policy" => self.stack_volume_policy(&args.id, &row, args.payload).await,
             ACTION_BACKUP => self.do_stack_backup(&args.id, &row, args.payload).await,
             ACTION_RESTORE => self.do_stack_restore(&args.id, &row, args.payload).await,
+            ACTION_UPDATE => self.do_stack_update(&args.id, &row, args.payload).await,
             "label_volumes" => self.stack_label_volumes(&args.id, &row, args.payload).await,
             "up" => {
                 let out = ownership::up(&row, &[]).await?;
@@ -818,23 +828,71 @@ impl DockerUnitProvider {
         )))
     }
 
+    async fn do_stack_update(
+        &self,
+        id: &UnitId,
+        row: &StackRow,
+        payload: Option<String>,
+    ) -> Result<VerbOutcome> {
+        let p: StackUpdatePayload = match payload.as_deref() {
+            None => StackUpdatePayload::default(),
+            Some(raw) => {
+                serde_json::from_str(raw).map_err(|e| anyhow::anyhow!("update payload: {e}"))?
+            }
+        };
+        let docker = self.adapter.client().map_err(adapter_err)?;
+        let project = row
+            .compose()
+            .map_err(anyhow::Error::from)?
+            .project_name()
+            .await
+            .map_err(anyhow::Error::from)?;
+        if p.dry_run {
+            return plan_update(id, row, &docker, &project).await;
+        }
+        let (changed, message) = run_update(
+            &mut EngineUpdate {
+                provider: self,
+                id,
+                row,
+                docker: &docker,
+                project: &project,
+            },
+            p.timeout_secs,
+        )
+        .await?;
+        Ok(VerbOutcome::Action(ActionOutcome { changed, message }))
+    }
+
     async fn do_update(&self, args: UpdateArgs) -> Result<VerbOutcome> {
-        let stack = args.id.kind == STACK_KIND;
-        let action = args.action.as_str();
         // Backup only adds an archive, and core's pre-mutation guard
-        // (`dispatch_guarded`) sends it with no caller and no payload: it must
-        // run for real, never answer with a plan. A caller, when present, is
-        // still held to admin, and so is any payload (a `dest` steers where
-        // the archive goes), since the guard never sends one. Remove the
-        // no-caller allowance once core forwards the mutation's caller to the
-        // guard (orca#704).
-        let backup = stack && action == ACTION_BACKUP;
-        if !(backup && args.caller.is_none() && guard_shaped(args.payload.as_deref())) {
+        // (`dispatch_guarded`) sends it to a stack with no caller and no
+        // payload: it must run for real, never answer with a plan. Remove
+        // the no-caller allowance once core forwards the mutation's caller to
+        // the guard (orca#704).
+        let guard = args.id.kind == STACK_KIND
+            && args.action == ACTION_BACKUP
+            && args.caller.is_none()
+            && guard_shaped(args.payload.as_deref());
+        if !guard {
             require_admin(
                 &format!("docker {} update", args.id.kind),
                 args.caller.as_ref(),
             )?;
         }
+        let args = if args.id.kind == KIND && CONTAINER_VIA_STACK.contains(&args.action.as_str()) {
+            let docker = self.adapter.client().map_err(adapter_err)?;
+            let row = owning_stack(&docker, &args.id.id).await?;
+            UpdateArgs {
+                id: self.stack_unit_id(&row),
+                ..args
+            }
+        } else {
+            args
+        };
+        let stack = args.id.kind == STACK_KIND;
+        let action = args.action.as_str();
+        let backup = stack && action == ACTION_BACKUP;
         let args = if backup {
             let (_, payload) = split_dry_run(args.payload.clone())?;
             UpdateArgs { payload, ..args }
@@ -1473,16 +1531,7 @@ fn stack_declaration() -> KindDeclaration {
     );
     // Minimal backup/restore as managed-unit actions (the pre-mutation guard and
     // scheduler reach these), routed to the stack's host over the mesh.
-    update_actions.push(ActionDecl {
-        action: ACTION_BACKUP.into(),
-        payload_schema: Some(schema_for!(StackBackupPayload)),
-        response_schema: Some(schema_for!(BackupRef)),
-    });
-    update_actions.push(ActionDecl {
-        action: ACTION_RESTORE.into(),
-        payload_schema: Some(schema_for!(StackRestorePayload)),
-        response_schema: None,
-    });
+    update_actions.extend(via_stack_actions());
 
     // A stack's minimal, restore-sufficient state is filesystem paths (its compose
     // project directory). The concrete path is per-instance; the kind declares the
@@ -1818,6 +1867,372 @@ impl RestoreSteps for EngineRestore<'_> {
     fn stop(&mut self) -> BoxFuture<'_, Result<()>> {
         Box::pin(stack_volumes::stop_project(self.docker, self.project))
     }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(crate = "plugin_toolkit::serde", deny_unknown_fields)]
+#[schemars(crate = "plugin_toolkit::schemars")]
+pub struct StackUpdatePayload {
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
+    pub dry_run: bool,
+    #[serde(
+        default,
+        rename = "timeoutSecs",
+        alias = "timeout_secs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(crate = "plugin_toolkit::serde", rename_all = "camelCase")]
+#[schemars(crate = "plugin_toolkit::schemars")]
+pub struct PlannedImage {
+    pub service: String,
+    pub image: String,
+    pub local_digests: Vec<String>,
+    pub remote_digest: Option<String>,
+    pub update_available: Option<bool>,
+    pub granted: bool,
+    pub needs_reapproval: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapContainer {
+    id: String,
+    service: String,
+    reference: String,
+    image_id: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Snapshot {
+    containers: Vec<SnapContainer>,
+    health: Vec<bollard::models::HealthConfig>,
+}
+
+fn health_timeout(checks: &[bollard::models::HealthConfig], requested: Option<u64>) -> Duration {
+    if let Some(secs) = requested {
+        return Duration::from_secs(secs.max(1)).min(HEALTH_CAP);
+    }
+    let secs = |ns: Option<i64>, default: u64| {
+        ns.filter(|n| *n > 0).map_or(default, |n| {
+            u64::try_from(n / 1_000_000_000).unwrap_or(default)
+        })
+    };
+    checks
+        .iter()
+        .map(|h| {
+            let retries = h
+                .retries
+                .filter(|r| *r > 0)
+                .map_or(3, |r| u64::try_from(r).unwrap_or(3));
+            Duration::from_secs(
+                secs(h.start_period, 0)
+                    .saturating_add((secs(h.interval, 30) + secs(h.timeout, 30)) * retries),
+            )
+        })
+        .max()
+        .unwrap_or(HEALTH_FLOOR)
+        .clamp(HEALTH_FLOOR, HEALTH_CAP)
+}
+
+async fn snapshot(docker: &bollard::Docker, project: &str) -> Result<Snapshot> {
+    let mut snap = Snapshot::default();
+    for id in crate::stack_manifest::containers_of(docker, project)
+        .await?
+        .iter()
+        .filter_map(|c| c.id.clone())
+    {
+        let Ok(info) = docker.inspect_container(&id, None).await else {
+            continue;
+        };
+        let c = crate::stack_manifest::StackContainer::from_inspect(&info);
+        if let Some(h) = info.config.as_ref().and_then(|c| c.healthcheck.clone()) {
+            snap.health.push(h);
+        }
+        snap.containers.push(SnapContainer {
+            id,
+            service: c.service,
+            reference: c.reference,
+            image_id: c.image_id,
+        });
+    }
+    snap.containers.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(snap)
+}
+
+async fn revert_images(docker: &bollard::Docker, before: &Snapshot) -> Result<()> {
+    use bollard::query_parameters::TagImageOptionsBuilder;
+    let mut done = std::collections::BTreeSet::new();
+    for c in &before.containers {
+        if c.image_id.is_empty() || !done.insert((&c.reference, &c.image_id)) {
+            continue;
+        }
+        let Some((repo, tag)) = crate::stack_pull::tag_target(&c.reference) else {
+            continue;
+        };
+        let opts = TagImageOptionsBuilder::new().repo(repo).tag(tag).build();
+        docker
+            .tag_image(&c.image_id, Some(opts))
+            .await
+            .map_err(|_| anyhow::anyhow!("re-tag the previous image of service {}", c.service))?;
+    }
+    Ok(())
+}
+
+fn planned_image(
+    row: &StackRow,
+    c: &SnapContainer,
+    local_digests: Vec<String>,
+    remote: std::result::Result<String, String>,
+) -> PlannedImage {
+    let granted = row.allow.iter().any(|g| g.service == c.service);
+    let (remote_digest, error) = match remote {
+        Ok(d) => (Some(d), None),
+        Err(e) => (None, Some(e)),
+    };
+    let update_available =
+        crate::image_update::update_available(&local_digests, remote_digest.as_deref());
+    PlannedImage {
+        service: c.service.clone(),
+        image: c.reference.clone(),
+        local_digests,
+        remote_digest,
+        update_available,
+        granted,
+        needs_reapproval: granted && update_available == Some(true),
+        error,
+    }
+}
+
+async fn plan_update(
+    id: &UnitId,
+    row: &StackRow,
+    docker: &bollard::Docker,
+    project: &str,
+) -> Result<VerbOutcome> {
+    let compose = row.compose().map_err(anyhow::Error::from)?;
+    policy::gate(Some(docker), row, &compose).await?;
+    let backup_dir = default_backup_dir(std::path::Path::new(&row.dir));
+    let snap = snapshot(docker, project).await?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut images = Vec::new();
+    for c in &snap.containers {
+        if !seen.insert(c.service.clone()) {
+            continue;
+        }
+        let local = crate::image_update::image_repo_digests(docker, &c.image_id, &c.reference)
+            .await
+            .unwrap_or_default();
+        let remote = match crate::image_update::pinned_digest(&c.reference) {
+            Some(d) => Ok(d.to_string()),
+            None => crate::image_update::remote_digest(
+                docker,
+                &c.reference,
+                crate::image_update::registry_credentials(&c.reference),
+            )
+            .await
+            .map(|r| r.digest)
+            .map_err(|e| e.to_string()),
+        };
+        images.push(planned_image(row, c, local, remote));
+    }
+    let body = json!({
+        "dryRun": true,
+        "plan": {
+            "backupDir": backup_dir.to_string_lossy(),
+            "images": images,
+        },
+        "howToExecute": "re-invoke without `dryRun` in the payload",
+    });
+    Ok(VerbOutcome::Item(ItemOutcome::new(
+        id.clone(),
+        body.to_string(),
+    )))
+}
+
+trait UpdateSteps {
+    fn snapshot(&mut self) -> BoxFuture<'_, Result<Snapshot>>;
+    fn backup(&mut self) -> BoxFuture<'_, Result<BackupRef>>;
+    fn pull(&mut self) -> BoxFuture<'_, Result<String>>;
+    fn up(&mut self) -> BoxFuture<'_, Result<String>>;
+    fn healthy(&mut self, timeout: Duration) -> BoxFuture<'_, Result<bool>>;
+    fn revert_images(&mut self, before: Snapshot) -> BoxFuture<'_, Result<()>>;
+    fn restore(&mut self, from: BackupRef) -> BoxFuture<'_, Result<String>>;
+}
+
+async fn run_update(s: &mut impl UpdateSteps, requested: Option<u64>) -> Result<(bool, String)> {
+    let before = s
+        .snapshot()
+        .await
+        .map_err(|e| e.context("update refused: reading the stack's containers failed"))?;
+    let backup = s
+        .backup()
+        .await
+        .map_err(|e| e.context("update refused: the pre-update backup failed"))?;
+    let pulled = s
+        .pull()
+        .await
+        .map_err(|e| e.context("update stopped at pull; the stack is unchanged"))?;
+    let (reason, failure) = match s.up().await {
+        Ok(up) => match s.healthy(health_timeout(&before.health, requested)).await {
+            Ok(true) => {
+                let changed = s.snapshot().await.map_or(true, |after| after != before);
+                return Ok((
+                    changed,
+                    format!(
+                        "updated from backup {}; pull: {}; up: {}",
+                        backup.locator,
+                        pulled.trim(),
+                        up.trim()
+                    ),
+                ));
+            }
+            Ok(false) => (
+                "unhealthy",
+                anyhow::anyhow!("the stack did not come up healthy"),
+            ),
+            Err(e) => ("health check failed", e.context("health check failed")),
+        },
+        Err(e) => ("compose up failed", e.context("compose up failed")),
+    };
+    let (locator, taken) = (backup.locator.clone(), backup.timestamp);
+    let reverted = s.revert_images(before).await;
+    match (reverted, s.restore(backup).await) {
+        (Ok(()), Ok(restored)) => Err(failure.context(format!(
+            "update rolled back to the previous images and backup {locator}: {}",
+            restored.trim()
+        ))),
+        _ => Err(anyhow::anyhow!(
+            "update failed ({reason}) and the rollback did not complete; restore the backup taken at {taken} by hand"
+        )),
+    }
+}
+
+struct EngineUpdate<'a> {
+    provider: &'a DockerUnitProvider,
+    id: &'a UnitId,
+    row: &'a StackRow,
+    docker: &'a bollard::Docker,
+    project: &'a str,
+}
+
+impl UpdateSteps for EngineUpdate<'_> {
+    fn snapshot(&mut self) -> BoxFuture<'_, Result<Snapshot>> {
+        Box::pin(snapshot(self.docker, self.project))
+    }
+
+    fn backup(&mut self) -> BoxFuture<'_, Result<BackupRef>> {
+        Box::pin(async move {
+            match self
+                .provider
+                .do_stack_backup(self.id, self.row, None)
+                .await?
+            {
+                VerbOutcome::Item(item) => serde_json::from_str(&item.payload)
+                    .map_err(|e| anyhow::anyhow!("backup ref: {e}")),
+                _ => Err(anyhow::anyhow!("backup returned no backup ref")),
+            }
+        })
+    }
+
+    fn pull(&mut self) -> BoxFuture<'_, Result<String>> {
+        Box::pin(async move {
+            let compose = self.row.compose().map_err(anyhow::Error::from)?;
+            policy::gate(Some(self.docker), self.row, &compose)
+                .await?
+                .pull()
+                .await
+        })
+    }
+
+    fn up(&mut self) -> BoxFuture<'_, Result<String>> {
+        Box::pin(ownership::up(self.row, &[]))
+    }
+
+    fn healthy(&mut self, timeout: Duration) -> BoxFuture<'_, Result<bool>> {
+        Box::pin(async move {
+            Ok(
+                crate::stack_health::wait(self.docker, self.project, timeout)
+                    .await?
+                    .ready,
+            )
+        })
+    }
+
+    fn revert_images(&mut self, before: Snapshot) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move { revert_images(self.docker, &before).await })
+    }
+
+    fn restore(&mut self, from: BackupRef) -> BoxFuture<'_, Result<String>> {
+        Box::pin(async move {
+            let payload = StackRestorePayload {
+                restore: RestorePayload {
+                    from,
+                    component: None,
+                },
+                allow_unverified: false,
+            };
+            let raw = serde_json::to_string(&payload)?;
+            match self
+                .provider
+                .do_stack_restore(self.id, self.row, Some(raw))
+                .await?
+            {
+                VerbOutcome::Action(a) => Ok(a.message),
+                _ => Ok(String::new()),
+            }
+        })
+    }
+}
+
+fn via_stack_actions() -> Vec<ActionDecl> {
+    vec![
+        ActionDecl {
+            action: ACTION_BACKUP.into(),
+            payload_schema: Some(schema_for!(StackBackupPayload)),
+            response_schema: Some(schema_for!(BackupRef)),
+        },
+        ActionDecl {
+            action: ACTION_RESTORE.into(),
+            payload_schema: Some(schema_for!(StackRestorePayload)),
+            response_schema: None,
+        },
+        ActionDecl {
+            action: ACTION_UPDATE.into(),
+            payload_schema: Some(schema_for!(StackUpdatePayload)),
+            response_schema: None,
+        },
+    ]
+}
+
+async fn owning_stack(docker: &bollard::Docker, container: &str) -> Result<StackRow> {
+    let not_found = || anyhow::anyhow!("container {container} not found in a managed stack");
+    let info = docker
+        .inspect_container(container, None)
+        .await
+        .map_err(|_| not_found())?;
+    let id = inspected_id(&info, container).map_err(|_| not_found())?;
+    let row = list_stack_members(docker)
+        .await
+        .map_err(|_| not_found())?
+        .remove(&id)
+        .ok_or_else(not_found)?;
+    let labels = info.config.as_ref().and_then(|c| c.labels.as_ref());
+    let label = |k: &str| labels.and_then(|l| l.get(k)).cloned();
+    let member = match label(crate::labels::STACK) {
+        Some(stack) => stack == row.name,
+        None => match (label(crate::prune::COMPOSE_PROJECT_LABEL), row.compose()) {
+            (Some(project), Ok(compose)) => compose.project_name().await.ok() == Some(project),
+            _ => false,
+        },
+    };
+    if !member {
+        return Err(not_found());
+    }
+    Ok(row)
 }
 
 /// Where a stack backup goes when the caller names no destination: a
@@ -2606,7 +3021,10 @@ impl UnitProvider for DockerUnitProvider {
                                 payload_schema: None,
                                 response_schema: None,
                             },
-                        ],
+                        ]
+                        .into_iter()
+                        .chain(via_stack_actions())
+                        .collect(),
                     },
                     VerbDecl {
                         verb: Verb::Create,
@@ -4621,5 +5039,291 @@ mod tests {
         let err = format!("{:#}", run(&mut s, true).err().unwrap());
         assert_eq!(s.calls, ["live", "take_down", "write", "swap", "up"]);
         assert!(err.contains("compose up failed: up broke"), "{err}");
+    }
+
+    struct FakeUpdate {
+        calls: Vec<String>,
+        up_fails: bool,
+        healthy: bool,
+        restore_fails: bool,
+        recreated: bool,
+    }
+
+    fn snap(image: &str) -> Snapshot {
+        Snapshot {
+            containers: vec![SnapContainer {
+                id: "c1".into(),
+                service: "app".into(),
+                reference: "app:1".into(),
+                image_id: image.into(),
+            }],
+            health: Vec::new(),
+        }
+    }
+
+    impl UpdateSteps for FakeUpdate {
+        fn snapshot(&mut self) -> BoxFuture<'_, Result<Snapshot>> {
+            let first = !self.calls.iter().any(|c| c == "snapshot");
+            self.calls.push("snapshot".into());
+            let image = if first || !self.recreated {
+                "sha256:old"
+            } else {
+                "sha256:new"
+            };
+            Box::pin(async move { Ok(snap(image)) })
+        }
+        fn backup(&mut self) -> BoxFuture<'_, Result<BackupRef>> {
+            self.calls.push("backup".into());
+            Box::pin(async {
+                Ok(BackupRef {
+                    locator: "/b/web-1.tar.gz".into(),
+                    manager: "docker@test".into(),
+                    timestamp: 1,
+                    checksum: Some("sha256:00".into()),
+                })
+            })
+        }
+        fn pull(&mut self) -> BoxFuture<'_, Result<String>> {
+            self.calls.push("pull".into());
+            Box::pin(async { Ok("pulled".into()) })
+        }
+        fn up(&mut self) -> BoxFuture<'_, Result<String>> {
+            self.calls.push("up".into());
+            let fails = self.up_fails;
+            Box::pin(async move {
+                if fails {
+                    anyhow::bail!("up broke")
+                }
+                Ok("recreated".into())
+            })
+        }
+        fn healthy(&mut self, timeout: Duration) -> BoxFuture<'_, Result<bool>> {
+            self.calls.push(format!("healthy {}", timeout.as_secs()));
+            let ok = self.healthy;
+            Box::pin(async move { Ok(ok) })
+        }
+        fn revert_images(&mut self, before: Snapshot) -> BoxFuture<'_, Result<()>> {
+            self.calls
+                .push(format!("revert {}", before.containers[0].image_id));
+            Box::pin(async { Ok(()) })
+        }
+        fn restore(&mut self, from: BackupRef) -> BoxFuture<'_, Result<String>> {
+            self.calls.push(format!("restore {}", from.locator));
+            let fails = self.restore_fails;
+            Box::pin(async move {
+                if fails {
+                    anyhow::bail!("tar: /srv/secret/path: engine said no")
+                }
+                Ok("restored".into())
+            })
+        }
+    }
+
+    fn update_run(
+        up_fails: bool,
+        healthy: bool,
+        restore_fails: bool,
+        recreated: bool,
+    ) -> (Vec<String>, Result<(bool, String)>) {
+        let mut s = FakeUpdate {
+            calls: Vec::new(),
+            up_fails,
+            healthy,
+            restore_fails,
+            recreated,
+        };
+        let r = plugin_toolkit::reactor::block_on(run_update(&mut s, Some(90)));
+        (s.calls, r)
+    }
+
+    #[test]
+    fn update_backs_up_pulls_ups_and_waits_healthy() {
+        let (calls, r) = update_run(false, true, false, true);
+        assert_eq!(
+            calls,
+            ["snapshot", "backup", "pull", "up", "healthy 90", "snapshot"]
+        );
+        let (changed, msg) = r.unwrap();
+        assert!(changed);
+        assert!(msg.contains("/b/web-1.tar.gz"), "{msg}");
+        let (_, r) = update_run(false, true, false, false);
+        assert!(!r.unwrap().0, "nothing recreated is no change");
+    }
+
+    #[test]
+    fn an_unhealthy_update_reverts_images_and_restores_the_backup() {
+        let (calls, r) = update_run(false, false, false, true);
+        assert_eq!(
+            calls,
+            [
+                "snapshot",
+                "backup",
+                "pull",
+                "up",
+                "healthy 90",
+                "revert sha256:old",
+                "restore /b/web-1.tar.gz"
+            ]
+        );
+        let err = format!("{:#}", r.unwrap_err());
+        assert!(err.contains("rolled back to the previous images"), "{err}");
+        assert!(err.contains("did not come up healthy"), "{err}");
+    }
+
+    #[test]
+    fn a_failed_up_reverts_images_and_restores_the_backup() {
+        let (calls, r) = update_run(true, true, false, true);
+        assert_eq!(
+            calls[3..],
+            ["up", "revert sha256:old", "restore /b/web-1.tar.gz"]
+        );
+        let err = format!("{:#}", r.unwrap_err());
+        assert!(err.contains("compose up failed"), "{err}");
+    }
+
+    #[test]
+    fn a_failed_rollback_reports_no_paths_or_engine_text() {
+        let (_, r) = update_run(false, false, true, true);
+        let err = format!("{:#}", r.unwrap_err());
+        assert!(err.contains("rollback did not complete"), "{err}");
+        assert!(!err.contains('/'), "{err}");
+        assert!(!err.contains("engine said"), "{err}");
+    }
+
+    #[test]
+    fn health_timeout_follows_the_healthchecks_within_bounds() {
+        use bollard::models::HealthConfig;
+        let s = 1_000_000_000;
+        let hc = |start: i64, interval: i64, retries: i64| HealthConfig {
+            start_period: Some(start * s),
+            interval: Some(interval * s),
+            timeout: Some(5 * s),
+            retries: Some(retries),
+            ..Default::default()
+        };
+        assert_eq!(health_timeout(&[], None), HEALTH_FLOOR);
+        assert_eq!(
+            health_timeout(&[hc(60, 10, 5), hc(0, 5, 3)], None),
+            Duration::from_secs(60 + 15 * 5)
+        );
+        assert_eq!(health_timeout(&[hc(3600, 10, 5)], None), HEALTH_CAP);
+        assert_eq!(health_timeout(&[], Some(120)), Duration::from_secs(120));
+        assert_eq!(health_timeout(&[], Some(99_999)), HEALTH_CAP);
+    }
+
+    #[test]
+    fn revert_images_tags_the_previous_image_back() {
+        use crate::test_engine::{FakeEngine, Route};
+        let engine = FakeEngine::routed(vec![Route::new("POST", "/tag", 201, "")]);
+        let docker = engine.client();
+        plugin_toolkit::reactor::block_on(revert_images(&docker, &snap("sha256:old"))).unwrap();
+        let tags = engine.targets("POST");
+        assert_eq!(tags.len(), 1, "{tags:?}");
+        assert!(tags[0].contains("/images/sha256:old/tag"), "{tags:?}");
+        assert!(
+            tags[0].contains("repo=app") && tags[0].contains("tag=1"),
+            "{tags:?}"
+        );
+    }
+
+    #[test]
+    fn the_update_plan_flags_granted_services_whose_upstream_changed() {
+        let mut row = StackRow {
+            name: "web".into(),
+            dir: "/s/web".into(),
+            file: "compose.yaml".into(),
+            enabled: true,
+            allow: Vec::new(),
+        };
+        let c = &snap("sha256:old").containers[0];
+        let plain = planned_image(&row, c, vec!["sha256:a".into()], Ok("sha256:b".into()));
+        assert_eq!(plain.update_available, Some(true));
+        assert!(!plain.needs_reapproval);
+        row.allow.push(policy::Grant {
+            service: "app".into(),
+            image: "app:1".into(),
+            definition: String::new(),
+            image_digest: "sha256:a".into(),
+            allow: "privileged".into(),
+        });
+        let granted = planned_image(&row, c, vec!["sha256:a".into()], Ok("sha256:b".into()));
+        assert!(granted.granted && granted.needs_reapproval);
+        let same = planned_image(&row, c, vec!["sha256:b".into()], Ok("sha256:b".into()));
+        assert!(!same.needs_reapproval);
+        let unknown = planned_image(&row, c, Vec::new(), Err("denied".into()));
+        assert_eq!(unknown.update_available, None);
+        assert_eq!(unknown.error.as_deref(), Some("denied"));
+    }
+
+    #[test]
+    fn container_routing_checks_admin_first_and_never_exempts_a_container_backup() {
+        use crate::test_support::caller;
+        let provider = DockerUnitProvider::new(crate::registration::adapter());
+        for (action, who) in [
+            (ACTION_UPDATE, Some(caller("user"))),
+            (ACTION_RESTORE, None),
+            (ACTION_BACKUP, None),
+        ] {
+            let err = err_of(plugin_toolkit::reactor::block_on(provider.do_update(
+                UpdateArgs {
+                    id: UnitId {
+                        manager: "docker@test".into(),
+                        kind: KIND.into(),
+                        id: "app".into(),
+                        name: "app".into(),
+                    },
+                    action: action.into(),
+                    payload: None,
+                    caller: who,
+                },
+            )));
+            crate::test_support::assert_admin_refusal(&err);
+        }
+    }
+
+    #[test]
+    fn container_actions_resolve_to_the_owning_stack() {
+        use crate::test_engine::{FakeEngine, Route};
+        let ((), _) = crate::test_support::with_db(|| {
+            let root = tempfile::tempdir().unwrap();
+            register_root(root.path());
+            let dir = root.path().join("web");
+            let row = registered_stack(&dir, "services: {}\n", None);
+            let labels = json!({ COMPOSE_WORKING_DIR_LABEL: row.dir, "orca.stack": "web" });
+            let stray = json!({ COMPOSE_WORKING_DIR_LABEL: row.dir, "orca.stack": "db" });
+            let engine = FakeEngine::routed(vec![
+                Route::new("GET", "/containers/app/json", 200,
+                    json!({"Id": "c1", "Config": {"Labels": labels}}).to_string()),
+                Route::new("GET", "/containers/stray/json", 200,
+                    json!({"Id": "c3", "Config": {"Labels": stray}}).to_string()),
+                Route::new("GET", "/containers/json", 200,
+                    json!([{"Id": "c1", "Labels": labels}, {"Id": "c2", "Labels": {}}, {"Id": "c3", "Labels": stray}]).to_string()),
+            ]);
+            let docker = engine.client();
+            let found = plugin_toolkit::reactor::block_on(owning_stack(&docker, "app")).unwrap();
+            assert_eq!(found.name, "web");
+            for other in ["other", "stray"] {
+                let err = plugin_toolkit::reactor::block_on(owning_stack(&docker, other))
+                    .unwrap_err()
+                    .to_string();
+                assert_eq!(
+                    err,
+                    format!("container {other} not found in a managed stack")
+                );
+            }
+        });
+        let decls = DockerUnitProvider::new(crate::registration::adapter()).declarations();
+        let container = decls.iter().find(|d| d.kind == KIND).unwrap();
+        let update = container
+            .verbs
+            .iter()
+            .find(|v| v.verb == Verb::Update)
+            .unwrap();
+        for action in CONTAINER_VIA_STACK {
+            assert!(
+                update.actions.iter().any(|a| a.action == *action),
+                "{action}"
+            );
+        }
     }
 }
