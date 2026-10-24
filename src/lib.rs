@@ -143,8 +143,9 @@ pub async fn clean_command(
 
 /// Run the docker CLI with `args`, optionally in `cwd`, returning stdout,
 /// under the same environment as [`clean_command`]. The child leads its own
-/// process group so a timeout also kills the compose plugin it spawns; the
-/// toolkit's `Command` cannot set a process group or expose the pid.
+/// process group, and every lingering descendant in that group is killed on
+/// every return, including timeout and cancellation; the toolkit's `Command`
+/// cannot set a process group or expose the pid.
 pub async fn run(args: &[&str], cwd: Option<&str>) -> plugin_toolkit::anyhow::Result<String> {
     let mut cmd = std::process::Command::new("/usr/bin/env");
     cmd.args(clean_argv(resolve_docker_bin()).await?).args(args);
@@ -156,8 +157,8 @@ pub async fn run(args: &[&str], cwd: Option<&str>) -> plugin_toolkit::anyhow::Re
 
 const CLI_BUDGET: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
-const POLL_MIN: std::time::Duration = std::time::Duration::from_millis(20);
-const POLL_MAX: std::time::Duration = std::time::Duration::from_millis(250);
+const POLL_MIN: std::time::Duration = std::time::Duration::from_millis(5);
+const POLL_MAX: std::time::Duration = std::time::Duration::from_millis(50);
 
 struct GroupGuard {
     child: Option<std::process::Child>,
@@ -171,8 +172,20 @@ impl GroupGuard {
         }
     }
 
-    fn disarm(&mut self) {
-        self.child.take();
+    fn leader_exited(&self) -> std::io::Result<bool> {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.pgid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(info.si_signo != 0)
     }
 }
 
@@ -180,7 +193,11 @@ impl Drop for GroupGuard {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
             self.kill_group();
-            child.wait().ok();
+            if !matches!(child.try_wait(), Ok(Some(_))) {
+                std::thread::spawn(move || {
+                    child.wait().ok();
+                });
+            }
         }
     }
 }
@@ -199,25 +216,35 @@ fn drain(
     });
 }
 
-async fn collect(rx: std::sync::mpsc::Receiver<(usize, Vec<u8>)>) -> [Vec<u8>; 2] {
+async fn collect(
+    rx: std::sync::mpsc::Receiver<(usize, Vec<u8>)>,
+) -> plugin_toolkit::anyhow::Result<[Vec<u8>; 2]> {
     let mut bufs = [Vec::new(), Vec::new()];
     let mut pending = 2;
     let deadline = std::time::Instant::now() + DRAIN_BUDGET;
     let mut pause = POLL_MIN;
-    while pending > 0 && std::time::Instant::now() < deadline {
+    while pending > 0 {
         match rx.try_recv() {
             Ok((slot, buf)) => {
                 bufs[slot] = buf;
                 pending -= 1;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
                 plugin_toolkit::time::sleep(pause).await;
                 pause = (pause * 2).min(POLL_MAX);
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
         }
     }
-    bufs
+    if pending > 0 {
+        plugin_toolkit::anyhow::bail!(
+            "output drain exceeded budget; a process outside the group holds the pipe"
+        );
+    }
+    Ok(bufs)
 }
 
 async fn run_within(
@@ -240,15 +267,7 @@ async fn run_within(
     };
     let deadline = std::time::Instant::now() + budget;
     let mut pause = POLL_MIN;
-    let status = loop {
-        if let Some(status) = guard
-            .child
-            .as_mut()
-            .and_then(|c| c.try_wait().transpose())
-            .transpose()?
-        {
-            break status;
-        }
+    while !guard.leader_exited()? {
         if std::time::Instant::now() >= deadline {
             drop(guard);
             plugin_toolkit::anyhow::bail!(
@@ -258,10 +277,13 @@ async fn run_within(
         }
         plugin_toolkit::time::sleep(pause).await;
         pause = (pause * 2).min(POLL_MAX);
-    };
+    }
     guard.kill_group();
-    guard.disarm();
-    let [out, err] = collect(rx).await;
+    let Some(mut leader) = guard.child.take() else {
+        unreachable!()
+    };
+    let status = leader.wait()?;
+    let [out, err] = collect(rx).await?;
     let stdout = String::from_utf8_lossy(&out).to_string();
     let stderr = String::from_utf8_lossy(&err).to_string();
     if !status.success() {
@@ -326,29 +348,25 @@ mod tests {
             std::time::Duration::from_millis(300),
         ))
         .unwrap_err();
-        let pid: libc::pid_t = std::fs::read_to_string(&pidfile)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        std::fs::remove_file(&pidfile).ok();
-        let gone = (0..50).any(|_| {
-            if unsafe { libc::kill(pid, 0) } != 0 {
-                return true;
+        assert!(grandchild_dead(&pidfile), "grandchild survived the timeout");
+    }
+
+    fn read_pid(pidfile: &std::path::Path) -> libc::pid_t {
+        for _ in 0..250 {
+            if let Some(pid) = std::fs::read_to_string(pidfile)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                std::fs::remove_file(pidfile).ok();
+                return pid;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
-            false
-        });
-        assert!(gone, "grandchild {pid} survived the timeout");
+        }
+        panic!("pidfile {} never appeared", pidfile.display());
     }
 
     fn grandchild_dead(pidfile: &std::path::Path) -> bool {
-        let pid: libc::pid_t = std::fs::read_to_string(pidfile)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        std::fs::remove_file(pidfile).ok();
+        let pid = read_pid(pidfile);
         (0..50).any(|_| {
             if unsafe { libc::kill(pid, 0) } != 0 {
                 return true;
@@ -395,6 +413,27 @@ mod tests {
             grandchild_dead(&pidfile),
             "grandchild survived cancellation"
         );
+    }
+
+    #[test]
+    fn a_process_outside_the_group_holding_stdout_is_an_error() {
+        let pidfile =
+            std::env::temp_dir().join(format!("docker-setsid-{}.pid", std::process::id()));
+        std::fs::remove_file(&pidfile).ok();
+        let script = format!(
+            "perl -e 'use POSIX; exit if fork; POSIX::setsid(); open F, \">{}\"; print F $$; close F; sleep 30' & echo ok; wait",
+            pidfile.display()
+        );
+        let err = plugin_toolkit::reactor::block_on(run_within(
+            sh(&script),
+            std::time::Duration::from_secs(20),
+        ))
+        .unwrap_err();
+        let pid = read_pid(&pidfile);
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        assert!(err.to_string().contains("drain exceeded budget"), "{err}");
     }
 
     #[test]

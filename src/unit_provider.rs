@@ -2877,7 +2877,7 @@ fn image_matches(
         Ok(())
     } else {
         Err(format!(
-            "container runs an older image than {declared} resolves to now; recreate the service"
+            "running image digest does not match {declared}; if expected, recreate the service"
         ))
     }
 }
@@ -3678,7 +3678,7 @@ mod tests {
         assert!(image_matches(&format!("nginx@{a}"), &[], &at(&b)).is_err());
         assert_eq!(
             image_matches("nginx:1", &at(&a), &at(&b)).unwrap_err(),
-            "container runs an older image than nginx:1 resolves to now; recreate the service"
+            "running image digest does not match nginx:1; if expected, recreate the service"
         );
         assert_eq!(
             image_matches("nginx:1", &[], &at(&a)).unwrap_err(),
