@@ -7,7 +7,10 @@ use plugin_toolkit::prelude::*;
 use plugin_toolkit::serde_json::{self, Value, json};
 
 const REDACTED: &str = "***";
-const SECRET_MARKERS: [&str; 6] = ["TOKEN", "SECRET", "PASSWORD", "KEY", "PASS", "CRED"];
+const SECRET_MARKERS: [&str; 9] = [
+    "TOKEN", "SECRET", "PASSWORD", "KEY", "PASS", "CRED", "AUTH", "CLAIM", "PRIVATE",
+];
+const COMPOSE_LABEL_PREFIX: &str = "com.docker.compose.";
 
 #[orca_struct(args)]
 pub struct DockerContainerInspectArgs {
@@ -114,6 +117,9 @@ pub struct ContainerInspectOutput {
     pub cap_drop: Vec<String>,
     pub privileged: bool,
     pub labels: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redacted_labels: Vec<String>,
+    pub init: bool,
     pub user: String,
     pub working_dir: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -133,9 +139,74 @@ pub fn is_secret_name(name: &str) -> bool {
     SECRET_MARKERS.iter().any(|m| upper.contains(m))
 }
 
+pub fn is_secret_value(value: &str) -> bool {
+    if value.starts_with('/') && is_secret_name(value) {
+        return true;
+    }
+    let Some((_, rest)) = value.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    authority
+        .rsplit_once('@')
+        .is_some_and(|(userinfo, _)| userinfo.contains(':'))
+}
+
+fn is_secret(name: &str, value: &str) -> bool {
+    is_secret_name(name) || is_secret_value(value)
+}
+
+fn redact_args(args: &[String], replace: impl Fn(&str) -> String) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut pending: Option<String> = None;
+    for arg in args {
+        if let Some(flag) = pending.take() {
+            out.push(replace(&flag));
+            continue;
+        }
+        if let Some((name, value)) = arg.split_once('=')
+            && is_secret(name, value)
+        {
+            out.push(format!("{name}={}", replace(name)));
+        } else if is_secret_value(arg) {
+            out.push(replace("ARG"));
+        } else {
+            if arg.starts_with('-') && is_secret_name(arg) {
+                pending = Some(arg.clone());
+            }
+            out.push(arg.clone());
+        }
+    }
+    out
+}
+
+fn env_ref(name: &str) -> String {
+    if name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return format!("${{{name}}}");
+    }
+    let clean: String = name
+        .trim_start_matches('-')
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("${{SECRET_{clean}}}")
+}
+
+fn is_anonymous_volume(name: &str) -> bool {
+    name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 pub fn env_var(raw: &str) -> EnvVar {
     let (name, value) = raw.split_once('=').unwrap_or((raw, ""));
-    let redacted = is_secret_name(name);
+    let redacted = is_secret(name, value);
     EnvVar {
         name: name.to_owned(),
         value: if redacted {
@@ -181,6 +252,22 @@ pub fn describe(c: &ContainerInspectResponse) -> ContainerInspectOutput {
         .unwrap_or_default();
     networks.sort();
     let restart = host.restart_policy.unwrap_or_default();
+    let mut redacted_labels = Vec::new();
+    let labels = config
+        .labels
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(k, v)| {
+            if is_secret(&k, &v) {
+                redacted_labels.push(k.clone());
+                (k, REDACTED.to_owned())
+            } else {
+                (k, v)
+            }
+        })
+        .collect();
+    redacted_labels.sort();
+    let masked = |a: Vec<String>| redact_args(&a, |_| REDACTED.to_owned());
     ContainerInspectOutput {
         id: c.id.clone().unwrap_or_default(),
         name: c
@@ -189,8 +276,8 @@ pub fn describe(c: &ContainerInspectResponse) -> ContainerInspectOutput {
             .map(|n| n.trim_start_matches('/').to_owned())
             .unwrap_or_default(),
         image: config.image.unwrap_or_default(),
-        command: config.cmd.unwrap_or_default(),
-        entrypoint: config.entrypoint.unwrap_or_default(),
+        command: masked(config.cmd.unwrap_or_default()),
+        entrypoint: masked(config.entrypoint.unwrap_or_default()),
         env: config
             .env
             .unwrap_or_default()
@@ -241,13 +328,15 @@ pub fn describe(c: &ContainerInspectResponse) -> ContainerInspectOutput {
         cap_add: host.cap_add.unwrap_or_default(),
         cap_drop: host.cap_drop.unwrap_or_default(),
         privileged: host.privileged.unwrap_or(false),
-        labels: config.labels.unwrap_or_default().into_iter().collect(),
+        labels,
+        redacted_labels,
+        init: host.init.unwrap_or(false),
         user: config.user.unwrap_or_default(),
         working_dir: config.working_dir.unwrap_or_default(),
         healthcheck: config.healthcheck.and_then(|h| {
             let test = h.test.unwrap_or_default();
             (!test.is_empty()).then_some(HealthcheckInfo {
-                test,
+                test: masked(test),
                 interval_ns: h.interval.filter(|n| *n > 0),
                 timeout_ns: h.timeout.filter(|n| *n > 0),
                 retries: h.retries.filter(|n| *n > 0),
@@ -258,12 +347,36 @@ pub fn describe(c: &ContainerInspectResponse) -> ContainerInspectOutput {
 }
 
 fn duration(ns: i64) -> String {
-    let ms = ns / 1_000_000;
-    if ms % 1000 == 0 {
-        format!("{}s", ms / 1000)
-    } else {
-        format!("{ms}ms")
+    match ns {
+        n if n % 1_000_000_000 == 0 => format!("{}s", n / 1_000_000_000),
+        n if n % 1_000_000 == 0 => format!("{}ms", n / 1_000_000),
+        n if n % 1_000 == 0 => format!("{}us", n / 1_000),
+        n => format!("{n}ns"),
     }
+}
+
+fn lit(s: &str) -> String {
+    s.replace('$', "$$")
+}
+
+fn compose_args(v: &[String]) -> Vec<String> {
+    let mut prev: Option<&str> = None;
+    v.iter()
+        .map(|arg| {
+            let out = if arg == REDACTED {
+                env_ref(
+                    prev.filter(|p| p.starts_with('-') && !p.contains('='))
+                        .unwrap_or("ARG"),
+                )
+            } else if let Some(name) = arg.strip_suffix(&format!("={REDACTED}")) {
+                format!("{}={}", lit(name), env_ref(name))
+            } else {
+                lit(arg)
+            };
+            prev = Some(arg);
+            out
+        })
+        .collect()
 }
 
 fn is_named_network(mode: &str) -> bool {
@@ -275,21 +388,24 @@ fn is_named_network(mode: &str) -> bool {
 
 pub fn service_value(c: &ContainerInspectOutput) -> Value {
     let mut svc = serde_json::Map::new();
-    svc.insert("image".into(), json!(c.image));
+    svc.insert("image".into(), json!(lit(&c.image)));
     if !c.name.is_empty() {
-        svc.insert("container_name".into(), json!(c.name));
+        svc.insert("container_name".into(), json!(lit(&c.name)));
     }
     if !c.entrypoint.is_empty() {
-        svc.insert("entrypoint".into(), json!(c.entrypoint));
+        svc.insert("entrypoint".into(), json!(compose_args(&c.entrypoint)));
     }
     if !c.command.is_empty() {
-        svc.insert("command".into(), json!(c.command));
+        svc.insert("command".into(), json!(compose_args(&c.command)));
+    }
+    if c.init {
+        svc.insert("init".into(), json!(true));
     }
     if !c.user.is_empty() {
-        svc.insert("user".into(), json!(c.user));
+        svc.insert("user".into(), json!(lit(&c.user)));
     }
     if !c.working_dir.is_empty() {
-        svc.insert("working_dir".into(), json!(c.working_dir));
+        svc.insert("working_dir".into(), json!(lit(&c.working_dir)));
     }
     if !c.env.is_empty() {
         let env: serde_json::Map<String, Value> = c
@@ -297,9 +413,9 @@ pub fn service_value(c: &ContainerInspectOutput) -> Value {
             .iter()
             .map(|e| {
                 let v = if e.redacted {
-                    format!("${{{}}}", e.name)
+                    env_ref(&e.name)
                 } else {
-                    e.value.replace('$', "$$")
+                    lit(&e.value)
                 };
                 (e.name.clone(), json!(v))
             })
@@ -318,10 +434,18 @@ pub fn service_value(c: &ContainerInspectOutput) -> Value {
             .iter()
             .map(|p| {
                 let target = p.container_port.trim_end_matches("/tcp");
-                match (&p.host_ip, &p.host_port) {
+                let ip = p.host_ip.as_deref().map(|ip| {
+                    if ip.contains(':') && !ip.starts_with('[') {
+                        format!("[{ip}]")
+                    } else {
+                        ip.to_owned()
+                    }
+                });
+                match (ip, &p.host_port) {
                     (Some(ip), Some(hp)) => format!("{ip}:{hp}:{target}"),
+                    (Some(ip), None) => format!("{ip}::{target}"),
                     (None, Some(hp)) => format!("{hp}:{target}"),
-                    _ => target.to_owned(),
+                    (None, None) => target.to_owned(),
                 }
             })
             .collect();
@@ -333,15 +457,17 @@ pub fn service_value(c: &ContainerInspectOutput) -> Value {
             .iter()
             .map(|m| {
                 let source = match (&m.volume_name, m.kind.as_str()) {
-                    (Some(v), "volume") => v.clone(),
-                    _ => m.source.clone(),
+                    (Some(v), "volume") if is_anonymous_volume(v) => String::new(),
+                    (Some(v), "volume") => lit(v),
+                    (_, "volume") => String::new(),
+                    _ => lit(&m.source),
                 };
                 let mut v = serde_json::Map::new();
                 v.insert("type".into(), json!(m.kind));
                 if !source.is_empty() {
                     v.insert("source".into(), json!(source));
                 }
-                v.insert("target".into(), json!(m.target));
+                v.insert("target".into(), json!(lit(&m.target)));
                 if m.read_only {
                     v.insert("read_only".into(), json!(true));
                 }
@@ -389,7 +515,15 @@ pub fn service_value(c: &ContainerInspectOutput) -> Value {
         let reqs: Vec<Value> = c
             .device_requests
             .iter()
-            .map(|d| {
+            .flat_map(|d| {
+                let sets: Vec<Vec<String>> = if d.capabilities.is_empty() {
+                    vec![Vec::new()]
+                } else {
+                    d.capabilities.clone()
+                };
+                sets.into_iter().map(move |caps| (d, caps))
+            })
+            .map(|(d, caps)| {
                 let mut r = serde_json::Map::new();
                 if !d.driver.is_empty() {
                     r.insert("driver".into(), json!(d.driver));
@@ -401,7 +535,6 @@ pub fn service_value(c: &ContainerInspectOutput) -> Value {
                 } else {
                     r.insert("count".into(), json!(d.count));
                 }
-                let caps: Vec<&String> = d.capabilities.iter().flatten().collect();
                 r.insert("capabilities".into(), json!(caps));
                 Value::Object(r)
             })
@@ -411,12 +544,29 @@ pub fn service_value(c: &ContainerInspectOutput) -> Value {
             json!({ "resources": { "reservations": { "devices": reqs } } }),
         );
     }
-    if !c.labels.is_empty() {
-        svc.insert("labels".into(), json!(c.labels));
+    let labels: serde_json::Map<String, Value> = c
+        .labels
+        .iter()
+        .filter(|(k, _)| !k.starts_with(COMPOSE_LABEL_PREFIX))
+        .map(|(k, v)| {
+            let v = if c.redacted_labels.contains(k) {
+                env_ref(k)
+            } else {
+                lit(v)
+            };
+            (k.clone(), json!(v))
+        })
+        .collect();
+    if !labels.is_empty() {
+        svc.insert("labels".into(), Value::Object(labels));
     }
     if let Some(h) = &c.healthcheck {
         let mut hc = serde_json::Map::new();
-        hc.insert("test".into(), json!(h.test));
+        if h.test.first().map(String::as_str) == Some("NONE") {
+            hc.insert("disable".into(), json!(true));
+        } else {
+            hc.insert("test".into(), json!(compose_args(&h.test)));
+        }
         for (key, ns) in [
             ("interval", h.interval_ns),
             ("timeout", h.timeout_ns),
@@ -448,15 +598,23 @@ fn scalar(v: &Value) -> String {
     }
 }
 
+fn is_plain_key(k: &str) -> bool {
+    let reserved = matches!(
+        k.to_ascii_lowercase().as_str(),
+        "true" | "false" | "yes" | "no" | "on" | "off" | "y" | "n" | "null" | "~"
+    );
+    !reserved
+        && k.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && k.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
 fn emit(v: &Value, indent: usize, out: &mut String) {
     let pad = " ".repeat(indent);
     match v {
         Value::Object(map) => {
             for (k, val) in map {
-                let key = if !k.is_empty()
-                    && k.chars()
-                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
-                {
+                let key = if is_plain_key(k) {
                     k.clone()
                 } else {
                     scalar(&Value::String(k.clone()))
@@ -517,6 +675,7 @@ pub fn compose_yaml(c: &ContainerInspectOutput) -> ContainerComposeOutput {
         .iter()
         .filter(|m| m.kind == "volume")
         .filter_map(|m| m.volume_name.clone())
+        .filter(|v| !is_anonymous_volume(v))
         .map(|v| (v, json!({ "external": true })))
         .collect();
     if !vols.is_empty() {
@@ -660,9 +819,133 @@ mod tests {
         assert!(!by["TZ"].redacted);
         assert_eq!(by["DB_PASSWORD"].value, REDACTED);
         assert_eq!(by["api_key"].value, REDACTED);
-        assert_eq!(by["PLEX_CLAIM"].value, "claim-xyz");
+        assert_eq!(by["PLEX_CLAIM"].value, REDACTED);
         assert!(!out.env.iter().any(|e| e.value == "hunter2"));
         assert_eq!(env_var("NOVALUE").value, "");
+    }
+
+    #[test]
+    fn secret_values_are_redacted_whatever_the_name() {
+        for raw in [
+            "DB=/run/secrets/db",
+            "CONF=/var/run/secrets/app/creds",
+            "DATABASE_URL=postgres://app:hunter2@db:5432/app",
+            "UPSTREAM=https://u:p@host/path?x=1",
+        ] {
+            assert_eq!(env_var(raw).value, REDACTED, "{raw}");
+        }
+        for raw in [
+            "URL=https://host/a@b",
+            "HOME=/home/app",
+            "DSN=redis://cache:6379",
+        ] {
+            assert!(!env_var(raw).redacted, "{raw}");
+        }
+    }
+
+    #[test]
+    fn secrets_in_args_labels_and_healthchecks_never_leak() {
+        let mut c = inspected();
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let raw = args(&[
+            "--password",
+            "hunter2",
+            "--token=tok1",
+            "API_KEY=k2",
+            "postgres://a:pw3@db/x",
+            "--port",
+            "80",
+        ]);
+        let masked = redact_args(&raw, |_| REDACTED.to_owned());
+        for leak in ["hunter2", "tok1", "k2", "pw3"] {
+            assert!(
+                !masked.iter().any(|a| a.contains(leak)),
+                "{leak} in {masked:?}"
+            );
+        }
+        assert_eq!(masked[6], "80");
+        c.command = masked;
+        c.labels.insert(
+            "traefik.http.middlewares.a.basicauth.users".into(),
+            REDACTED.into(),
+        );
+        c.redacted_labels = vec!["traefik.http.middlewares.a.basicauth.users".into()];
+        let y = compose_yaml(&c).yaml;
+        assert!(
+            y.contains("- \"--password\"\n      - \"${SECRET_PASSWORD}\"\n"),
+            "{y}"
+        );
+        assert!(y.contains("- \"--token=${SECRET_TOKEN}\"\n"), "{y}");
+        assert!(y.contains("- \"API_KEY=${API_KEY}\"\n"), "{y}");
+        assert!(y.contains("- \"${ARG}\"\n"), "{y}");
+        assert!(
+            y.contains(
+                "basicauth.users\": \"${SECRET_TRAEFIK_HTTP_MIDDLEWARES_A_BASICAUTH_USERS}\""
+            ) || y.contains(
+                "basicauth.users: \"${SECRET_TRAEFIK_HTTP_MIDDLEWARES_A_BASICAUTH_USERS}\""
+            ),
+            "{y}"
+        );
+        assert!(!y.contains(REDACTED), "{y}");
+    }
+
+    #[test]
+    fn compose_reproduces_init_anonymous_volumes_and_ipv6_ports() {
+        let mut c = inspected();
+        c.init = true;
+        c.mounts.push(MountInfo {
+            kind: "volume".into(),
+            source: "/var/lib/docker/volumes/x/_data".into(),
+            target: "/cache".into(),
+            read_only: false,
+            volume_name: Some("a".repeat(64)),
+        });
+        c.ports = vec![
+            PortMapping {
+                container_port: "53/udp".into(),
+                host_ip: Some("::1".into()),
+                host_port: Some("53".into()),
+            },
+            PortMapping {
+                container_port: "80/tcp".into(),
+                host_ip: Some("10.0.0.5".into()),
+                host_port: None,
+            },
+        ];
+        let y = compose_yaml(&c).yaml;
+        assert!(y.contains("    init: true\n"), "{y}");
+        assert!(
+            y.contains("      - target: \"/cache\"\n        type: \"volume\"\n"),
+            "{y}"
+        );
+        assert!(!y.contains(&"a".repeat(64)), "{y}");
+        assert!(y.contains("\"[::1]:53:53/udp\""), "{y}");
+        assert!(y.contains("\"10.0.0.5::80\""), "{y}");
+        assert!(!y.contains("com.docker.compose"), "{y}");
+    }
+
+    #[test]
+    fn yaml_quotes_keys_a_parser_would_retype() {
+        let mut out = String::new();
+        emit(
+            &json!({ "on": 1, "8080": 2, "-x": 3, "ok_key": 4 }),
+            0,
+            &mut out,
+        );
+        assert!(out.contains("\"on\": 1\n"), "{out}");
+        assert!(out.contains("\"8080\": 2\n"), "{out}");
+        assert!(out.contains("\"-x\": 3\n"), "{out}");
+        assert!(out.contains("ok_key: 4\n"), "{out}");
+    }
+
+    #[test]
+    fn literal_dollars_are_escaped_everywhere() {
+        let mut c = inspected();
+        c.command = vec!["echo $HOME".into()];
+        c.labels.insert("price".into(), "$5".into());
+        let y = compose_yaml(&c).yaml;
+        assert!(y.contains("\"echo $$HOME\""), "{y}");
+        assert!(y.contains("price: \"$$5\""), "{y}");
     }
 
     #[test]

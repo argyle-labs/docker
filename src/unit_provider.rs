@@ -1121,11 +1121,10 @@ impl DockerUnitProvider {
                     .map_err(|e| anyhow::anyhow!("inspect {}: {e}", exec.id))?;
                 let target = inspected_id(&info, &exec.id)?;
                 let resolve = |p: &std::path::Path| Ok(std::fs::canonicalize(p)?);
-                let why = match exec_scope(docker, &info).await {
-                    Ok(scope) => exec_refusal(&info, &scope, &resolve),
-                    Err(why) => Some(why),
-                };
-                if let Some(why) = why {
+                let scope = exec_scope(docker, &info)
+                    .await
+                    .map_err(|b| exec_blocked(&exec.id, b))?;
+                if let Some(why) = exec_refusal(&info, &scope, &resolve) {
                     return Err(exec_refused(&exec.id, &why));
                 }
                 let result = self
@@ -2623,14 +2622,35 @@ fn volume_names(info: &bollard::models::ContainerInspectResponse) -> Vec<String>
     names
 }
 
+enum ExecBlock {
+    Refused(String),
+    Failed(String),
+}
+
+impl From<String> for ExecBlock {
+    fn from(why: String) -> Self {
+        ExecBlock::Failed(why)
+    }
+}
+
 fn exec_refused(id: &str, why: &str) -> anyhow::Error {
     plugin_toolkit::contract::OrcaError::forbidden(format!("exec in {id} refused: {why}")).into()
+}
+
+fn exec_blocked(id: &str, block: ExecBlock) -> anyhow::Error {
+    match block {
+        ExecBlock::Refused(why) => exec_refused(id, &why),
+        ExecBlock::Failed(why) => plugin_toolkit::contract::OrcaError::unavailable(format!(
+            "exec in {id} cannot be vetted: {why}"
+        ))
+        .into(),
+    }
 }
 
 async fn exec_scope(
     docker: &bollard::Docker,
     info: &bollard::models::ContainerInspectResponse,
-) -> std::result::Result<ExecScope, String> {
+) -> std::result::Result<ExecScope, ExecBlock> {
     let members = list_stack_members(docker)
         .await
         .map_err(|e| format!("cannot list the stacks' containers: {e}"))?;
@@ -2638,7 +2658,9 @@ async fn exec_scope(
         .id
         .as_ref()
         .and_then(|id| members.get(id))
-        .ok_or("the container is not part of a registered stack")?;
+        .ok_or_else(|| {
+            ExecBlock::Refused("the container is not part of a registered stack".into())
+        })?;
     let labels = info
         .config
         .as_ref()
@@ -2646,10 +2668,10 @@ async fn exec_scope(
         .unwrap_or_default();
     let service = labels
         .get(crate::image_update::COMPOSE_SERVICE_LABEL)
-        .ok_or("the container has no compose service label")?;
-    let hash = labels
-        .get(COMPOSE_CONFIG_HASH_LABEL)
-        .ok_or("the container has no compose config-hash label")?;
+        .ok_or_else(|| ExecBlock::Refused("the container has no compose service label".into()))?;
+    let hash = labels.get(COMPOSE_CONFIG_HASH_LABEL).ok_or_else(|| {
+        ExecBlock::Refused("the container has no compose config-hash label".into())
+    })?;
     let compose = row
         .compose()
         .map_err(|e| format!("stack {}: {e}", row.name))?;
@@ -2663,10 +2685,10 @@ async fn exec_scope(
         .await
         .map_err(|e| format!("cannot hash service {service} of stack {}: {e}", row.name))?;
     if &expected != hash {
-        return Err(format!(
+        return Err(ExecBlock::Refused(format!(
             "its config-hash does not match service {service} of stack {}",
             row.name
-        ));
+        )));
     }
     let stack_dir = std::fs::canonicalize(&row.dir)
         .map_err(|e| format!("cannot resolve stack dir {}: {e}", row.dir))?;
@@ -2732,8 +2754,12 @@ async fn exec_scope(
         hashes.insert(svc.to_string(), h);
     }
     for (name, p) in same_stack {
-        let svc = vet_peer(p, &hashes)
-            .map_err(|why| format!("namespace peer {name} of stack {}: {why}", row.name))?;
+        let svc = vet_peer(p, &hashes).map_err(|why| {
+            ExecBlock::Refused(format!(
+                "namespace peer {name} of stack {}: {why}",
+                row.name
+            ))
+        })?;
         if let Some(id) = p.id.clone() {
             declared.insert(id, declared_binds(&cfg, &svc, &resolve));
         }
@@ -3555,6 +3581,23 @@ mod tests {
         assert!(
             err.to_string().contains("not part of a registered stack"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn exec_that_cannot_be_vetted_is_unavailable_not_forbidden() {
+        let err = exec_blocked(
+            "web",
+            ExecBlock::Failed("cannot list the stacks' containers".into()),
+        );
+        assert_eq!(
+            refusal_kind(&err),
+            plugin_toolkit::contract::ErrorKind::Unavailable
+        );
+        let err = exec_blocked("web", ExecBlock::Refused("not ours".into()));
+        assert_eq!(
+            refusal_kind(&err),
+            plugin_toolkit::contract::ErrorKind::Forbidden
         );
     }
 
