@@ -2703,6 +2703,14 @@ async fn exec_scope(
         .filter(|g| &g.service == service)
         .map(|g| g.allow.clone())
         .collect();
+    let cfg_value: Value = serde_json::from_str(checked.config())
+        .map_err(|e| format!("cannot read the compose config of stack {}: {e}", row.name))?;
+    vet_image(docker, &cfg_value, service, info)
+        .await
+        .map_err(|b| match b {
+            ExecBlock::Refused(why) => ExecBlock::Refused(format!("{why} of stack {}", row.name)),
+            failed => failed,
+        })?;
     let mut peers = std::collections::HashMap::new();
     let hc = info.host_config.clone().unwrap_or_default();
     for peer in namespace_peers(&hc) {
@@ -2761,6 +2769,15 @@ async fn exec_scope(
                 row.name
             ))
         })?;
+        vet_image(docker, &cfg_value, &svc, p)
+            .await
+            .map_err(|b| match b {
+                ExecBlock::Refused(why) => ExecBlock::Refused(format!(
+                    "namespace peer {name} of stack {}: {why}",
+                    row.name
+                )),
+                failed => failed,
+            })?;
         if let Some(id) = p.id.clone() {
             declared.insert(id, declared_binds(&cfg, &svc, &resolve));
         }
@@ -2800,6 +2817,64 @@ fn vet_peer(
         return Err(format!("its config-hash does not match service {service}"));
     }
     Ok(service.to_string())
+}
+
+async fn vet_image(
+    docker: &bollard::Docker,
+    cfg: &Value,
+    service: &str,
+    container: &bollard::models::ContainerInspectResponse,
+) -> std::result::Result<(), ExecBlock> {
+    let declared = cfg
+        .pointer(&format!("/services/{service}/image"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if declared.is_empty() {
+        return Err(ExecBlock::Refused(format!(
+            "service {service} declares no image"
+        )));
+    }
+    let running = container
+        .image
+        .as_deref()
+        .ok_or_else(|| ExecBlock::Refused("the container names no image".into()))?;
+    let actual = docker
+        .inspect_image(running)
+        .await
+        .map_err(|e| format!("cannot inspect image {running}: {e}"))?
+        .repo_digests
+        .unwrap_or_default();
+    let expected = match crate::image_update::pinned_digest(declared) {
+        Some(_) => Vec::new(),
+        None => docker
+            .inspect_image(declared)
+            .await
+            .map_err(|e| format!("cannot inspect image {declared}: {e}"))?
+            .repo_digests
+            .unwrap_or_default(),
+    };
+    image_matches(declared, &expected, &actual)
+        .map_err(|why| ExecBlock::Refused(format!("{why} for service {service}")))
+}
+
+fn image_matches(
+    declared: &str,
+    expected: &[String],
+    actual: &[String],
+) -> std::result::Result<(), String> {
+    let want: Vec<String> = match crate::image_update::pinned_digest(declared) {
+        Some(d) => vec![d.to_string()],
+        None => crate::image_update::local_digests(expected, declared),
+    };
+    if want.is_empty() {
+        return Err(format!("image {declared} has no registry digest"));
+    }
+    let have = crate::image_update::local_digests(actual, declared);
+    if have.iter().any(|d| want.contains(d)) {
+        Ok(())
+    } else {
+        Err(format!("the running image is not {declared}"))
+    }
 }
 
 const DENIED_BIND_TREES: &[&str] = &["/proc", "/sys", "/run", "/var/run", "/dev"];
@@ -3583,6 +3658,19 @@ mod tests {
             err.to_string().contains("not part of a registered stack"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn exec_image_must_carry_the_declared_digest() {
+        let a = format!("sha256:{}", "a".repeat(64));
+        let b = format!("sha256:{}", "b".repeat(64));
+        let at = |d: &str| vec![format!("nginx@{d}")];
+        assert!(image_matches("nginx:1", &at(&a), &at(&a)).is_ok());
+        assert!(image_matches("nginx:1", &at(&a), &at(&b)).is_err());
+        assert!(image_matches("nginx:1", &[], &at(&a)).is_err());
+        assert!(image_matches("nginx:1", &at(&a), &[format!("evil@{a}")]).is_err());
+        assert!(image_matches(&format!("nginx@{a}"), &[], &at(&a)).is_ok());
+        assert!(image_matches(&format!("nginx@{a}"), &[], &at(&b)).is_err());
     }
 
     #[test]
