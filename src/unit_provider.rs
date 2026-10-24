@@ -71,6 +71,11 @@ const ACTION_REMOVE: &str = "remove";
 /// Container update actions; they take only the opt-in.
 const CONTAINER_ACTIONS: &[&str] = &["start", "stop", "restart"];
 
+const ACTION_UPDATE: &str = "update";
+
+/// Container update actions run on the container's owning stack.
+const CONTAINER_VIA_STACK: &[&str] = &[ACTION_BACKUP, ACTION_RESTORE, ACTION_UPDATE];
+
 /// Payload for an action that takes nothing but the opt-in.
 #[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(crate = "plugin_toolkit::serde", deny_unknown_fields)]
@@ -338,6 +343,7 @@ impl DockerUnitProvider {
             "volume_policy" => self.stack_volume_policy(&args.id, &row, args.payload).await,
             ACTION_BACKUP => self.do_stack_backup(&args.id, &row, args.payload).await,
             ACTION_RESTORE => self.do_stack_restore(&args.id, &row, args.payload).await,
+            ACTION_UPDATE => self.do_stack_update(&args.id, &row).await,
             "label_volumes" => self.stack_label_volumes(&args.id, &row, args.payload).await,
             "up" => {
                 let out = ownership::up(&row, &[]).await?;
@@ -818,7 +824,33 @@ impl DockerUnitProvider {
         )))
     }
 
+    /// Back up, pull the pinned images, recreate what changed and wait for the
+    /// stack to come up healthy; on a failed `up` or an unhealthy stack,
+    /// restore the backup taken first.
+    async fn do_stack_update(&self, id: &UnitId, row: &StackRow) -> Result<VerbOutcome> {
+        let message = run_update(&mut EngineUpdate {
+            provider: self,
+            id,
+            row,
+        })
+        .await?;
+        Ok(VerbOutcome::Action(ActionOutcome {
+            changed: true,
+            message,
+        }))
+    }
+
     async fn do_update(&self, args: UpdateArgs) -> Result<VerbOutcome> {
+        let args = if args.id.kind == KIND && CONTAINER_VIA_STACK.contains(&args.action.as_str()) {
+            let docker = self.adapter.client().map_err(adapter_err)?;
+            let row = owning_stack(&docker, &args.id.id).await?;
+            UpdateArgs {
+                id: self.stack_unit_id(&row),
+                ..args
+            }
+        } else {
+            args
+        };
         let stack = args.id.kind == STACK_KIND;
         let action = args.action.as_str();
         // Backup only adds an archive, and core's pre-mutation guard
@@ -1473,16 +1505,7 @@ fn stack_declaration() -> KindDeclaration {
     );
     // Minimal backup/restore as managed-unit actions (the pre-mutation guard and
     // scheduler reach these), routed to the stack's host over the mesh.
-    update_actions.push(ActionDecl {
-        action: ACTION_BACKUP.into(),
-        payload_schema: Some(schema_for!(StackBackupPayload)),
-        response_schema: Some(schema_for!(BackupRef)),
-    });
-    update_actions.push(ActionDecl {
-        action: ACTION_RESTORE.into(),
-        payload_schema: Some(schema_for!(StackRestorePayload)),
-        response_schema: None,
-    });
+    update_actions.extend(via_stack_actions());
 
     // A stack's minimal, restore-sufficient state is filesystem paths (its compose
     // project directory). The concrete path is per-instance; the kind declares the
@@ -1818,6 +1841,160 @@ impl RestoreSteps for EngineRestore<'_> {
     fn stop(&mut self) -> BoxFuture<'_, Result<()>> {
         Box::pin(stack_volumes::stop_project(self.docker, self.project))
     }
+}
+
+/// The steps of a stack update, behind a trait so their order and rollback
+/// are testable without an engine.
+trait UpdateSteps {
+    fn backup(&mut self) -> BoxFuture<'_, Result<BackupRef>>;
+    fn pull(&mut self) -> BoxFuture<'_, Result<String>>;
+    fn up(&mut self) -> BoxFuture<'_, Result<String>>;
+    fn healthy(&mut self) -> BoxFuture<'_, Result<bool>>;
+    fn restore(&mut self, from: BackupRef) -> BoxFuture<'_, Result<String>>;
+}
+
+async fn run_update(s: &mut impl UpdateSteps) -> Result<String> {
+    let backup = s
+        .backup()
+        .await
+        .map_err(|e| e.context("update refused: the pre-update backup failed"))?;
+    let pulled = s
+        .pull()
+        .await
+        .map_err(|e| e.context("update stopped at pull; the stack is unchanged"))?;
+    let failure = match s.up().await {
+        Ok(up) => match s.healthy().await {
+            Ok(true) => {
+                return Ok(format!(
+                    "updated from backup {}; pull: {}; up: {}",
+                    backup.locator,
+                    pulled.trim(),
+                    up.trim()
+                ));
+            }
+            Ok(false) => anyhow::anyhow!("the stack did not come up healthy"),
+            Err(e) => e.context("health check failed"),
+        },
+        Err(e) => e.context("compose up failed"),
+    };
+    let locator = backup.locator.clone();
+    match s.restore(backup).await {
+        Ok(restored) => Err(failure.context(format!(
+            "update rolled back from {locator}: {}",
+            restored.trim()
+        ))),
+        Err(e) => Err(failure.context(format!(
+            "update failed and restoring {locator} failed too: {e:#}"
+        ))),
+    }
+}
+
+struct EngineUpdate<'a> {
+    provider: &'a DockerUnitProvider,
+    id: &'a UnitId,
+    row: &'a StackRow,
+}
+
+impl UpdateSteps for EngineUpdate<'_> {
+    fn backup(&mut self) -> BoxFuture<'_, Result<BackupRef>> {
+        Box::pin(async move {
+            match self
+                .provider
+                .do_stack_backup(self.id, self.row, None)
+                .await?
+            {
+                VerbOutcome::Item(item) => serde_json::from_str(&item.payload)
+                    .map_err(|e| anyhow::anyhow!("backup ref: {e}")),
+                _ => Err(anyhow::anyhow!("backup returned no backup ref")),
+            }
+        })
+    }
+
+    fn pull(&mut self) -> BoxFuture<'_, Result<String>> {
+        Box::pin(async move {
+            let compose = self.row.compose().map_err(anyhow::Error::from)?;
+            let client = self.provider.adapter.client().ok();
+            policy::gate(client.as_ref(), self.row, &compose)
+                .await?
+                .pull()
+                .await
+        })
+    }
+
+    fn up(&mut self) -> BoxFuture<'_, Result<String>> {
+        Box::pin(ownership::up(self.row, &[]))
+    }
+
+    fn healthy(&mut self) -> BoxFuture<'_, Result<bool>> {
+        Box::pin(async move {
+            let docker = self.provider.adapter.client().map_err(adapter_err)?;
+            let project = self
+                .row
+                .compose()
+                .map_err(anyhow::Error::from)?
+                .project_name()
+                .await
+                .map_err(anyhow::Error::from)?;
+            let health =
+                crate::stack_health::wait(&docker, &project, crate::stack_health::timeout(None))
+                    .await?;
+            Ok(health.ready)
+        })
+    }
+
+    fn restore(&mut self, from: BackupRef) -> BoxFuture<'_, Result<String>> {
+        Box::pin(async move {
+            let payload = StackRestorePayload {
+                restore: RestorePayload {
+                    from,
+                    component: None,
+                },
+                allow_unverified: false,
+            };
+            let raw = serde_json::to_string(&payload)?;
+            match self
+                .provider
+                .do_stack_restore(self.id, self.row, Some(raw))
+                .await?
+            {
+                VerbOutcome::Action(a) => Ok(a.message),
+                _ => Ok(String::new()),
+            }
+        })
+    }
+}
+
+fn via_stack_actions() -> Vec<ActionDecl> {
+    vec![
+        ActionDecl {
+            action: ACTION_BACKUP.into(),
+            payload_schema: Some(schema_for!(StackBackupPayload)),
+            response_schema: Some(schema_for!(BackupRef)),
+        },
+        ActionDecl {
+            action: ACTION_RESTORE.into(),
+            payload_schema: Some(schema_for!(StackRestorePayload)),
+            response_schema: None,
+        },
+        ActionDecl {
+            action: ACTION_UPDATE.into(),
+            payload_schema: Some(schema_for!(DryRunOptIn)),
+            response_schema: None,
+        },
+    ]
+}
+
+/// The managed stack a container belongs to, by its compose working dir.
+async fn owning_stack(docker: &bollard::Docker, container: &str) -> Result<StackRow> {
+    let info = docker
+        .inspect_container(container, None)
+        .await
+        .map_err(|e| anyhow::anyhow!("inspect container {container}: {e}"))?;
+    let id = inspected_id(&info, container)?;
+    list_stack_members(docker)
+        .await?
+        .remove(&id)
+        .ok_or_else(|| anyhow::anyhow!("container {container} belongs to no managed stack"))
 }
 
 /// Where a stack backup goes when the caller names no destination: a
@@ -2606,7 +2783,10 @@ impl UnitProvider for DockerUnitProvider {
                                 payload_schema: None,
                                 response_schema: None,
                             },
-                        ],
+                        ]
+                        .into_iter()
+                        .chain(via_stack_actions())
+                        .collect(),
                     },
                     VerbDecl {
                         verb: Verb::Create,
@@ -4621,5 +4801,147 @@ mod tests {
         let err = format!("{:#}", run(&mut s, true).err().unwrap());
         assert_eq!(s.calls, ["live", "take_down", "write", "swap", "up"]);
         assert!(err.contains("compose up failed: up broke"), "{err}");
+    }
+
+    struct FakeUpdate {
+        calls: Vec<String>,
+        up_fails: bool,
+        healthy: bool,
+    }
+
+    impl UpdateSteps for FakeUpdate {
+        fn backup(&mut self) -> BoxFuture<'_, Result<BackupRef>> {
+            self.calls.push("backup".into());
+            Box::pin(async {
+                Ok(BackupRef {
+                    locator: "/b/web-1.tar.gz".into(),
+                    manager: "docker@test".into(),
+                    timestamp: 1,
+                    checksum: Some("sha256:00".into()),
+                })
+            })
+        }
+        fn pull(&mut self) -> BoxFuture<'_, Result<String>> {
+            self.calls.push("pull".into());
+            Box::pin(async { Ok("pulled".into()) })
+        }
+        fn up(&mut self) -> BoxFuture<'_, Result<String>> {
+            self.calls.push("up".into());
+            let fails = self.up_fails;
+            Box::pin(async move {
+                if fails {
+                    anyhow::bail!("up broke")
+                }
+                Ok("recreated".into())
+            })
+        }
+        fn healthy(&mut self) -> BoxFuture<'_, Result<bool>> {
+            self.calls.push("healthy".into());
+            let ok = self.healthy;
+            Box::pin(async move { Ok(ok) })
+        }
+        fn restore(&mut self, from: BackupRef) -> BoxFuture<'_, Result<String>> {
+            self.calls.push(format!("restore {}", from.locator));
+            Box::pin(async { Ok("restored".into()) })
+        }
+    }
+
+    fn update_run(up_fails: bool, healthy: bool) -> (Vec<String>, Result<String>) {
+        let mut s = FakeUpdate {
+            calls: Vec::new(),
+            up_fails,
+            healthy,
+        };
+        let r = plugin_toolkit::reactor::block_on(run_update(&mut s));
+        (s.calls, r)
+    }
+
+    #[test]
+    fn update_backs_up_pulls_ups_and_waits_healthy() {
+        let (calls, r) = update_run(false, true);
+        assert_eq!(calls, ["backup", "pull", "up", "healthy"]);
+        let msg = r.unwrap();
+        assert!(msg.contains("/b/web-1.tar.gz"), "{msg}");
+        assert!(msg.contains("recreated"), "{msg}");
+    }
+
+    #[test]
+    fn an_unhealthy_update_restores_the_backup_it_took() {
+        let (calls, r) = update_run(false, false);
+        assert_eq!(
+            calls,
+            ["backup", "pull", "up", "healthy", "restore /b/web-1.tar.gz"]
+        );
+        let err = format!("{:#}", r.unwrap_err());
+        assert!(err.contains("rolled back from /b/web-1.tar.gz"), "{err}");
+        assert!(err.contains("did not come up healthy"), "{err}");
+    }
+
+    #[test]
+    fn a_failed_up_restores_the_backup() {
+        let (calls, r) = update_run(true, true);
+        assert_eq!(calls, ["backup", "pull", "up", "restore /b/web-1.tar.gz"]);
+        let err = format!("{:#}", r.unwrap_err());
+        assert!(err.contains("compose up failed"), "{err}");
+    }
+
+    #[test]
+    fn update_dry_run_plans_and_changes_nothing() {
+        let ((), _) = crate::test_support::with_db(|| {
+            let root = tempfile::tempdir().unwrap();
+            register_root(root.path());
+            registered_stack(&root.path().join("web"), "services: {}\n", None);
+            let out = stack_update(ACTION_UPDATE, Some(json!({"dryRun": true}))).unwrap();
+            let VerbOutcome::Item(item) = out else {
+                panic!("expected a plan");
+            };
+            assert!(item.payload.contains("\"dryRun\":true"), "{}", item.payload);
+        });
+    }
+
+    #[test]
+    fn container_actions_resolve_to_the_owning_stack() {
+        use crate::test_engine::{FakeEngine, Route};
+        let ((), _) = crate::test_support::with_db(|| {
+            let root = tempfile::tempdir().unwrap();
+            register_root(root.path());
+            let dir = root.path().join("web");
+            let row = registered_stack(&dir, "services: {}\n", None);
+            let labels = json!({ COMPOSE_WORKING_DIR_LABEL: row.dir });
+            let engine = FakeEngine::routed(vec![
+                Route::new(
+                    "GET",
+                    "/containers/app/json",
+                    200,
+                    json!({"Id": "c1", "Config": {"Labels": labels}}).to_string(),
+                ),
+                Route::new(
+                    "GET",
+                    "/containers/json",
+                    200,
+                    json!([{"Id": "c1", "Labels": labels}, {"Id": "c2", "Labels": {}}]).to_string(),
+                ),
+            ]);
+            let docker = engine.client();
+            let found = plugin_toolkit::reactor::block_on(owning_stack(&docker, "app")).unwrap();
+            assert_eq!(found.name, "web");
+            let err = plugin_toolkit::reactor::block_on(owning_stack(&docker, "other"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("inspect container other"), "{err}");
+        });
+        let decls = DockerUnitProvider::new(crate::registration::adapter()).declarations();
+        let container = decls.iter().find(|d| d.kind == KIND).unwrap();
+        let update = container
+            .verbs
+            .iter()
+            .find(|v| v.verb == Verb::Update)
+            .unwrap();
+        for action in CONTAINER_VIA_STACK {
+            assert!(
+                update.actions.iter().any(|a| a.action == *action),
+                "{action}"
+            );
+        }
     }
 }

@@ -98,4 +98,11 @@ mod tests {
             vec!["stacks", "volume_policies", "runtime_settings"]
         );
     }
+
+    #[test]
+    fn host_update_is_not_a_tool() {
+        let manifest = plugin_toolkit::tool_manifest::manifest_for("docker.");
+        assert!(manifest.contains("docker.stack_wait_healthy"), "{manifest}");
+        assert!(!manifest.contains("host_update"), "{manifest}");
+    }
 }
