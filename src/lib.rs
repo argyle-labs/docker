@@ -140,11 +140,28 @@ pub async fn run(args: &[&str], cwd: Option<&str>) -> plugin_toolkit::anyhow::Re
     if let Some(dir) = cwd {
         cmd = cmd.current_dir(dir);
     }
-    let out = cmd.output().await?;
+    run_within(cmd, CLI_BUDGET).await
+}
+
+const CLI_BUDGET: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+async fn run_within(
+    cmd: plugin_toolkit::process::Command,
+    budget: std::time::Duration,
+) -> plugin_toolkit::anyhow::Result<String> {
+    let Some(out) = plugin_toolkit::time::timeout(budget, cmd.output()).await else {
+        plugin_toolkit::anyhow::bail!("docker CLI timed out after {:?}", budget);
+    };
+    let out = out?;
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-    if !out.status.success && stdout.trim().is_empty() {
-        plugin_toolkit::anyhow::bail!("{}", stderr.trim());
+    if !out.status.success {
+        let why = if stderr.trim().is_empty() {
+            &stdout
+        } else {
+            &stderr
+        };
+        plugin_toolkit::anyhow::bail!("{}", why.trim());
     }
     Ok(if stdout.is_empty() { stderr } else { stdout })
 }
@@ -152,6 +169,40 @@ pub async fn run(args: &[&str], cwd: Option<&str>) -> plugin_toolkit::anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sh(script: &str) -> plugin_toolkit::process::Command {
+        plugin_toolkit::process::Command::new("/bin/sh").args(["-c", script])
+    }
+
+    #[test]
+    fn a_non_zero_exit_fails_even_with_stdout() {
+        let err = plugin_toolkit::reactor::block_on(run_within(
+            sh("echo partial; echo boom >&2; exit 3"),
+            std::time::Duration::from_secs(10),
+        ))
+        .unwrap_err();
+        assert_eq!(err.to_string(), "boom");
+    }
+
+    #[test]
+    fn a_zero_exit_returns_stdout() {
+        let out = plugin_toolkit::reactor::block_on(run_within(
+            sh("echo ok"),
+            std::time::Duration::from_secs(10),
+        ))
+        .unwrap();
+        assert_eq!(out, "ok\n");
+    }
+
+    #[test]
+    fn a_hung_cli_times_out() {
+        let err = plugin_toolkit::reactor::block_on(run_within(
+            sh("sleep 30"),
+            std::time::Duration::from_millis(100),
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+    }
 
     #[test]
     fn only_the_listed_variables_reach_a_child() {
