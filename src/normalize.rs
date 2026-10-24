@@ -17,6 +17,7 @@ const CONTAINER_NAME: &str = "container_name";
 const ICON_BASE: &str = "https://gitea.scottkey.me/argyle-labs";
 const ICON_PATH: &str = "raw/branch/main/assets/icon-256.png";
 const PROBE_ATTEMPTS: usize = 3;
+const PROBE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
 const ALIASES: &[(&str, &str)] = &[
     ("act_runner", "gitea"),
     ("gitea-runner", "gitea"),
@@ -144,7 +145,7 @@ pub fn icon_url(app: &str) -> String {
     format!("{ICON_BASE}/{app}/{ICON_PATH}")
 }
 
-fn probe(url: &str) -> bool {
+fn probe(url: &str) -> Option<bool> {
     let req = plugin_toolkit::abi::HttpRequest {
         method: "HEAD".into(),
         url: url.into(),
@@ -156,14 +157,17 @@ fn probe(url: &str) -> bool {
         body_b64: true,
         follow_redirects: None,
     };
-    for _ in 0..PROBE_ATTEMPTS {
+    for attempt in 0..PROBE_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(PROBE_BACKOFF * u32::try_from(attempt).unwrap_or(1));
+        }
         match plugin_toolkit::capsink::http_request(&req) {
-            Ok(r) if r.status < 500 => return r.status == 200,
-            Err(e) if e.to_string().contains("capability unavailable") => return false,
+            Ok(r) if r.status < 500 => return Some((200..300).contains(&r.status)),
+            Err(e) if e.to_string().contains("capability unavailable") => return None,
             _ => {}
         }
     }
-    false
+    None
 }
 
 fn icon_cache() -> &'static Mutex<HashMap<String, bool>> {
@@ -171,11 +175,13 @@ fn icon_cache() -> &'static Mutex<HashMap<String, bool>> {
     CACHE.get_or_init(Mutex::default)
 }
 
-fn has_icon(app: &str, probe: &dyn Fn(&str) -> bool) -> bool {
+fn has_icon(app: &str, probe: &dyn Fn(&str) -> Option<bool>) -> bool {
     if let Some(hit) = icon_cache().lock().ok().and_then(|c| c.get(app).copied()) {
         return hit;
     }
-    let found = probe(&icon_url(app));
+    let Some(found) = probe(&icon_url(app)) else {
+        return false;
+    };
     if let Ok(mut c) = icon_cache().lock() {
         c.insert(app.to_string(), found);
     }
@@ -378,14 +384,12 @@ pub async fn collision(docker: &Docker, project: &str, name: &str) -> Option<Str
     }
 }
 
-pub async fn plan_stack(row: &StackRow, docker: Option<&Docker>) -> Result<Plan> {
-    let cfg = policy::user_cfg(row).await?;
-    let before = row.read_compose()?;
-    let (planned, mut warnings) = plan(&row.name, &cfg, docker.is_some(), is_unraid(), &icon_for);
+async fn plan_text(name: &str, before: String, cfg: Value, docker: Option<&Docker>) -> Plan {
+    let (planned, mut warnings) = plan(name, &cfg, docker.is_some(), is_unraid(), &icon_for);
     let project = cfg
         .get("name")
         .and_then(Value::as_str)
-        .unwrap_or(&row.name)
+        .unwrap_or(name)
         .to_string();
     let mut free = Vec::new();
     for c in planned {
@@ -400,13 +404,33 @@ pub async fn plan_stack(row: &StackRow, docker: Option<&Docker>) -> Result<Plan>
     }
     let (after, changes, skipped) = apply(&before, &free);
     warnings.extend(skipped);
-    Ok(Plan {
+    Plan {
         before,
         after,
         changes,
         warnings,
         cfg,
-    })
+    }
+}
+
+pub async fn plan_stack(row: &StackRow, docker: Option<&Docker>) -> Result<Plan> {
+    let cfg = policy::user_cfg(row).await?;
+    let before = row.read_compose()?;
+    Ok(plan_text(&row.name, before, cfg, docker).await)
+}
+
+pub async fn plan_inline(
+    name: &str,
+    dir: &std::path::Path,
+    yaml: &str,
+    docker: Option<&Docker>,
+) -> Result<Plan> {
+    let tmp = crate::fsat::PrivateDir::new("orca-normalize-")?;
+    let file = tmp.write("compose.yaml", yaml.as_bytes())?;
+    let project_dir = if dir.is_dir() { dir } else { tmp.path() };
+    let raw = stacks::resolved_config(project_dir, &[file], None).await?;
+    let cfg: Value = plugin_toolkit::serde_json::from_str(&raw)?;
+    Ok(plan_text(name, yaml.to_string(), cfg, docker).await)
 }
 
 pub async fn write(row: &mut StackRow, plan: &Plan, docker: Option<&Docker>) -> Result<()> {
@@ -556,11 +580,19 @@ mod tests {
         let calls = std::cell::Cell::new(0);
         let probe = |_: &str| {
             calls.set(calls.get() + 1);
-            true
+            Some(true)
         };
         assert!(has_icon("cache-test-app", &probe));
         assert!(has_icon("cache-test-app", &probe));
         assert_eq!(calls.get(), 1);
+        let gave_up = |_: &str| {
+            calls.set(calls.get() + 1);
+            None
+        };
+        assert!(!has_icon("cache-test-unreachable", &gave_up));
+        assert!(!has_icon("cache-test-unreachable", &gave_up));
+        assert_eq!(calls.get(), 3, "a give-up is not cached");
+        assert!(has_icon("cache-test-unreachable", &probe));
     }
 
     #[test]
