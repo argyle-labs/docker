@@ -166,6 +166,7 @@ pub struct ContainerInspectOutput {
 pub struct ContainerComposeOutput {
     pub service: String,
     pub yaml: String,
+    pub warnings: Vec<String>,
 }
 
 pub fn is_secret_name(name: &str) -> bool {
@@ -190,7 +191,7 @@ fn is_secret(name: &str, value: &str) -> bool {
     is_secret_name(name) || is_secret_value(value)
 }
 
-fn redact_args(args: &[String], replace: impl Fn(&str) -> String) -> Vec<String> {
+fn redact_args(args: &[String], replace: &dyn Fn(&str) -> String) -> Vec<String> {
     let mut out = Vec::with_capacity(args.len());
     let mut pending: Option<String> = None;
     for arg in args {
@@ -204,6 +205,8 @@ fn redact_args(args: &[String], replace: impl Fn(&str) -> String) -> Vec<String>
             out.push(format!("{name}={}", replace(name)));
         } else if is_secret_value(arg) {
             out.push(replace("ARG"));
+        } else if let Some(masked) = redact_words(arg, replace) {
+            out.push(masked);
         } else {
             if arg.starts_with('-') && is_secret_name(arg) {
                 pending = Some(arg.clone());
@@ -212,6 +215,27 @@ fn redact_args(args: &[String], replace: impl Fn(&str) -> String) -> Vec<String>
         }
     }
     out
+}
+
+fn redact_words(arg: &str, replace: &dyn Fn(&str) -> String) -> Option<String> {
+    if !arg.contains(char::is_whitespace) {
+        return None;
+    }
+    let words: Vec<String> = arg.split_whitespace().map(str::to_owned).collect();
+    let masked = redact_args(&words, &|_| REDACTED.to_owned());
+    (masked != words).then(|| {
+        masked
+            .iter()
+            .map(|w| {
+                if w == REDACTED {
+                    replace("ARG")
+                } else {
+                    w.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
 }
 
 fn env_ref(name: &str) -> String {
@@ -301,7 +325,7 @@ pub fn describe(c: &ContainerInspectResponse) -> ContainerInspectOutput {
         })
         .collect();
     redacted_labels.sort();
-    let masked = |a: Vec<String>| redact_args(&a, |_| REDACTED.to_owned());
+    let masked = |a: Vec<String>| redact_args(&a, &|_| REDACTED.to_owned());
     let log = host.log_config.clone().unwrap_or_default();
     let mut redacted_log_options = Vec::new();
     let log_options = log
@@ -504,14 +528,11 @@ pub fn service_value(c: &ContainerInspectOutput) -> Value {
         svc.insert("network_mode".into(), json!(mode));
     } else if c.networks == ["bridge"] {
         svc.insert("network_mode".into(), json!("bridge"));
-    } else if !c.networks.is_empty() {
-        let mut nets: Vec<&str> = c
-            .networks
-            .iter()
-            .map(|n| if n == "bridge" { "default" } else { n.as_str() })
-            .collect();
-        nets.sort();
-        svc.insert("networks".into(), json!(nets));
+    } else {
+        let nets: Vec<&String> = c.networks.iter().filter(|n| is_named_network(n)).collect();
+        if !nets.is_empty() {
+            svc.insert("networks".into(), json!(nets));
+        }
     }
     if !c.hostname.is_empty() && !c.id.starts_with(&c.hostname) {
         svc.insert("hostname".into(), json!(lit(&c.hostname)));
@@ -841,16 +862,10 @@ pub fn compose_yaml(c: &ContainerInspectOutput) -> ContainerComposeOutput {
     let external: Vec<&String> = c.networks.iter().filter(|n| is_named_network(n)).collect();
     let mode = c.network_mode.as_str();
     if !external.is_empty() && !matches!(mode, "host" | "none") && !mode.starts_with("container:") {
-        let mut nets: serde_json::Map<String, Value> = external
+        let nets: serde_json::Map<String, Value> = external
             .iter()
             .map(|n| ((*n).clone(), json!({ "external": true })))
             .collect();
-        if c.networks.iter().any(|n| n == "bridge") {
-            nets.insert(
-                "default".into(),
-                json!({ "name": "bridge", "external": true }),
-            );
-        }
         doc.insert("networks".into(), Value::Object(nets));
     }
     let vols: serde_json::Map<String, Value> = c
@@ -870,7 +885,19 @@ pub fn compose_yaml(c: &ContainerInspectOutput) -> ContainerComposeOutput {
             emit(&json!({ key: v }), 0, &mut yaml);
         }
     }
-    ContainerComposeOutput { service, yaml }
+    let mut warnings = Vec::new();
+    if !external.is_empty() && c.networks.iter().any(|n| n == "bridge") {
+        warnings.push(format!(
+            "compose cannot attach a service to the default bridge alongside other networks; \
+             run `docker network connect bridge {}` after `up` to restore it",
+            c.name
+        ));
+    }
+    ContainerComposeOutput {
+        service,
+        yaml,
+        warnings,
+    }
 }
 
 pub async fn inspect(docker: &Docker, container: &str) -> Result<ContainerInspectOutput> {
@@ -1039,7 +1066,7 @@ mod tests {
             "--port",
             "80",
         ]);
-        let masked = redact_args(&raw, |_| REDACTED.to_owned());
+        let masked = redact_args(&raw, &|_| REDACTED.to_owned());
         for leak in ["hunter2", "tok1", "k2", "pw3"] {
             assert!(
                 !masked.iter().any(|a| a.contains(leak)),
@@ -1242,18 +1269,42 @@ mod tests {
     }
 
     #[test]
-    fn bridge_plus_other_networks_uses_the_default_network() {
+    fn bridge_plus_other_networks_drops_the_bridge_with_a_warning() {
         let (out, y) = tuned();
         assert_eq!(out.networks, vec!["bridge", "media"]);
+        assert!(y.contains("    networks:\n      - \"media\"\n"), "{y}");
         assert!(
-            y.contains("    networks:\n      - \"default\"\n      - \"media\"\n"),
+            y.ends_with("\nnetworks:\n  media:\n    external: true\n"),
             "{y}"
         );
+        assert!(!y.contains("network_mode") && !y.contains("default"), "{y}");
+        let warnings = compose_yaml(&out).warnings;
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("docker network connect bridge tuned"));
+    }
+
+    #[test]
+    fn secrets_inside_shell_strings_are_redacted() {
+        let raw: Vec<String> = [
+            "CMD-SHELL",
+            "TOKEN=abc123 curl -f http://localhost",
+            "mysql --password hunter2 -h db",
+            "echo hello world",
+        ]
+        .map(String::from)
+        .to_vec();
+        let masked = redact_args(&raw, &|_| REDACTED.to_owned());
+        let joined = masked.join("|");
         assert!(
-            y.contains("\nnetworks:\n  default:\n    external: true\n    name: \"bridge\"\n  media:\n    external: true\n"),
-            "{y}"
+            !joined.contains("abc123") && !joined.contains("hunter2"),
+            "{joined}"
         );
-        assert!(!y.contains("network_mode"), "{y}");
+        assert_eq!(masked[3], "echo hello world");
+        let composed = compose_args(&masked).join("|");
+        assert!(
+            !composed.contains("abc123") && !composed.contains("hunter2"),
+            "{composed}"
+        );
     }
 
     #[test]
