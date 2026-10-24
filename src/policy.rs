@@ -1809,6 +1809,17 @@ impl Checked {
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
         crate::run(&argv, None).await
     }
+
+    pub fn config(&self) -> &str {
+        &self.config
+    }
+
+    pub async fn config_hash(&self, service: &str) -> Result<String> {
+        let flag = format!("--hash={service}");
+        let out = self.run(&["config", &flag]).await?;
+        compose::parse_config_hash(&out, service)
+            .ok_or_else(|| anyhow!("checked compose config has no hash for service {service}"))
+    }
 }
 
 fn checked_args(project: &str, dir: &Path, file: &Path, sub: &[&str]) -> Vec<String> {
@@ -4231,6 +4242,71 @@ mod tests {
             );
         }
         check_with(&bind("/srv/data"), &["bind:/srv/data"], &daemon()).unwrap();
+    }
+
+    fn checked_hash_of(dir: &Path, image: &str) -> (String, String) {
+        let checked = Checked {
+            dir: dir.to_path_buf(),
+            project: "web".into(),
+            config: serde_json::json!({
+                "name": "web",
+                "services": {"web": {"image": image, "environment": {"A": "1"}}}
+            })
+            .to_string(),
+        };
+        crate::test_support::with_db(|| {
+            plugin_toolkit::reactor::block_on(async {
+                let ours = checked.config_hash("web").await.unwrap();
+                let stamped = checked.run(&["config", "--hash=web"]).await.unwrap();
+                (ours, stamped)
+            })
+        })
+        .0
+    }
+
+    #[test]
+    fn exec_hash_matches_the_hash_up_stamps_from_the_checked_config() {
+        if !crate::test_support::have_compose() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "A=1\n").unwrap();
+        std::fs::write(
+            dir.path().join("compose.yaml"),
+            "services:\n  web:\n    image: nginx:1\n    env_file: .env\n",
+        )
+        .unwrap();
+        let pinned = format!("nginx@sha256:{}", "a".repeat(64));
+        let (ours, stamped) = checked_hash_of(dir.path(), &pinned);
+        assert_eq!(
+            compose::parse_config_hash(&stamped, "web"),
+            Some(ours.clone())
+        );
+        let file = dir
+            .path()
+            .join("compose.yaml")
+            .to_string_lossy()
+            .into_owned();
+        let raw = crate::test_support::with_db(|| {
+            plugin_toolkit::reactor::block_on(crate::run(
+                &["compose", "-p", "web", "-f", &file, "config", "--hash=web"],
+                None,
+            ))
+        })
+        .0
+        .unwrap();
+        assert_ne!(compose::parse_config_hash(&raw, "web"), Some(ours));
+    }
+
+    #[test]
+    fn exec_hash_refuses_a_moved_image_tag() {
+        if !crate::test_support::have_compose() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (running, _) = checked_hash_of(dir.path(), &format!("nginx@sha256:{}", "a".repeat(64)));
+        let (moved, _) = checked_hash_of(dir.path(), &format!("nginx@sha256:{}", "b".repeat(64)));
+        assert_ne!(running, moved);
     }
 
     #[test]

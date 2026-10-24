@@ -364,7 +364,7 @@ fn pull_args<'a>(services: &[&'a str]) -> Vec<&'a str> {
     args
 }
 
-fn parse_config_hash(raw: &str, service: &str) -> Option<String> {
+pub(crate) fn parse_config_hash(raw: &str, service: &str) -> Option<String> {
     raw.lines().find_map(|line| {
         let mut parts = line.split_whitespace();
         (parts.next()? == service).then(|| parts.next().map(str::to_string))?
