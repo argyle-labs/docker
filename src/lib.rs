@@ -134,28 +134,65 @@ pub async fn clean_command(
 }
 
 /// Run the docker CLI with `args`, optionally in `cwd`, returning stdout,
-/// through [`clean_command`].
+/// under the same environment as [`clean_command`]. The child leads its own
+/// process group so a timeout also kills the compose plugin it spawns; the
+/// toolkit's `Command` cannot set a process group or expose the pid.
 pub async fn run(args: &[&str], cwd: Option<&str>) -> plugin_toolkit::anyhow::Result<String> {
-    let mut cmd = clean_command(resolve_docker_bin()).await?.args(args);
+    let env = passed_env(|k| std::env::var(k).ok(), docker_host().await?);
+    let mut cmd = std::process::Command::new("/usr/bin/env");
+    cmd.arg("-i").args(env).arg(resolve_docker_bin()).args(args);
     if let Some(dir) = cwd {
-        cmd = cmd.current_dir(dir);
+        cmd.current_dir(dir);
     }
     run_within(cmd, CLI_BUDGET).await
 }
 
 const CLI_BUDGET: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
+fn drain(pipe: Option<impl std::io::Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut p) = pipe {
+            p.read_to_end(&mut buf).ok();
+        }
+        buf
+    })
+}
+
 async fn run_within(
-    cmd: plugin_toolkit::process::Command,
+    mut cmd: std::process::Command,
     budget: std::time::Duration,
 ) -> plugin_toolkit::anyhow::Result<String> {
-    let Some(out) = plugin_toolkit::time::timeout(budget, cmd.output()).await else {
-        plugin_toolkit::anyhow::bail!("docker CLI timed out after {:?}", budget);
+    use std::os::unix::process::CommandExt;
+    let mut child = cmd
+        .process_group(0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let out_reader = drain(child.stdout.take());
+    let err_reader = drain(child.stderr.take());
+    let deadline = std::time::Instant::now() + budget;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let pgid = child.id() as libc::pid_t;
+            unsafe {
+                libc::killpg(pgid, libc::SIGKILL);
+            }
+            child.wait().ok();
+            plugin_toolkit::anyhow::bail!(
+                "docker CLI timed out after {:?} and was killed; the daemon-side operation may still be running",
+                budget
+            );
+        }
+        plugin_toolkit::time::sleep(std::time::Duration::from_millis(20)).await;
     };
-    let out = out?;
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-    if !out.status.success {
+    let stdout = String::from_utf8_lossy(&out_reader.join().unwrap_or_default()).to_string();
+    let stderr = String::from_utf8_lossy(&err_reader.join().unwrap_or_default()).to_string();
+    if !status.success() {
         let why = if stderr.trim().is_empty() {
             &stdout
         } else {
@@ -170,8 +207,10 @@ async fn run_within(
 mod tests {
     use super::*;
 
-    fn sh(script: &str) -> plugin_toolkit::process::Command {
-        plugin_toolkit::process::Command::new("/bin/sh").args(["-c", script])
+    fn sh(script: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", script]);
+        cmd
     }
 
     #[test]
@@ -202,6 +241,33 @@ mod tests {
         ))
         .unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(err.to_string().contains("may still be running"), "{err}");
+    }
+
+    #[test]
+    fn a_timeout_kills_the_whole_process_group() {
+        let pidfile = std::env::temp_dir().join(format!("docker-pg-{}.pid", std::process::id()));
+        std::fs::remove_file(&pidfile).ok();
+        let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
+        plugin_toolkit::reactor::block_on(run_within(
+            sh(&script),
+            std::time::Duration::from_millis(300),
+        ))
+        .unwrap_err();
+        let pid: libc::pid_t = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        std::fs::remove_file(&pidfile).ok();
+        let gone = (0..50).any(|_| {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            false
+        });
+        assert!(gone, "grandchild {pid} survived the timeout");
     }
 
     #[test]
