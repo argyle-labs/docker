@@ -226,18 +226,25 @@ fn drain(
             let fd = p.as_raw_fd();
             unsafe {
                 let flags = libc::fcntl(fd, libc::F_GETFL);
-                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                if flags >= 0 {
+                    libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                }
             }
             let mut chunk = [0u8; 65536];
+            let mut pause = POLL_MIN;
             loop {
                 match p.read(&mut chunk) {
                     Ok(0) => break,
-                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        pause = POLL_MIN;
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         if stop.load(std::sync::atomic::Ordering::SeqCst) {
                             break;
                         }
-                        std::thread::sleep(POLL_MIN);
+                        std::thread::sleep(pause);
+                        pause = (pause * 2).min(POLL_MAX);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(_) => break,
