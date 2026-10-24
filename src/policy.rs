@@ -1768,6 +1768,11 @@ async fn resolved(
     Ok((dir, roots, cfg, user_cfg))
 }
 
+pub async fn user_cfg(row: &StackRow) -> Result<Value> {
+    let compose = row.compose()?;
+    Ok(resolved(row, &compose).await?.3)
+}
+
 /// The config [`gate`] checked, which compose runs from.
 #[derive(Debug)]
 pub struct Checked {
@@ -2031,6 +2036,8 @@ pub struct DockerStackAllowOutput {
     /// `true`: the stack was not registered and is (or would be) registered
     /// by this call.
     pub adopted: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub normalized: Vec<String>,
     pub before: Vec<String>,
     pub after: Vec<String>,
     /// Items in `after` and not in `before`.
@@ -2130,11 +2137,21 @@ async fn stack_allow(
         .filter(|g| !planned.contains(g))
         .cloned()
         .collect();
+    let normalize = if adopted {
+        Some(crate::normalize::plan_stack(&row).await?)
+    } else {
+        None
+    };
+    let normalized: Vec<String> = normalize
+        .iter()
+        .flat_map(|n| n.changes.iter().map(ToString::to_string))
+        .collect();
     if args.dry_run {
         return Ok(DockerStackAllowOutput {
             dry_run: true,
             name: args.name,
             adopted,
+            normalized,
             before,
             after: planned,
             added,
@@ -2164,10 +2181,14 @@ async fn stack_allow(
     } else {
         stacks::put(&row)?;
     }
+    if let Some(plan) = &normalize {
+        crate::normalize::write(&mut row, plan, Some(docker)).await?;
+    }
     Ok(DockerStackAllowOutput {
         dry_run: false,
         name: args.name,
         adopted,
+        normalized,
         before,
         after: planned,
         added,
@@ -3191,9 +3212,24 @@ mod tests {
                 .filter(|i| **i != adopt_item)
                 .cloned()
                 .collect();
+            let unbound = |g: &str| {
+                let mut f: Vec<&str> = g.split('|').collect();
+                f.remove(2);
+                f.join("|")
+            };
             assert_eq!(
-                row.allow.iter().map(Grant::to_string).collect::<Vec<_>>(),
-                grants
+                row.allow
+                    .iter()
+                    .map(|g| unbound(&g.to_string()))
+                    .collect::<Vec<_>>(),
+                grants.iter().map(|g| unbound(g)).collect::<Vec<_>>()
+            );
+            assert_eq!(plan.normalized, ["app: container_name=web"]);
+            assert_eq!(done.normalized, plan.normalized);
+            assert!(
+                row.read_compose()
+                    .unwrap()
+                    .contains("container_name: \"web\"")
             );
             let compose = row.compose().unwrap();
             plugin_toolkit::reactor::block_on(gate(Some(&docker), &row, &compose)).unwrap();
