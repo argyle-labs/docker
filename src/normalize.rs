@@ -156,6 +156,8 @@ fn probe(url: &str) -> Option<bool> {
         max_body_bytes: Some(0),
         body_b64: true,
         follow_redirects: None,
+        connect_timeout_ms: None,
+        retry: None,
     };
     for attempt in 0..PROBE_ATTEMPTS {
         if attempt > 0 {
