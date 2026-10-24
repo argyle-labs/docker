@@ -2865,8 +2865,13 @@ fn image_matches(
         None => crate::image_update::local_digests(expected, declared),
     };
     let have = crate::image_update::local_digests(actual, declared);
-    if want.is_empty() || have.is_empty() {
+    if want.is_empty() {
         return Err(NO_REGISTRY_DIGEST.into());
+    }
+    if have.is_empty() {
+        return Err(format!(
+            "running container's image digest is unknown; cannot vet it against {declared}"
+        ));
     }
     if have.iter().any(|d| want.contains(d)) {
         Ok(())
@@ -3681,7 +3686,7 @@ mod tests {
         );
         assert_eq!(
             image_matches("nginx:1", &at(&a), &[]).unwrap_err(),
-            NO_REGISTRY_DIGEST
+            "running container's image digest is unknown; cannot vet it against nginx:1"
         );
     }
 
