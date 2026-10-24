@@ -271,11 +271,11 @@ pub fn audit(
 
 // ── fix: line edits to the compose file ─────────────────────────────────────
 
-fn indent_of(line: &str) -> usize {
+pub(crate) fn indent_of(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
 
-fn is_content(line: &str) -> bool {
+pub(crate) fn is_content(line: &str) -> bool {
     let t = line.trim();
     !t.is_empty() && !t.starts_with('#')
 }
@@ -326,7 +326,7 @@ fn service_block(lines: &[String], svc: &str) -> Option<(usize, usize, usize)> {
 /// [`service_block`] for an edit: refused when the service is written in
 /// flow style (`app: {image: x}`), which line edits would turn into invalid
 /// YAML.
-fn block_service(lines: &[String], svc: &str) -> Result<(usize, usize, usize), String> {
+pub(crate) fn block_service(lines: &[String], svc: &str) -> Result<(usize, usize, usize), String> {
     let (header, end, child) = service_block(lines, svc)
         .ok_or_else(|| format!("service '{svc}' not found in the file"))?;
     let rest = lines[header]

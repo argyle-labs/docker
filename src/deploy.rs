@@ -146,6 +146,7 @@ impl DockerDeployTarget {
             compose_yaml: Some(compose_json(spec)?),
             compose_env: None,
             deploy: true,
+            normalize: true,
         })
     }
 

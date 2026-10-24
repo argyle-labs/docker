@@ -64,7 +64,15 @@ const STACK_LIFECYCLE: &[&str] = &["up", "down", "start", "stop", "restart", "bu
 
 /// Stack update actions whose payload carries its own `dry_run` and `items`
 /// and plans itself; every other mutating action is gated here.
-const SELF_PLANNING: &[&str] = &["fix", "volume_policy", "label_volumes", ACTION_UPDATE];
+const SELF_PLANNING: &[&str] = &[
+    "fix",
+    "volume_policy",
+    "label_volumes",
+    ACTION_UPDATE,
+    ACTION_NORMALIZE,
+];
+
+const ACTION_NORMALIZE: &str = "normalize";
 
 /// Tears the stack down and deregisters it: the executable form of `delete`,
 /// whose args carry no payload for an opt-in.
@@ -349,6 +357,7 @@ impl DockerUnitProvider {
             ACTION_RESTORE => self.do_stack_restore(&args.id, &row, args.payload).await,
             ACTION_UPDATE => self.do_stack_update(&args.id, &row, args.payload).await,
             "label_volumes" => self.stack_label_volumes(&args.id, &row, args.payload).await,
+            ACTION_NORMALIZE => self.stack_normalize(&args.id, row, args.payload).await,
             "up" => {
                 let out = ownership::up(&row, &[]).await?;
                 Ok(VerbOutcome::Action(ActionOutcome {
@@ -388,6 +397,99 @@ impl DockerUnitProvider {
     /// the edit path. With `dry_run`, returns the changes and the diff.
     /// Execute applies only the confirmed `items` that still apply cleanly to
     /// the file as it is now. Does not deploy; run `up` afterwards.
+    async fn normalize_note(&self, payload: Option<&str>) -> String {
+        let Some(p) = payload.and_then(|raw| serde_json::from_str::<StackDeployPayload>(raw).ok())
+        else {
+            return String::new();
+        };
+        if !p.normalize {
+            return String::new();
+        }
+        if p.compose_yaml.is_some() {
+            return "; normalize: planned once the compose file is written".to_string();
+        }
+        let row = StackRow {
+            name: p.name.clone(),
+            dir: p.dir.clone(),
+            file: p
+                .file
+                .clone()
+                .unwrap_or_else(|| stacks::DEFAULT_COMPOSE_FILE.to_string()),
+            enabled: true,
+            allow: stacks::get(&p.name)
+                .ok()
+                .flatten()
+                .map(|r| r.allow)
+                .unwrap_or_default(),
+        };
+        if !row.compose_path().is_file() {
+            return String::new();
+        }
+        let docker = self.adapter.client().ok();
+        let report = match crate::normalize::plan_stack(&row, docker.as_ref()).await {
+            Ok(plan) => plan.report(),
+            Err(e) => vec![format!("warning: normalize skipped: {e:#}")],
+        };
+        if report.is_empty() {
+            String::new()
+        } else {
+            format!("; normalize: {}", report.join(", "))
+        }
+    }
+
+    async fn stack_normalize(
+        &self,
+        id: &UnitId,
+        mut row: StackRow,
+        payload: Option<String>,
+    ) -> Result<VerbOutcome> {
+        let p: DryRunOptIn = match payload.as_deref() {
+            None => DryRunOptIn::default(),
+            Some(raw) => {
+                serde_json::from_str(raw).map_err(|e| anyhow::anyhow!("normalize payload: {e}"))?
+            }
+        };
+        let docker = self.adapter.client().ok();
+        let plan = crate::normalize::plan_stack(&row, docker.as_ref()).await?;
+        if p.dry_run {
+            let body = json!({
+                "dryRun": true,
+                "changes": plan.changes,
+                "warnings": plan.warnings,
+                "diff": lint::diff(&plan.before, &plan.after),
+                "howToExecute": "re-invoke without `dryRun` in the payload",
+            });
+            return Ok(VerbOutcome::Item(ItemOutcome::new(
+                id.clone(),
+                body.to_string(),
+            )));
+        }
+        if !plan.warnings.is_empty() {
+            return Err(anyhow::anyhow!(
+                "normalize refused: {}",
+                plan.warnings.join("; ")
+            ));
+        }
+        if plan.changes.is_empty() {
+            return Ok(VerbOutcome::Action(ActionOutcome {
+                changed: false,
+                message: format!("stack '{}' is already normalized", row.name),
+            }));
+        }
+        crate::normalize::write(&mut row, &plan, docker.as_ref()).await?;
+        let up = ownership::up(&row, &[]).await?;
+        let shown: Vec<String> = plan.changes.iter().map(ToString::to_string).collect();
+        Ok(VerbOutcome::Action(ActionOutcome {
+            changed: true,
+            message: format!(
+                "normalized stack '{}': {}; up: {}",
+                row.name,
+                shown.join(", "),
+                up.trim()
+            ),
+        }))
+    }
+
     async fn stack_fix(
         &self,
         id: &UnitId,
@@ -788,6 +890,12 @@ impl DockerUnitProvider {
         )
         .await?;
         stacks::put(&row)?;
+        let mut row = row;
+        let normalized = if p.normalize && row.compose_path().is_file() {
+            crate::normalize::normalize(&mut row, self.adapter.client().ok().as_ref()).await
+        } else {
+            Vec::new()
+        };
         if p.deploy {
             ownership::up(&row, &[]).await?;
         }
@@ -797,6 +905,7 @@ impl DockerUnitProvider {
                 name: row.name.clone(),
                 created: !existed,
                 deployed: p.deploy,
+                normalized: normalized.iter().map(ToString::to_string).collect(),
             })
             .unwrap_or_default(),
         )))
@@ -959,7 +1068,11 @@ impl DockerUnitProvider {
         let (plan_only, payload) = split_dry_run(args.payload.clone())?;
         if plan_only {
             let target = match args.action.as_str() {
-                "deploy" => format!("stack {}", payload_name(payload.as_deref())),
+                "deploy" => format!(
+                    "stack {}{}",
+                    payload_name(payload.as_deref()),
+                    self.normalize_note(payload.as_deref()).await
+                ),
                 _ => payload
                     .as_deref()
                     .and_then(|p| serde_json::from_str::<ExecPayload>(p).ok())
@@ -1054,7 +1167,9 @@ impl DockerUnitProvider {
         if args.id.kind == STACK_KIND {
             let (plan_only, payload) = split_dry_run(args.payload.clone())?;
             if plan_only {
-                let plan = format!("{} stack {}", args.action, payload_name(payload.as_deref()));
+                let name = payload_name(payload.as_deref());
+                let mut plan = format!("{} stack {name}", args.action);
+                plan.push_str(&self.normalize_note(payload.as_deref()).await);
                 return Ok(dry_run(args.id, plan));
             }
             let args = UpsertArgs { payload, ..args };
@@ -1478,6 +1593,8 @@ pub struct StackDeployPayload {
     /// Run `docker compose up -d` after writing (default `true`).
     #[serde(default = "default_deploy")]
     pub deploy: bool,
+    #[serde(default = "default_deploy")]
+    pub normalize: bool,
 }
 
 fn default_deploy() -> bool {
@@ -1494,6 +1611,8 @@ pub struct StackDeployResult {
     pub created: bool,
     /// Whether `docker compose up -d` was run.
     pub deployed: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub normalized: Vec<String>,
 }
 
 /// The `stack` [`KindDeclaration`]: view (Detail), edit + lifecycle (Update),
@@ -1513,6 +1632,11 @@ fn stack_declaration() -> KindDeclaration {
         action: "label_volumes".into(),
         payload_schema: Some(schema_for!(LabelVolumesPayload)),
         response_schema: Some(schema_for!(LabelVolumesResult)),
+    });
+    update_actions.push(ActionDecl {
+        action: ACTION_NORMALIZE.into(),
+        payload_schema: Some(schema_for!(DryRunOptIn)),
+        response_schema: None,
     });
     update_actions.push(ActionDecl {
         action: "volume_policy".into(),
@@ -5325,5 +5449,84 @@ mod tests {
                 "{action}"
             );
         }
+    }
+
+    #[test]
+    fn normalize_without_an_engine_warns_on_set_and_fails_hard_on_its_own() {
+        if !crate::test_support::have_compose() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let dir = root.join("web");
+        let yaml = "services:\n  app:\n    image: x:1\n  db:\n    image: y:1\n";
+        let ((), _) = crate::test_support::with_db(|| {
+            register_root(&root);
+            registered_stack(&dir, yaml, None);
+            let out = stack_update(ACTION_NORMALIZE, Some(json!({"dryRun": true}))).unwrap();
+            let body = dry_run_body(out);
+            assert!(body["changes"].as_array().unwrap().is_empty(), "{body}");
+            assert_eq!(body["warnings"].as_array().unwrap().len(), 2, "{body}");
+            let err = err_of(stack_update(ACTION_NORMALIZE, None));
+            assert!(
+                err.contains("normalize refused") && err.contains("no engine connection"),
+                "{err}"
+            );
+
+            let provider = DockerUnitProvider::new(crate::registration::adapter());
+            let set = |extra: serde_json::Value| {
+                let mut payload = json!({
+                    "name": "web",
+                    "dir": dir.to_string_lossy(),
+                    "file": "compose.yaml",
+                    "deploy": false
+                });
+                payload
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                plugin_toolkit::reactor::block_on(provider.do_upsert(UpsertArgs {
+                    id: UnitId {
+                        manager: "docker@test".into(),
+                        kind: STACK_KIND.into(),
+                        id: "web".into(),
+                        name: "web".into(),
+                    },
+                    action: "set".into(),
+                    payload: Some(payload.to_string()),
+                    caller: Some(crate::test_support::caller("admin")),
+                }))
+                .unwrap()
+            };
+            let plan = dry_run_body(set(json!({"dryRun": true})));
+            assert!(
+                plan["plan"]
+                    .as_str()
+                    .unwrap()
+                    .contains("normalize: warning:"),
+                "{plan}"
+            );
+            let VerbOutcome::Item(item) = set(json!({})) else {
+                panic!("expected a deploy result");
+            };
+            assert!(
+                item.payload
+                    .contains("warning: app: container_name not set"),
+                "{}",
+                item.payload
+            );
+            assert!(
+                stacks::get("web").unwrap().is_some(),
+                "the stack stays registered"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.join("compose.yaml")).unwrap(),
+                yaml
+            );
+            let VerbOutcome::Item(item) = set(json!({"normalize": false})) else {
+                panic!("expected a deploy result");
+            };
+            assert!(!item.payload.contains("normalized"), "{}", item.payload);
+        });
     }
 }

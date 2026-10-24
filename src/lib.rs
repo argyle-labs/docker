@@ -28,6 +28,7 @@ pub mod lifecycle;
 pub mod lint;
 pub mod manageability;
 pub mod mounts;
+pub mod normalize;
 pub mod ownership;
 pub mod path_writable;
 pub mod policy;
