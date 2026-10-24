@@ -393,10 +393,6 @@ impl DockerUnitProvider {
         }
     }
 
-    /// **fix** — rewrite the fixable lint findings in the compose file through
-    /// the edit path. With `dry_run`, returns the changes and the diff.
-    /// Execute applies only the confirmed `items` that still apply cleanly to
-    /// the file as it is now. Does not deploy; run `up` afterwards.
     async fn normalize_note(&self, payload: Option<&str>) -> String {
         let Some(p) = payload.and_then(|raw| serde_json::from_str::<StackDeployPayload>(raw).ok())
         else {
@@ -405,28 +401,36 @@ impl DockerUnitProvider {
         if !p.normalize {
             return String::new();
         }
-        if p.compose_yaml.is_some() {
-            return "; normalize: planned once the compose file is written".to_string();
-        }
-        let row = StackRow {
-            name: p.name.clone(),
-            dir: p.dir.clone(),
-            file: p
-                .file
-                .clone()
-                .unwrap_or_else(|| stacks::DEFAULT_COMPOSE_FILE.to_string()),
-            enabled: true,
-            allow: stacks::get(&p.name)
-                .ok()
-                .flatten()
-                .map(|r| r.allow)
-                .unwrap_or_default(),
-        };
-        if !row.compose_path().is_file() {
+        let Ok(dir) = crate::tools::stacks_roots()
+            .and_then(|roots| stacks::stack_dir_in_roots(&p.dir, &roots))
+        else {
             return String::new();
-        }
+        };
         let docker = self.adapter.client().ok();
-        let report = match crate::normalize::plan_stack(&row, docker.as_ref()).await {
+        let planned = match &p.compose_yaml {
+            Some(yaml) => crate::normalize::plan_inline(&p.name, &dir, yaml, docker.as_ref()).await,
+            None => {
+                let row = StackRow {
+                    name: p.name.clone(),
+                    dir: dir.to_string_lossy().into_owned(),
+                    file: p
+                        .file
+                        .clone()
+                        .unwrap_or_else(|| stacks::DEFAULT_COMPOSE_FILE.to_string()),
+                    enabled: true,
+                    allow: stacks::get(&p.name)
+                        .ok()
+                        .flatten()
+                        .map(|r| r.allow)
+                        .unwrap_or_default(),
+                };
+                if !row.compose_path().is_file() {
+                    return String::new();
+                }
+                crate::normalize::plan_stack(&row, docker.as_ref()).await
+            }
+        };
+        let report = match planned {
             Ok(plan) => plan.report(),
             Err(e) => vec![format!("warning: normalize skipped: {e:#}")],
         };
@@ -490,6 +494,10 @@ impl DockerUnitProvider {
         }))
     }
 
+    /// **fix** — rewrite the fixable lint findings in the compose file through
+    /// the edit path. With `dry_run`, returns the changes and the diff.
+    /// Execute applies only the confirmed `items` that still apply cleanly to
+    /// the file as it is now. Does not deploy; run `up` afterwards.
     async fn stack_fix(
         &self,
         id: &UnitId,
@@ -5527,6 +5535,42 @@ mod tests {
                 panic!("expected a deploy result");
             };
             assert!(!item.payload.contains("normalized"), "{}", item.payload);
+        });
+    }
+
+    #[test]
+    fn deploy_dry_run_plans_inline_compose_and_ignores_dirs_outside_the_roots() {
+        if !crate::test_support::have_compose() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let ((), _) = crate::test_support::with_db(|| {
+            register_root(&root);
+            let provider = DockerUnitProvider::new(crate::registration::adapter());
+            let plan = |dir: &std::path::Path| {
+                let payload = json!({
+                    "name": "web",
+                    "dir": dir.to_string_lossy(),
+                    "compose_yaml": "services:\n  app:\n    image: x:1\n",
+                    "dryRun": true
+                });
+                let out = plugin_toolkit::reactor::block_on(provider.do_create(CreateArgs {
+                    action: "deploy".into(),
+                    payload: Some(payload.to_string()),
+                    caller: Some(crate::test_support::caller("admin")),
+                }))
+                .unwrap();
+                dry_run_body(out)["plan"].as_str().unwrap().to_string()
+            };
+            let inside = plan(&root.join("web"));
+            assert!(
+                inside.contains("normalize: warning: app: container_name not set"),
+                "{inside}"
+            );
+            let out = plan(&outside.path().join("web"));
+            assert!(!out.contains("normalize"), "{out}");
         });
     }
 }
