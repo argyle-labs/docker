@@ -2315,6 +2315,8 @@ fn adoptable(args: &DockerStackAllowArgs) -> Result<StackRow> {
         file,
         enabled: true,
         allow: Vec::new(),
+        files: Vec::new(),
+        env_files: Vec::new(),
     })
 }
 
@@ -2971,6 +2973,8 @@ mod tests {
             file: "compose.yaml".into(),
             enabled: true,
             allow: Vec::new(),
+            files: Vec::new(),
+            env_files: Vec::new(),
         };
         stacks::put(&row).unwrap();
         row

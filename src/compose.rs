@@ -108,6 +108,9 @@ pub struct Compose {
     file: PathBuf,
     override_file: Option<PathBuf>,
     orca_file: Option<PathBuf>,
+    extra_files: Vec<PathBuf>,
+    env_files: Vec<PathBuf>,
+    project: Option<String>,
 }
 
 impl Compose {
@@ -135,6 +138,23 @@ impl Compose {
             file: file.to_path_buf(),
             override_file,
             orca_file: None,
+            extra_files: Vec::new(),
+            env_files: Vec::new(),
+            project: None,
+        })
+    }
+
+    /// Exactly `files` in order, with `env_files` and the project name, as a
+    /// running project's labels list them; nothing is auto-loaded.
+    pub fn listed(files: &[PathBuf], env_files: &[PathBuf], project: &str) -> Option<Compose> {
+        let (file, extra) = files.split_first()?;
+        Some(Compose {
+            file: file.clone(),
+            override_file: None,
+            orca_file: None,
+            extra_files: extra.to_vec(),
+            env_files: env_files.to_vec(),
+            project: Some(project.to_string()),
         })
     }
 
@@ -185,6 +205,7 @@ impl Compose {
     pub fn files(&self) -> Vec<&Path> {
         std::iter::once(self.file.as_path())
             .chain(self.override_file.as_deref())
+            .chain(self.extra_files.iter().map(PathBuf::as_path))
             .chain(self.orca_file.as_deref())
             .collect()
     }
@@ -195,6 +216,20 @@ impl Compose {
             .into_iter()
             .flat_map(|f| ["-f".to_string(), f.to_string_lossy().into_owned()])
             .collect()
+    }
+
+    /// The global `compose` arguments: the project name and env files when
+    /// listed, then [`file_args`](Self::file_args).
+    pub fn args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if let Some(p) = &self.project {
+            args.extend(["-p".to_string(), p.clone()]);
+        }
+        for env in &self.env_files {
+            args.extend(["--env-file".to_string(), env.to_string_lossy().into_owned()]);
+        }
+        args.extend(self.file_args());
+        args
     }
 
     /// Service names declared in the compose file.
@@ -357,7 +392,7 @@ impl Compose {
     }
 
     async fn docker(&self, sub: &[&str]) -> Result<String, anyhow::Error> {
-        let files = self.file_args();
+        let files = self.args();
         let mut args: Vec<&str> = vec!["compose"];
         args.extend(files.iter().map(String::as_str));
         args.extend_from_slice(sub);

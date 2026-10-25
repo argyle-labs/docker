@@ -430,6 +430,8 @@ impl DockerUnitProvider {
                         .flatten()
                         .map(|r| r.allow)
                         .unwrap_or_default(),
+                    files: Vec::new(),
+                    env_files: Vec::new(),
                 };
                 if !crate::stacks::allowed_roots()
                     .and_then(|roots| row.compose_path(&roots))
@@ -901,6 +903,8 @@ impl DockerUnitProvider {
                 .as_ref()
                 .map(|r| r.allow.clone())
                 .unwrap_or_default(),
+            files: Vec::new(),
+            env_files: Vec::new(),
         };
         row.write_checked(
             p.compose_yaml.as_deref(),
@@ -3780,6 +3784,8 @@ mod tests {
             file: "compose.yaml".into(),
             enabled: true,
             allow: Vec::new(),
+            files: Vec::new(),
+            env_files: Vec::new(),
         };
         let summary = |id: &str, wd: Option<&str>| bollard::models::ContainerSummary {
             id: Some(id.into()),
@@ -3819,6 +3825,8 @@ mod tests {
             file: "compose.yaml".into(),
             enabled: true,
             allow: Vec::new(),
+            files: Vec::new(),
+            env_files: Vec::new(),
         };
         let summary = |id: &str, wd: &std::path::Path| bollard::models::ContainerSummary {
             id: Some(id.into()),
@@ -4564,6 +4572,8 @@ mod tests {
             file: "compose.yaml".into(),
             enabled: true,
             allow: Vec::new(),
+            files: Vec::new(),
+            env_files: Vec::new(),
         };
         stacks::put(&row).unwrap();
         row
@@ -5605,6 +5615,8 @@ mod tests {
             file: "compose.yaml".into(),
             enabled: true,
             allow: Vec::new(),
+            files: Vec::new(),
+            env_files: Vec::new(),
         };
         let c = &snap("sha256:old").containers[0];
         let plain = planned_image(&row, c, vec!["sha256:a".into()], Ok("sha256:b".into()));

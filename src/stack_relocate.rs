@@ -785,6 +785,8 @@ mod tests {
                 file: stacks::DEFAULT_COMPOSE_FILE.into(),
                 enabled: true,
                 allow: Vec::new(),
+                files: Vec::new(),
+                env_files: Vec::new(),
             })
             .unwrap();
             for bad in ["relative", "/srv/../etc", "/"] {

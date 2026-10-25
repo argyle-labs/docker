@@ -74,13 +74,16 @@ pub fn repository(reference: &str) -> String {
     let name = written_repository(reference);
     let (registry, path) = match name.split_once('/') {
         Some((first, rest))
-            if first.contains('.') || first.contains(':') || first == "localhost" =>
+            if first.contains('.')
+                || first.contains(':')
+                || first == "localhost"
+                || first.chars().any(|c| c.is_ascii_uppercase()) =>
         {
-            (first, rest)
+            (first.to_ascii_lowercase(), rest)
         }
-        _ => (DOCKER_HUB, name),
+        _ => (DOCKER_HUB.to_string(), name),
     };
-    let registry = match registry {
+    let registry = match registry.as_str() {
         "index.docker.io" | "registry-1.docker.io" => DOCKER_HUB,
         r => r,
     };
@@ -194,5 +197,14 @@ mod tests {
         assert!(ImageRef::parse(&format!("nginx:9@{DIGEST}")).matches(&[], &digests));
         assert!(!ImageRef::parse(&format!("other@{DIGEST}")).matches(&[], &digests));
         assert!(!ImageRef::parse(&format!("nginx@{DIGEST}")).matches(&tags, &[]));
+    }
+
+    #[test]
+    fn a_registry_host_is_lowercased_and_an_uppercase_first_component_is_a_host() {
+        assert_eq!(repository("GHCR.IO/org/app:1"), "ghcr.io/org/app");
+        assert_eq!(repository("MyHost/app"), "myhost/app");
+        assert!(
+            ImageRef::parse("Ghcr.io/org/app:1").matches(&["ghcr.io/org/app:1".to_string()], &[])
+        );
     }
 }
