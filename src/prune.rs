@@ -15,20 +15,25 @@
 //! Networks that any managed stack declares `external: true` are never
 //! candidates. When a stack's config cannot be read, no network is a
 //! candidate, because any of them might be that stack's external network.
+//! The same holds for orphan volumes and unused images: a volume any managed
+//! stack's config declares, and an image any of its services uses or builds,
+//! is never one, and an unreadable config withholds them all.
 //!
 //! Opt-in, host-wide only: `unusedImages` adds tagged images that no
 //! container, running or stopped, uses directly or through a parent or child
 //! image, last pulled or tagged (`Metadata.LastTagTime`) at least
 //! `minPullAgeDays` (default 1) and, if set, `olderThanDays` ago, and only the
 //! oldest-created until the unused ones left fit `keepBytes`; `buildCache`
-//! prunes the build cache down to `buildCacheKeepBytes`; `orphanVolumes` adds
-//! named volumes no container mounts that carry no compose project or
-//! `orca.stack` label and were created at least `orphanVolumeMinAgeDays`
-//! (default 7) ago. Image bytes count only layers no other image shares.
+//! prunes the build cache down to `buildCacheKeepBytes`, which must be given;
+//! `orphanVolumes` adds named volumes no container mounts that carry no
+//! `com.docker.*` ownership label (compose, Swarm) or `orca.stack` label and
+//! were created at least `orphanVolumeMinAgeDays` (default 7) ago. A volume
+//! the engine reports no creation time for is never a candidate. Image bytes count only layers no other image shares.
 //!
 //! An image is removed by one DELETE of its id without force, which the engine
 //! refuses atomically when anything uses it. An image with several tags is
-//! refused that way too; it is then untagged one tag at a time, each right
+//! refused that way too; unless an image is built on it, it is then untagged
+//! one tag at a time, each right
 //! after re-checking that no container uses it, stopping at the first that
 //! does.
 //!
@@ -120,7 +125,35 @@ pub struct Scope<'a> {
     /// Networks managed stacks declare `external: true`, by name or id.
     /// `None` means unknown, so no network is a candidate.
     pub external_networks: Option<&'a HashSet<String>>,
+    /// What managed stacks reference. `None` means unknown, so no orphan
+    /// volume or unused image is a candidate.
+    pub stack_refs: Option<&'a StackRefs>,
     pub extras: Extras,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StackRefs {
+    pub volumes: HashSet<String>,
+    pub images: HashSet<String>,
+}
+
+fn normalize_ref(r: &str) -> String {
+    let r = r
+        .strip_prefix("docker.io/library/")
+        .or_else(|| r.strip_prefix("docker.io/"))
+        .unwrap_or(r);
+    let last = r.rsplit('/').next().unwrap_or(r);
+    if r.contains('@') || last.contains(':') {
+        r.to_string()
+    } else {
+        format!("{r}:latest")
+    }
+}
+
+fn referenced_by_stacks(i: &ImageSummary, refs: &HashSet<String>) -> bool {
+    refs.iter()
+        .map(|r| normalize_ref(r))
+        .any(|r| i.repo_tags.contains(&r) || i.repo_digests.contains(&r) || i.id == r)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -190,6 +223,7 @@ fn container_image_ids<'a>(
 fn protected_images<'a>(
     images: &'a [ImageSummary],
     containers: &'a [ContainerSummary],
+    refs: &HashSet<String>,
 ) -> HashSet<&'a str> {
     let parent: HashMap<&str, &str> = images
         .iter()
@@ -200,7 +234,13 @@ fn protected_images<'a>(
     for (child, p) in &parent {
         children.entry(p).or_default().push(child);
     }
-    let used = container_image_ids(images, containers);
+    let mut used = container_image_ids(images, containers);
+    used.extend(
+        images
+            .iter()
+            .filter(|i| referenced_by_stacks(i, refs))
+            .map(|i| i.id.as_str()),
+    );
     let mut out: HashSet<&str> = HashSet::new();
     for &id in &used {
         let mut cur = id;
@@ -223,8 +263,9 @@ fn protected_images<'a>(
 fn unused_images<'a>(
     images: &'a [ImageSummary],
     containers: &[ContainerSummary],
+    refs: &HashSet<String>,
 ) -> Vec<&'a ImageSummary> {
-    let protected = protected_images(images, containers);
+    let protected = protected_images(images, containers, refs);
     images
         .iter()
         .filter(|i| !is_dangling_image(i) && !protected.contains(i.id.as_str()))
@@ -236,8 +277,9 @@ pub fn unused_image_candidates(
     containers: &[ContainerSummary],
     u: UnusedImages,
     tagged_at: &HashMap<String, i64>,
+    refs: &HashSet<String>,
 ) -> Vec<Candidate> {
-    let unused = unused_images(images, containers);
+    let unused = unused_images(images, containers, refs);
     let min_age = u.older_than_secs.unwrap_or(0).max(u.min_pull_age_secs);
     let mut eligible: Vec<&ImageSummary> = unused
         .iter()
@@ -274,12 +316,18 @@ pub fn unused_image_candidates(
         .collect()
 }
 
-fn volume_candidate(v: &Volume, detail: &str) -> Candidate {
+fn volume_candidate(v: &Volume, detail: &str) -> Option<Candidate> {
+    let created = v.created_at.as_deref().filter(|c| !c.is_empty())?;
     let mut c = Candidate::new(ResourceKind::Volume, &v.name, detail.to_string());
-    if let Some(created) = v.created_at.as_deref() {
-        c.key = format!("{}@{created}", c.key);
-    }
-    c
+    c.key = format!("{}@{created}", c.key);
+    Some(c)
+}
+
+fn owned(v: &Volume) -> bool {
+    v.labels.contains_key(crate::labels::STACK)
+        || v.labels
+            .keys()
+            .any(|k| k.starts_with("com.docker.") && k != ANONYMOUS_VOLUME_LABEL)
 }
 
 pub fn orphan_volume_candidates(
@@ -287,6 +335,7 @@ pub fn orphan_volume_candidates(
     project: Option<&str>,
     mounts: &HashMap<String, String>,
     o: OrphanVolumes,
+    referenced: &HashSet<String>,
 ) -> Vec<Candidate> {
     volumes
         .iter()
@@ -294,16 +343,13 @@ pub fn orphan_volume_candidates(
             !v.labels.contains_key(ANONYMOUS_VOLUME_LABEL)
                 || v.labels.contains_key(COMPOSE_VOLUME_LABEL)
         })
-        .filter(|v| {
-            !v.labels.contains_key(COMPOSE_PROJECT_LABEL)
-                && !v.labels.contains_key(crate::labels::STACK)
-        })
+        .filter(|v| !owned(v) && !referenced.contains(&v.name))
         .filter(|v| epoch(v.created_at.as_deref()).is_some_and(|t| t <= o.now - o.min_age_secs))
         .filter(|v| match project {
             Some(p) => crate::label_audit::volume_owner(v, mounts).as_deref() == Some(p),
             None => true,
         })
-        .map(|v| volume_candidate(v, "orphaned named volume, no container mounts it"))
+        .filter_map(|v| volume_candidate(v, "orphaned named volume, no container mounts it"))
         .collect()
 }
 
@@ -328,6 +374,9 @@ pub fn extras(args: &DockerPruneArgs, now: i64) -> Result<Extras> {
     }
     if !args.build_cache && args.build_cache_keep_bytes.is_some() {
         bail!("{TOOL}: `buildCacheKeepBytes` needs `buildCache`");
+    }
+    if args.build_cache && args.build_cache_keep_bytes.is_none() {
+        bail!("{TOOL}: `buildCache` needs `buildCacheKeepBytes`; pass 0 to empty the cache");
     }
     if args.stack.is_some() && (args.unused_images || args.build_cache || args.orphan_volumes) {
         bail!(
@@ -356,7 +405,7 @@ pub fn extras(args: &DockerPruneArgs, now: i64) -> Result<Extras> {
     let build_cache_keep_bytes = if args.build_cache {
         Some(as_bytes(
             "buildCacheKeepBytes",
-            args.build_cache_keep_bytes.unwrap_or(0),
+            args.build_cache_keep_bytes.unwrap_or_default(),
         )?)
     } else {
         None
@@ -421,7 +470,7 @@ pub fn volume_candidates(
             Some(p) => crate::label_audit::volume_owner(v, mounts).as_deref() == Some(p),
             None => true,
         })
-        .map(|v| volume_candidate(v, "dangling anonymous volume"))
+        .filter_map(|v| volume_candidate(v, "dangling anonymous volume"))
         .collect()
 }
 
@@ -636,10 +685,10 @@ pub async fn candidates(docker: &Docker, scope: Scope<'_>) -> Result<Vec<Candida
     .map_err(|e| engine_err("list networks", e))?;
     let containers = list_containers(docker).await?;
 
-    let mut out = match (project, scope.extras.unused_images) {
-        (Some(_), _) => Vec::new(),
-        (None, None) => dangling_images(docker).await?,
-        (None, Some(u)) => {
+    let mut out = match (project, scope.extras.unused_images, scope.stack_refs) {
+        (Some(_), _, _) => Vec::new(),
+        (None, None, _) | (None, Some(_), None) => dangling_images(docker).await?,
+        (None, Some(u), Some(refs)) => {
             let images = call(|| {
                 docker.list_images(Some(
                     ListImagesOptionsBuilder::new().shared_size(true).build(),
@@ -648,7 +697,7 @@ pub async fn candidates(docker: &Docker, scope: Scope<'_>) -> Result<Vec<Candida
             .await
             .map_err(|e| engine_err("list images", e))?;
             let mut tagged_at = HashMap::new();
-            for i in unused_images(&images, &containers) {
+            for i in unused_images(&images, &containers, &refs.images) {
                 let inspected = match call(|| docker.inspect_image(&i.id)).await {
                     Ok(inspected) => inspected,
                     Err(e) if is_404(&e) => continue,
@@ -663,14 +712,26 @@ pub async fn candidates(docker: &Docker, scope: Scope<'_>) -> Result<Vec<Candida
                 }
             }
             let mut found = image_candidates(&images, None);
-            found.extend(unused_image_candidates(&images, &containers, u, &tagged_at));
+            found.extend(unused_image_candidates(
+                &images,
+                &containers,
+                u,
+                &tagged_at,
+                &refs.images,
+            ));
             found
         }
     };
     let mounts = crate::label_audit::mount_owners(&containers);
     out.extend(volume_candidates(&volumes, project, &mounts));
-    if let Some(o) = scope.extras.orphan_volumes {
-        out.extend(orphan_volume_candidates(&volumes, project, &mounts, o));
+    if let (Some(o), Some(refs)) = (scope.extras.orphan_volumes, scope.stack_refs) {
+        out.extend(orphan_volume_candidates(
+            &volumes,
+            project,
+            &mounts,
+            o,
+            &refs.volumes,
+        ));
     }
     out.extend(network_candidates(&networks, &containers, scope));
     if let (None, Some(keep)) = (project, scope.extras.build_cache_keep_bytes) {
@@ -784,6 +845,13 @@ async fn remove_image(
         Ok(()) => return Ok(Removal::Removed(c.bytes)),
         Err(e) if is_multi_ref(&e) => {}
         Err(e) => return Err(e),
+    }
+    let all = call(|| docker.list_images(Some(ListImagesOptionsBuilder::new().all(true).build())))
+        .await?;
+    if all.iter().any(|i| i.parent_id == c.id) {
+        return Ok(Removal::Skipped(
+            "in use: an image is built on it (dependent child images)".to_string(),
+        ));
     }
     let mut untagged = Vec::new();
     for tag in tags {
@@ -1018,7 +1086,7 @@ pub fn plan<A: Serialize>(
     };
     let summary = if networks_withheld {
         format!(
-            "{summary}; networks not considered: a managed stack's compose config could not be read"
+            "{summary}; networks, orphan volumes and unused images not considered: a managed stack's compose config could not be read"
         )
     } else {
         summary
@@ -1066,7 +1134,8 @@ pub struct DockerPruneArgs {
     #[arg(long)]
     #[serde(default, rename = "keepBytes")]
     pub keep_bytes: Option<u64>,
-    /// Also prune the build cache, keeping `buildCacheKeepBytes` (default 0).
+    /// Also prune the build cache down to `buildCacheKeepBytes`, which is
+    /// required; 0 empties it.
     #[arg(long)]
     #[serde(default, rename = "buildCache")]
     pub build_cache: bool,
@@ -1092,20 +1161,24 @@ async fn project_for(stack: &str) -> Result<String> {
         .await?)
 }
 
-/// Networks every managed stack declares external, or `None` when any
-/// stack's config cannot be read.
-async fn external_networks() -> Result<Option<HashSet<String>>> {
-    let mut out = HashSet::new();
+/// Networks every managed stack declares external and what the stacks
+/// reference, or `None` when any stack's config cannot be read.
+async fn stack_configs() -> Result<Option<(HashSet<String>, StackRefs)>> {
+    let mut networks = HashSet::new();
+    let mut refs = StackRefs::default();
     for row in crate::stacks::all_here().await? {
         let Ok(compose) = row.compose(&crate::stacks::allowed_roots()?) else {
             return Ok(None);
         };
-        match compose.config_json().await {
-            Ok(raw) => out.extend(crate::compose::parse_external_networks(&raw)),
-            Err(_) => return Ok(None),
-        }
+        let Ok(raw) = compose.config_json().await else {
+            return Ok(None);
+        };
+        networks.extend(crate::compose::parse_external_networks(&raw));
+        refs.volumes
+            .extend(crate::compose::parse_stack_volumes(&raw));
+        refs.images.extend(crate::compose::parse_stack_images(&raw));
     }
-    Ok(Some(out))
+    Ok(Some((networks, refs)))
 }
 
 /// **Remove orphaned engine resources**: dangling images, dangling anonymous
@@ -1139,10 +1212,11 @@ async fn docker_prune(args: DockerPruneArgs, ctx: &ToolCtx) -> Result<PruneChang
     let docker = &crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
-    let external = external_networks().await?;
+    let configs = stack_configs().await?;
     let scope = Scope {
         project: project.as_deref(),
-        external_networks: external.as_ref(),
+        external_networks: configs.as_ref().map(|(n, _)| n),
+        stack_refs: configs.as_ref().map(|(_, r)| r),
         extras,
     };
     if !args.dry_run {
@@ -1155,7 +1229,7 @@ async fn docker_prune(args: DockerPruneArgs, ctx: &ToolCtx) -> Result<PruneChang
         &args,
         args.stack.as_deref(),
         &found,
-        external.is_none(),
+        configs.is_none(),
     )?))
 }
 
@@ -1175,7 +1249,7 @@ mod tests {
     fn volume(name: &str, labels: &[(&str, &str)]) -> String {
         let labels: HashMap<&str, &str> = labels.iter().copied().collect();
         format!(
-            r#"{{"Name":"{name}","Driver":"local","Mountpoint":"/var/lib/docker/volumes/{name}/_data","Labels":{},"Scope":"local","Options":{{}}}}"#,
+            r#"{{"Name":"{name}","Driver":"local","Mountpoint":"/var/lib/docker/volumes/{name}/_data","CreatedAt":"2026-01-01T00:00:00Z","Labels":{},"Scope":"local","Options":{{}}}}"#,
             plugin_toolkit::serde_json::to_string(&labels).unwrap()
         )
     }
@@ -1268,10 +1342,13 @@ mod tests {
         ["proxy".to_string()].into()
     }
 
+    static NO_REFS: std::sync::LazyLock<StackRefs> = std::sync::LazyLock::new(StackRefs::default);
+
     fn all(ext: &HashSet<String>) -> Scope<'_> {
         Scope {
             project: None,
             external_networks: Some(ext),
+            stack_refs: Some(&NO_REFS),
             extras: Extras::default(),
         }
     }
@@ -1293,8 +1370,8 @@ mod tests {
             vec![
                 "image:sha256:dead",
                 "image:sha256:digestonly",
-                "volume:anon1",
-                "volume:anon2",
+                "volume:anon1@2026-01-01T00:00:00Z",
+                "volume:anon2@2026-01-01T00:00:00Z",
                 "network:n-media-orphan",
                 "network:n-orphan",
             ]
@@ -1375,6 +1452,7 @@ mod tests {
         let scope = Scope {
             project: Some("media"),
             external_networks: Some(&ext),
+            stack_refs: Some(&NO_REFS),
             extras: Extras::default(),
         };
         assert_eq!(keys(&found(&e, scope)), vec!["network:n-media-orphan"]);
@@ -1442,7 +1520,7 @@ mod tests {
             plan(&args, None, &f, true)
                 .unwrap()
                 .summary
-                .contains("networks not considered")
+                .contains("unused images not considered")
         );
     }
 
@@ -1455,19 +1533,26 @@ mod tests {
         ]);
         let confirmed = vec![
             "image:sha256:dead".to_string(),
-            "volume:anon1".to_string(),
+            "volume:anon1@2026-01-01T00:00:00Z".to_string(),
             "network:n-orphan".to_string(),
-            "volume:gone-since-plan".to_string(),
+            "volume:gone-since-plan@2026-01-01T00:00:00Z".to_string(),
         ];
         let ext = external();
         let applied =
             plugin_toolkit::reactor::block_on(apply(&e.client(), all(&ext), &confirmed)).unwrap();
         assert_eq!(
             applied.removed,
-            vec!["image:sha256:dead", "volume:anon1", "network:n-orphan"]
+            vec![
+                "image:sha256:dead",
+                "volume:anon1@2026-01-01T00:00:00Z",
+                "network:n-orphan"
+            ]
         );
         assert_eq!(applied.skipped.len(), 1);
-        assert_eq!(applied.skipped[0].item, "volume:gone-since-plan");
+        assert_eq!(
+            applied.skipped[0].item,
+            "volume:gone-since-plan@2026-01-01T00:00:00Z"
+        );
         // Candidates that were not confirmed are untouched.
         let deletes = e.paths("DELETE");
         assert_eq!(deletes.len(), 3, "{deletes:?}");
@@ -1533,7 +1618,10 @@ mod tests {
         let applied = plugin_toolkit::reactor::block_on(apply(
             &e.client(),
             all(&ext),
-            &["volume:anon2".to_string(), "network:n-orphan".to_string()],
+            &[
+                "volume:anon2@2026-01-01T00:00:00Z".to_string(),
+                "network:n-orphan".to_string(),
+            ],
         ))
         .unwrap();
         assert!(applied.removed.is_empty());
@@ -1574,7 +1662,7 @@ mod tests {
     fn execute_without_an_admin_caller_is_refused() {
         let args = DockerPruneArgs {
             stack: None,
-            items: vec!["volume:anon1".into()],
+            items: vec!["volume:anon1@2026-01-01T00:00:00Z".into()],
             dry_run: false,
             ..Default::default()
         };
@@ -1680,10 +1768,16 @@ mod tests {
     fn unused(u: UnusedImages) -> Vec<String> {
         let images: Vec<ImageSummary> = parse(&fleet_images());
         let containers: Vec<ContainerSummary> = parse(&fleet_containers());
-        unused_image_candidates(&images, &containers, u, &tagged_at_created(&images))
-            .into_iter()
-            .map(|c| c.key)
-            .collect()
+        unused_image_candidates(
+            &images,
+            &containers,
+            u,
+            &tagged_at_created(&images),
+            &HashSet::new(),
+        )
+        .into_iter()
+        .map(|c| c.key)
+        .collect()
     }
 
     fn every(now: i64) -> UnusedImages {
@@ -1792,6 +1886,7 @@ mod tests {
             &containers,
             every(NOW),
             &tagged_at_created(&images),
+            &HashSet::new(),
         );
         assert_eq!(c[0].bytes, 400);
         assert!(c[0].detail.contains("ci-rust:1.95.0"), "{}", c[0].detail);
@@ -1865,7 +1960,7 @@ mod tests {
                 "image:sha256:ci",
                 "image:sha256:runner",
                 "image:sha256:fresh",
-                "volume:anon1",
+                "volume:anon1@2026-01-01T00:00:00Z",
                 &act_key(),
                 "buildcache:1000@5000",
             ]
@@ -1878,7 +1973,10 @@ mod tests {
         let e = extras_engine(vec![]);
         let ext = external();
         let f = found(&e, all(&ext));
-        assert_eq!(keys(&f), vec!["image:sha256:dangle", "volume:anon1"]);
+        assert_eq!(
+            keys(&f),
+            vec!["image:sha256:dangle", "volume:anon1@2026-01-01T00:00:00Z"]
+        );
         assert!(e.paths("GET").iter().all(|p| !p.ends_with("/system/df")));
     }
 
@@ -2168,6 +2266,10 @@ mod tests {
     }
 
     fn orphans(vols: &[String]) -> Vec<String> {
+        orphans_referenced(vols, &HashSet::new())
+    }
+
+    fn orphans_referenced(vols: &[String], referenced: &HashSet<String>) -> Vec<String> {
         let vols: Vec<Volume> = vols.iter().map(|v| parse(v)).collect();
         orphan_volume_candidates(
             &vols,
@@ -2177,6 +2279,7 @@ mod tests {
                 now: NOW,
                 min_age_secs: 7 * DAY,
             },
+            referenced,
         )
         .into_iter()
         .map(|c| c.id)
@@ -2220,7 +2323,7 @@ mod tests {
             ("sha256:stale".to_string(), NOW - 30 * DAY),
         ]);
         let keys = |u| -> Vec<String> {
-            unused_image_candidates(&images, &[], u, &tagged)
+            unused_image_candidates(&images, &[], u, &tagged, &HashSet::new())
                 .into_iter()
                 .map(|c| c.id)
                 .collect()
@@ -2236,7 +2339,10 @@ mod tests {
         };
         assert_eq!(keys(pull_age), vec!["sha256:stale"]);
         let untagged_time = HashMap::new();
-        assert!(unused_image_candidates(&images, &[], pull_age, &untagged_time).is_empty());
+        assert!(
+            unused_image_candidates(&images, &[], pull_age, &untagged_time, &HashSet::new())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2276,7 +2382,7 @@ mod tests {
             shared("b", NOW - 10 * DAY)
         ));
         let tagged = tagged_at_created(&images);
-        let all = unused_image_candidates(&images, &[], every(NOW), &tagged);
+        let all = unused_image_candidates(&images, &[], every(NOW), &tagged, &HashSet::new());
         assert_eq!(
             all.iter().map(|c| c.bytes).collect::<Vec<_>>(),
             vec![40, 40]
@@ -2285,7 +2391,7 @@ mod tests {
             keep_bytes: Some(50),
             ..every(NOW)
         };
-        let ids: Vec<_> = unused_image_candidates(&images, &[], u, &tagged)
+        let ids: Vec<_> = unused_image_candidates(&images, &[], u, &tagged, &HashSet::new())
             .into_iter()
             .map(|c| c.id)
             .collect();
@@ -2320,7 +2426,8 @@ mod tests {
                 &images,
                 &containers,
                 every(NOW),
-                &tagged_at_created(&images)
+                &tagged_at_created(&images),
+                &HashSet::new(),
             )
             .is_empty()
         );
@@ -2358,6 +2465,7 @@ mod tests {
             older_than_days: Some(7),
             keep_bytes: Some(2_000_000_000),
             build_cache: true,
+            build_cache_keep_bytes: Some(0),
             orphan_volumes: true,
             ..Default::default()
         };
@@ -2430,5 +2538,123 @@ mod tests {
             ..Default::default()
         };
         assert!(extras(&args, NOW).is_err());
+    }
+
+    #[test]
+    fn an_external_volume_of_a_downed_stack_is_kept() {
+        let old = NOW - 30 * DAY;
+        let referenced: HashSet<String> = ["shared_ext".to_string()].into();
+        assert_eq!(
+            orphans_referenced(
+                &[
+                    volume_at("shared_ext", &[], old),
+                    volume_at("loose", &[], old)
+                ],
+                &referenced
+            ),
+            vec!["loose"]
+        );
+    }
+
+    #[test]
+    fn a_volume_named_by_a_stacks_name_key_is_kept() {
+        let old = NOW - 30 * DAY;
+        let referenced: HashSet<String> = ["my-pinned".to_string()].into();
+        assert!(orphans_referenced(&[volume_at("my-pinned", &[], old)], &referenced).is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_stack_config_withholds_every_orphan_volume_and_unused_image() {
+        let e = extras_engine(vec![]);
+        let ext = external();
+        let scope = Scope {
+            stack_refs: None,
+            ..host_wide(&ext, opted_in())
+        };
+        let f = found(&e, scope);
+        assert!(!keys(&f).contains(&act_key().as_str()), "{f:?}");
+        assert!(
+            !f.iter()
+                .any(|c| c.kind == ResourceKind::Image && c.id != "sha256:dangle"),
+            "{f:?}"
+        );
+        assert!(keys(&f).contains(&"image:sha256:dangle"), "{f:?}");
+    }
+
+    #[test]
+    fn images_of_a_downed_stack_built_or_pulled_are_kept() {
+        let images: Vec<ImageSummary> = parse(&format!(
+            "[{},{},{},{}]",
+            img("sha256:pulled", "", &["nginx:1"], NOW - 90 * DAY, 10),
+            img("sha256:base", "", &["base:1"], NOW - 90 * DAY, 10),
+            img(
+                "sha256:built",
+                "sha256:base",
+                &["media-app:latest"],
+                NOW - 90 * DAY,
+                10
+            ),
+            img("sha256:loose", "", &["loose:1"], NOW - 90 * DAY, 10),
+        ));
+        let refs: HashSet<String> = ["nginx:1".to_string(), "media-app".to_string()].into();
+        let ids: Vec<_> =
+            unused_image_candidates(&images, &[], every(NOW), &tagged_at_created(&images), &refs)
+                .into_iter()
+                .map(|c| c.id)
+                .collect();
+        assert_eq!(ids, vec!["sha256:loose"]);
+    }
+
+    #[test]
+    fn a_swarm_labelled_volume_is_kept() {
+        let old = NOW - 30 * DAY;
+        assert!(
+            orphans(&[volume_at(
+                "swarm_data",
+                &[("com.docker.stack.namespace", "swarm")],
+                old
+            )])
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_undated_anonymous_volume_is_withheld() {
+        let v: Volume = parse(
+            r#"{"Name":"anon","Driver":"local","Mountpoint":"/x","Labels":{"com.docker.volume.anonymous":""},"Scope":"local","Options":{}}"#,
+        );
+        assert!(volume_candidates(&[v], None, &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn build_cache_without_a_keep_value_is_refused() {
+        let args = DockerPruneArgs {
+            build_cache: true,
+            ..Default::default()
+        };
+        let err = extras(&args, NOW).unwrap_err();
+        assert!(err.to_string().contains("buildCacheKeepBytes"), "{err}");
+    }
+
+    #[test]
+    fn a_child_images_parent_tags_are_not_removed() {
+        let with_child = format!(
+            "[{}]",
+            img("sha256:kid", "sha256:ci", &["kid:1"], NOW - 10 * DAY, 10)
+        );
+        let e = extras_engine(vec![
+            Route::new("GET", "/images/json", 200, with_child).when_query("all=true"),
+            Route::new("DELETE", "/images/sha256:ci", 409, MULTI_REF),
+            Route::new("DELETE", "/images/ci-rust:1.95.0", 200, "[]"),
+            Route::new("DELETE", "/images/ci-rust:latest", 200, "[]"),
+        ]);
+        let applied = run_apply(&e, opted_in(), &["image:sha256:ci"]);
+        assert!(applied.removed.is_empty(), "{applied:?}");
+        assert!(applied.skipped[0].reason.contains("child"), "{applied:?}");
+        let deletes = e.paths("DELETE");
+        assert!(
+            !deletes.iter().any(|d| d.contains("ci-rust")),
+            "{deletes:?}"
+        );
     }
 }

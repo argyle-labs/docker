@@ -407,6 +407,40 @@ pub fn parse_external_networks(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Engine-side names of every volume a resolved config declares, external or
+/// named by `name:` included (its `name`, else its key).
+pub fn parse_stack_volumes(raw: &str) -> Vec<String> {
+    let Ok(v): Result<Value, _> = serde_json::from_str(raw) else {
+        return Vec::new();
+    };
+    let Some(vols) = v["volumes"].as_object() else {
+        return Vec::new();
+    };
+    vols.iter()
+        .map(|(key, n)| n["name"].as_str().unwrap_or(key).to_string())
+        .collect()
+}
+
+/// Image refs a resolved config's services use: each `image`, else for a
+/// service with only `build`, the `<project>-<service>` name compose builds.
+pub fn parse_stack_images(raw: &str) -> Vec<String> {
+    let Ok(v): Result<Value, _> = serde_json::from_str(raw) else {
+        return Vec::new();
+    };
+    let project = v["name"].as_str().unwrap_or_default();
+    let Some(services) = v["services"].as_object() else {
+        return Vec::new();
+    };
+    services
+        .iter()
+        .filter_map(|(name, svc)| match svc["image"].as_str() {
+            Some(image) => Some(image.to_string()),
+            None if !svc["build"].is_null() => Some(format!("{project}-{name}")),
+            None => None,
+        })
+        .collect()
+}
+
 /// Parse JSON-lines output of `docker compose ps --format json` into a map
 /// keyed by service name.
 pub fn parse_compose_ps(raw: &str) -> HashMap<String, ServiceStatus> {
@@ -594,6 +628,23 @@ mod tests {
         nets.sort();
         assert_eq!(nets, vec!["bare", "caddy_proxy"]);
         assert!(parse_external_networks(r#"{"services":{}}"#).is_empty());
+    }
+
+    #[test]
+    fn parse_stack_volumes_reads_external_and_named_volumes() {
+        let raw = r#"{"name":"media","volumes":{"data":{"name":"media_data"},"shared":{"name":"shared_ext","external":true},"pinned":{"name":"my-pinned"}}}"#;
+        let mut vols = parse_stack_volumes(raw);
+        vols.sort();
+        assert_eq!(vols, vec!["media_data", "my-pinned", "shared_ext"]);
+        assert!(parse_stack_volumes(r#"{"services":{}}"#).is_empty());
+    }
+
+    #[test]
+    fn parse_stack_images_reads_pulled_and_built_images() {
+        let raw = r#"{"name":"media","services":{"web":{"image":"nginx:1"},"app":{"build":{"context":"."}},"tool":{"build":{"context":"."},"image":"mytool:dev"}}}"#;
+        let mut imgs = parse_stack_images(raw);
+        imgs.sort();
+        assert_eq!(imgs, vec!["media-app", "mytool:dev", "nginx:1"]);
     }
 
     #[test]
