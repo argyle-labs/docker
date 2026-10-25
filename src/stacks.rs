@@ -1015,6 +1015,87 @@ pub async fn all(docker: Option<&bollard::Docker>) -> Result<Vec<StackRow>> {
     Ok(rows)
 }
 
+pub async fn all_here() -> Result<Vec<StackRow>> {
+    all(crate::registration::adapter().present_client().as_ref()).await
+}
+
+pub async fn find_here(name: &str) -> Result<StackRow> {
+    find(
+        name,
+        crate::registration::adapter().present_client().as_ref(),
+    )
+    .await
+}
+
+pub const DOCKGE_STACKS_ROOT: &str = "/opt/stacks";
+
+pub async fn units(docker: Option<&bollard::Docker>) -> Result<Vec<StackRow>> {
+    let registered = list()?;
+    let Some(docker) = docker else {
+        return Ok(registered);
+    };
+    let found = match discover(docker).await {
+        Ok(found) => found,
+        Err(e) => {
+            plugin_toolkit::tracing::warn!(error = %e, "docker stacks: compose discovery failed");
+            Vec::new()
+        }
+    };
+    let yield_to_dockge = found.iter().any(under_dockge_root) && dockge_is_local();
+    let mut rows = registered;
+    rows.extend(
+        found
+            .into_iter()
+            .filter(|r| !(yield_to_dockge && under_dockge_root(r))),
+    );
+    Ok(rows)
+}
+
+fn under_dockge_root(row: &StackRow) -> bool {
+    Path::new(&row.dir).parent() == Some(Path::new(DOCKGE_STACKS_ROOT))
+}
+
+fn dockge_is_local() -> bool {
+    if !plugin_toolkit::tool_call::available() {
+        return false;
+    }
+    match plugin_toolkit::tool_call::call_json("dockge.list", plugin_toolkit::serde_json::json!({}))
+    {
+        Ok(v) => lists_local_dockge(&v, plugin_toolkit::containers::local_hostname()),
+        Err(_) => false,
+    }
+}
+
+pub fn lists_local_dockge(listed: &plugin_toolkit::serde_json::Value, hostname: &str) -> bool {
+    listed
+        .get("endpoints")
+        .and_then(|e| e.as_array())
+        .is_some_and(|eps| {
+            eps.iter().any(|e| {
+                e.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true)
+                    && e.get("base_url")
+                        .or_else(|| e.get("baseUrl"))
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|u| is_local_url(u, hostname))
+            })
+        })
+}
+
+fn is_local_url(url: &str, hostname: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => authority.split(':').next().unwrap_or(""),
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host.eq_ignore_ascii_case(hostname)
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 pub async fn find(name: &str, docker: Option<&bollard::Docker>) -> Result<StackRow> {
     if let Some(row) = get(name)? {
         return Ok(row);
@@ -1211,6 +1292,65 @@ mod tests {
             let all = plugin_toolkit::reactor::block_on(all(Some(&docker))).unwrap();
             assert_eq!(all.len(), 1);
             assert!(plugin_toolkit::reactor::block_on(find("absent", Some(&docker))).is_err());
+        });
+    }
+
+    #[test]
+    fn a_local_dockge_endpoint_is_recognised() {
+        use plugin_toolkit::serde_json::json;
+        let listed = |url: &str, enabled: bool| json!({"endpoints": [{"name": "d", "base_url": url, "enabled": enabled}]});
+        assert!(lists_local_dockge(
+            &listed("http://localhost:5001", true),
+            "freyr"
+        ));
+        assert!(lists_local_dockge(
+            &listed("http://127.0.0.1:5001/", true),
+            "freyr"
+        ));
+        assert!(lists_local_dockge(
+            &listed("http://[::1]:5001", true),
+            "freyr"
+        ));
+        assert!(lists_local_dockge(
+            &listed("http://FREYR:5001", true),
+            "freyr"
+        ));
+        assert!(!lists_local_dockge(
+            &listed("http://localhost:5001", false),
+            "freyr"
+        ));
+        assert!(!lists_local_dockge(
+            &listed("http://baldur:5001", true),
+            "freyr"
+        ));
+        assert!(!lists_local_dockge(
+            &listed("http://10.0.0.5:5001", true),
+            "freyr"
+        ));
+        assert!(!lists_local_dockge(&json!({"endpoints": []}), "freyr"));
+    }
+
+    #[test]
+    fn units_keep_dockge_root_projects_without_a_local_dockge() {
+        use crate::test_engine::{FakeEngine, Route};
+        crate::test_support::with_db(|| {
+            let e = FakeEngine::routed(vec![Route::new(
+                "GET",
+                "/containers/json",
+                200,
+                format!(
+                    "[{},{}]",
+                    compose_container("arr", "/opt/stacks/arr", "/opt/stacks/arr/compose.yaml"),
+                    compose_container("ntfy", "/srv/ntfy", "/srv/ntfy/compose.yaml")
+                ),
+            )]);
+            let docker = e.client();
+            let names: Vec<String> = plugin_toolkit::reactor::block_on(units(Some(&docker)))
+                .unwrap()
+                .into_iter()
+                .map(|r| r.name)
+                .collect();
+            assert_eq!(names, ["arr", "ntfy"]);
         });
     }
 

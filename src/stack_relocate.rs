@@ -110,8 +110,8 @@ async fn docker_stack_bindings(
     _ctx: &ToolCtx,
 ) -> Result<StackBindingsOutput> {
     let rows = match &args.stack {
-        Some(name) => vec![stacks::require(name)?],
-        None => stacks::list()?,
+        Some(name) => vec![stacks::find_here(name).await?],
+        None => stacks::all_here().await?,
     };
     let mut out = Vec::new();
     for row in rows {
@@ -404,7 +404,7 @@ struct Plan {
 }
 
 async fn plan(args: &DockerStackRelocateArgs) -> Result<Plan> {
-    let row = stacks::require(&args.stack)?;
+    let row = stacks::find_here(&args.stack).await?;
     if !fsat::is_single_component(&row.name) {
         bail!("stack name '{}' is not a plain dir name", row.name);
     }

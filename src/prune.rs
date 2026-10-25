@@ -464,7 +464,7 @@ pub struct DockerPruneArgs {
 }
 
 async fn project_for(stack: &str) -> Result<String> {
-    let row = crate::stacks::require(stack)?;
+    let row = crate::stacks::find_here(stack).await?;
     Ok(row.compose()?.project_name().await?)
 }
 
@@ -472,7 +472,7 @@ async fn project_for(stack: &str) -> Result<String> {
 /// stack's config cannot be read.
 async fn external_networks() -> Result<Option<HashSet<String>>> {
     let mut out = HashSet::new();
-    for row in crate::stacks::list()? {
+    for row in crate::stacks::all_here().await? {
         let Ok(compose) = row.compose() else {
             return Ok(None);
         };

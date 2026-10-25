@@ -220,7 +220,7 @@ impl DockerUnitProvider {
         }
 
         if want.is_none() || want == Some(STACK_KIND) {
-            for row in stacks::all(self.adapter.present_client().as_ref()).await? {
+            for row in stacks::units(self.adapter.present_client().as_ref()).await? {
                 let services = Self::stack_services(&row).await;
                 let summary = StackSummary {
                     name: row.name.clone(),
@@ -1154,7 +1154,7 @@ impl DockerUnitProvider {
             args.caller.as_ref(),
         )?;
         if args.id.kind == STACK_KIND {
-            stacks::require(&args.id.id)?;
+            stacks::find(&args.id.id, self.adapter.present_client().as_ref()).await?;
             let plan = format!(
                 "tear down stack '{}' (`compose down`) and deregister it; apply with update action={ACTION_REMOVE}",
                 args.id.id
@@ -2572,7 +2572,7 @@ async fn list_stack_members(
     docker: &bollard::Docker,
 ) -> Result<std::collections::HashMap<String, StackRow>> {
     use bollard::query_parameters::ListContainersOptionsBuilder;
-    let rows = stacks::list()?;
+    let rows = stacks::all(Some(docker)).await?;
     let filters =
         std::collections::HashMap::from([("label", vec![COMPOSE_WORKING_DIR_LABEL.to_string()])]);
     let containers = docker
@@ -3299,7 +3299,7 @@ impl UnitProvider for DockerUnitProvider {
                     parent: None,
                 })
                 .collect();
-            for row in stacks::all(self.adapter.present_client().as_ref()).await? {
+            for row in stacks::units(self.adapter.present_client().as_ref()).await? {
                 units.push(UnitDescriptor {
                     id: self.stack_unit_id(&row),
                     verbs: vec![
