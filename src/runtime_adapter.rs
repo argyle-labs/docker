@@ -57,6 +57,13 @@ impl DockerAdapter {
         self.engine().map(|(c, _)| c)
     }
 
+    pub(crate) fn present_client(&self) -> Option<Docker> {
+        if self.fixed.is_none() && crate::tools::docker_absent().unwrap_or(false) {
+            return None;
+        }
+        self.client().ok()
+    }
+
     fn host(&self) -> Result<Option<String>, AdapterError> {
         crate::tools::resolve_docker_host().map_err(|e| AdapterError::Unavailable(e.to_string()))
     }
@@ -215,6 +222,12 @@ impl RuntimeAdapter for DockerAdapter {
     }
 
     async fn list(&self, filter: &ListFilter) -> Result<Vec<Container>, AdapterError> {
+        if self.fixed.is_none()
+            && crate::tools::docker_absent()
+                .map_err(|e| AdapterError::Unavailable(e.to_string()))?
+        {
+            return Ok(Vec::new());
+        }
         let (client, host) = self.engine()?;
         let err = |e: bollard::errors::Error| at(&host, map_bollard_err(e));
         let opts = ListContainersOptionsBuilder::new().all(filter.all).build();

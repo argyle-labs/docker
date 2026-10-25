@@ -194,6 +194,16 @@ pub fn runtime(name: &str) -> Result<Option<Runtime>> {
 /// (a root is configuration, not liveness), else [`DEFAULT_STACKS_ROOT`].
 /// Stack dirs must resolve inside one of these.
 pub fn stacks_roots() -> Result<Vec<String>> {
+    let mut roots = configured_stacks_roots()?;
+    for root in crate::stacks::observed_roots() {
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    Ok(roots)
+}
+
+pub fn configured_stacks_roots() -> Result<Vec<String>> {
     let mut roots = Vec::new();
     for rt in runtimes()? {
         if let Some(root) = rt.stacks_root
@@ -286,7 +296,7 @@ async fn docker_list(args: DockerListArgs, _ctx: &ToolCtx) -> Result<DockerListO
         endpoints: page.items,
         next_cursor: page.next_cursor,
         total: page.total,
-        stacks_root_drift: crate::stacks_root_drift::observe(&stacks_roots()?).await,
+        stacks_root_drift: crate::stacks_root_drift::observe(&configured_stacks_roots()?).await,
     })
 }
 
@@ -675,6 +685,11 @@ fn first_existing_socket(paths: &[&str]) -> Option<String> {
 ///
 /// Returns `None` only when nothing is discoverable, in which case a direct
 /// bollard client falls back to its own compiled-in default.
+pub fn docker_absent() -> Result<bool> {
+    Ok(std::env::var_os("DOCKER_HOST").is_none_or(|h| h.is_empty())
+        && resolve_docker_host()?.is_none())
+}
+
 pub fn resolve_docker_host() -> Result<Option<String>> {
     if let Some(host) = active_host()? {
         return Ok(Some(host));

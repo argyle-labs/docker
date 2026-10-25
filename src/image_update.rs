@@ -448,13 +448,16 @@ pub struct DockerImageStatusArgs {
     execute_gated = false
 )]
 async fn docker_image_status(args: DockerImageStatusArgs, _ctx: &ToolCtx) -> Result<ImageStatus> {
-    let rows = match &args.stack {
-        Some(s) => vec![crate::stacks::require(s)?],
-        None => crate::stacks::list()?,
-    };
+    if crate::tools::docker_absent()? {
+        return Ok(ImageStatus::default());
+    }
     let docker = &crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
+    let rows = match &args.stack {
+        Some(s) => vec![crate::stacks::find(s, Some(docker)).await?],
+        None => crate::stacks::all(Some(docker)).await?,
+    };
     let mut remote = RemoteCache::new();
     let mut out = ImageStatus::default();
     for row in rows {

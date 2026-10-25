@@ -913,6 +913,120 @@ pub fn require(name: &str) -> Result<StackRow> {
     get(name)?.ok_or_else(|| anyhow::anyhow!("no managed stack named '{name}'"))
 }
 
+pub const CONFIG_FILES_LABEL: &str = "com.docker.compose.project.config_files";
+
+#[cfg(not(test))]
+fn with_discovered_roots<R>(f: impl FnOnce(&mut Vec<String>) -> R) -> R {
+    static ROOTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    f(&mut ROOTS.lock().unwrap_or_else(|p| p.into_inner()))
+}
+
+#[cfg(test)]
+fn with_discovered_roots<R>(f: impl FnOnce(&mut Vec<String>) -> R) -> R {
+    thread_local! {
+        static ROOTS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    ROOTS.with(|r| f(&mut r.borrow_mut()))
+}
+
+pub fn observed_roots() -> Vec<String> {
+    with_discovered_roots(|r| r.clone())
+}
+
+pub fn from_labels(
+    containers: &[bollard::models::ContainerSummary],
+    registered: &[StackRow],
+) -> Vec<StackRow> {
+    let mut found: std::collections::BTreeMap<String, StackRow> = Default::default();
+    for labels in containers.iter().filter_map(|c| c.labels.as_ref()) {
+        let (Some(project), Some(dir)) = (
+            labels.get(crate::prune::COMPOSE_PROJECT_LABEL),
+            labels.get(crate::stacks_root_drift::WORKING_DIR_LABEL),
+        ) else {
+            continue;
+        };
+        if project.is_empty() || !Path::new(dir).is_absolute() || found.contains_key(project) {
+            continue;
+        }
+        if registered
+            .iter()
+            .any(|r| &r.name == project || &r.dir == dir)
+        {
+            continue;
+        }
+        let file = labels
+            .get(CONFIG_FILES_LABEL)
+            .and_then(|f| f.split(',').next())
+            .map(Path::new)
+            .filter(|f| f.parent() == Some(Path::new(dir)))
+            .and_then(|f| f.file_name())
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(default_compose_file);
+        found.insert(
+            project.clone(),
+            StackRow {
+                name: project.clone(),
+                dir: dir.clone(),
+                file,
+                enabled: true,
+                allow: Vec::new(),
+            },
+        );
+    }
+    found.into_values().collect()
+}
+
+pub async fn discover(docker: &bollard::Docker) -> Result<Vec<StackRow>> {
+    let filters = std::collections::HashMap::from([(
+        "label",
+        vec![crate::prune::COMPOSE_PROJECT_LABEL.to_string()],
+    )]);
+    let containers = docker
+        .list_containers(Some(
+            bollard::query_parameters::ListContainersOptionsBuilder::new()
+                .all(true)
+                .filters(&filters)
+                .build(),
+        ))
+        .await
+        .map_err(|e| anyhow::anyhow!("list compose containers: {e}"))?;
+    let rows = from_labels(&containers, &list()?);
+    with_discovered_roots(|roots| {
+        for parent in rows.iter().filter_map(|r| Path::new(&r.dir).parent()) {
+            let parent = parent.to_string_lossy().into_owned();
+            if parent != "/" && !roots.contains(&parent) {
+                roots.push(parent);
+            }
+        }
+    });
+    Ok(rows)
+}
+
+pub async fn all(docker: Option<&bollard::Docker>) -> Result<Vec<StackRow>> {
+    let mut rows = list()?;
+    if let Some(docker) = docker {
+        match discover(docker).await {
+            Ok(found) => rows.extend(found),
+            Err(e) => {
+                plugin_toolkit::tracing::warn!(error = %e, "docker stacks: compose discovery failed")
+            }
+        }
+    }
+    Ok(rows)
+}
+
+pub async fn find(name: &str, docker: Option<&bollard::Docker>) -> Result<StackRow> {
+    if let Some(row) = get(name)? {
+        return Ok(row);
+    }
+    if let Some(docker) = docker
+        && let Some(row) = discover(docker).await?.into_iter().find(|r| r.name == name)
+    {
+        return Ok(row);
+    }
+    Err(anyhow::anyhow!("no managed stack named '{name}'"))
+}
+
 /// Whether a stack with this name is registered.
 pub fn exists(name: &str) -> Result<bool> {
     Ok(get(name)?.is_some())
@@ -1010,6 +1124,93 @@ mod tests {
             insert(&row("/opt/stacks/web")).unwrap();
             assert!(insert(&row("/opt/stacks/elsewhere")).is_err());
             assert_eq!(require("web").unwrap().dir, "/opt/stacks/web");
+        });
+    }
+
+    fn compose_container(project: &str, dir: &str, files: &str) -> String {
+        format!(
+            r#"{{"Id":"{project}","Labels":{{"com.docker.compose.project":"{project}","com.docker.compose.project.working_dir":"{dir}","com.docker.compose.project.config_files":"{files}"}}}}"#
+        )
+    }
+
+    #[test]
+    fn compose_projects_are_discovered_from_container_labels() {
+        let body = format!(
+            "[{},{},{},{}]",
+            compose_container(
+                "komga",
+                "/opt/stacks/komga",
+                "/opt/stacks/komga/compose.yaml"
+            ),
+            compose_container(
+                "komga",
+                "/opt/stacks/komga",
+                "/opt/stacks/komga/compose.yaml"
+            ),
+            compose_container("ntfy", "/srv/ntfy", "/elsewhere/ntfy.yml"),
+            compose_container(
+                "web",
+                "/opt/halvor/compose/web",
+                "/opt/halvor/compose/web/docker-compose.yml"
+            ),
+        );
+        let containers: Vec<bollard::models::ContainerSummary> =
+            plugin_toolkit::serde_json::from_str(&body).unwrap();
+        let registered = [StackRow {
+            name: "web".into(),
+            dir: "/opt/halvor/compose/web".into(),
+            file: DEFAULT_COMPOSE_FILE.into(),
+            enabled: true,
+            allow: Vec::new(),
+        }];
+        let rows = from_labels(&containers, &registered);
+        let got: Vec<(&str, &str, &str)> = rows
+            .iter()
+            .map(|r| (r.name.as_str(), r.dir.as_str(), r.file.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("komga", "/opt/stacks/komga", "compose.yaml"),
+                ("ntfy", "/srv/ntfy", DEFAULT_COMPOSE_FILE),
+            ]
+        );
+    }
+
+    #[test]
+    fn discovery_adds_the_project_parent_to_the_stacks_roots() {
+        use crate::test_engine::{FakeEngine, Route};
+        crate::test_support::with_db(|| {
+            let e = FakeEngine::routed(vec![Route::new(
+                "GET",
+                "/containers/json",
+                200,
+                format!(
+                    "[{}]",
+                    compose_container(
+                        "immich",
+                        "/opt/dockge-test/immich",
+                        "/opt/dockge-test/immich/compose.yaml"
+                    )
+                ),
+            )]);
+            let docker = e.client();
+            let row = plugin_toolkit::reactor::block_on(find("immich", Some(&docker))).unwrap();
+            assert_eq!(row.dir, "/opt/dockge-test/immich");
+            assert_eq!(row.file, "compose.yaml");
+            assert!(
+                crate::tools::stacks_roots()
+                    .unwrap()
+                    .contains(&"/opt/dockge-test".to_string())
+            );
+            assert!(
+                !crate::tools::configured_stacks_roots()
+                    .unwrap()
+                    .contains(&"/opt/dockge-test".to_string())
+            );
+            let all = plugin_toolkit::reactor::block_on(all(Some(&docker))).unwrap();
+            assert_eq!(all.len(), 1);
+            assert!(plugin_toolkit::reactor::block_on(find("absent", Some(&docker))).is_err());
         });
     }
 

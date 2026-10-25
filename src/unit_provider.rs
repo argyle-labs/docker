@@ -220,7 +220,7 @@ impl DockerUnitProvider {
         }
 
         if want.is_none() || want == Some(STACK_KIND) {
-            for row in stacks::list()? {
+            for row in stacks::all(self.adapter.present_client().as_ref()).await? {
                 let services = Self::stack_services(&row).await;
                 let summary = StackSummary {
                     name: row.name.clone(),
@@ -248,7 +248,7 @@ impl DockerUnitProvider {
     /// **view** — compose YAML + `.env` + per-service status. `query.kind =
     /// "logs"` tails the project's compose logs instead.
     async fn stack_detail(&self, args: DetailArgs) -> Result<VerbOutcome> {
-        let row = stacks::require(&args.id.id)?;
+        let row = stacks::find(&args.id.id, self.adapter.present_client().as_ref()).await?;
         if args.query.kind.as_deref() == Some("coverage") {
             let (project, volumes) = self.stack_volumes(&row).await?;
             let policies = volume_coverage::policies(&row.name)?;
@@ -317,7 +317,7 @@ impl DockerUnitProvider {
 
     /// **edit** (rewrite YAML/env, no deploy) or a compose lifecycle action.
     pub(crate) async fn stack_update(&self, args: UpdateArgs) -> Result<VerbOutcome> {
-        let row = stacks::require(&args.id.id)?;
+        let row = stacks::find(&args.id.id, self.adapter.present_client().as_ref()).await?;
         match args.action.as_str() {
             "edit" => {
                 let raw = args
@@ -3299,7 +3299,7 @@ impl UnitProvider for DockerUnitProvider {
                     parent: None,
                 })
                 .collect();
-            for row in stacks::list()? {
+            for row in stacks::all(self.adapter.present_client().as_ref()).await? {
                 units.push(UnitDescriptor {
                     id: self.stack_unit_id(&row),
                     verbs: vec![
