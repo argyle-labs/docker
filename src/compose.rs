@@ -100,6 +100,8 @@ pub fn override_in(dir: &Path) -> Option<PathBuf> {
         .find(|o| o.exists())
 }
 
+pub const CONFIG_JSON_ARGS: [&str; 5] = ["--profile", "*", "config", "--format", "json"];
+
 /// A located compose project.
 #[derive(Debug, Clone)]
 pub struct Compose {
@@ -244,11 +246,11 @@ impl Compose {
             .collect())
     }
 
-    /// `docker compose config --format json`: the file as compose resolves
-    /// it, with interpolation applied, paths made absolute and mounts in long
-    /// syntax.
+    /// `docker compose config --format json` with every profile enabled: the
+    /// file as compose resolves it, with interpolation applied, paths made
+    /// absolute and mounts in long syntax.
     pub async fn config_json(&self) -> Result<String, ComposeError> {
-        Ok(self.docker(&["config", "--format", "json"]).await?)
+        Ok(self.docker(&CONFIG_JSON_ARGS).await?)
     }
 
     /// The project name from the resolved config: the value the engine stamps
@@ -645,6 +647,11 @@ mod tests {
         let mut imgs = parse_stack_images(raw);
         imgs.sort();
         assert_eq!(imgs, vec!["media-app", "mytool:dev", "nginx:1"]);
+    }
+
+    #[test]
+    fn config_json_enables_every_profile() {
+        assert!(CONFIG_JSON_ARGS.windows(2).any(|w| w == ["--profile", "*"]));
     }
 
     #[test]

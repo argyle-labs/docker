@@ -34,6 +34,7 @@ use plugin_toolkit::prelude::*;
 use plugin_toolkit::serde_json::{self, Value};
 
 use crate::compose::{self, Compose};
+use crate::image_ref::ImageRef;
 use crate::stacks::{self, StackDir, StackRow};
 use crate::{engine_state, execute, fsat};
 
@@ -377,7 +378,7 @@ pub struct Roots {
 }
 
 /// An image a granted service runs: `stack`'s `service` holds a grant while
-/// running `image` (normalized, see [`norm_image`]).
+/// running `image` (see [`ImageRef::canonical`]).
 #[derive(Debug, Clone)]
 pub struct GrantedImage {
     pub image: String,
@@ -1254,22 +1255,6 @@ fn service(name: &str, svc: &Value, c: &mut Collector<'_>, roots: &Roots, resolv
     }
 }
 
-/// `image` in one spelling: no `docker.io/` or `library/` prefix, and
-/// `:latest` when it names no tag or digest.
-pub fn norm_image(image: &str) -> String {
-    let i = image
-        .strip_prefix("docker.io/")
-        .or_else(|| image.strip_prefix("index.docker.io/"))
-        .unwrap_or(image);
-    let i = i.strip_prefix("library/").unwrap_or(i);
-    let last = i.rsplit('/').next().unwrap_or(i);
-    if last.contains(':') || i.contains('@') {
-        i.to_string()
-    } else {
-        format!("{i}:latest")
-    }
-}
-
 /// Refuse a build that would tag an image a granted service runs, and any
 /// other stack naming one: building or pulling it under that name would
 /// change what the granted service runs.
@@ -1284,13 +1269,14 @@ fn image_names(name: &str, svc: &Value, c: &mut Collector<'_>, roots: &Roots) {
                 .map(|t| t.as_str().unwrap_or("")),
         )
         .filter(|n| !n.is_empty())
-        .map(norm_image)
+        .map(str::to_string)
         .collect();
     for n in named {
+        let canonical = ImageRef::parse(&n).canonical();
         let why = roots
             .granted_images
             .iter()
-            .filter(|g| g.image == n)
+            .filter(|g| g.image == canonical)
             .find_map(|g| {
                 if builds {
                     Some(format!(
@@ -1677,7 +1663,7 @@ fn granted_images(row: &StackRow, others: &[StackRow]) -> Vec<GrantedImage> {
         .chain(std::iter::once(row))
         .flat_map(|r| {
             r.allow.iter().map(|g| GrantedImage {
-                image: norm_image(&g.image),
+                image: ImageRef::parse(&g.image).canonical(),
                 stack: r.name.clone(),
                 service: g.service.clone(),
             })
@@ -4216,12 +4202,12 @@ mod tests {
                 "web",
                 vec![
                     GrantedImage {
-                        image: norm_image("x:1"),
+                        image: ImageRef::parse("x:1").canonical(),
                         stack: "web".into(),
                         service: "app".into(),
                     },
                     GrantedImage {
-                        image: norm_image("docker.io/library/ha"),
+                        image: ImageRef::parse("docker.io/library/ha").canonical(),
                         stack: "home".into(),
                         service: "ha".into(),
                     },
@@ -4255,9 +4241,6 @@ mod tests {
         ok(
             json!({"name": "web", "services": {"b": {"image": "y:1", "build": {"context": STACK}}}}),
         );
-        assert_eq!(norm_image("docker.io/library/ha"), "ha:latest");
-        assert_eq!(norm_image("ghcr.io/a/b:2"), "ghcr.io/a/b:2");
-        assert_eq!(norm_image("localhost:5000/b"), "localhost:5000/b:latest");
     }
 
     #[test]

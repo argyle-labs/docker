@@ -29,9 +29,9 @@ use flate2::write::GzEncoder;
 use plugin_toolkit::prelude::*;
 
 use crate::engine_state::{self, Limits};
+use crate::image_ref::written_repository;
 use crate::lifecycle::{in_backup_root, open_archive};
 use crate::prune::{COMPOSE_PROJECT_LABEL, COMPOSE_VOLUME_LABEL};
-use crate::stack_manifest::repo_of;
 use crate::volume_coverage::{HELPER_IMAGE, STAGING_DIR, VolumeArtifact, engine_volumes};
 
 const EXPORT_TOOL: &str = "docker.stack_volumes_export";
@@ -143,7 +143,7 @@ fn skipped(volumes: &[VolumeEntry]) -> Vec<Skipped> {
 }
 
 fn is_cache_image(image: &str) -> bool {
-    let repo = repo_of(image);
+    let repo = written_repository(image);
     CACHE_IMAGES.contains(&repo.rsplit('/').next().unwrap_or(repo))
 }
 

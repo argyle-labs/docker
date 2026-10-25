@@ -23,6 +23,7 @@ pub mod engine_state;
 mod exec;
 pub mod execute;
 pub mod fsat;
+pub mod image_ref;
 pub mod image_update;
 #[allow(clippy::disallowed_methods)]
 pub mod init;
@@ -155,6 +156,13 @@ pub async fn run(args: &[&str]) -> plugin_toolkit::anyhow::Result<String> {
     let mut cmd = std::process::Command::new("/usr/bin/env");
     cmd.args(clean_argv(resolve_docker_bin()).await?).args(args);
     run_within(cmd, CLI_BUDGET).await
+}
+
+/// [`run`], returning stdout and stderr apart.
+pub async fn run_with_stderr(args: &[&str]) -> plugin_toolkit::anyhow::Result<(String, String)> {
+    let mut cmd = std::process::Command::new("/usr/bin/env");
+    cmd.args(clean_argv(resolve_docker_bin()).await?).args(args);
+    run_split(cmd, CLI_BUDGET, &mut Vec::new()).await
 }
 
 const CLI_BUDGET: std::time::Duration = std::time::Duration::from_secs(30 * 60);
@@ -296,10 +304,19 @@ async fn run_within(
 }
 
 async fn run_tracked(
-    mut cmd: std::process::Command,
+    cmd: std::process::Command,
     budget: std::time::Duration,
     drains: &mut Vec<std::thread::JoinHandle<()>>,
 ) -> plugin_toolkit::anyhow::Result<String> {
+    let (stdout, stderr) = run_split(cmd, budget, drains).await?;
+    Ok(if stdout.is_empty() { stderr } else { stdout })
+}
+
+async fn run_split(
+    mut cmd: std::process::Command,
+    budget: std::time::Duration,
+    drains: &mut Vec<std::thread::JoinHandle<()>>,
+) -> plugin_toolkit::anyhow::Result<(String, String)> {
     use std::os::unix::process::CommandExt;
     let mut child = cmd
         .process_group(0)
@@ -342,7 +359,7 @@ async fn run_tracked(
         };
         plugin_toolkit::anyhow::bail!("{}", why.trim());
     }
-    Ok(if stdout.is_empty() { stderr } else { stdout })
+    Ok((stdout, stderr))
 }
 
 #[cfg(test)]

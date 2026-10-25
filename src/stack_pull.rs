@@ -8,7 +8,7 @@ use bollard::Docker;
 use bollard::query_parameters::{CreateImageOptionsBuilder, TagImageOptionsBuilder};
 use plugin_toolkit::prelude::*;
 
-use crate::stack_manifest::{normalize, repo_of};
+use crate::image_ref::{repository, written_repository};
 
 const TOOL: &str = "docker.stack_pull_pinned";
 
@@ -39,7 +39,7 @@ pub fn parse(pair: &str) -> Result<Pin> {
         bail!("'{pair}': '{digest}' is not a sha256 digest");
     }
     // Tagging a different repository's digest as `image` would run the wrong software.
-    if normalize(repo_of(pinned)) != normalize(repo_of(image)) {
+    if repository(pinned) != repository(image) {
         bail!("'{pair}': '{pinned}' is not a digest of '{image}'");
     }
     if image.contains('@') && image != pinned {
@@ -57,7 +57,7 @@ pub fn tag_target(image: &str) -> Option<(&str, &str)> {
     if image.contains('@') {
         return None;
     }
-    let repo = repo_of(image);
+    let repo = written_repository(image);
     let tag = image[repo.len()..].strip_prefix(':').unwrap_or("latest");
     Some((repo, tag))
 }
