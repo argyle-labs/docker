@@ -2068,12 +2068,17 @@ pub struct DockerStackAllowOutput {
     domain = "docker",
     verb = "stack_allow",
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    dry_run_aware = true
 )]
 async fn docker_stack_allow(
     args: DockerStackAllowArgs,
     ctx: &ToolCtx,
 ) -> Result<DockerStackAllowOutput> {
+    let args = DockerStackAllowArgs {
+        dry_run: args.dry_run || ctx.dry_run(),
+        ..args
+    };
     execute::require_admin(ALLOW_TOOL, ctx)?;
     let docker = &crate::registration::adapter()
         .client()
@@ -2297,10 +2302,11 @@ fn adoptable(args: &DockerStackAllowArgs) -> Result<StackRow> {
         .clone()
         .unwrap_or_else(|| stacks::DEFAULT_COMPOSE_FILE.to_string());
     stacks::check_file_name(&file)?;
-    let dir = stacks::stack_dir_in_roots(dir, &crate::tools::stacks_roots()?)?;
+    let roots = crate::tools::stacks_roots()?;
+    let dir = stacks::stack_dir_in_roots(dir, &roots)?;
     stacks::check_dir_free(&args.name, &dir)?;
     let path = dir.join(&file);
-    if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+    if !stacks::regular_file_in_roots(&path, &roots) {
         bail!(
             "{ALLOW_TOOL}: compose file {} is not a regular file",
             path.display()
@@ -2312,7 +2318,7 @@ fn adoptable(args: &DockerStackAllowArgs) -> Result<StackRow> {
         .chain(&[compose::ORCA_FILE, stacks::ENV_FILE])
     {
         let p = dir.join(name);
-        if std::fs::symlink_metadata(&p).is_ok_and(|m| !m.is_file()) {
+        if std::fs::symlink_metadata(&p).is_ok() && !stacks::regular_file_in_roots(&p, &roots) {
             bail!("{ALLOW_TOOL}: {} is not a regular file", p.display());
         }
     }
@@ -3343,6 +3349,32 @@ mod tests {
                 std::fs::remove_file(&link).unwrap();
             }
             assert!(stacks::get("web").unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn adopting_accepts_a_compose_file_symlinked_inside_the_stacks_root() {
+        if !crate::test_support::have_compose() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let fake = engine(&[PULLED]);
+        let docker = fake.client();
+        crate::test_support::with_db(|| {
+            let dir = unregistered(&root, "");
+            let shared = root.join("shared");
+            std::fs::create_dir(&shared).unwrap();
+            std::fs::write(
+                shared.join("compose.yaml"),
+                "services:\n  app:\n    image: x:1\n",
+            )
+            .unwrap();
+            std::fs::remove_file(dir.join("compose.yaml")).unwrap();
+            std::os::unix::fs::symlink(shared.join("compose.yaml"), dir.join("compose.yaml"))
+                .unwrap();
+            let out = adopt(&docker, Some(&dir), Vec::new(), false).unwrap();
+            assert!(out.adopted && out.dry_run);
         });
     }
 

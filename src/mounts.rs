@@ -395,12 +395,17 @@ pub fn select(
     verb = "mount_check",
     local_only = true,
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    dry_run_aware = true
 )]
 async fn docker_mount_check(
     args: DockerMountCheckArgs,
     ctx: &ToolCtx,
 ) -> Result<DockerMountCheckOutput> {
+    let args = DockerMountCheckArgs {
+        dry_run: args.dry_run || ctx.dry_run(),
+        ..args
+    };
     execute::require_admin(CHECK_TOOL, ctx)?;
     let host = host_mounts(&HostProc)?;
     let checked = check(scan(false).await?, &host, &HostProc);
@@ -769,12 +774,15 @@ pub struct DockerMountGateOutput {
     verb = "mount_gate",
     local_only = true,
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    dry_run_aware = true
 )]
 async fn docker_mount_gate(
     args: DockerMountGateArgs,
     ctx: &ToolCtx,
 ) -> Result<DockerMountGateOutput> {
+    let mut args = args;
+    args.dry_run |= ctx.dry_run();
     execute::require_admin(GATE_TOOL, ctx)?;
     let root = Path::new("/");
     let host = host_mounts(&HostProc)?;

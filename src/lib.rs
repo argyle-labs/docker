@@ -347,6 +347,26 @@ async fn run_tracked(
 mod tests {
     use super::*;
 
+    #[test]
+    fn every_tool_taking_dry_run_lets_core_forward_it() {
+        use plugin_toolkit::dispatch;
+        let aware = dispatch::dry_run_aware_names();
+        let gated = dispatch::execute_gated_names();
+        assert!(aware.contains(&"docker.prune"), "{aware:?}");
+        for def in dispatch::mcp_definitions() {
+            let name = def["name"].as_str().unwrap_or_default();
+            if !name.starts_with("docker.") {
+                continue;
+            }
+            if def["inputSchema"]["properties"].get("dryRun").is_some() {
+                assert!(
+                    aware.contains(&name) || gated.contains(&name),
+                    "{name} reads dryRun but core refuses to forward it"
+                );
+            }
+        }
+    }
+
     fn sh(script: &str) -> std::process::Command {
         let mut cmd = std::process::Command::new("/bin/sh");
         cmd.args(["-c", script]);

@@ -404,7 +404,7 @@ struct Plan {
 }
 
 async fn plan(args: &DockerStackRelocateArgs) -> Result<Plan> {
-    let row = stacks::find_here(&args.stack).await?;
+    let row = stacks::require_registered_here(&args.stack).await?;
     if !fsat::is_single_component(&row.name) {
         bail!("stack name '{}' is not a plain dir name", row.name);
     }
@@ -588,12 +588,17 @@ async fn relocate(args: &DockerStackRelocateArgs) -> Result<RelocateOutput> {
     domain = "docker",
     verb = "stack_relocate",
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    dry_run_aware = true
 )]
 async fn docker_stack_relocate(
     args: DockerStackRelocateArgs,
     ctx: &ToolCtx,
 ) -> Result<RelocateOutput> {
+    let args = DockerStackRelocateArgs {
+        dry_run: args.dry_run || ctx.dry_run(),
+        ..args
+    };
     crate::execute::require_admin(TOOL, ctx)?;
     relocate(&args).await
 }

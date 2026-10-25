@@ -194,16 +194,6 @@ pub fn runtime(name: &str) -> Result<Option<Runtime>> {
 /// (a root is configuration, not liveness), else [`DEFAULT_STACKS_ROOT`].
 /// Stack dirs must resolve inside one of these.
 pub fn stacks_roots() -> Result<Vec<String>> {
-    let mut roots = configured_stacks_roots()?;
-    for root in crate::stacks::observed_roots() {
-        if !roots.contains(&root) {
-            roots.push(root);
-        }
-    }
-    Ok(roots)
-}
-
-pub fn configured_stacks_roots() -> Result<Vec<String>> {
     let mut roots = Vec::new();
     for rt in runtimes()? {
         if let Some(root) = rt.stacks_root
@@ -296,7 +286,7 @@ async fn docker_list(args: DockerListArgs, _ctx: &ToolCtx) -> Result<DockerListO
         endpoints: page.items,
         next_cursor: page.next_cursor,
         total: page.total,
-        stacks_root_drift: crate::stacks_root_drift::observe(&configured_stacks_roots()?).await,
+        stacks_root_drift: crate::stacks_root_drift::observe(&stacks_roots()?).await,
     })
 }
 
@@ -399,12 +389,17 @@ pub struct DockerCreateOutput {
     domain = "docker",
     verb = "create",
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    dry_run_aware = true
 )]
 pub(crate) async fn docker_create(
     args: DockerCreateArgs,
     ctx: &ToolCtx,
 ) -> Result<DockerCreateOutput> {
+    let args = DockerCreateArgs {
+        dry_run: args.dry_run || ctx.dry_run(),
+        ..args
+    };
     execute::require_admin(CREATE_TOOL, ctx)?;
     if let Some(root) = &args.stacks_root {
         validate_stacks_root(root)?;
@@ -516,9 +511,14 @@ pub struct DockerUpdateOutput {
     domain = "docker",
     verb = "update",
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    dry_run_aware = true
 )]
 async fn docker_update(args: DockerUpdateArgs, ctx: &ToolCtx) -> Result<DockerUpdateOutput> {
+    let args = DockerUpdateArgs {
+        dry_run: args.dry_run || ctx.dry_run(),
+        ..args
+    };
     execute::require_admin(UPDATE_TOOL, ctx)?;
     if let Some(root) = &args.stacks_root {
         validate_stacks_root(root)?;
@@ -614,9 +614,14 @@ pub struct DockerDeleteOutput {
     domain = "docker",
     verb = "delete",
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    dry_run_aware = true
 )]
 async fn docker_delete(args: DockerDeleteArgs, ctx: &ToolCtx) -> Result<DockerDeleteOutput> {
+    let args = DockerDeleteArgs {
+        dry_run: args.dry_run || ctx.dry_run(),
+        ..args
+    };
     execute::require_admin(DELETE_TOOL, ctx)?;
     if args.dry_run {
         let changed = endpoint_db::get(&args.name)?.is_some();
@@ -669,29 +674,47 @@ fn one_engine(read: Result<Vec<Runtime>>) -> Result<Option<String>> {
 const WELL_KNOWN_SOCKETS: &[&str] = &["/var/run/docker.sock", "/run/docker.sock"];
 
 /// First existing socket in `paths`, formatted as a `unix://` `DOCKER_HOST`.
-/// Pure over the filesystem so it can be unit-tested with a temp path.
-fn first_existing_socket(paths: &[&str]) -> Option<String> {
+/// A path whose existence cannot be checked (EACCES on a parent) counts as
+/// present, so connecting reports the real error instead of "not found".
+fn first_existing_socket<P: AsRef<str>>(paths: &[P]) -> Option<String> {
     paths
         .iter()
-        .find(|p| std::path::Path::new(p).exists())
+        .map(AsRef::as_ref)
+        .find(|p| std::path::Path::new(p).try_exists().unwrap_or(true))
         .map(|p| format!("unix://{p}"))
+}
+
+/// Socket paths probed after the registered runtime and `DOCKER_HOST`: the
+/// rootless daemon's under `XDG_RUNTIME_DIR` (or `/run/user/<uid>`), then the
+/// system daemon's.
+fn socket_candidates(xdg_runtime_dir: Option<&str>, uid: u32) -> Vec<String> {
+    let mut out = Vec::new();
+    match xdg_runtime_dir.filter(|d| !d.is_empty()) {
+        Some(dir) => out.push(format!("{dir}/docker.sock")),
+        None => out.push(format!("/run/user/{uid}/docker.sock")),
+    }
+    out.extend(WELL_KNOWN_SOCKETS.iter().map(|p| p.to_string()));
+    out
+}
+
+pub fn docker_absent() -> Result<bool> {
+    Ok(resolve_docker_host()?.is_none())
 }
 
 /// Resolve the `DOCKER_HOST` to inject, trying every source in order:
 /// 1. the first enabled registered runtime (socket/tcp),
-/// 2. colima's default socket,
-/// 3. a docker socket present at a well-known path (covers Unraid and any
-///    host running the engine on the standard socket without registration).
+/// 2. a non-empty `DOCKER_HOST`,
+/// 3. colima's default socket,
+/// 4. a rootless or system docker socket that exists (covers Unraid, Alpine
+///    LXCs and any host running the engine without registration).
 ///
 /// Returns `None` only when nothing is discoverable, in which case a direct
 /// bollard client falls back to its own compiled-in default.
-pub fn docker_absent() -> Result<bool> {
-    Ok(std::env::var_os("DOCKER_HOST").is_none_or(|h| h.is_empty())
-        && resolve_docker_host()?.is_none())
-}
-
 pub fn resolve_docker_host() -> Result<Option<String>> {
     if let Some(host) = active_host()? {
+        return Ok(Some(host));
+    }
+    if let Some(host) = std::env::var("DOCKER_HOST").ok().filter(|h| !h.is_empty()) {
         return Ok(Some(host));
     }
     if let Ok(home) = std::env::var("HOME") {
@@ -700,12 +723,56 @@ pub fn resolve_docker_host() -> Result<Option<String>> {
             return Ok(Some(format!("unix://{colima}")));
         }
     }
-    Ok(first_existing_socket(WELL_KNOWN_SOCKETS))
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+    Ok(first_existing_socket(&socket_candidates(
+        xdg.as_deref(),
+        uid,
+    )))
 }
 
 #[cfg(test)]
 mod resolve_tests {
-    use super::first_existing_socket;
+    use super::{first_existing_socket, socket_candidates};
+
+    #[test]
+    fn socket_candidates_try_rootless_then_system_sockets() {
+        assert_eq!(
+            socket_candidates(Some("/run/user/1000"), 1000),
+            [
+                "/run/user/1000/docker.sock",
+                "/var/run/docker.sock",
+                "/run/docker.sock"
+            ]
+        );
+        assert_eq!(
+            socket_candidates(Some(""), 1001)[0],
+            "/run/user/1001/docker.sock"
+        );
+        assert_eq!(
+            socket_candidates(None, 1001)[0],
+            "/run/user/1001/docker.sock"
+        );
+    }
+
+    #[test]
+    fn a_socket_behind_an_unreadable_dir_counts_as_present() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let sock = locked.join("docker.sock").to_string_lossy().into_owned();
+        assert_eq!(
+            first_existing_socket(&["/definitely/not/a/real/docker.sock", sock.as_str()]),
+            Some(format!("unix://{sock}"))
+        );
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 
     #[test]
     fn first_existing_socket_picks_present_path_and_formats_unix() {

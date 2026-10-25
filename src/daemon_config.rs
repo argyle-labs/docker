@@ -1035,12 +1035,17 @@ pub struct DaemonConfigUpdateOutput {
     local_only = true,
     role = "admin",
     execute_gated = false,
-    reaches = ["privileged.apply"]
+    reaches = ["privileged.apply"],
+    dry_run_aware = true
 )]
 async fn docker_daemon_config_update(
     args: DockerDaemonConfigUpdateArgs,
     ctx: &ToolCtx,
 ) -> Result<DaemonConfigUpdateOutput> {
+    let args = DockerDaemonConfigUpdateArgs {
+        dry_run: args.dry_run || ctx.dry_run(),
+        ..args
+    };
     execute::require_admin(UPDATE_TOOL, ctx)?;
     refuse_macos(UPDATE_TOOL)?;
     if is_root() {

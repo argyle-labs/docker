@@ -317,7 +317,8 @@ impl DockerUnitProvider {
 
     /// **edit** (rewrite YAML/env, no deploy) or a compose lifecycle action.
     pub(crate) async fn stack_update(&self, args: UpdateArgs) -> Result<VerbOutcome> {
-        let row = stacks::find(&args.id.id, self.adapter.present_client().as_ref()).await?;
+        let row =
+            stacks::require_registered(&args.id.id, self.adapter.present_client().as_ref()).await?;
         match args.action.as_str() {
             "edit" => {
                 let raw = args
@@ -663,7 +664,7 @@ impl DockerUnitProvider {
         }
         let dest = match &p.dest {
             Some(d) => crate::lifecycle::in_backup_root(d, &engine_state::backup_roots())?,
-            None => default_backup_dir(dir),
+            None => default_backup_dir()?,
         };
         std::fs::create_dir_all(&dest)
             .map_err(|e| anyhow::anyhow!("create backup dir {}: {e}", dest.display()))?;
@@ -1154,7 +1155,7 @@ impl DockerUnitProvider {
             args.caller.as_ref(),
         )?;
         if args.id.kind == STACK_KIND {
-            stacks::find(&args.id.id, self.adapter.present_client().as_ref()).await?;
+            stacks::require_registered(&args.id.id, self.adapter.present_client().as_ref()).await?;
             let plan = format!(
                 "tear down stack '{}' (`compose down`) and deregister it; apply with update action={ACTION_REMOVE}",
                 args.id.id
@@ -1555,9 +1556,7 @@ pub struct StackFixResult {
 pub struct StackBackupPayload {
     /// Directory the archive is written to; must resolve inside the daemon's
     /// backup roots (`ORCA_DOCKER_BACKUP_ROOTS`, else `/mnt/backups`). `None`
-    /// → a `.orca-backups` sibling of the stack's project directory (a
-    /// system-owned WHERE, until the backup target/storage layer resolves it
-    /// centrally).
+    /// → `docker/stack-backups` under orca's state dir.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dest: Option<String>,
 }
@@ -2146,7 +2145,7 @@ async fn plan_update(
 ) -> Result<VerbOutcome> {
     let compose = row.compose().map_err(anyhow::Error::from)?;
     policy::gate(Some(docker), row, &compose).await?;
-    let backup_dir = default_backup_dir(std::path::Path::new(&row.dir));
+    let backup_dir = default_backup_dir()?;
     let snap = snapshot(docker, project).await?;
     let mut seen = std::collections::BTreeSet::new();
     let mut images = Vec::new();
@@ -2366,10 +2365,17 @@ async fn owning_stack(docker: &bollard::Docker, container: &str) -> Result<Stack
     Ok(row)
 }
 
-/// Where a stack backup goes when the caller names no destination: a
-/// `.orca-backups` sibling of the stack dir, so the archive is never written
-/// inside the directory being archived.
-fn default_backup_dir(dir: &std::path::Path) -> std::path::PathBuf {
+/// Where a stack backup goes when the caller names no destination: orca's
+/// own state dir, which the orca user can write whoever owns the stack dir.
+fn default_backup_dir() -> Result<std::path::PathBuf> {
+    Ok(plugin_toolkit::contract::config::paths::state_dir()?
+        .join("docker")
+        .join("stack-backups"))
+}
+
+/// Where backups without a destination were written before they moved to
+/// [`default_backup_dir`]; still read on restore.
+fn legacy_backup_dir(dir: &std::path::Path) -> std::path::PathBuf {
     dir.parent().unwrap_or(dir).join(".orca-backups")
 }
 
@@ -2427,12 +2433,16 @@ fn restore_notes(restored: &[String], dumps: &[String], unverified: bool) -> Str
     notes
 }
 
-/// Open a restore archive, refused outside the backup roots and outside the
-/// stack's own default backup dir, where an un-targeted backup put it.
+/// Open a restore archive, refused outside the backup roots and the default
+/// backup dirs, where an un-targeted backup put it.
 fn restore_source(archive: &str, stack_dir: &str, roots: &[String]) -> Result<std::fs::File> {
-    let default = default_backup_dir(std::path::Path::new(stack_dir));
     let mut allowed = roots.to_vec();
-    allowed.push(default.to_string_lossy().into_owned());
+    allowed.push(default_backup_dir()?.to_string_lossy().into_owned());
+    allowed.push(
+        legacy_backup_dir(std::path::Path::new(stack_dir))
+            .to_string_lossy()
+            .into_owned(),
+    );
     crate::lifecycle::open_archive(archive, &allowed)
 }
 
@@ -4454,6 +4464,19 @@ mod tests {
 
     fn path(p: &std::path::Path) -> String {
         p.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn default_backups_go_under_orcas_state_dir_not_the_stack_dir() {
+        let dir = default_backup_dir().unwrap();
+        let state = plugin_toolkit::contract::config::paths::state_dir().unwrap();
+        assert!(dir.starts_with(&state), "{}", dir.display());
+        assert!(!dir.starts_with("/opt"), "{}", dir.display());
+        std::fs::create_dir_all(&dir).unwrap();
+        let own = dir.join("web-default-backup-test.tar.gz");
+        std::fs::write(&own, b"x").unwrap();
+        restore_source(&path(&own), "/opt/halvor/compose/web", &[]).unwrap();
+        std::fs::remove_file(&own).unwrap();
     }
 
     #[test]

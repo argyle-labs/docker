@@ -999,12 +999,17 @@ pub async fn export(
     domain = "docker",
     verb = "stack_move_export",
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    dry_run_aware = true
 )]
 async fn docker_stack_move_export(
     args: DockerStackMoveExportArgs,
     ctx: &ToolCtx,
 ) -> Result<StackMoveExportOutput> {
+    let args = DockerStackMoveExportArgs {
+        dry_run: args.dry_run || ctx.dry_run(),
+        ..args
+    };
     crate::execute::require_admin(EXPORT_TOOL, ctx)?;
     let docker = &crate::registration::adapter()
         .client()
@@ -1358,12 +1363,17 @@ fn health_timeout(requested: Option<u64>) -> Duration {
     domain = "docker",
     verb = "stack_move_import",
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    dry_run_aware = true
 )]
 async fn docker_stack_move_import(
     args: DockerStackMoveImportArgs,
     ctx: &ToolCtx,
 ) -> Result<StackMoveImportOutput> {
+    let args = DockerStackMoveImportArgs {
+        dry_run: args.dry_run || ctx.dry_run(),
+        ..args
+    };
     crate::execute::require_admin(IMPORT_TOOL, ctx)?;
     let docker = &crate::registration::adapter()
         .client()
@@ -1536,12 +1546,17 @@ pub async fn finish(
     domain = "docker",
     verb = "stack_move_finish",
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    dry_run_aware = true
 )]
 async fn docker_stack_move_finish(
     args: DockerStackMoveFinishArgs,
     ctx: &ToolCtx,
 ) -> Result<StackMoveFinishOutput> {
+    let args = DockerStackMoveFinishArgs {
+        dry_run: args.dry_run || ctx.dry_run(),
+        ..args
+    };
     crate::execute::require_admin(FINISH_TOOL, ctx)?;
     let docker = &crate::registration::adapter()
         .client()

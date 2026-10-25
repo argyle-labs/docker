@@ -491,9 +491,14 @@ async fn external_networks() -> Result<Option<HashSet<String>>> {
     domain = "docker",
     verb = "prune",
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    dry_run_aware = true
 )]
 async fn docker_prune(args: DockerPruneArgs, ctx: &ToolCtx) -> Result<PruneChange> {
+    let args = DockerPruneArgs {
+        dry_run: args.dry_run || ctx.dry_run(),
+        ..args
+    };
     execute::require_admin(TOOL, ctx)?;
     let project = match &args.stack {
         Some(s) => Some(project_for(s).await?),

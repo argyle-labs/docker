@@ -146,6 +146,12 @@ impl StackRow {
             Some(staged) => staged.temp_path(),
             None => match dir.stat(&name)? {
                 Some(st) if st.kind == fsat::Kind::File => dir.path().join(&name),
+                Some(st)
+                    if st.kind == fsat::Kind::Symlink
+                        && regular_file_in_roots(&dir.path().join(&name), stacks_roots) =>
+                {
+                    dir.path().join(&name)
+                }
                 Some(_) => anyhow::bail!(
                     "compose file '{name}' in {} is not a regular file",
                     dir.path().display()
@@ -752,6 +758,19 @@ pub struct StagedWrite<'a> {
     committed: bool,
 }
 
+fn staging_error(e: std::io::Error, temp: &str, dir: &Path) -> anyhow::Error {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        return anyhow::anyhow!(
+            "cannot write in stack dir {}: permission denied for uid {uid}; orca stages {temp} there and renames it into place, so the orca user needs write access to {} (owner or group write)",
+            dir.display(),
+            dir.display()
+        );
+    }
+    anyhow::Error::new(e).context(format!("creating {temp} in {}", dir.display()))
+}
+
 impl<'a> StagedWrite<'a> {
     pub fn new(dir: &'a StackDir, name: &str, contents: &str) -> Result<Self> {
         use std::io::Write;
@@ -777,7 +796,7 @@ impl<'a> StagedWrite<'a> {
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
             0o600,
         )
-        .with_context(|| format!("creating {temp} in {}", dir.path().display()))?;
+        .map_err(|e| staging_error(e, &temp, dir.path()))?;
         let staged = StagedWrite {
             dir,
             name: name.to_string(),
@@ -915,24 +934,6 @@ pub fn require(name: &str) -> Result<StackRow> {
 
 pub const CONFIG_FILES_LABEL: &str = "com.docker.compose.project.config_files";
 
-#[cfg(not(test))]
-fn with_discovered_roots<R>(f: impl FnOnce(&mut Vec<String>) -> R) -> R {
-    static ROOTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-    f(&mut ROOTS.lock().unwrap_or_else(|p| p.into_inner()))
-}
-
-#[cfg(test)]
-fn with_discovered_roots<R>(f: impl FnOnce(&mut Vec<String>) -> R) -> R {
-    thread_local! {
-        static ROOTS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
-    }
-    ROOTS.with(|r| f(&mut r.borrow_mut()))
-}
-
-pub fn observed_roots() -> Vec<String> {
-    with_discovered_roots(|r| r.clone())
-}
-
 pub fn from_labels(
     containers: &[bollard::models::ContainerSummary],
     registered: &[StackRow],
@@ -945,7 +946,10 @@ pub fn from_labels(
         ) else {
             continue;
         };
-        if project.is_empty() || !Path::new(dir).is_absolute() || found.contains_key(project) {
+        if !fsat::is_single_component(project)
+            || !Path::new(dir).is_absolute()
+            || found.contains_key(project)
+        {
             continue;
         }
         if registered
@@ -990,16 +994,7 @@ pub async fn discover(docker: &bollard::Docker) -> Result<Vec<StackRow>> {
         ))
         .await
         .map_err(|e| anyhow::anyhow!("list compose containers: {e}"))?;
-    let rows = from_labels(&containers, &list()?);
-    with_discovered_roots(|roots| {
-        for parent in rows.iter().filter_map(|r| Path::new(&r.dir).parent()) {
-            let parent = parent.to_string_lossy().into_owned();
-            if parent != "/" && !roots.contains(&parent) {
-                roots.push(parent);
-            }
-        }
-    });
-    Ok(rows)
+    Ok(from_labels(&containers, &list()?))
 }
 
 pub async fn all(docker: Option<&bollard::Docker>) -> Result<Vec<StackRow>> {
@@ -1101,11 +1096,65 @@ pub async fn find(name: &str, docker: Option<&bollard::Docker>) -> Result<StackR
         return Ok(row);
     }
     if let Some(docker) = docker
-        && let Some(row) = discover(docker).await?.into_iter().find(|r| r.name == name)
+        && let Some(row) = discovered(docker, name).await
     {
         return Ok(row);
     }
     Err(anyhow::anyhow!("no managed stack named '{name}'"))
+}
+
+async fn discovered(docker: &bollard::Docker, name: &str) -> Option<StackRow> {
+    match discover(docker).await {
+        Ok(found) => found.into_iter().find(|r| r.name == name),
+        Err(e) => {
+            plugin_toolkit::tracing::warn!(error = %e, "docker stacks: compose discovery failed");
+            None
+        }
+    }
+}
+
+pub async fn require_registered(name: &str, docker: Option<&bollard::Docker>) -> Result<StackRow> {
+    if let Some(row) = get(name)? {
+        return Ok(row);
+    }
+    if let Some(docker) = docker
+        && discovered(docker, name).await.is_some()
+    {
+        anyhow::bail!(
+            "stack '{name}' is a discovered compose project, not a registered one; adopt it with docker.stack_allow (`dir` + `approve_current`) before changing it"
+        );
+    }
+    Err(anyhow::anyhow!("no managed stack named '{name}'"))
+}
+
+pub async fn require_registered_here(name: &str) -> Result<StackRow> {
+    require_registered(
+        name,
+        crate::registration::adapter().present_client().as_ref(),
+    )
+    .await
+}
+
+/// Whether `path` is a regular file, or a symlink resolving to one inside
+/// one of `roots`.
+pub fn regular_file_in_roots(path: &Path, roots: &[String]) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if meta.is_file() {
+        return true;
+    }
+    if !meta.file_type().is_symlink() {
+        return false;
+    }
+    let Ok(real) = path.canonicalize() else {
+        return false;
+    };
+    real.is_file()
+        && roots
+            .iter()
+            .filter_map(|r| Path::new(r).canonicalize().ok())
+            .any(|r| real.starts_with(r))
 }
 
 /// Whether a stack with this name is registered.
@@ -1258,41 +1307,129 @@ mod tests {
         );
     }
 
-    #[test]
-    fn discovery_adds_the_project_parent_to_the_stacks_roots() {
+    fn discovered_engine(project: &str, dir: &str) -> crate::test_engine::FakeEngine {
         use crate::test_engine::{FakeEngine, Route};
+        FakeEngine::routed(vec![Route::new(
+            "GET",
+            "/containers/json",
+            200,
+            format!(
+                "[{}]",
+                compose_container(project, dir, &format!("{dir}/compose.yaml"))
+            ),
+        )])
+    }
+
+    #[test]
+    fn a_discovered_project_never_becomes_a_stacks_root() {
         crate::test_support::with_db(|| {
-            let e = FakeEngine::routed(vec![Route::new(
-                "GET",
-                "/containers/json",
-                200,
-                format!(
-                    "[{}]",
-                    compose_container(
-                        "immich",
-                        "/opt/dockge-test/immich",
-                        "/opt/dockge-test/immich/compose.yaml"
-                    )
-                ),
-            )]);
+            let e = discovered_engine("x", "/etc/x");
             let docker = e.client();
-            let row = plugin_toolkit::reactor::block_on(find("immich", Some(&docker))).unwrap();
-            assert_eq!(row.dir, "/opt/dockge-test/immich");
-            assert_eq!(row.file, "compose.yaml");
+            let row = plugin_toolkit::reactor::block_on(find("x", Some(&docker))).unwrap();
+            assert_eq!(row.dir, "/etc/x");
+            let roots = crate::tools::stacks_roots().unwrap();
             assert!(
-                crate::tools::stacks_roots()
-                    .unwrap()
-                    .contains(&"/opt/dockge-test".to_string())
+                !roots.iter().any(|r| Path::new("/etc/x").starts_with(r)),
+                "{roots:?}"
             );
-            assert!(
-                !crate::tools::configured_stacks_roots()
-                    .unwrap()
-                    .contains(&"/opt/dockge-test".to_string())
-            );
+            assert!(StackDir::open("/etc/x", &roots, true).is_err());
             let all = plugin_toolkit::reactor::block_on(all(Some(&docker))).unwrap();
             assert_eq!(all.len(), 1);
             assert!(plugin_toolkit::reactor::block_on(find("absent", Some(&docker))).is_err());
         });
+    }
+
+    #[test]
+    fn changing_a_discovered_unregistered_project_is_refused() {
+        crate::test_support::with_db(|| {
+            let e = discovered_engine("immich", "/opt/stacks/immich");
+            let docker = e.client();
+            let err =
+                plugin_toolkit::reactor::block_on(require_registered("immich", Some(&docker)))
+                    .unwrap_err()
+                    .to_string();
+            assert!(err.contains("docker.stack_allow"), "{err}");
+            let err =
+                plugin_toolkit::reactor::block_on(require_registered("absent", Some(&docker)))
+                    .unwrap_err()
+                    .to_string();
+            assert!(err.contains("no managed stack"), "{err}");
+        });
+    }
+
+    #[test]
+    fn a_symlinked_working_dir_cannot_escape_the_stacks_root() {
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        symlink(outside.path(), root.path().join("web")).unwrap();
+        let roots = vec![s(&root.path().canonicalize().unwrap())];
+        let dir = PathBuf::from(&roots[0]).join("web");
+        assert!(StackDir::open(&s(&dir), &roots, true).is_err());
+    }
+
+    #[test]
+    fn a_multi_component_project_name_is_not_discovered() {
+        let body = format!(
+            "[{},{},{}]",
+            compose_container("../etc", "/opt/stacks/a", "/opt/stacks/a/compose.yaml"),
+            compose_container("a/b", "/opt/stacks/b", "/opt/stacks/b/compose.yaml"),
+            compose_container("ok", "/opt/stacks/ok", "/opt/stacks/ok/compose.yaml"),
+        );
+        let containers: Vec<bollard::models::ContainerSummary> =
+            plugin_toolkit::serde_json::from_str(&body).unwrap();
+        let names: Vec<String> = from_labels(&containers, &[])
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(names, ["ok"]);
+    }
+
+    #[test]
+    fn a_symlink_counts_as_a_regular_file_only_inside_a_root() {
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let roots = vec![s(root.path())];
+        let shared = root.path().join("shared.yaml");
+        std::fs::write(&shared, "services: {}\n").unwrap();
+        let evil = outside.path().join("evil.yaml");
+        std::fs::write(&evil, "services: {}\n").unwrap();
+        let inside = root.path().join("in.yaml");
+        let escape = root.path().join("out.yaml");
+        let dangling = root.path().join("gone.yaml");
+        let to_dir = root.path().join("dir.yaml");
+        symlink(&shared, &inside).unwrap();
+        symlink(&evil, &escape).unwrap();
+        symlink(root.path().join("missing"), &dangling).unwrap();
+        symlink(outside.path(), &to_dir).unwrap();
+        assert!(regular_file_in_roots(&shared, &roots));
+        assert!(regular_file_in_roots(&inside, &roots));
+        assert!(!regular_file_in_roots(&escape, &roots));
+        assert!(!regular_file_in_roots(&dangling, &roots));
+        assert!(!regular_file_in_roots(&to_dir, &roots));
+        assert!(!regular_file_in_roots(&root.path().join("none"), &roots));
+    }
+
+    #[test]
+    fn a_denied_staging_write_names_the_dir_and_the_grant() {
+        let err = staging_error(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            ".x.tmp",
+            Path::new("/opt/halvor/compose"),
+        )
+        .to_string();
+        assert!(
+            err.contains("/opt/halvor/compose") && err.contains("needs write access"),
+            "{err}"
+        );
+        let err = staging_error(
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+            ".x.tmp",
+            Path::new("/d"),
+        );
+        assert!(
+            format!("{err:#}").contains("creating .x.tmp in /d"),
+            "{err:#}"
+        );
     }
 
     #[test]
