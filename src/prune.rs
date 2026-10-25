@@ -18,10 +18,11 @@
 //! The same holds for orphan volumes and unused images, and for dangling
 //! images pinned by digest: a volume any stack's config declares, and an
 //! image any of its services uses or builds, is never one. The stacks are the
-//! registered ones, those running containers name, and every compose project
-//! directly under the stacks roots; each config is resolved with every
-//! profile, its `.env` and its project name. A config that cannot be read,
-//! interpolates an unset variable, or a failed discovery withholds them all.
+//! registered ones, those containers name (with every config and env file
+//! their labels list), and every compose project directly under the stacks
+//! roots; each config is resolved with every profile, its env files and its
+//! project name. A config or listed file that cannot be read, an unset
+//! variable, or a failed container listing withholds them all.
 //! With Swarm active, every service's image is protected too, and services
 //! that cannot be listed withhold them all.
 //!
@@ -157,6 +158,7 @@ pub struct Protection {
     pub stacks: usize,
     pub scanned: usize,
     pub roots: Vec<String>,
+    pub swarm_services: usize,
 }
 
 fn plural(n: usize, word: &str) -> String {
@@ -170,10 +172,11 @@ fn plural(n: usize, word: &str) -> String {
 impl Protection {
     fn describe(&self) -> String {
         format!(
-            "protected: the images and volumes of {} and {} under {}, and the images of swarm services",
+            "protected: the images and volumes of {} and {} under {}, and the images of {}",
             plural(self.stacks, "managed or running stack"),
             plural(self.scanned, "compose project"),
-            self.roots.join(", ")
+            self.roots.join(", "),
+            plural(self.swarm_services, "swarm service")
         )
     }
 }
@@ -704,23 +707,26 @@ fn containerd_store(info: &bollard::models::SystemInfo) -> bool {
         .any(|v| v.starts_with("io.containerd.snapshotter"))
 }
 
-/// `refs` plus every swarm service's image, or `None` when Swarm is in a
+/// `configs` plus every swarm service's image, or `None` when Swarm is in a
 /// state its services cannot be read in.
-async fn with_swarm(docker: &Docker, refs: Option<&StackRefs>) -> Result<Option<StackRefs>> {
-    let Some(refs) = refs else {
+async fn with_swarm(
+    docker: &Docker,
+    configs: Option<StackConfigs>,
+) -> Result<Option<StackConfigs>> {
+    let Some(mut configs) = configs else {
         return Ok(None);
     };
     let info = call(|| docker.info())
         .await
         .map_err(|e| engine_err("engine info", e))?;
-    let mut refs = refs.clone();
     match swarm_state(&info) {
         None | Some(LocalNodeState::EMPTY | LocalNodeState::INACTIVE) => {}
         Some(LocalNodeState::ACTIVE) => {
             let Ok(services) = call(|| docker.list_services(None)).await else {
                 return Ok(None);
             };
-            refs.images.extend(
+            configs.protection.swarm_services = services.len();
+            configs.refs.images.extend(
                 services
                     .into_iter()
                     .filter_map(|s| s.spec?.task_template?.container_spec?.image),
@@ -728,7 +734,7 @@ async fn with_swarm(docker: &Docker, refs: Option<&StackRefs>) -> Result<Option<
         }
         Some(_) => return Ok(None),
     }
-    Ok(Some(refs))
+    Ok(Some(configs))
 }
 
 /// Every current candidate within `scope`.
@@ -756,10 +762,10 @@ pub async fn candidates(docker: &Docker, scope: Scope<'_>) -> Result<Vec<Candida
     let containers = list_containers(docker).await?;
     let refs = match project {
         Some(_) => None,
-        None => with_swarm(docker, scope.stack_refs).await?,
+        None => scope.stack_refs,
     };
 
-    let mut out = match (project, scope.extras.unused_images, refs.as_ref()) {
+    let mut out = match (project, scope.extras.unused_images, refs) {
         (Some(_), _, _) => Vec::new(),
         (None, None, refs) | (None, Some(_), refs @ None) => {
             dangling_images(docker, refs.map(|r| &r.images)).await?
@@ -800,7 +806,7 @@ pub async fn candidates(docker: &Docker, scope: Scope<'_>) -> Result<Vec<Candida
     };
     let mounts = crate::label_audit::mount_owners(&containers);
     out.extend(volume_candidates(&volumes, project, &mounts));
-    if let (Some(o), Some(refs)) = (scope.extras.orphan_volumes, refs.as_ref()) {
+    if let (Some(o), Some(refs)) = (scope.extras.orphan_volumes, refs) {
         out.extend(orphan_volume_candidates(
             &volumes,
             project,
@@ -1261,26 +1267,89 @@ impl StackConfigs {
     }
 }
 
-/// The registered stacks then the discovered ones (`true`), or `None` when
-/// discovery failed.
-fn complete_rows(
-    registered: Vec<crate::stacks::StackRow>,
-    discovered: Result<Vec<crate::stacks::StackRow>>,
-) -> Option<Vec<(crate::stacks::StackRow, bool)>> {
-    let discovered = discovered.ok()?;
-    Some(
-        registered
-            .into_iter()
-            .map(|r| (r, false))
-            .chain(discovered.into_iter().map(|r| (r, true)))
-            .collect(),
-    )
+pub const ENV_FILE_LABEL: &str = "com.docker.compose.project.environment_file";
+
+/// An unregistered compose project as its containers' labels describe it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LabelledProject {
+    project: String,
+    dir: PathBuf,
+    files: Vec<PathBuf>,
+    env_files: Vec<PathBuf>,
+}
+
+impl LabelledProject {
+    fn readable(&self) -> bool {
+        self.files
+            .iter()
+            .chain(&self.env_files)
+            .all(|f| std::fs::File::open(f).is_ok_and(|h| h.metadata().is_ok_and(|m| m.is_file())))
+    }
+}
+
+fn label_paths(value: Option<&String>) -> Vec<PathBuf> {
+    value
+        .map(|v| {
+            v.split(',')
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The compose projects `containers` name that are not `registered`, or
+/// `None` when the listing failed or a project's labels are missing or
+/// disagree.
+fn labelled_projects(
+    registered: &[crate::stacks::StackRow],
+    containers: Result<Vec<ContainerSummary>>,
+) -> Option<Vec<LabelledProject>> {
+    let containers = containers.ok()?;
+    let registered_dirs: HashSet<PathBuf> = registered
+        .iter()
+        .map(|r| {
+            Path::new(&r.dir)
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(&r.dir))
+        })
+        .collect();
+    let mut out: Vec<LabelledProject> = Vec::new();
+    for labels in containers.iter().filter_map(|c| c.labels.as_ref()) {
+        let Some(project) = labels.get(COMPOSE_PROJECT_LABEL) else {
+            continue;
+        };
+        if registered.iter().any(|r| &r.name == project) {
+            continue;
+        }
+        let dir = PathBuf::from(labels.get(crate::stacks_root_drift::WORKING_DIR_LABEL)?);
+        let dir = dir.canonicalize().unwrap_or(dir);
+        if registered_dirs.contains(&dir) {
+            continue;
+        }
+        let files = label_paths(labels.get(crate::stacks::CONFIG_FILES_LABEL));
+        if files.is_empty() {
+            return None;
+        }
+        let found = LabelledProject {
+            project: project.clone(),
+            dir,
+            files,
+            env_files: label_paths(labels.get(ENV_FILE_LABEL)),
+        };
+        match out.iter().find(|p| p.project == found.project) {
+            Some(p) if *p != found => return None,
+            Some(_) => {}
+            None => out.push(found),
+        }
+    }
+    Some(out)
 }
 
 fn refs_config_args(
     dir: &Path,
     files: &[PathBuf],
-    env_file: Option<&Path>,
+    env_files: &[PathBuf],
     project: Option<&str>,
 ) -> Vec<String> {
     let mut args = vec!["compose".to_string()];
@@ -1294,7 +1363,7 @@ fn refs_config_args(
     for f in files {
         args.extend(["-f".to_string(), f.to_string_lossy().into_owned()]);
     }
-    if let Some(env) = env_file {
+    for env in env_files {
         args.extend(["--env-file".to_string(), env.to_string_lossy().into_owned()]);
     }
     args.extend(crate::compose::CONFIG_JSON_ARGS.map(String::from));
@@ -1331,42 +1400,70 @@ fn compose_dirs(roots: &[String], known: &HashSet<PathBuf>) -> Option<Vec<PathBu
     Some(out)
 }
 
-async fn read_config(dir: &Path, file: &Path, project: Option<&str>) -> Option<String> {
-    let mut files = vec![file.to_path_buf()];
-    files.extend(crate::compose::override_in(dir));
-    let env = dir.join(".env");
-    let args = refs_config_args(dir, &files, env.is_file().then_some(env.as_path()), project);
+async fn read_config(
+    dir: &Path,
+    files: &[PathBuf],
+    env_files: &[PathBuf],
+    project: Option<&str>,
+) -> Option<String> {
+    let args = refs_config_args(dir, files, env_files, project);
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     let (raw, stderr) = crate::run_with_stderr(&argv).await.ok()?;
     (!unset_variable(&stderr)).then_some(raw)
 }
 
-/// What every stack references, or `None` when discovery fails or any
-/// stack's config cannot be read.
+async fn read_found(dir: &Path, file: &Path) -> Option<String> {
+    let mut files = vec![file.to_path_buf()];
+    files.extend(crate::compose::override_in(dir));
+    let env = dir.join(".env");
+    let envs: Vec<PathBuf> = env.is_file().then_some(env).into_iter().collect();
+    read_config(dir, &files, &envs, None).await
+}
+
+/// What every stack references, or `None` when the engine's compose
+/// projects cannot be listed or any stack's config cannot be read.
 async fn stack_configs(docker: &Docker) -> Result<Option<StackConfigs>> {
     let roots = crate::stacks::allowed_roots()?;
-    let Some(rows) = complete_rows(
-        crate::stacks::list()?,
-        crate::stacks::discover(docker).await,
-    ) else {
+    let registered = crate::stacks::list()?;
+    let containers = call(|| {
+        docker.list_containers(Some(
+            ListContainersOptionsBuilder::new()
+                .all(true)
+                .filters(&label_filter(None))
+                .build(),
+        ))
+    })
+    .await
+    .map_err(|e| engine_err("list compose containers", e));
+    let Some(projects) = labelled_projects(&registered, containers) else {
         return Ok(None);
     };
     let mut out = StackConfigs::default();
     let mut known = HashSet::new();
-    for (row, discovered) in &rows {
+    for row in &registered {
         let Ok(compose) = row.compose(&roots) else {
             return Ok(None);
         };
         let Some(dir) = compose.file().parent().map(Path::to_path_buf) else {
             return Ok(None);
         };
-        let project = discovered.then_some(row.name.as_str());
-        let Some(raw) = read_config(&dir, compose.file(), project).await else {
+        let Some(raw) = read_found(&dir, compose.file()).await else {
             return Ok(None);
         };
         out.absorb(&raw);
         out.protection.stacks += 1;
         known.insert(dir.canonicalize().unwrap_or(dir));
+    }
+    for p in &projects {
+        if !p.readable() {
+            return Ok(None);
+        }
+        let Some(raw) = read_config(&p.dir, &p.files, &p.env_files, Some(&p.project)).await else {
+            return Ok(None);
+        };
+        out.absorb(&raw);
+        out.protection.stacks += 1;
+        known.insert(p.dir.clone());
     }
     let Some(dirs) = compose_dirs(&roots, &known) else {
         return Ok(None);
@@ -1375,7 +1472,7 @@ async fn stack_configs(docker: &Docker) -> Result<Option<StackConfigs>> {
         let Some(compose) = crate::compose::Compose::find(&dir) else {
             continue;
         };
-        let Some(raw) = read_config(&dir, compose.file(), None).await else {
+        let Some(raw) = read_found(&dir, compose.file()).await else {
             return Ok(None);
         };
         out.absorb(&raw);
@@ -1416,7 +1513,7 @@ async fn docker_prune(args: DockerPruneArgs, ctx: &ToolCtx) -> Result<PruneChang
     let docker = &crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
-    let configs = stack_configs(docker).await?;
+    let configs = with_swarm(docker, stack_configs(docker).await?).await?;
     let scope = Scope {
         project: project.as_deref(),
         external_networks: configs.as_ref().map(|c| &c.networks),
@@ -2884,16 +2981,62 @@ mod tests {
         }
     }
 
+    fn labelled(id: &str, project: &str, labels: &[(&str, &str)]) -> ContainerSummary {
+        let mut all: HashMap<&str, &str> = labels.iter().copied().collect();
+        all.insert(COMPOSE_PROJECT_LABEL, project);
+        parse(&format!(
+            r#"{{"Id":"{id}","Labels":{}}}"#,
+            plugin_toolkit::serde_json::to_string(&all).unwrap()
+        ))
+    }
+
     #[test]
     fn a_failed_discovery_withholds_every_stack_ref() {
-        assert!(complete_rows(vec![row("a")], Err(anyhow!("engine down"))).is_none());
-        let rows = complete_rows(vec![row("a")], Ok(vec![row("b")])).unwrap();
+        assert!(labelled_projects(&[row("a")], Err(anyhow!("engine down"))).is_none());
+    }
+
+    #[test]
+    fn discovered_projects_carry_every_config_and_env_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().canonicalize().unwrap();
+        for f in ["compose.yaml", "extra.yaml", ".env", "more.env"] {
+            std::fs::write(d.join(f), "").unwrap();
+        }
+        let p = |f: &str| d.join(f).to_string_lossy().into_owned();
+        let files = format!("{},{}", p("compose.yaml"), p("extra.yaml"));
+        let envs = format!("{},{}", p(".env"), p("more.env"));
+        let dir_s = d.to_string_lossy().into_owned();
+        let containers = vec![
+            labelled(
+                "c1",
+                "media",
+                &[
+                    (crate::stacks::CONFIG_FILES_LABEL, &files),
+                    (crate::stacks_root_drift::WORKING_DIR_LABEL, &dir_s),
+                    (ENV_FILE_LABEL, &envs),
+                ],
+            ),
+            labelled("c2", "registered", &[]),
+        ];
+        let found = labelled_projects(&[row("registered")], Ok(containers)).unwrap();
         assert_eq!(
-            rows.iter()
-                .map(|(r, discovered)| (r.name.as_str(), *discovered))
-                .collect::<Vec<_>>(),
-            vec![("a", false), ("b", true)]
+            found,
+            vec![LabelledProject {
+                project: "media".into(),
+                dir: d.clone(),
+                files: vec![d.join("compose.yaml"), d.join("extra.yaml")],
+                env_files: vec![d.join(".env"), d.join("more.env")],
+            }]
         );
+        assert!(found[0].readable());
+        std::fs::remove_file(d.join("extra.yaml")).unwrap();
+        assert!(!found[0].readable());
+    }
+
+    #[test]
+    fn a_project_without_a_working_dir_or_config_files_is_withheld() {
+        let containers = vec![labelled("c1", "media", &[])];
+        assert!(labelled_projects(&[], Ok(containers)).is_none());
     }
 
     #[test]
@@ -2901,7 +3044,7 @@ mod tests {
         let args = refs_config_args(
             Path::new("/opt/stacks/a"),
             &[PathBuf::from("/opt/stacks/a/compose.yaml")],
-            Some(Path::new("/opt/stacks/a/.env")),
+            &[PathBuf::from("/opt/stacks/a/.env")],
             Some("a"),
         );
         let has = |pair: [&str; 2]| args.windows(2).any(|w| w == pair);
@@ -2911,7 +3054,7 @@ mod tests {
         let bare = refs_config_args(
             Path::new("/opt/stacks/a"),
             &[PathBuf::from("/opt/stacks/a/compose.yaml")],
-            None,
+            &[],
             None,
         );
         assert!(
@@ -2960,11 +3103,12 @@ mod tests {
             stacks: 3,
             scanned: 2,
             roots: vec!["/opt/stacks".into()],
+            swarm_services: 1,
         };
         let plan = plan(&DockerPruneArgs::default(), None, &[], Some(&p)).unwrap();
         assert!(
             plan.summary.contains(
-                "protected: the images and volumes of 3 managed or running stacks and 2 compose projects under /opt/stacks, and the images of swarm services"
+                "protected: the images and volumes of 3 managed or running stacks and 2 compose projects under /opt/stacks, and the images of 1 swarm service"
             ),
             "{}",
             plan.summary
@@ -3014,6 +3158,11 @@ mod tests {
         assert_eq!(e.paths("DELETE").len(), 1);
     }
 
+    fn swarmed(e: &FakeEngine) -> Option<StackConfigs> {
+        plugin_toolkit::reactor::block_on(with_swarm(&e.client(), Some(StackConfigs::default())))
+            .unwrap()
+    }
+
     fn swarm_engine(services: Route) -> FakeEngine {
         extras_engine(vec![
             Route::new(
@@ -3034,8 +3183,16 @@ mod tests {
             200,
             r#"[{"ID":"s1","Spec":{"TaskTemplate":{"ContainerSpec":{"Image":"gitea/runner-images:ubuntu-latest"}}}}]"#,
         ));
+        let configs = swarmed(&e).unwrap();
+        assert_eq!(configs.protection.swarm_services, 1);
         let ext = external();
-        let f = found(&e, host_wide(&ext, opted_in()));
+        let f = found(
+            &e,
+            Scope {
+                stack_refs: Some(&configs.refs),
+                ..host_wide(&ext, opted_in())
+            },
+        );
         assert!(!keys(&f).contains(&"image:sha256:runner"), "{f:?}");
         assert!(keys(&f).contains(&"image:sha256:ci"), "{f:?}");
     }
@@ -3048,8 +3205,6 @@ mod tests {
             503,
             r#"{"message":"This node is not a swarm manager"}"#,
         ));
-        let ext = external();
-        let f = found(&e, host_wide(&ext, opted_in()));
-        assert!(!keys(&f).contains(&"image:sha256:ci"), "{f:?}");
+        assert!(swarmed(&e).is_none());
     }
 }
