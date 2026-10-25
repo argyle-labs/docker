@@ -587,12 +587,17 @@ pub async fn export(
     domain = "docker",
     verb = "stack_volumes_export",
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    dry_run_aware = true
 )]
 async fn docker_stack_volumes_export(
     args: DockerStackVolumesExportArgs,
     ctx: &ToolCtx,
 ) -> Result<StackVolumesExportOutput> {
+    let args = DockerStackVolumesExportArgs {
+        dry_run: args.dry_run || ctx.dry_run(),
+        ..args
+    };
     crate::execute::require_admin(EXPORT_TOOL, ctx)?;
     let docker = &crate::registration::adapter()
         .client()
@@ -1456,12 +1461,17 @@ pub async fn import(
     domain = "docker",
     verb = "stack_volumes_import",
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    dry_run_aware = true
 )]
 async fn docker_stack_volumes_import(
     args: DockerStackVolumesImportArgs,
     ctx: &ToolCtx,
 ) -> Result<StackVolumesImportOutput> {
+    let args = DockerStackVolumesImportArgs {
+        dry_run: args.dry_run || ctx.dry_run(),
+        ..args
+    };
     crate::execute::require_admin(IMPORT_TOOL, ctx)?;
     let docker = &crate::registration::adapter()
         .client()

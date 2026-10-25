@@ -464,16 +464,19 @@ pub struct DockerPruneArgs {
 }
 
 async fn project_for(stack: &str) -> Result<String> {
-    let row = crate::stacks::require(stack)?;
-    Ok(row.compose()?.project_name().await?)
+    let row = crate::stacks::find_here(stack).await?;
+    Ok(row
+        .compose(&crate::stacks::allowed_roots()?)?
+        .project_name()
+        .await?)
 }
 
 /// Networks every managed stack declares external, or `None` when any
 /// stack's config cannot be read.
 async fn external_networks() -> Result<Option<HashSet<String>>> {
     let mut out = HashSet::new();
-    for row in crate::stacks::list()? {
-        let Ok(compose) = row.compose() else {
+    for row in crate::stacks::all_here().await? {
+        let Ok(compose) = row.compose(&crate::stacks::allowed_roots()?) else {
             return Ok(None);
         };
         match compose.config_json().await {
@@ -491,9 +494,14 @@ async fn external_networks() -> Result<Option<HashSet<String>>> {
     domain = "docker",
     verb = "prune",
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    dry_run_aware = true
 )]
 async fn docker_prune(args: DockerPruneArgs, ctx: &ToolCtx) -> Result<PruneChange> {
+    let args = DockerPruneArgs {
+        dry_run: args.dry_run || ctx.dry_run(),
+        ..args
+    };
     execute::require_admin(TOOL, ctx)?;
     let project = match &args.stack {
         Some(s) => Some(project_for(s).await?),

@@ -205,9 +205,14 @@ pub struct DockerInstallOutput {
     verb = "install",
     local_only = true,
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    dry_run_aware = true
 )]
 async fn docker_install(args: DockerInstallArgs, ctx: &ToolCtx) -> Result<DockerInstallOutput> {
+    let args = DockerInstallArgs {
+        dry_run: args.dry_run || ctx.dry_run(),
+        ..args
+    };
     execute::require_admin(INSTALL_TOOL, ctx)?;
     let runtime = args.runtime.as_arg();
     let plan = format!("run the embedded install.sh {runtime}");
@@ -272,12 +277,17 @@ pub struct DockerEngineUpdateOutput {
     verb = "engine_update",
     local_only = true,
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    dry_run_aware = true
 )]
 async fn docker_engine_update(
     args: DockerEngineUpdateArgs,
     ctx: &ToolCtx,
 ) -> Result<DockerEngineUpdateOutput> {
+    let args = DockerEngineUpdateArgs {
+        dry_run: args.dry_run || ctx.dry_run(),
+        ..args
+    };
     execute::require_admin(ENGINE_UPDATE_TOOL, ctx)?;
     let runtime = args.runtime.as_arg();
     let plan = format!("run the embedded update.sh {runtime}");
@@ -350,9 +360,14 @@ pub struct DockerBackupOutput {
     verb = "backup",
     local_only = true,
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    dry_run_aware = true
 )]
 async fn docker_backup(args: DockerBackupArgs, ctx: &ToolCtx) -> Result<DockerBackupOutput> {
+    let args = DockerBackupArgs {
+        dry_run: args.dry_run || ctx.dry_run(),
+        ..args
+    };
     let home = std::env::var("HOME").unwrap_or_default();
     backup(args, &home, &engine_state::backup_roots(), ctx).await
 }
@@ -455,9 +470,14 @@ pub struct DockerRestoreOutput {
     verb = "restore",
     local_only = true,
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    dry_run_aware = true
 )]
 async fn docker_restore(args: DockerRestoreArgs, ctx: &ToolCtx) -> Result<DockerRestoreOutput> {
+    let args = DockerRestoreArgs {
+        dry_run: args.dry_run || ctx.dry_run(),
+        ..args
+    };
     let home = std::env::var("HOME").unwrap_or_default();
     restore(args, &home, &engine_state::backup_roots(), ctx).await
 }

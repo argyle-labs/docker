@@ -417,7 +417,7 @@ async fn plan_text(name: &str, before: String, cfg: Value, docker: Option<&Docke
 
 pub async fn plan_stack(row: &StackRow, docker: Option<&Docker>) -> Result<Plan> {
     let cfg = policy::user_cfg(row).await?;
-    let before = row.read_compose()?;
+    let before = row.read_compose(&crate::stacks::allowed_roots()?)?;
     Ok(plan_text(&row.name, before, cfg, docker).await)
 }
 

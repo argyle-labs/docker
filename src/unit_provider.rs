@@ -191,7 +191,10 @@ impl DockerUnitProvider {
     /// yields an empty list rather than an error, so a registered-but-not-yet-
     /// written stack still lists.
     pub(crate) async fn stack_services(row: &StackRow) -> Vec<StackService> {
-        let Ok(compose) = row.compose() else {
+        let Ok(compose) = crate::stacks::allowed_roots()
+            .map_err(|e| crate::ComposeError::NoComposeFile(e.to_string().into()))
+            .and_then(|roots| row.compose(&roots))
+        else {
             return Vec::new();
         };
         compose
@@ -220,7 +223,7 @@ impl DockerUnitProvider {
         }
 
         if want.is_none() || want == Some(STACK_KIND) {
-            for row in stacks::list()? {
+            for row in stacks::units(self.adapter.present_client().as_ref()).await? {
                 let services = Self::stack_services(&row).await;
                 let summary = StackSummary {
                     name: row.name.clone(),
@@ -248,7 +251,7 @@ impl DockerUnitProvider {
     /// **view** — compose YAML + `.env` + per-service status. `query.kind =
     /// "logs"` tails the project's compose logs instead.
     async fn stack_detail(&self, args: DetailArgs) -> Result<VerbOutcome> {
-        let row = stacks::require(&args.id.id)?;
+        let row = stacks::find(&args.id.id, self.adapter.present_client().as_ref()).await?;
         if args.query.kind.as_deref() == Some("coverage") {
             let (project, volumes) = self.stack_volumes(&row).await?;
             let policies = volume_coverage::policies(&row.name)?;
@@ -290,7 +293,7 @@ impl DockerUnitProvider {
         if args.query.kind.as_deref() == Some("logs") {
             let tail = args.query.limit.unwrap_or(200);
             let logs = row
-                .compose()
+                .compose(&crate::stacks::allowed_roots()?)
                 .map_err(anyhow::Error::from)?
                 .logs(&[], tail)
                 .await
@@ -300,12 +303,13 @@ impl DockerUnitProvider {
                 serde_json::to_string(&StackLogs { logs }).unwrap_or_default(),
             )));
         }
+        let allowed = crate::stacks::allowed_roots()?;
         let detail = StackDetail {
-            compose_yaml: row.read_compose().unwrap_or_default(),
-            env_keys: env_keys(row.read_env().as_deref().unwrap_or("")),
+            compose_yaml: row.read_compose(&allowed).unwrap_or_default(),
+            env_keys: env_keys(row.read_env(&allowed).as_deref().unwrap_or("")),
             services: Self::stack_services(&row).await,
             name: row.name.clone(),
-            dir: row.dir.clone(),
+            dir: row.emitted_dir(&allowed).unwrap_or_default(),
             file: row.file.clone(),
             enabled: row.enabled,
         };
@@ -317,7 +321,8 @@ impl DockerUnitProvider {
 
     /// **edit** (rewrite YAML/env, no deploy) or a compose lifecycle action.
     pub(crate) async fn stack_update(&self, args: UpdateArgs) -> Result<VerbOutcome> {
-        let row = stacks::require(&args.id.id)?;
+        let row =
+            stacks::require_registered(&args.id.id, self.adapter.present_client().as_ref()).await?;
         match args.action.as_str() {
             "edit" => {
                 let raw = args
@@ -366,7 +371,9 @@ impl DockerUnitProvider {
                 }))
             }
             action if STACK_LIFECYCLE.contains(&action) => {
-                let compose = row.compose().map_err(anyhow::Error::from)?;
+                let compose = row
+                    .compose(&crate::stacks::allowed_roots()?)
+                    .map_err(anyhow::Error::from)?;
                 // Only stopping and removing containers needs no check. Build
                 // and pull read the config, so they run from the checked one;
                 // start and restart act on containers that already exist.
@@ -424,7 +431,10 @@ impl DockerUnitProvider {
                         .map(|r| r.allow)
                         .unwrap_or_default(),
                 };
-                if !row.compose_path().is_file() {
+                if !crate::stacks::allowed_roots()
+                    .and_then(|roots| row.compose_path(&roots))
+                    .is_ok_and(|p| p.is_file())
+                {
                     return String::new();
                 }
                 crate::normalize::plan_stack(&row, docker.as_ref()).await
@@ -515,12 +525,14 @@ impl DockerUnitProvider {
         };
         let roots = lint::managed_roots(None);
         let findings = stack_findings(row, &roots).await?;
-        let yaml = row.read_compose()?;
+        let allowed = crate::stacks::allowed_roots()?;
+        let yaml = row.read_compose(&allowed)?;
         let override_yaml = row
-            .compose()
+            .compose(&allowed)
             .map_err(anyhow::Error::from)?
             .override_file()
-            .map(std::fs::read_to_string)
+            .and_then(|o| o.file_name())
+            .map(|o| row.read_file(&o.to_string_lossy(), &allowed))
             .transpose()?;
         let (result, new_yaml) = fix_result(&yaml, override_yaml.as_deref(), &findings, &p)?;
         if let Some(new_yaml) = new_yaml {
@@ -579,7 +591,8 @@ impl DockerUnitProvider {
         let (_, cfg) = ownership::user_config(row).await?;
         let docker = &self.adapter.client().map_err(adapter_err)?;
         let containers = ownership::project_containers(docker, &cfg.name).await?;
-        let converted = ownership::read_conversions(std::path::Path::new(&row.dir))?;
+        let converted =
+            ownership::read_conversions(&row.open_dir(&crate::stacks::allowed_roots()?)?)?;
         let planned = ownership::plan(&cfg, &containers, &converted);
         let warnings = ownership::relabel_warning(&containers)
             .into_iter()
@@ -608,7 +621,7 @@ impl DockerUnitProvider {
         let p: VolumePolicyPayload = serde_json::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("volume_policy payload: {e}"))?;
         let raw_cfg = row
-            .compose()
+            .compose(&crate::stacks::allowed_roots()?)
             .map_err(anyhow::Error::from)?
             .config_json()
             .await
@@ -663,7 +676,7 @@ impl DockerUnitProvider {
         }
         let dest = match &p.dest {
             Some(d) => crate::lifecycle::in_backup_root(d, &engine_state::backup_roots())?,
-            None => default_backup_dir(dir),
+            None => default_backup_dir()?,
         };
         std::fs::create_dir_all(&dest)
             .map_err(|e| anyhow::anyhow!("create backup dir {}: {e}", dest.display()))?;
@@ -754,13 +767,12 @@ impl DockerUnitProvider {
         let mut staged = StagedRestore::stage(row, &mut file, &roots)?;
         let live = stacks::stack_dir_in_roots(&row.dir, &roots)?;
         let env = staged.env_file();
-        let staged_secrets = env
-            .as_deref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
+        let staged_secrets = staged
+            .read_env()
             .map(|e| stacks::env_values(&e))
             .unwrap_or_default();
         let checked = async {
-            let sets = staged.compose_sets(row);
+            let sets = staged.compose_sets(row, &roots);
             let Some(plain) = sets.first() else {
                 return Ok(());
             };
@@ -899,7 +911,7 @@ impl DockerUnitProvider {
         .await?;
         stacks::put(&row)?;
         let mut row = row;
-        let normalized = if p.normalize && row.compose_path().is_file() {
+        let normalized = if p.normalize && row.compose_path(&roots).is_ok_and(|p| p.is_file()) {
             crate::normalize::normalize(&mut row, self.adapter.client().ok().as_ref()).await
         } else {
             Vec::new()
@@ -959,7 +971,7 @@ impl DockerUnitProvider {
         };
         let docker = self.adapter.client().map_err(adapter_err)?;
         let project = row
-            .compose()
+            .compose(&crate::stacks::allowed_roots()?)
             .map_err(anyhow::Error::from)?
             .project_name()
             .await
@@ -1154,7 +1166,7 @@ impl DockerUnitProvider {
             args.caller.as_ref(),
         )?;
         if args.id.kind == STACK_KIND {
-            stacks::require(&args.id.id)?;
+            stacks::require_registered(&args.id.id, self.adapter.present_client().as_ref()).await?;
             let plan = format!(
                 "tear down stack '{}' (`compose down`) and deregister it; apply with update action={ACTION_REMOVE}",
                 args.id.id
@@ -1198,7 +1210,7 @@ impl DockerUnitProvider {
 /// `compose down`, then deregister the stack.
 pub(crate) async fn stack_remove(row: &StackRow) -> Result<VerbOutcome> {
     let secrets = stack_secrets(&row.name, None);
-    let teardown = match row.compose() {
+    let teardown = match row.compose(&crate::stacks::allowed_roots()?) {
         Ok(c) => match c.run_action("down", None, None).await {
             Ok(out) => {
                 let out = out.trim();
@@ -1555,9 +1567,7 @@ pub struct StackFixResult {
 pub struct StackBackupPayload {
     /// Directory the archive is written to; must resolve inside the daemon's
     /// backup roots (`ORCA_DOCKER_BACKUP_ROOTS`, else `/mnt/backups`). `None`
-    /// → a `.orca-backups` sibling of the stack's project directory (a
-    /// system-owned WHERE, until the backup target/storage layer resolves it
-    /// centrally).
+    /// → `docker/stack-backups` under orca's state dir.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dest: Option<String>,
 }
@@ -1718,7 +1728,7 @@ fn stack_declaration() -> KindDeclaration {
 /// Lint findings for a stack's resolved compose config.
 async fn stack_findings(row: &StackRow, roots: &[String]) -> Result<Vec<Finding>> {
     let raw = row
-        .compose()
+        .compose(&crate::stacks::allowed_roots()?)
         .map_err(anyhow::Error::from)?
         .config_json()
         .await
@@ -2144,9 +2154,11 @@ async fn plan_update(
     docker: &bollard::Docker,
     project: &str,
 ) -> Result<VerbOutcome> {
-    let compose = row.compose().map_err(anyhow::Error::from)?;
+    let compose = row
+        .compose(&crate::stacks::allowed_roots()?)
+        .map_err(anyhow::Error::from)?;
     policy::gate(Some(docker), row, &compose).await?;
-    let backup_dir = default_backup_dir(std::path::Path::new(&row.dir));
+    let backup_dir = default_backup_dir()?;
     let snap = snapshot(docker, project).await?;
     let mut seen = std::collections::BTreeSet::new();
     let mut images = Vec::new();
@@ -2271,7 +2283,10 @@ impl UpdateSteps for EngineUpdate<'_> {
 
     fn pull(&mut self) -> BoxFuture<'_, Result<String>> {
         Box::pin(async move {
-            let compose = self.row.compose().map_err(anyhow::Error::from)?;
+            let compose = self
+                .row
+                .compose(&crate::stacks::allowed_roots()?)
+                .map_err(anyhow::Error::from)?;
             policy::gate(Some(self.docker), self.row, &compose)
                 .await?
                 .pull()
@@ -2355,7 +2370,10 @@ async fn owning_stack(docker: &bollard::Docker, container: &str) -> Result<Stack
     let label = |k: &str| labels.and_then(|l| l.get(k)).cloned();
     let member = match label(crate::labels::STACK) {
         Some(stack) => stack == row.name,
-        None => match (label(crate::prune::COMPOSE_PROJECT_LABEL), row.compose()) {
+        None => match (
+            label(crate::prune::COMPOSE_PROJECT_LABEL),
+            row.compose(&crate::stacks::allowed_roots()?),
+        ) {
             (Some(project), Ok(compose)) => compose.project_name().await.ok() == Some(project),
             _ => false,
         },
@@ -2366,10 +2384,17 @@ async fn owning_stack(docker: &bollard::Docker, container: &str) -> Result<Stack
     Ok(row)
 }
 
-/// Where a stack backup goes when the caller names no destination: a
-/// `.orca-backups` sibling of the stack dir, so the archive is never written
-/// inside the directory being archived.
-fn default_backup_dir(dir: &std::path::Path) -> std::path::PathBuf {
+/// Where a stack backup goes when the caller names no destination: orca's
+/// own state dir, which the orca user can write whoever owns the stack dir.
+fn default_backup_dir() -> Result<std::path::PathBuf> {
+    Ok(plugin_toolkit::contract::config::paths::state_dir()?
+        .join("docker")
+        .join("stack-backups"))
+}
+
+/// Where backups without a destination were written before they moved to
+/// [`default_backup_dir`]; still read on restore.
+fn legacy_backup_dir(dir: &std::path::Path) -> std::path::PathBuf {
     dir.parent().unwrap_or(dir).join(".orca-backups")
 }
 
@@ -2427,12 +2452,16 @@ fn restore_notes(restored: &[String], dumps: &[String], unverified: bool) -> Str
     notes
 }
 
-/// Open a restore archive, refused outside the backup roots and outside the
-/// stack's own default backup dir, where an un-targeted backup put it.
+/// Open a restore archive, refused outside the backup roots and the default
+/// backup dirs, where an un-targeted backup put it.
 fn restore_source(archive: &str, stack_dir: &str, roots: &[String]) -> Result<std::fs::File> {
-    let default = default_backup_dir(std::path::Path::new(stack_dir));
     let mut allowed = roots.to_vec();
-    allowed.push(default.to_string_lossy().into_owned());
+    allowed.push(default_backup_dir()?.to_string_lossy().into_owned());
+    allowed.push(
+        legacy_backup_dir(std::path::Path::new(stack_dir))
+            .to_string_lossy()
+            .into_owned(),
+    );
     crate::lifecycle::open_archive(archive, &allowed)
 }
 
@@ -2447,7 +2476,7 @@ fn stack_secrets(name: &str, payload: Option<&str>) -> Vec<String> {
     let mut envs: Vec<String> = stacks::get(name)
         .ok()
         .flatten()
-        .and_then(|r| r.read_env())
+        .and_then(|r| r.read_env(&crate::stacks::allowed_roots().ok()?))
         .into_iter()
         .collect();
     envs.extend(
@@ -2572,7 +2601,7 @@ async fn list_stack_members(
     docker: &bollard::Docker,
 ) -> Result<std::collections::HashMap<String, StackRow>> {
     use bollard::query_parameters::ListContainersOptionsBuilder;
-    let rows = stacks::list()?;
+    let rows = stacks::all(Some(docker)).await?;
     let filters =
         std::collections::HashMap::from([("label", vec![COMPOSE_WORKING_DIR_LABEL.to_string()])]);
     let containers = docker
@@ -2672,11 +2701,14 @@ async fn exec_scope(
     let hash = labels.get(COMPOSE_CONFIG_HASH_LABEL).ok_or_else(|| {
         ExecBlock::Refused("the container has no compose config-hash label".into())
     })?;
+    let roots = crate::stacks::allowed_roots().map_err(|e| format!("stack {}: {e}", row.name))?;
     let compose = row
-        .compose()
+        .compose(&roots)
         .map_err(|e| format!("stack {}: {e}", row.name))?;
     let compose = if std::path::Path::new(&row.dir).join(ORCA_FILE).is_file() {
-        compose.with_orca()
+        compose
+            .with_orca(&roots)
+            .map_err(|e| format!("stack {}: {e}", row.name))?
     } else {
         compose
     };
@@ -3299,7 +3331,7 @@ impl UnitProvider for DockerUnitProvider {
                     parent: None,
                 })
                 .collect();
-            for row in stacks::list()? {
+            for row in stacks::units(self.adapter.present_client().as_ref()).await? {
                 units.push(UnitDescriptor {
                     id: self.stack_unit_id(&row),
                     verbs: vec![
@@ -3332,6 +3364,7 @@ impl UnitProvider for DockerUnitProvider {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
@@ -4457,6 +4490,19 @@ mod tests {
     }
 
     #[test]
+    fn default_backups_go_under_orcas_state_dir_not_the_stack_dir() {
+        let dir = default_backup_dir().unwrap();
+        let state = plugin_toolkit::contract::config::paths::state_dir().unwrap();
+        assert!(dir.starts_with(&state), "{}", dir.display());
+        assert!(!dir.starts_with("/opt"), "{}", dir.display());
+        std::fs::create_dir_all(&dir).unwrap();
+        let own = dir.join("web-default-backup-test.tar.gz");
+        std::fs::write(&own, b"x").unwrap();
+        restore_source(&path(&own), "/opt/halvor/compose/web", &[]).unwrap();
+        std::fs::remove_file(&own).unwrap();
+    }
+
+    #[test]
     fn restore_reads_only_from_the_backup_roots_or_the_stacks_own_backups() {
         let roots_dir = tempfile::tempdir().unwrap();
         let stacks = tempfile::tempdir().unwrap();
@@ -4493,6 +4539,7 @@ mod tests {
             url: None,
             stacks_root: Some(path(root)),
             data_roots: Vec::new(),
+            discovery_roots: Vec::new(),
             registries: Vec::new(),
             routes: Vec::new(),
             dry_run: false,
@@ -4679,7 +4726,7 @@ mod tests {
         let ((), _) = crate::test_support::with_db(|| {
             register_root(root.path());
             let row = registered_stack(&dir, yaml, None);
-            let compose = row.compose().unwrap();
+            let compose = crate::Compose::at(&dir.join("compose.yaml")).unwrap();
             let docker = crate::test_engine::FakeEngine::routed(Vec::new()).client();
             let err =
                 plugin_toolkit::reactor::block_on(policy::gate(Some(&docker), &row, &compose))
@@ -4843,6 +4890,7 @@ mod tests {
                 url: None,
                 stacks_root: Some(root_s.clone()),
                 data_roots: Vec::new(),
+                discovery_roots: Vec::new(),
                 registries: Vec::new(),
                 routes: Vec::new(),
                 dry_run: false,

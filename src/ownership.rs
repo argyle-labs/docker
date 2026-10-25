@@ -321,13 +321,11 @@ pub fn render(
 /// The conversions recorded in an existing [`ORCA_FILE`]. A file that exists
 /// but cannot be read fails: regenerating without its conversions would
 /// silently swap converted volumes back to fresh anonymous ones.
-pub fn read_conversions(dir: &Path) -> Result<Vec<Conversion>> {
-    let path = dir.join(ORCA_FILE);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(anyhow::anyhow!("read {}: {e}", path.display())),
+pub fn read_conversions(dir: &crate::stacks::StackDir) -> Result<Vec<Conversion>> {
+    let Some(text) = dir.read_rel(Path::new(ORCA_FILE))? else {
+        return Ok(Vec::new());
     };
+    let path = dir.path().join(ORCA_FILE);
     let json: String = text
         .lines()
         .filter(|l| !l.trim_start().starts_with('#'))
@@ -448,7 +446,9 @@ pub async fn project_containers(docker: &Docker, project: &str) -> Result<Vec<Co
 
 /// The user's resolved config (without [`ORCA_FILE`]).
 pub async fn user_config(row: &StackRow) -> Result<(Compose, ComposeConfig)> {
-    let compose = row.compose()?.without_orca();
+    let compose = row
+        .compose(&crate::stacks::allowed_roots()?)?
+        .without_orca();
     let raw = compose.config_json().await?;
     Ok((compose, ComposeConfig::parse(&raw)?))
 }
@@ -465,7 +465,7 @@ pub async fn write_with(
     let conversions = match conversions {
         Some(c) => c,
         None => {
-            recorded = read_conversions(Path::new(&row.dir))?;
+            recorded = read_conversions(&row.open_dir(&crate::stacks::allowed_roots()?)?)?;
             &recorded
         }
     };
@@ -473,7 +473,10 @@ pub async fn write_with(
     let networks = engine_networks(docker, &cfg).await?;
     let rendered = render(&cfg, &row.name, conversions, &engine, &networks);
     write_orca(row, &rendered.text)?;
-    Ok((compose.with_orca(), rendered.notes))
+    Ok((
+        compose.with_orca(&crate::stacks::allowed_roots()?)?,
+        rendered.notes,
+    ))
 }
 
 fn client() -> Result<Docker> {
@@ -1063,13 +1066,19 @@ pub struct ComposeMigrator<'a> {
 impl Migrator for ComposeMigrator<'_> {
     fn stop<'a>(&'a self, service: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            self.row.compose()?.stop(&[service]).await?;
+            self.row
+                .compose(&crate::stacks::allowed_roots()?)?
+                .stop(&[service])
+                .await?;
             Ok(())
         })
     }
     fn start<'a>(&'a self, service: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            self.row.compose()?.start(&[service]).await?;
+            self.row
+                .compose(&crate::stacks::allowed_roots()?)?
+                .start(&[service])
+                .await?;
             Ok(())
         })
     }
@@ -1090,12 +1099,9 @@ impl Migrator for ComposeMigrator<'_> {
         })
     }
     fn current_override(&self) -> Result<Option<String>> {
-        let path = Path::new(&self.row.dir).join(ORCA_FILE);
-        match std::fs::read_to_string(&path) {
-            Ok(s) => Ok(Some(s)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(anyhow::anyhow!("read {}: {e}", path.display())),
-        }
+        self.row
+            .open_dir(&crate::stacks::allowed_roots()?)?
+            .read_rel(Path::new(ORCA_FILE))
     }
     fn write_override<'a>(&'a self, conversions: &'a [Conversion]) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
@@ -1120,9 +1126,10 @@ impl Migrator for ComposeMigrator<'_> {
         Box::pin(async move {
             // The override on disk is what this step means to apply: a
             // regeneration here would undo a restored one.
-            let compose = self.row.compose()?;
+            let allowed = crate::stacks::allowed_roots()?;
+            let compose = self.row.compose(&allowed)?;
             let compose = if Path::new(&self.row.dir).join(ORCA_FILE).exists() {
-                compose.with_orca()
+                compose.with_orca(&allowed)?
             } else {
                 compose
             };
@@ -1298,8 +1305,8 @@ mod tests {
 
     #[test]
     fn conversions_read_back_and_an_unreadable_file_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(read_conversions(dir.path()).unwrap().is_empty());
+        let (_root, dir) = stack_dir();
+        assert!(read_conversions(&dir).unwrap().is_empty());
         let c = Conversion::new("media", "app", "/cache");
         std::fs::write(
             dir.path().join(ORCA_FILE),
@@ -1313,9 +1320,9 @@ mod tests {
             .text,
         )
         .unwrap();
-        assert_eq!(read_conversions(dir.path()).unwrap(), vec![c]);
+        assert_eq!(read_conversions(&dir).unwrap(), vec![c]);
         std::fs::write(dir.path().join(ORCA_FILE), "services: {}\n").unwrap();
-        assert!(read_conversions(dir.path()).is_err());
+        assert!(read_conversions(&dir).is_err());
     }
 
     fn container(name: &str, service: &str, mounts: &[(&str, &str)]) -> ContainerSummary {
@@ -1760,9 +1767,33 @@ mod tests {
 
     #[test]
     fn an_unreadable_orca_file_is_an_error_but_a_missing_one_is_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(read_conversions(dir.path()).unwrap().is_empty());
+        let (_root, dir) = stack_dir();
+        assert!(read_conversions(&dir).unwrap().is_empty());
         std::fs::create_dir(dir.path().join(ORCA_FILE)).unwrap();
-        assert!(read_conversions(dir.path()).is_err());
+        assert!(read_conversions(&dir).is_err());
+    }
+
+    #[test]
+    fn a_symlinked_orca_file_is_refused() {
+        let (_root, dir) = stack_dir();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("x"), "services: {}\n").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("x"), dir.path().join(ORCA_FILE)).unwrap();
+        assert!(read_conversions(&dir).is_err());
+    }
+
+    fn stack_dir() -> (tempfile::TempDir, crate::stacks::StackDir) {
+        let root = tempfile::tempdir().unwrap();
+        let roots = vec![
+            root.path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        ];
+        let dir = crate::stacks::StackDir::open(&format!("{}/web", roots[0]), &roots, true)
+            .unwrap()
+            .unwrap();
+        (root, dir)
     }
 }

@@ -7,12 +7,14 @@
 //! No bollard yet. When a real Engine API call site lands (exec streaming,
 //! event subscription) we'll add a third layer rather than retro-fitting.
 
+#[allow(clippy::disallowed_methods)]
 pub mod cgroup;
 pub mod compose;
 pub mod compose_config;
 pub mod container_delete;
 pub mod container_inspect;
 pub mod containers;
+#[allow(clippy::disallowed_methods)]
 pub mod daemon_config;
 pub mod deploy;
 pub mod engine;
@@ -22,12 +24,15 @@ mod exec;
 pub mod execute;
 pub mod fsat;
 pub mod image_update;
+#[allow(clippy::disallowed_methods)]
 pub mod init;
 pub mod label_audit;
 pub mod labels;
+#[allow(clippy::disallowed_methods)]
 pub mod lifecycle;
 pub mod lint;
 pub mod manageability;
+#[allow(clippy::disallowed_methods)]
 pub mod mounts;
 pub mod normalize;
 pub mod ownership;
@@ -141,17 +146,14 @@ pub async fn clean_command(
     Ok(plugin_toolkit::process::Command::new("/usr/bin/env").args(clean_argv(program).await?))
 }
 
-/// Run the docker CLI with `args`, optionally in `cwd`, returning stdout,
+/// Run the docker CLI with `args`, returning stdout,
 /// under the same environment as [`clean_command`]. The child leads its own
 /// process group, and every lingering descendant in that group is killed on
 /// every return, including timeout and cancellation; the toolkit's `Command`
 /// cannot set a process group or expose the pid.
-pub async fn run(args: &[&str], cwd: Option<&str>) -> plugin_toolkit::anyhow::Result<String> {
+pub async fn run(args: &[&str]) -> plugin_toolkit::anyhow::Result<String> {
     let mut cmd = std::process::Command::new("/usr/bin/env");
     cmd.args(clean_argv(resolve_docker_bin()).await?).args(args);
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-    }
     run_within(cmd, CLI_BUDGET).await
 }
 
@@ -344,8 +346,29 @@ async fn run_tracked(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_tool_taking_dry_run_lets_core_forward_it() {
+        use plugin_toolkit::dispatch;
+        let aware = dispatch::dry_run_aware_names();
+        let gated = dispatch::execute_gated_names();
+        assert!(aware.contains(&"docker.prune"), "{aware:?}");
+        for def in dispatch::mcp_definitions() {
+            let name = def["name"].as_str().unwrap_or_default();
+            if !name.starts_with("docker.") {
+                continue;
+            }
+            if def["inputSchema"]["properties"].get("dryRun").is_some() {
+                assert!(
+                    aware.contains(&name) || gated.contains(&name),
+                    "{name} reads dryRun but core refuses to forward it"
+                );
+            }
+        }
+    }
 
     fn sh(script: &str) -> std::process::Command {
         let mut cmd = std::process::Command::new("/bin/sh");
@@ -556,10 +579,9 @@ mod tests {
         .unwrap();
         let file = file.to_string_lossy().into_owned();
         let out = crate::test_support::with_db(|| {
-            plugin_toolkit::reactor::block_on(run(
-                &["compose", "-f", &file, "config", "--format", "json"],
-                None,
-            ))
+            plugin_toolkit::reactor::block_on(run(&[
+                "compose", "-f", &file, "config", "--format", "json",
+            ]))
         })
         .0
         .unwrap();

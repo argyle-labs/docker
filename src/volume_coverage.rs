@@ -847,6 +847,7 @@ pub fn verify_archive(file: &mut std::fs::File) -> Result<ArchiveVolumes> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::compose_config::FIXTURE;

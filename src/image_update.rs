@@ -430,6 +430,15 @@ pub struct DockerImageStatusArgs {
     pub stack: Option<String>,
 }
 
+fn require_docker(absent: bool) -> Result<()> {
+    if absent {
+        bail!(
+            "docker not present on this host: no registered runtime, DOCKER_HOST or docker socket"
+        );
+    }
+    Ok(())
+}
+
 /// **Check managed stacks for image updates**: per service (running or
 /// stopped; one-off containers excluded), the local and registry digests of
 /// its image and whether they differ. A registry lookup that fails reports
@@ -448,17 +457,18 @@ pub struct DockerImageStatusArgs {
     execute_gated = false
 )]
 async fn docker_image_status(args: DockerImageStatusArgs, _ctx: &ToolCtx) -> Result<ImageStatus> {
-    let rows = match &args.stack {
-        Some(s) => vec![crate::stacks::require(s)?],
-        None => crate::stacks::list()?,
-    };
+    require_docker(crate::tools::docker_absent()?)?;
     let docker = &crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
+    let rows = match &args.stack {
+        Some(s) => vec![crate::stacks::find(s, Some(docker)).await?],
+        None => crate::stacks::all(Some(docker)).await?,
+    };
     let mut remote = RemoteCache::new();
     let mut out = ImageStatus::default();
     for row in rows {
-        let project = match row.compose() {
+        let project = match row.compose(&crate::stacks::allowed_roots()?) {
             Ok(c) => c.project_name().await.map_err(|e| e.to_string()),
             Err(e) => Err(e.to_string()),
         };
@@ -478,6 +488,13 @@ async fn docker_image_status(args: DockerImageStatusArgs, _ctx: &ToolCtx) -> Res
 mod tests {
     use super::*;
     use crate::test_engine::{FakeEngine, Route};
+
+    #[test]
+    fn image_status_without_docker_says_docker_is_absent() {
+        let err = require_docker(true).unwrap_err().to_string();
+        assert!(err.contains("docker not present on this host"), "{err}");
+        require_docker(false).unwrap();
+    }
 
     const INDEX: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
     const OLD: &str = "sha256:2222222222222222222222222222222222222222222222222222222222222222";

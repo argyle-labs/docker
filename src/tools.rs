@@ -65,6 +65,10 @@ pub struct Runtime {
     /// the stacks root only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub data_roots: Vec<String>,
+    /// Directories outside the stacks roots whose labelled compose projects
+    /// may be discovered; empty means the stacks roots only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discovery_roots: Vec<String>,
     /// Image registries deployed workloads may pull from; empty allows any.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub registries: Vec<String>,
@@ -125,6 +129,10 @@ fn joined(row: EndpointRow) -> Result<Runtime> {
             Some(raw) => plugin_toolkit::serde_json::from_str(&raw)?,
             None => Vec::new(),
         },
+        discovery_roots: match setting("discovery_roots")? {
+            Some(raw) => plugin_toolkit::serde_json::from_str(&raw)?,
+            None => Vec::new(),
+        },
         registries: match setting("registries")? {
             Some(raw) => plugin_toolkit::serde_json::from_str(&raw)?,
             None => Vec::new(),
@@ -148,6 +156,14 @@ fn store_settings(rt: &Runtime) -> Result<()> {
             DbValue::Null
         } else {
             DbValue::Text(plugin_toolkit::serde_json::to_string(&rt.data_roots)?)
+        },
+    );
+    row.insert(
+        "discovery_roots".to_string(),
+        if rt.discovery_roots.is_empty() {
+            DbValue::Null
+        } else {
+            DbValue::Text(plugin_toolkit::serde_json::to_string(&rt.discovery_roots)?)
         },
     );
     row.insert(
@@ -204,6 +220,18 @@ pub fn stacks_roots() -> Result<Vec<String>> {
     }
     if roots.is_empty() {
         roots.push(DEFAULT_STACKS_ROOT.to_string());
+    }
+    Ok(roots)
+}
+
+pub fn discovery_roots() -> Result<Vec<String>> {
+    let mut roots = Vec::new();
+    for rt in runtimes()? {
+        for root in rt.discovery_roots {
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
     }
     Ok(roots)
 }
@@ -349,6 +377,11 @@ pub struct DockerCreateArgs {
     #[arg(long = "data-root", action = plugin_toolkit::clap::ArgAction::Append)]
     #[serde(default, alias = "data_roots")]
     pub data_roots: Vec<String>,
+    /// Directory outside the stacks roots whose labelled compose projects
+    /// may be discovered. Repeatable; none means the stacks roots only.
+    #[arg(long = "discovery-root", action = plugin_toolkit::clap::ArgAction::Append)]
+    #[serde(default, alias = "discovery_roots")]
+    pub discovery_roots: Vec<String>,
     /// Image registry deployed workloads may pull from (e.g. `docker.io`,
     /// `ghcr.io`). Repeatable; none allows any.
     #[arg(long = "registry", action = plugin_toolkit::clap::ArgAction::Append)]
@@ -389,17 +422,23 @@ pub struct DockerCreateOutput {
     domain = "docker",
     verb = "create",
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    dry_run_aware = true
 )]
 pub(crate) async fn docker_create(
     args: DockerCreateArgs,
     ctx: &ToolCtx,
 ) -> Result<DockerCreateOutput> {
+    let args = DockerCreateArgs {
+        dry_run: args.dry_run || ctx.dry_run(),
+        ..args
+    };
     execute::require_admin(CREATE_TOOL, ctx)?;
     if let Some(root) = &args.stacks_root {
         validate_stacks_root(root)?;
     }
     validate_data_roots(&args.data_roots)?;
+    validate_data_roots(&args.discovery_roots)?;
     if endpoint_db::get(&args.name)?.is_some() {
         bail!(
             "docker endpoint '{}' already exists; use docker.update",
@@ -413,6 +452,7 @@ pub(crate) async fn docker_create(
         url: args.url,
         stacks_root: args.stacks_root,
         data_roots: args.data_roots,
+        discovery_roots: args.discovery_roots,
         registries: args.registries,
         routes: Routes::from(args.routes),
         enabled: true,
@@ -462,6 +502,11 @@ pub struct DockerUpdateArgs {
     #[arg(long = "data-root", action = plugin_toolkit::clap::ArgAction::Append)]
     #[serde(default, alias = "data_roots")]
     pub data_roots: Vec<String>,
+    /// Directory outside the stacks roots whose labelled compose projects
+    /// may be discovered. Repeatable; none means the stacks roots only.
+    #[arg(long = "discovery-root", action = plugin_toolkit::clap::ArgAction::Append)]
+    #[serde(default, alias = "discovery_roots")]
+    pub discovery_roots: Vec<String>,
     /// Image registry deployed workloads may pull from (e.g. `docker.io`,
     /// `ghcr.io`). Repeatable; none allows any.
     #[arg(long = "registry", action = plugin_toolkit::clap::ArgAction::Append)]
@@ -506,14 +551,23 @@ pub struct DockerUpdateOutput {
     domain = "docker",
     verb = "update",
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    dry_run_aware = true
 )]
-async fn docker_update(args: DockerUpdateArgs, ctx: &ToolCtx) -> Result<DockerUpdateOutput> {
+pub(crate) async fn docker_update(
+    args: DockerUpdateArgs,
+    ctx: &ToolCtx,
+) -> Result<DockerUpdateOutput> {
+    let args = DockerUpdateArgs {
+        dry_run: args.dry_run || ctx.dry_run(),
+        ..args
+    };
     execute::require_admin(UPDATE_TOOL, ctx)?;
     if let Some(root) = &args.stacks_root {
         validate_stacks_root(root)?;
     }
     validate_data_roots(&args.data_roots)?;
+    validate_data_roots(&args.discovery_roots)?;
     let mut rt = runtime(&args.name)?
         .ok_or_else(|| plugin_toolkit::runtime::missing_row_error("docker", &args.name))?;
     let mut applied = Vec::new();
@@ -531,6 +585,10 @@ async fn docker_update(args: DockerUpdateArgs, ctx: &ToolCtx) -> Result<DockerUp
     if !args.data_roots.is_empty() {
         rt.data_roots = args.data_roots;
         applied.push("data_roots".to_string());
+    }
+    if !args.discovery_roots.is_empty() {
+        rt.discovery_roots = args.discovery_roots;
+        applied.push("discovery_roots".to_string());
     }
     if !args.registries.is_empty() {
         rt.registries = args.registries;
@@ -604,9 +662,14 @@ pub struct DockerDeleteOutput {
     domain = "docker",
     verb = "delete",
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    dry_run_aware = true
 )]
 async fn docker_delete(args: DockerDeleteArgs, ctx: &ToolCtx) -> Result<DockerDeleteOutput> {
+    let args = DockerDeleteArgs {
+        dry_run: args.dry_run || ctx.dry_run(),
+        ..args
+    };
     execute::require_admin(DELETE_TOOL, ctx)?;
     if args.dry_run {
         let changed = endpoint_db::get(&args.name)?.is_some();
@@ -659,24 +722,47 @@ fn one_engine(read: Result<Vec<Runtime>>) -> Result<Option<String>> {
 const WELL_KNOWN_SOCKETS: &[&str] = &["/var/run/docker.sock", "/run/docker.sock"];
 
 /// First existing socket in `paths`, formatted as a `unix://` `DOCKER_HOST`.
-/// Pure over the filesystem so it can be unit-tested with a temp path.
-fn first_existing_socket(paths: &[&str]) -> Option<String> {
+/// A path whose existence cannot be checked (EACCES on a parent) counts as
+/// present, so connecting reports the real error instead of "not found".
+fn first_existing_socket<P: AsRef<str>>(paths: &[P]) -> Option<String> {
     paths
         .iter()
-        .find(|p| std::path::Path::new(p).exists())
+        .map(AsRef::as_ref)
+        .find(|p| std::path::Path::new(p).try_exists().unwrap_or(true))
         .map(|p| format!("unix://{p}"))
+}
+
+/// Socket paths probed after the registered runtime and `DOCKER_HOST`: the
+/// rootless daemon's under `XDG_RUNTIME_DIR` (or `/run/user/<uid>`), then the
+/// system daemon's.
+fn socket_candidates(xdg_runtime_dir: Option<&str>, uid: u32) -> Vec<String> {
+    let mut out = Vec::new();
+    match xdg_runtime_dir.filter(|d| !d.is_empty()) {
+        Some(dir) => out.push(format!("{dir}/docker.sock")),
+        None => out.push(format!("/run/user/{uid}/docker.sock")),
+    }
+    out.extend(WELL_KNOWN_SOCKETS.iter().map(|p| p.to_string()));
+    out
+}
+
+pub fn docker_absent() -> Result<bool> {
+    Ok(resolve_docker_host()?.is_none())
 }
 
 /// Resolve the `DOCKER_HOST` to inject, trying every source in order:
 /// 1. the first enabled registered runtime (socket/tcp),
-/// 2. colima's default socket,
-/// 3. a docker socket present at a well-known path (covers Unraid and any
-///    host running the engine on the standard socket without registration).
+/// 2. a non-empty `DOCKER_HOST`,
+/// 3. colima's default socket,
+/// 4. a rootless or system docker socket that exists (covers Unraid, Alpine
+///    LXCs and any host running the engine without registration).
 ///
 /// Returns `None` only when nothing is discoverable, in which case a direct
 /// bollard client falls back to its own compiled-in default.
 pub fn resolve_docker_host() -> Result<Option<String>> {
     if let Some(host) = active_host()? {
+        return Ok(Some(host));
+    }
+    if let Some(host) = std::env::var("DOCKER_HOST").ok().filter(|h| !h.is_empty()) {
         return Ok(Some(host));
     }
     if let Ok(home) = std::env::var("HOME") {
@@ -685,12 +771,56 @@ pub fn resolve_docker_host() -> Result<Option<String>> {
             return Ok(Some(format!("unix://{colima}")));
         }
     }
-    Ok(first_existing_socket(WELL_KNOWN_SOCKETS))
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+    Ok(first_existing_socket(&socket_candidates(
+        xdg.as_deref(),
+        uid,
+    )))
 }
 
 #[cfg(test)]
 mod resolve_tests {
-    use super::first_existing_socket;
+    use super::{first_existing_socket, socket_candidates};
+
+    #[test]
+    fn socket_candidates_try_rootless_then_system_sockets() {
+        assert_eq!(
+            socket_candidates(Some("/run/user/1000"), 1000),
+            [
+                "/run/user/1000/docker.sock",
+                "/var/run/docker.sock",
+                "/run/docker.sock"
+            ]
+        );
+        assert_eq!(
+            socket_candidates(Some(""), 1001)[0],
+            "/run/user/1001/docker.sock"
+        );
+        assert_eq!(
+            socket_candidates(None, 1001)[0],
+            "/run/user/1001/docker.sock"
+        );
+    }
+
+    #[test]
+    fn a_socket_behind_an_unreadable_dir_counts_as_present() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let sock = locked.join("docker.sock").to_string_lossy().into_owned();
+        assert_eq!(
+            first_existing_socket(&["/definitely/not/a/real/docker.sock", sock.as_str()]),
+            Some(format!("unix://{sock}"))
+        );
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 
     #[test]
     fn first_existing_socket_picks_present_path_and_formats_unix() {
@@ -727,6 +857,7 @@ mod registry_tests {
             url: None,
             stacks_root: Some("/srv/stacks".into()),
             data_roots: Vec::new(),
+            discovery_roots: Vec::new(),
             registries: Vec::new(),
             routes: Vec::new(),
             dry_run: !execute,
@@ -741,6 +872,7 @@ mod registry_tests {
             url: None,
             stacks_root: Some("/srv/other".into()),
             data_roots: Vec::new(),
+            discovery_roots: Vec::new(),
             registries: Vec::new(),
             routes: Vec::new(),
             enabled: None,
@@ -857,6 +989,7 @@ mod registry_tests {
             url: None,
             stacks_root: None,
             data_roots: Vec::new(),
+            discovery_roots: Vec::new(),
             registries: Vec::new(),
             routes: Routes::from(Vec::new()),
             enabled,

@@ -123,12 +123,17 @@ pub async fn apply(
     domain = "docker",
     verb = "container_delete",
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    dry_run_aware = true
 )]
 async fn docker_container_delete(
     args: DockerContainerDeleteArgs,
     ctx: &ToolCtx,
 ) -> Result<ContainerDeleteOutput> {
+    let args = DockerContainerDeleteArgs {
+        dry_run: args.dry_run || ctx.dry_run(),
+        ..args
+    };
     crate::execute::require_admin(TOOL, ctx)?;
     let docker = &crate::registration::adapter()
         .client()

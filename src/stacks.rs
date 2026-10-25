@@ -65,20 +65,30 @@ fn default_true() -> bool {
 }
 
 impl StackRow {
-    /// The stack's compose file: `<dir>/<file>` when it exists, else the
-    /// conventional file compose would pick in `dir`, else `<dir>/<file>` (to
-    /// be created). Audit, view, edit and every compose call use this one
-    /// path.
-    pub fn compose_path(&self) -> PathBuf {
-        Path::new(&self.dir).join(self.compose_name())
+    pub fn open_dir(&self, roots: &[String]) -> Result<StackDir> {
+        StackDir::open(&self.dir, roots, false)?
+            .ok_or_else(|| anyhow::anyhow!("stack dir {} does not exist", self.dir))
+    }
+
+    /// The stack's compose file inside its dir under `roots`: `<file>` when
+    /// it exists, else the conventional file compose would pick, else
+    /// `<file>` (to be created). Refused when the dir is outside `roots` or
+    /// the file is neither a regular file nor a symlink to one in `roots`.
+    pub fn compose_path(&self, roots: &[String]) -> Result<PathBuf> {
+        let dir = self.open_dir(roots)?;
+        let name = self.compose_name(&dir);
+        if dir.stat(&name)?.is_some() {
+            file_in_roots(&dir, &name, roots)?;
+        }
+        Ok(dir.path().join(name))
     }
 
     /// The file name of [`compose_path`](Self::compose_path) inside `dir`.
-    pub fn compose_name(&self) -> String {
-        if Path::new(&self.dir).join(&self.file).is_file() {
+    pub fn compose_name(&self, dir: &StackDir) -> String {
+        if dir.path().join(&self.file).is_file() {
             return self.file.clone();
         }
-        Compose::find(Path::new(&self.dir))
+        Compose::find(dir.path())
             .and_then(|c| {
                 c.file()
                     .file_name()
@@ -87,35 +97,36 @@ impl StackRow {
             .unwrap_or_else(|| self.file.clone())
     }
 
+    pub fn emitted_dir(&self, roots: &[String]) -> Option<String> {
+        canonical_in_roots(&self.dir, roots).map(|d| d.to_string_lossy().into_owned())
+    }
+
     /// Absolute path to the stack's `.env` file.
     pub fn env_path(&self) -> PathBuf {
         Path::new(&self.dir).join(ENV_FILE)
     }
 
     /// Read the compose file contents (the `view` operation).
-    pub fn read_compose(&self) -> Result<String> {
-        let p = self.compose_path();
-        std::fs::read_to_string(&p).with_context(|| format!("reading compose file {}", p.display()))
+    pub fn read_compose(&self, roots: &[String]) -> Result<String> {
+        let dir = self.open_dir(roots)?;
+        self.read_file(&self.compose_name(&dir), roots)
     }
 
-    /// Read the `.env` contents if present. Missing file, or a symlink in
-    /// its place → `None`.
-    pub fn read_env(&self) -> Option<String> {
-        use std::io::Read;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(self.env_path())
-            .ok()?;
-        let mut s = String::new();
-        f.read_to_string(&mut s).ok()?;
-        Some(s)
+    pub fn read_file(&self, name: &str, roots: &[String]) -> Result<String> {
+        let dir = self.open_dir(roots)?;
+        let (dir, name) = file_in_roots(&dir, name, roots)?;
+        dir.read(&name)
+    }
+
+    /// Read the `.env` contents if present. Missing file, a dir outside
+    /// `roots`, or a symlink in its place → `None`.
+    pub fn read_env(&self, roots: &[String]) -> Option<String> {
+        self.open_dir(roots).ok()?.read(ENV_FILE).ok()
     }
 
     /// `text` with every value the stack's `.env` sets replaced by `***`.
-    pub fn redact(&self, text: &str) -> String {
-        redact(text, &env_values(&self.read_env().unwrap_or_default()))
+    pub fn redact(&self, text: &str, roots: &[String]) -> String {
+        redact(text, &env_values(&self.read_env(roots).unwrap_or_default()))
     }
 
     /// Write the compose file and/or `.env` for `deploy`, `set` and `edit`:
@@ -137,7 +148,7 @@ impl StackRow {
         else {
             return Ok(());
         };
-        let name = self.compose_name();
+        let name = self.compose_name(&dir);
         let compose = yaml.map(|y| StagedWrite::new(&dir, &name, y)).transpose()?;
         let env = env
             .map(|e| StagedWrite::new(&dir, ENV_FILE, e))
@@ -146,6 +157,12 @@ impl StackRow {
             Some(staged) => staged.temp_path(),
             None => match dir.stat(&name)? {
                 Some(st) if st.kind == fsat::Kind::File => dir.path().join(&name),
+                Some(st)
+                    if st.kind == fsat::Kind::Symlink
+                        && regular_file_in_roots(&dir.path().join(&name), stacks_roots) =>
+                {
+                    dir.path().join(&name)
+                }
                 Some(_) => anyhow::bail!(
                     "compose file '{name}' in {} is not a regular file",
                     dir.path().display()
@@ -184,12 +201,12 @@ impl StackRow {
     ) -> Result<()> {
         let dir = StackDir::open(&self.dir, stacks_roots, false)?
             .ok_or_else(|| anyhow::anyhow!("stack dir {} does not exist", self.dir))?;
-        let name = self.compose_name();
+        let name = self.compose_name(&dir);
         let now = dir.read(&name)?;
         if content_hash(&now) != content_hash(read_before) {
             anyhow::bail!(
                 "compose file {} changed since it was read; re-run the dry run",
-                self.compose_path().display()
+                dir.path().join(&name).display()
             );
         }
         let staged = StagedWrite::new(&dir, &name, yaml)?;
@@ -201,9 +218,21 @@ impl StackRow {
 
     /// The [`Compose`] project of [`compose_path`](Self::compose_path).
     /// Errors when that file does not exist.
-    pub fn compose(&self) -> Result<Compose, crate::ComposeError> {
-        Compose::at(&self.compose_path())
-            .ok_or_else(|| crate::ComposeError::NoComposeFile(PathBuf::from(&self.dir)))
+    pub fn compose(&self, roots: &[String]) -> Result<Compose, crate::ComposeError> {
+        let missing = || crate::ComposeError::NoComposeFile(PathBuf::from(&self.dir));
+        let path = self
+            .compose_path(roots)
+            .map_err(crate::ComposeError::Refused)?;
+        let compose = Compose::at(&path).ok_or_else(missing)?;
+        if let Some(o) = compose.override_file()
+            && !regular_file_in_roots(o, roots)
+        {
+            return Err(crate::ComposeError::Refused(anyhow::anyhow!(
+                "{} is not a regular file inside the stacks roots",
+                o.display()
+            )));
+        }
+        Ok(compose)
     }
 }
 
@@ -415,7 +444,7 @@ pub async fn resolved_config(
 ) -> Result<String> {
     let args = config_args(dir, files, env_file);
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    crate::run(&argv, None)
+    crate::run(&argv)
         .await
         .context("compose rejects the stack's config")
 }
@@ -464,6 +493,36 @@ pub fn check_file_name(file: &str) -> Result<()> {
         anyhow::bail!("compose file '{file}' must be a plain file name inside the stack dir");
     }
     Ok(())
+}
+
+fn file_in_roots(dir: &StackDir, name: &str, roots: &[String]) -> Result<(StackDir, String)> {
+    let path = dir.path().join(name);
+    match dir.stat(name)? {
+        Some(st) if st.kind == fsat::Kind::File => Ok((
+            StackDir {
+                fd: dir.fd.try_clone()?,
+                path: dir.path.clone(),
+            },
+            name.to_string(),
+        )),
+        Some(st) if st.kind == fsat::Kind::Symlink && regular_file_in_roots(&path, roots) => {
+            let real = path.canonicalize()?;
+            let (Some(parent), Some(file)) = (real.parent(), real.file_name()) else {
+                anyhow::bail!("{} is not a file", real.display());
+            };
+            Ok((
+                StackDir {
+                    fd: fsat::open_dir(parent)?,
+                    path: parent.to_path_buf(),
+                },
+                file.to_string_lossy().into_owned(),
+            ))
+        }
+        _ => anyhow::bail!(
+            "'{name}' in {} is not a regular file inside the stacks roots",
+            dir.path().display()
+        ),
+    }
 }
 
 /// An open stack dir. Opened by walking each component below its stacks root
@@ -668,24 +727,23 @@ impl StagedRestore {
     /// The compose files in the staged dir that `row` would run, in `-f`
     /// order, without and then with [`crate::compose::ORCA_FILE`] when the
     /// archive holds one. Empty when it holds no compose file.
-    pub fn compose_sets(&self, row: &StackRow) -> Vec<Vec<PathBuf>> {
+    pub fn compose_sets(&self, row: &StackRow, roots: &[String]) -> Vec<Vec<PathBuf>> {
         let named = self.staged.join(&row.file);
         let Some(compose) = Compose::at(&named).or_else(|| Compose::find(&self.staged)) else {
             return Vec::new();
         };
         let plain: Vec<PathBuf> = compose.files().into_iter().map(Path::to_path_buf).collect();
         let mut sets = vec![plain];
-        if self.staged.join(crate::compose::ORCA_FILE).is_file() {
-            sets.push(
-                compose
-                    .with_orca()
-                    .files()
-                    .into_iter()
-                    .map(Path::to_path_buf)
-                    .collect(),
-            );
+        if self.staged.join(crate::compose::ORCA_FILE).is_file()
+            && let Ok(with) = compose.with_orca(roots)
+        {
+            sets.push(with.files().into_iter().map(Path::to_path_buf).collect());
         }
         sets
+    }
+
+    pub fn read_env(&self) -> Option<String> {
+        self.parent.child(&self.staging).ok()?.read(ENV_FILE).ok()
     }
 
     /// The staged `.env`, if any.
@@ -752,6 +810,19 @@ pub struct StagedWrite<'a> {
     committed: bool,
 }
 
+fn staging_error(e: std::io::Error, temp: &str, dir: &Path) -> anyhow::Error {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        return anyhow::anyhow!(
+            "cannot write in stack dir {}: permission denied for uid {uid}; orca stages {temp} there and renames it into place, so the orca user needs write access to {} (owner or group write)",
+            dir.display(),
+            dir.display()
+        );
+    }
+    anyhow::Error::new(e).context(format!("creating {temp} in {}", dir.display()))
+}
+
 impl<'a> StagedWrite<'a> {
     pub fn new(dir: &'a StackDir, name: &str, contents: &str) -> Result<Self> {
         use std::io::Write;
@@ -777,7 +848,7 @@ impl<'a> StagedWrite<'a> {
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
             0o600,
         )
-        .with_context(|| format!("creating {temp} in {}", dir.path().display()))?;
+        .map_err(|e| staging_error(e, &temp, dir.path()))?;
         let staged = StagedWrite {
             dir,
             name: name.to_string(),
@@ -913,6 +984,296 @@ pub fn require(name: &str) -> Result<StackRow> {
     get(name)?.ok_or_else(|| anyhow::anyhow!("no managed stack named '{name}'"))
 }
 
+pub fn allowed_roots() -> Result<Vec<String>> {
+    let mut roots = crate::tools::stacks_roots()?;
+    for root in crate::tools::discovery_roots()? {
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    Ok(roots)
+}
+
+pub const CONFIG_FILES_LABEL: &str = "com.docker.compose.project.config_files";
+
+pub fn from_labels(
+    containers: &[bollard::models::ContainerSummary],
+    registered: &[StackRow],
+    roots: &[String],
+) -> Vec<StackRow> {
+    let mut found: std::collections::BTreeMap<String, StackRow> = Default::default();
+    let mut seen: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeSet<(PathBuf, Option<&String>)>,
+    > = Default::default();
+    for labels in containers.iter().filter_map(|c| c.labels.as_ref()) {
+        let (Some(project), Some(dir)) = (
+            labels.get(crate::prune::COMPOSE_PROJECT_LABEL),
+            labels.get(crate::stacks_root_drift::WORKING_DIR_LABEL),
+        ) else {
+            continue;
+        };
+        if !fsat::is_single_component(project) {
+            continue;
+        }
+        seen.entry(project.clone())
+            .or_default()
+            .insert((normalized(dir), labels.get(CONFIG_FILES_LABEL)));
+        let Some(real) = canonical_in_roots(dir, roots) else {
+            continue;
+        };
+        let Some(file) = labels
+            .get(CONFIG_FILES_LABEL)
+            .and_then(|files| config_file(files, &real, roots))
+        else {
+            continue;
+        };
+        if found.contains_key(project)
+            || registered
+                .iter()
+                .any(|r| &r.name == project || normalized(&r.dir) == real)
+        {
+            continue;
+        }
+        found.insert(
+            project.clone(),
+            StackRow {
+                name: project.clone(),
+                dir: real.to_string_lossy().into_owned(),
+                file,
+                enabled: true,
+                allow: Vec::new(),
+            },
+        );
+    }
+    found.retain(|name, _| seen.get(name).is_none_or(|s| s.len() == 1));
+    found.into_values().collect()
+}
+
+fn normalized(dir: &str) -> PathBuf {
+    Path::new(dir)
+        .canonicalize()
+        .unwrap_or_else(|_| Path::new(dir).components().collect())
+}
+
+fn canonical_in_roots(dir: &str, roots: &[String]) -> Option<PathBuf> {
+    let path = Path::new(dir);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+    {
+        return None;
+    }
+    let real = path.canonicalize().ok().filter(|p| p.is_dir())?;
+    roots
+        .iter()
+        .filter_map(|r| Path::new(r).canonicalize().ok())
+        .any(|r| {
+            real.strip_prefix(&r)
+                .is_ok_and(|rel| rel.components().next().is_some())
+        })
+        .then_some(real)
+}
+
+fn config_file(files: &str, dir: &Path, roots: &[String]) -> Option<String> {
+    let [file] = files.split(',').collect::<Vec<_>>()[..] else {
+        return None;
+    };
+    let path = Path::new(file);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+    {
+        return None;
+    }
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    (path.parent().and_then(|p| p.canonicalize().ok()).as_deref() == Some(dir)
+        && regular_file_in_roots(&dir.join(&name), roots))
+    .then_some(name)
+}
+
+pub async fn discover(docker: &bollard::Docker) -> Result<Vec<StackRow>> {
+    let filters = std::collections::HashMap::from([(
+        "label",
+        vec![crate::prune::COMPOSE_PROJECT_LABEL.to_string()],
+    )]);
+    let containers = docker
+        .list_containers(Some(
+            bollard::query_parameters::ListContainersOptionsBuilder::new()
+                .all(true)
+                .filters(&filters)
+                .build(),
+        ))
+        .await
+        .map_err(|e| anyhow::anyhow!("list compose containers: {e}"))?;
+    Ok(from_labels(&containers, &list()?, &allowed_roots()?))
+}
+
+pub async fn all(docker: Option<&bollard::Docker>) -> Result<Vec<StackRow>> {
+    let mut rows = list()?;
+    if let Some(docker) = docker {
+        match discover(docker).await {
+            Ok(found) => rows.extend(found),
+            Err(e) => {
+                plugin_toolkit::tracing::warn!(error = %e, "docker stacks: compose discovery failed")
+            }
+        }
+    }
+    Ok(rows)
+}
+
+pub async fn all_here() -> Result<Vec<StackRow>> {
+    all(crate::registration::adapter().present_client().as_ref()).await
+}
+
+pub async fn find_here(name: &str) -> Result<StackRow> {
+    find(
+        name,
+        crate::registration::adapter().present_client().as_ref(),
+    )
+    .await
+}
+
+pub const DOCKGE_STACKS_ROOT: &str = "/opt/stacks";
+
+pub async fn units(docker: Option<&bollard::Docker>) -> Result<Vec<StackRow>> {
+    let registered = list()?;
+    let Some(docker) = docker else {
+        return Ok(registered);
+    };
+    let found = match discover(docker).await {
+        Ok(found) => found,
+        Err(e) => {
+            plugin_toolkit::tracing::warn!(error = %e, "docker stacks: compose discovery failed");
+            Vec::new()
+        }
+    };
+    let yield_to_dockge = found.iter().any(under_dockge_root) && dockge_is_local();
+    let mut rows = registered;
+    rows.extend(
+        found
+            .into_iter()
+            .filter(|r| !(yield_to_dockge && under_dockge_root(r))),
+    );
+    Ok(rows)
+}
+
+fn under_dockge_root(row: &StackRow) -> bool {
+    !Path::new(&row.dir)
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+        && normalized(&row.dir).parent() == Some(normalized(DOCKGE_STACKS_ROOT).as_path())
+}
+
+fn dockge_is_local() -> bool {
+    if !plugin_toolkit::tool_call::available() {
+        return false;
+    }
+    match plugin_toolkit::tool_call::call_json("dockge.list", plugin_toolkit::serde_json::json!({}))
+    {
+        Ok(v) => lists_local_dockge(&v, plugin_toolkit::containers::local_hostname()),
+        Err(_) => false,
+    }
+}
+
+pub fn lists_local_dockge(listed: &plugin_toolkit::serde_json::Value, hostname: &str) -> bool {
+    listed
+        .get("endpoints")
+        .and_then(|e| e.as_array())
+        .is_some_and(|eps| {
+            eps.iter().any(|e| {
+                e.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true)
+                    && e.get("base_url")
+                        .or_else(|| e.get("baseUrl"))
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|u| is_local_url(u, hostname))
+            })
+        })
+}
+
+fn is_local_url(url: &str, hostname: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => authority.split(':').next().unwrap_or(""),
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host.eq_ignore_ascii_case(hostname)
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+pub async fn find(name: &str, docker: Option<&bollard::Docker>) -> Result<StackRow> {
+    if let Some(row) = get(name)? {
+        return Ok(row);
+    }
+    if let Some(docker) = docker
+        && let Some(row) = discovered(docker, name).await
+    {
+        return Ok(row);
+    }
+    Err(anyhow::anyhow!("no managed stack named '{name}'"))
+}
+
+async fn discovered(docker: &bollard::Docker, name: &str) -> Option<StackRow> {
+    match discover(docker).await {
+        Ok(found) => found.into_iter().find(|r| r.name == name),
+        Err(e) => {
+            plugin_toolkit::tracing::warn!(error = %e, "docker stacks: compose discovery failed");
+            None
+        }
+    }
+}
+
+pub async fn require_registered(name: &str, docker: Option<&bollard::Docker>) -> Result<StackRow> {
+    if let Some(row) = get(name)? {
+        return Ok(row);
+    }
+    if let Some(docker) = docker
+        && discovered(docker, name).await.is_some()
+    {
+        anyhow::bail!(
+            "stack '{name}' is a discovered compose project, not a registered one; adopt it with docker.stack_allow (`dir` + `approve_current`) before changing it"
+        );
+    }
+    Err(anyhow::anyhow!("no managed stack named '{name}'"))
+}
+
+pub async fn require_registered_here(name: &str) -> Result<StackRow> {
+    require_registered(
+        name,
+        crate::registration::adapter().present_client().as_ref(),
+    )
+    .await
+}
+
+/// Whether `path` is a regular file, or a symlink resolving to one inside
+/// one of `roots`.
+pub fn regular_file_in_roots(path: &Path, roots: &[String]) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if meta.is_file() {
+        return true;
+    }
+    if !meta.file_type().is_symlink() {
+        return false;
+    }
+    let Ok(real) = path.canonicalize() else {
+        return false;
+    };
+    real.is_file()
+        && roots
+            .iter()
+            .filter_map(|r| Path::new(r).canonicalize().ok())
+            .any(|r| real.starts_with(r))
+}
+
 /// Whether a stack with this name is registered.
 pub fn exists(name: &str) -> Result<bool> {
     Ok(get(name)?.is_some())
@@ -988,6 +1349,7 @@ pub fn remove(name: &str) -> Result<bool> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
@@ -1010,6 +1372,504 @@ mod tests {
             insert(&row("/opt/stacks/web")).unwrap();
             assert!(insert(&row("/opt/stacks/elsewhere")).is_err());
             assert_eq!(require("web").unwrap().dir, "/opt/stacks/web");
+        });
+    }
+
+    fn compose_container(project: &str, dir: &str, files: &str) -> String {
+        format!(
+            r#"{{"Id":"{project}","Labels":{{"com.docker.compose.project":"{project}","com.docker.compose.project.working_dir":"{dir}","com.docker.compose.project.config_files":"{files}"}}}}"#
+        )
+    }
+
+    fn summaries(entries: &[(&str, &str, &str)]) -> Vec<bollard::models::ContainerSummary> {
+        let body = entries
+            .iter()
+            .map(|(p, d, f)| compose_container(p, d, f))
+            .collect::<Vec<_>>()
+            .join(",");
+        plugin_toolkit::serde_json::from_str(&format!("[{body}]")).unwrap()
+    }
+
+    struct Roots {
+        _root: tempfile::TempDir,
+        roots: Vec<String>,
+    }
+
+    impl Roots {
+        fn new(stacks: &[&str]) -> Self {
+            let root = tempdir().unwrap();
+            let roots = vec![s(&root.path().canonicalize().unwrap())];
+            for name in stacks {
+                let dir = PathBuf::from(&roots[0]).join(name);
+                std::fs::create_dir(&dir).unwrap();
+                std::fs::write(dir.join("compose.yaml"), "services: {}\n").unwrap();
+            }
+            Roots { _root: root, roots }
+        }
+
+        fn path(&self, rel: &str) -> String {
+            format!("{}/{rel}", self.roots[0])
+        }
+    }
+
+    #[test]
+    fn compose_projects_are_discovered_from_container_labels() {
+        let r = Roots::new(&["komga", "ntfy", "web"]);
+        let containers = summaries(&[
+            ("komga", &r.path("komga"), &r.path("komga/compose.yaml")),
+            ("komga", &r.path("komga"), &r.path("komga/compose.yaml")),
+            ("ntfy", &r.path("ntfy"), &r.path("ntfy/compose.yaml")),
+            ("web", &r.path("web"), &r.path("web/compose.yaml")),
+        ]);
+        let registered = [StackRow {
+            name: "web".into(),
+            dir: r.path("web"),
+            file: DEFAULT_COMPOSE_FILE.into(),
+            enabled: true,
+            allow: Vec::new(),
+        }];
+        let rows = from_labels(&containers, &registered, &r.roots);
+        let got: Vec<(String, String, String)> = rows
+            .into_iter()
+            .map(|row| (row.name, row.dir, row.file))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("komga".into(), r.path("komga"), "compose.yaml".into()),
+                ("ntfy".into(), r.path("ntfy"), "compose.yaml".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn labels_pointing_outside_the_roots_discover_and_read_nothing() {
+        let r = Roots::new(&["web"]);
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("compose.yaml"), "services: {}\n").unwrap();
+        std::fs::write(outside.path().join(".env"), "TOKEN=abcd\n").unwrap();
+        symlink(outside.path(), PathBuf::from(&r.roots[0]).join("escape")).unwrap();
+        let ssh = format!("{}/.ssh", std::env::var("HOME").unwrap());
+        let cases = [
+            ("/etc".to_string(), "/etc/passwd".to_string()),
+            (
+                "/opt/stacks/../../etc".to_string(),
+                "/opt/stacks/../../etc/passwd".to_string(),
+            ),
+            (r.path("web/../../../etc"), "/etc/passwd".to_string()),
+            (r.path("escape"), r.path("escape/compose.yaml")),
+            (ssh.clone(), format!("{ssh}/config")),
+        ];
+        for (dir, file) in &cases {
+            let containers = summaries(&[("evil", dir, file)]);
+            assert!(from_labels(&containers, &[], &r.roots).is_empty(), "{dir}");
+            let row = StackRow {
+                name: "evil".into(),
+                dir: dir.clone(),
+                file: Path::new(file)
+                    .file_name()
+                    .map(|f| f.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                enabled: true,
+                allow: Vec::new(),
+            };
+            assert!(row.read_compose(&r.roots).is_err(), "{dir}");
+            assert!(row.compose_path(&r.roots).is_err(), "{dir}");
+            assert!(row.compose(&r.roots).is_err(), "{dir}");
+            assert!(row.read_env(&r.roots).is_none(), "{dir}");
+            assert_eq!(row.redact("TOKEN=abcd", &r.roots), "TOKEN=abcd", "{dir}");
+        }
+    }
+
+    #[test]
+    fn discovered_dirs_are_canonical_and_dot_dot_is_refused() {
+        let r = Roots::new(&["web"]);
+        let canonical = r.path("web");
+        for dir in [
+            format!("{}/./web", r.roots[0]),
+            format!("{}//web", r.roots[0]),
+            format!("{}/web/", r.roots[0]),
+        ] {
+            let containers = summaries(&[("web", &dir, &format!("{dir}/compose.yaml"))]);
+            let rows = from_labels(&containers, &[], &r.roots);
+            assert_eq!(rows.len(), 1, "{dir}");
+            assert_eq!(rows[0].dir, canonical, "{dir}");
+        }
+        let dotted = format!("{}/web/../web", r.roots[0]);
+        let containers = summaries(&[("web", &dotted, &r.path("web/compose.yaml"))]);
+        assert!(from_labels(&containers, &[], &r.roots).is_empty());
+    }
+
+    #[test]
+    fn a_registered_dir_matches_its_discovered_project_after_normalizing() {
+        let r = Roots::new(&["web"]);
+        let containers = summaries(&[("other", &r.path("web"), &r.path("web/compose.yaml"))]);
+        for dir in [
+            format!("{}/./web", r.roots[0]),
+            format!("{}//web", r.roots[0]),
+            format!("{}/web/", r.roots[0]),
+        ] {
+            let registered = [StackRow {
+                name: "web".into(),
+                dir: dir.clone(),
+                file: DEFAULT_COMPOSE_FILE.into(),
+                enabled: true,
+                allow: Vec::new(),
+            }];
+            assert!(
+                from_labels(&containers, &registered, &r.roots).is_empty(),
+                "{dir}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_project_name_seen_with_two_dirs_is_not_discovered() {
+        let r = Roots::new(&["a", "b", "c"]);
+        let containers = summaries(&[
+            ("dup", &r.path("a"), &r.path("a/compose.yaml")),
+            ("dup", &r.path("b"), &r.path("b/compose.yaml")),
+            ("c", &r.path("c"), &r.path("c/compose.yaml")),
+        ]);
+        let names: Vec<String> = from_labels(&containers, &[], &r.roots)
+            .into_iter()
+            .map(|row| row.name)
+            .collect();
+        assert_eq!(names, ["c"]);
+        let containers = summaries(&[
+            ("dup", &r.path("a"), &r.path("a/compose.yaml")),
+            ("dup", "/etc", "/etc/passwd"),
+        ]);
+        assert!(from_labels(&containers, &[], &r.roots).is_empty());
+        std::fs::write(PathBuf::from(r.path("a/other.yaml")), "services: {}\n").unwrap();
+        let containers = summaries(&[
+            ("dup", &r.path("a"), &r.path("a/compose.yaml")),
+            ("dup", &r.path("a"), &r.path("a/other.yaml")),
+        ]);
+        assert!(from_labels(&containers, &[], &r.roots).is_empty());
+    }
+
+    #[test]
+    fn config_files_never_fall_back_to_the_default() {
+        let r = Roots::new(&["web"]);
+        std::fs::write(PathBuf::from(r.path("web/override.yaml")), "services: {}\n").unwrap();
+        let multi = format!(
+            "{},{}",
+            r.path("web/compose.yaml"),
+            r.path("web/override.yaml")
+        );
+        for files in [
+            multi.as_str(),
+            "/etc/passwd",
+            "/elsewhere/ntfy.yml",
+            &r.path("web/missing.yaml"),
+            "",
+        ] {
+            let containers = summaries(&[("web", &r.path("web"), files)]);
+            assert!(
+                from_labels(&containers, &[], &r.roots).is_empty(),
+                "{files}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_canonical_in_root_dir_is_emitted() {
+        let r = Roots::new(&["web"]);
+        let outside = tempdir().unwrap();
+        symlink(outside.path(), PathBuf::from(&r.roots[0]).join("escape")).unwrap();
+        let at = |dir: String| StackRow {
+            name: "x".into(),
+            dir,
+            file: DEFAULT_COMPOSE_FILE.into(),
+            enabled: true,
+            allow: Vec::new(),
+        };
+        let web = Some(r.path("web"));
+        assert_eq!(at(r.path("web")).emitted_dir(&r.roots), web);
+        assert_eq!(
+            at(format!("{}/./web", r.roots[0])).emitted_dir(&r.roots),
+            web
+        );
+        assert_eq!(
+            at(format!("{}//web", r.roots[0])).emitted_dir(&r.roots),
+            web
+        );
+        assert_eq!(
+            at(format!("{}/web/../web", r.roots[0])).emitted_dir(&r.roots),
+            None
+        );
+        assert_eq!(at(r.path("escape")).emitted_dir(&r.roots), None);
+        assert_eq!(at("/etc".into()).emitted_dir(&r.roots), None);
+        assert_eq!(at(r.roots[0].clone()).emitted_dir(&r.roots), None);
+    }
+
+    #[test]
+    fn a_stack_file_name_with_a_path_is_never_read() {
+        let r = Roots::new(&["web", "other"]);
+        let row = StackRow {
+            name: "web".into(),
+            dir: r.path("web"),
+            file: "../other/compose.yaml".into(),
+            enabled: true,
+            allow: Vec::new(),
+        };
+        assert!(row.compose_path(&r.roots).is_err());
+        assert!(row.read_file("../other/compose.yaml", &r.roots).is_err());
+    }
+
+    #[test]
+    fn dockge_root_membership_compares_normalized_paths() {
+        let at = |dir: &str| StackRow {
+            name: "x".into(),
+            dir: dir.into(),
+            file: DEFAULT_COMPOSE_FILE.into(),
+            enabled: true,
+            allow: Vec::new(),
+        };
+        assert!(under_dockge_root(&at("/opt/stacks/x")));
+        assert!(under_dockge_root(&at("/opt/stacks/./x")));
+        assert!(under_dockge_root(&at("/opt//stacks/x")));
+        assert!(under_dockge_root(&at("/opt/stacks/x/")));
+        assert!(!under_dockge_root(&at("/opt/stacks/x/../../etc")));
+        assert!(!under_dockge_root(&at("/opt/stacks/../x")));
+    }
+
+    fn discovered_engine(project: &str, dir: &str) -> crate::test_engine::FakeEngine {
+        use crate::test_engine::{FakeEngine, Route};
+        FakeEngine::routed(vec![Route::new(
+            "GET",
+            "/containers/json",
+            200,
+            format!(
+                "[{}]",
+                compose_container(project, dir, &format!("{dir}/compose.yaml"))
+            ),
+        )])
+    }
+
+    fn register_root(root: &str, discovery_roots: &[String]) {
+        let args = crate::tools::DockerCreateArgs {
+            name: "local".into(),
+            socket_path: None,
+            host: None,
+            url: None,
+            stacks_root: Some(root.into()),
+            data_roots: Vec::new(),
+            discovery_roots: discovery_roots.to_vec(),
+            registries: Vec::new(),
+            routes: Vec::new(),
+            dry_run: false,
+        };
+        plugin_toolkit::reactor::block_on(crate::tools::docker_create(
+            args,
+            &crate::test_support::admin(),
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn an_admin_discovery_root_admits_projects_outside_the_stacks_roots() {
+        crate::test_support::with_db(|| {
+            let stacks = Roots::new(&[]);
+            let extra = Roots::new(&["legacy"]);
+            let e = discovered_engine("legacy", &extra.path("legacy"));
+            let docker = e.client();
+            register_root(&stacks.roots[0], &[]);
+            assert!(
+                plugin_toolkit::reactor::block_on(all(Some(&docker)))
+                    .unwrap()
+                    .is_empty()
+            );
+            let args: crate::tools::DockerUpdateArgs =
+                plugin_toolkit::serde_json::from_value(plugin_toolkit::serde_json::json!({
+                    "name": "local",
+                    "discoveryRoots": extra.roots,
+                }))
+                .unwrap();
+            plugin_toolkit::reactor::block_on(crate::tools::docker_update(
+                args,
+                &crate::test_support::admin(),
+            ))
+            .unwrap();
+            let rows = plugin_toolkit::reactor::block_on(all(Some(&docker))).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].dir, extra.path("legacy"));
+            assert_eq!(
+                rows[0].read_compose(&allowed_roots().unwrap()).unwrap(),
+                "services: {}\n"
+            );
+        });
+    }
+
+    #[test]
+    fn a_discovered_project_outside_the_roots_is_never_found() {
+        crate::test_support::with_db(|| {
+            let e = discovered_engine("x", "/etc/x");
+            let docker = e.client();
+            let err = plugin_toolkit::reactor::block_on(find("x", Some(&docker)))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("no managed stack"), "{err}");
+            assert!(
+                plugin_toolkit::reactor::block_on(all(Some(&docker)))
+                    .unwrap()
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn changing_a_discovered_unregistered_project_is_refused() {
+        crate::test_support::with_db(|| {
+            let r = Roots::new(&["immich"]);
+            register_root(&r.roots[0], &[]);
+            let e = discovered_engine("immich", &r.path("immich"));
+            let docker = e.client();
+            let err =
+                plugin_toolkit::reactor::block_on(require_registered("immich", Some(&docker)))
+                    .unwrap_err()
+                    .to_string();
+            assert!(err.contains("docker.stack_allow"), "{err}");
+            let err =
+                plugin_toolkit::reactor::block_on(require_registered("absent", Some(&docker)))
+                    .unwrap_err()
+                    .to_string();
+            assert!(err.contains("no managed stack"), "{err}");
+        });
+    }
+
+    #[test]
+    fn a_symlinked_working_dir_cannot_escape_the_stacks_root() {
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        symlink(outside.path(), root.path().join("web")).unwrap();
+        let roots = vec![s(&root.path().canonicalize().unwrap())];
+        let dir = PathBuf::from(&roots[0]).join("web");
+        assert!(StackDir::open(&s(&dir), &roots, true).is_err());
+    }
+
+    #[test]
+    fn a_multi_component_project_name_is_not_discovered() {
+        let r = Roots::new(&["a", "b", "ok"]);
+        let containers = summaries(&[
+            ("../etc", &r.path("a"), &r.path("a/compose.yaml")),
+            ("a/b", &r.path("b"), &r.path("b/compose.yaml")),
+            ("ok", &r.path("ok"), &r.path("ok/compose.yaml")),
+        ]);
+        let names: Vec<String> = from_labels(&containers, &[], &r.roots)
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(names, ["ok"]);
+    }
+
+    #[test]
+    fn a_symlink_counts_as_a_regular_file_only_inside_a_root() {
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let roots = vec![s(root.path())];
+        let shared = root.path().join("shared.yaml");
+        std::fs::write(&shared, "services: {}\n").unwrap();
+        let evil = outside.path().join("evil.yaml");
+        std::fs::write(&evil, "services: {}\n").unwrap();
+        let inside = root.path().join("in.yaml");
+        let escape = root.path().join("out.yaml");
+        let dangling = root.path().join("gone.yaml");
+        let to_dir = root.path().join("dir.yaml");
+        symlink(&shared, &inside).unwrap();
+        symlink(&evil, &escape).unwrap();
+        symlink(root.path().join("missing"), &dangling).unwrap();
+        symlink(outside.path(), &to_dir).unwrap();
+        assert!(regular_file_in_roots(&shared, &roots));
+        assert!(regular_file_in_roots(&inside, &roots));
+        assert!(!regular_file_in_roots(&escape, &roots));
+        assert!(!regular_file_in_roots(&dangling, &roots));
+        assert!(!regular_file_in_roots(&to_dir, &roots));
+        assert!(!regular_file_in_roots(&root.path().join("none"), &roots));
+    }
+
+    #[test]
+    fn a_denied_staging_write_names_the_dir_and_the_grant() {
+        let err = staging_error(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            ".x.tmp",
+            Path::new("/opt/halvor/compose"),
+        )
+        .to_string();
+        assert!(
+            err.contains("/opt/halvor/compose") && err.contains("needs write access"),
+            "{err}"
+        );
+        let err = staging_error(
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+            ".x.tmp",
+            Path::new("/d"),
+        );
+        assert!(
+            format!("{err:#}").contains("creating .x.tmp in /d"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn a_local_dockge_endpoint_is_recognised() {
+        use plugin_toolkit::serde_json::json;
+        let listed = |url: &str, enabled: bool| json!({"endpoints": [{"name": "d", "base_url": url, "enabled": enabled}]});
+        assert!(lists_local_dockge(
+            &listed("http://localhost:5001", true),
+            "freyr"
+        ));
+        assert!(lists_local_dockge(
+            &listed("http://127.0.0.1:5001/", true),
+            "freyr"
+        ));
+        assert!(lists_local_dockge(
+            &listed("http://[::1]:5001", true),
+            "freyr"
+        ));
+        assert!(lists_local_dockge(
+            &listed("http://FREYR:5001", true),
+            "freyr"
+        ));
+        assert!(!lists_local_dockge(
+            &listed("http://localhost:5001", false),
+            "freyr"
+        ));
+        assert!(!lists_local_dockge(
+            &listed("http://baldur:5001", true),
+            "freyr"
+        ));
+        assert!(!lists_local_dockge(
+            &listed("http://10.0.0.5:5001", true),
+            "freyr"
+        ));
+        assert!(!lists_local_dockge(&json!({"endpoints": []}), "freyr"));
+    }
+
+    #[test]
+    fn units_keep_dockge_root_projects_without_a_local_dockge() {
+        use crate::test_engine::{FakeEngine, Route};
+        crate::test_support::with_db(|| {
+            let r = Roots::new(&["arr", "ntfy"]);
+            register_root(&r.roots[0], &[]);
+            let e = FakeEngine::routed(vec![Route::new(
+                "GET",
+                "/containers/json",
+                200,
+                format!(
+                    "[{},{}]",
+                    compose_container("arr", &r.path("arr"), &r.path("arr/compose.yaml")),
+                    compose_container("ntfy", &r.path("ntfy"), &r.path("ntfy/compose.yaml"))
+                ),
+            )]);
+            let docker = e.client();
+            let names: Vec<String> = plugin_toolkit::reactor::block_on(units(Some(&docker)))
+                .unwrap()
+                .into_iter()
+                .map(|r| r.name)
+                .collect();
+            assert_eq!(names, ["arr", "ntfy"]);
         });
     }
 
@@ -1068,15 +1928,14 @@ mod tests {
 
     #[test]
     fn compose_and_env_paths_join_dir() {
-        let r = StackRow {
-            name: "x".into(),
-            dir: "/srv/x".into(),
-            file: "compose.yaml".into(),
-            enabled: true,
-            allow: Vec::new(),
-        };
-        assert_eq!(r.compose_path(), Path::new("/srv/x/compose.yaml"));
-        assert_eq!(r.env_path(), Path::new("/srv/x/.env"));
+        let f = Fixture::new();
+        let mut r = f.row();
+        r.file = "compose.yaml".into();
+        assert_eq!(
+            r.compose_path(&f.roots).unwrap(),
+            f.dir().join("compose.yaml")
+        );
+        assert_eq!(r.env_path(), f.dir().join(".env"));
     }
 
     #[test]
@@ -1183,7 +2042,7 @@ mod tests {
     fn write_compose_if_unchanged_refuses_a_file_edited_since_it_was_read() {
         let f = Fixture::new();
         let r = f.row();
-        std::fs::write(r.compose_path(), "a: 2\n").unwrap();
+        std::fs::write(r.compose_path(&f.roots).unwrap(), "a: 2\n").unwrap();
         let err = plugin_toolkit::reactor::block_on(r.write_compose_if_unchanged(
             "a: 3\n",
             "a: 1\n",
@@ -1195,7 +2054,7 @@ mod tests {
             err.to_string().contains("changed since it was read"),
             "{err}"
         );
-        assert_eq!(r.read_compose().unwrap(), "a: 2\n");
+        assert_eq!(r.read_compose(&f.roots).unwrap(), "a: 2\n");
     }
 
     #[test]
@@ -1257,15 +2116,16 @@ mod tests {
 
     #[test]
     fn compose_path_is_the_named_file_else_the_one_compose_picks() {
-        let dir = tempdir().unwrap();
-        let mut r = row(dir.path());
+        let f = Fixture::new();
+        let mut r = f.row();
         r.file = "prod.yml".into();
-        assert!(r.compose_path().ends_with("prod.yml"), "to be created");
-        std::fs::write(dir.path().join("compose.yaml"), "services: {}\n").unwrap();
-        assert!(r.compose_path().ends_with("compose.yaml"));
-        std::fs::write(dir.path().join("prod.yml"), "services: {}\n").unwrap();
-        assert!(r.compose_path().ends_with("prod.yml"));
-        assert!(r.compose().unwrap().file().ends_with("prod.yml"));
+        let path = |r: &StackRow| r.compose_path(&f.roots).unwrap();
+        assert!(path(&r).ends_with("prod.yml"), "to be created");
+        std::fs::write(f.dir().join("compose.yaml"), "services: {}\n").unwrap();
+        assert!(path(&r).ends_with("compose.yaml"));
+        std::fs::write(f.dir().join("prod.yml"), "services: {}\n").unwrap();
+        assert!(path(&r).ends_with("prod.yml"));
+        assert!(r.compose(&f.roots).unwrap().file().ends_with("prod.yml"));
     }
 
     #[test]
@@ -1279,17 +2139,17 @@ mod tests {
 
     #[test]
     fn read_env_absent_is_none() {
-        let dir = tempdir().unwrap();
-        assert!(row(dir.path()).read_env().is_none());
+        let f = Fixture::new();
+        assert!(f.row().read_env(&f.roots).is_none());
     }
 
     #[test]
     fn read_env_refuses_a_symlink() {
-        let dir = tempdir().unwrap();
+        let f = Fixture::new();
         let outside = tempdir().unwrap();
         std::fs::write(outside.path().join("secrets"), "TOKEN=abcd\n").unwrap();
-        symlink(outside.path().join("secrets"), dir.path().join(".env")).unwrap();
-        assert!(row(dir.path()).read_env().is_none());
+        symlink(outside.path().join("secrets"), f.dir().join(".env")).unwrap();
+        assert!(f.row().read_env(&f.roots).is_none());
     }
 
     #[test]
@@ -1541,7 +2401,7 @@ mod tests {
         let staged = StagedRestore::stage(&f.row(), &mut file, &f.roots).unwrap();
         assert_eq!(staged.env_file(), Some(staged.path().join(".env")));
         assert_eq!(
-            staged.compose_sets(&f.row()),
+            staged.compose_sets(&f.row(), &f.roots),
             vec![vec![staged.path().join("compose.yaml")]]
         );
         assert_eq!(staged.swap().unwrap(), None);

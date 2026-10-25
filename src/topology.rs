@@ -146,14 +146,14 @@ pub async fn collect_claims() -> anyhow::Result<Vec<TopologyClaim>> {
 fn compose_service_identity(labels: &BTreeMap<String, String>) -> Option<String> {
     let working_dir = labels
         .get(COMPOSE_WORKING_DIR_LABEL)
-        .map(String::as_str)
-        .filter(|s| !s.is_empty());
+        .and_then(|d| crate::lifecycle::resolve(std::path::Path::new(d)).ok())
+        .map(|d| d.to_string_lossy().into_owned());
     let project = labels
         .get(COMPOSE_PROJECT_LABEL)
         .map(String::as_str)
         .filter(|s| !s.is_empty());
     let host = plugin_toolkit::containers::local_hostname();
-    TopologyClaim::normalize_service_identity(host, working_dir, project)
+    TopologyClaim::normalize_service_identity(host, working_dir.as_deref(), project)
 }
 
 /// Map a docker `State` string onto orca's normalized run-state vocabulary.
@@ -260,7 +260,7 @@ fn extract_addresses(entry: &InspectEntry, drivers: &BTreeMap<String, String>) -
 /// (the collector then advertises no container IPs, which is the safe default —
 /// reachability still comes through published-port endpoints).
 async fn network_drivers() -> BTreeMap<String, String> {
-    let Ok(out) = crate::run(&["network", "ls", "--format", "{{json .}}"], None).await else {
+    let Ok(out) = crate::run(&["network", "ls", "--format", "{{json .}}"]).await else {
         return BTreeMap::new();
     };
     out.lines()
@@ -332,6 +332,25 @@ mod tests {
         .unwrap();
         assert_eq!(got, expected);
         assert!(got.ends_with("\u{1f}/opt/stacks/jellyfin"));
+    }
+
+    #[test]
+    fn compose_service_identity_uses_only_a_canonical_working_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().canonicalize().unwrap().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let identity = |dir: &str| {
+            let mut labels = BTreeMap::new();
+            labels.insert(COMPOSE_WORKING_DIR_LABEL.to_string(), dir.to_string());
+            labels.insert(COMPOSE_PROJECT_LABEL.to_string(), "app".to_string());
+            compose_service_identity(&labels).unwrap()
+        };
+        let real_s = real.to_string_lossy().into_owned();
+        assert!(identity(&link.to_string_lossy()).ends_with(&format!("\u{1f}{real_s}")));
+        assert!(identity(&format!("{real_s}/../real")).ends_with("\u{1f}app"));
+        assert!(identity("relative/dir").ends_with("\u{1f}app"));
     }
 
     #[test]

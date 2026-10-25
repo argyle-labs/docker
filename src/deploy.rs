@@ -86,8 +86,10 @@ impl DockerDeployTarget {
     }
 
     fn recheck(&self, row: &stacks::StackRow) -> Result<(), DeployError> {
-        check_stack_dir(Path::new(&row.dir), &row.compose_name())?;
-        let compose = std::fs::read_to_string(row.compose_path()).map_err(other)?;
+        let roots = [self.root.clone()];
+        let dir = row.open_dir(&roots).map_err(other)?;
+        check_stack_dir(dir.path(), &row.compose_name(&dir))?;
+        let compose = row.read_compose(&roots).map_err(other)?;
         recheck_compose(&compose, &self.data_roots, orca_home().as_deref())?;
         let doc: Value = serde_json::from_str(&compose).map_err(other)?;
         for svc in doc["services"]
@@ -1019,7 +1021,10 @@ impl DeployTarget for DockerDeployTarget {
                 detail: None,
             });
         };
-        let services = match row.compose() {
+        let services = match crate::stacks::allowed_roots()
+            .map_err(|e| e.to_string())
+            .and_then(|roots| row.compose(&roots).map_err(|e| e.to_string()))
+        {
             Ok(c) => c
                 .services()
                 .await

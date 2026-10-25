@@ -1,6 +1,8 @@
 //! Pins `scripts/restore.sh`: staged swap, size/entry caps, outward-symlink
 //! refusal, and an untouched state dir on any failure.
 
+#![allow(clippy::disallowed_methods)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};

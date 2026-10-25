@@ -186,12 +186,15 @@ async fn docker_stdout(args: &[&str]) -> std::result::Result<String, String> {
     verb = "host_probe",
     local_only = true,
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    dry_run_aware = true
 )]
 async fn docker_host_probe(
     args: DockerHostProbeArgs,
     ctx: &ToolCtx,
 ) -> Result<DockerHostProbeOutput> {
+    let mut args = args;
+    args.dry_run |= ctx.dry_run();
     crate::execute::require_admin(PROBE_TOOL, ctx)?;
     let cgroup = assess(Path::new("/"));
     let swap_limit_warning = docker_stdout(&["info", "--format", "{{json .Warnings}}"])
@@ -335,12 +338,15 @@ pub struct DockerHostPrepareOutput {
     verb = "host_prepare",
     local_only = true,
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    dry_run_aware = true
 )]
 async fn docker_host_prepare(
     args: DockerHostPrepareArgs,
     ctx: &ToolCtx,
 ) -> Result<DockerHostPrepareOutput> {
+    let mut args = args;
+    args.dry_run |= ctx.dry_run();
     crate::execute::require_admin(PREPARE_TOOL, ctx)?;
     let root = Path::new("/");
     let cgroup = assess(root);

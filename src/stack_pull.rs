@@ -198,12 +198,17 @@ pub struct DockerStackPullPinnedArgs {
     domain = "docker",
     verb = "stack_pull_pinned",
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    dry_run_aware = true
 )]
 async fn docker_stack_pull_pinned(
     args: DockerStackPullPinnedArgs,
     ctx: &ToolCtx,
 ) -> Result<StackPullOutput> {
+    let args = DockerStackPullPinnedArgs {
+        dry_run: args.dry_run || ctx.dry_run(),
+        ..args
+    };
     crate::execute::require_admin(TOOL, ctx)?;
     let pins = args
         .pins

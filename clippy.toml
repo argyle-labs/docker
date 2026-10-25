@@ -1,0 +1,4 @@
+disallowed-methods = [
+    { path = "std::fs::read_to_string", reason = "read stack files through stacks::StackDir so every path stays inside the allowed roots" },
+    { path = "std::process::Command::current_dir", reason = "a working dir from a stack row escapes the StackDir checks" },
+]
