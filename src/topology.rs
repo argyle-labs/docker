@@ -260,7 +260,7 @@ fn extract_addresses(entry: &InspectEntry, drivers: &BTreeMap<String, String>) -
 /// (the collector then advertises no container IPs, which is the safe default —
 /// reachability still comes through published-port endpoints).
 async fn network_drivers() -> BTreeMap<String, String> {
-    let Ok(out) = crate::run(&["network", "ls", "--format", "{{json .}}"], None).await else {
+    let Ok(out) = crate::run(&["network", "ls", "--format", "{{json .}}"]).await else {
         return BTreeMap::new();
     };
     out.lines()

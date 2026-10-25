@@ -468,7 +468,7 @@ async fn docker_image_status(args: DockerImageStatusArgs, _ctx: &ToolCtx) -> Res
     let mut remote = RemoteCache::new();
     let mut out = ImageStatus::default();
     for row in rows {
-        let project = match row.compose() {
+        let project = match row.compose(&crate::stacks::allowed_roots()?) {
             Ok(c) => c.project_name().await.map_err(|e| e.to_string()),
             Err(e) => Err(e.to_string()),
         };

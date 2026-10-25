@@ -18,6 +18,7 @@ use plugin_toolkit::serde_json::{self, Value};
 #[derive(Debug)]
 pub enum ComposeError {
     NoComposeFile(PathBuf),
+    Refused(anyhow::Error),
     Docker(anyhow::Error),
     UnknownAction(String),
 }
@@ -26,6 +27,7 @@ impl std::fmt::Display for ComposeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ComposeError::NoComposeFile(p) => write!(f, "no compose file found in {}", p.display()),
+            ComposeError::Refused(e) => write!(f, "{e:#}"),
             ComposeError::Docker(e) => write!(f, "docker error: {e}"),
             ComposeError::UnknownAction(a) => write!(f, "unknown action: {a}"),
         }
@@ -35,7 +37,7 @@ impl std::fmt::Display for ComposeError {
 impl std::error::Error for ComposeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            ComposeError::Docker(e) => Some(e.as_ref()),
+            ComposeError::Docker(e) | ComposeError::Refused(e) => Some(e.as_ref()),
             _ => None,
         }
     }
@@ -347,7 +349,7 @@ impl Compose {
         let mut args: Vec<&str> = vec!["compose"];
         args.extend(files.iter().map(String::as_str));
         args.extend_from_slice(sub);
-        super::run(&args, None).await
+        super::run(&args).await
     }
 }
 

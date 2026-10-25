@@ -465,7 +465,10 @@ pub struct DockerPruneArgs {
 
 async fn project_for(stack: &str) -> Result<String> {
     let row = crate::stacks::find_here(stack).await?;
-    Ok(row.compose()?.project_name().await?)
+    Ok(row
+        .compose(&crate::stacks::allowed_roots()?)?
+        .project_name()
+        .await?)
 }
 
 /// Networks every managed stack declares external, or `None` when any
@@ -473,7 +476,7 @@ async fn project_for(stack: &str) -> Result<String> {
 async fn external_networks() -> Result<Option<HashSet<String>>> {
     let mut out = HashSet::new();
     for row in crate::stacks::all_here().await? {
-        let Ok(compose) = row.compose() else {
+        let Ok(compose) = row.compose(&crate::stacks::allowed_roots()?) else {
             return Ok(None);
         };
         match compose.config_json().await {

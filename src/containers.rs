@@ -31,7 +31,7 @@ pub async fn list(all: bool) -> anyhow::Result<Vec<ContainerSummary>> {
     if all {
         args.push("--all");
     }
-    let out = super::run(&args, None).await?;
+    let out = super::run(&args).await?;
     let mut result = Vec::new();
     for line in out.lines().filter(|l| !l.trim().is_empty()) {
         match serde_json::from_str::<ContainerSummary>(line) {
@@ -50,7 +50,7 @@ pub async fn logs(container: &str, tail: Option<u32>) -> anyhow::Result<String> 
     }
     let n = tail.unwrap_or(100).clamp(1, 10_000);
     let n_str = n.to_string();
-    super::run(&["logs", "--tail", &n_str, container], None).await
+    super::run(&["logs", "--tail", &n_str, container]).await
 }
 
 /// `docker start <container>`.
@@ -73,7 +73,7 @@ pub async fn inspect(container: &str) -> anyhow::Result<Value> {
     if container.is_empty() {
         anyhow::bail!("missing 'container'");
     }
-    let out = super::run(&["inspect", container], None).await?;
+    let out = super::run(&["inspect", container]).await?;
     Ok(serde_json::from_str(&out)?)
 }
 
@@ -81,7 +81,7 @@ async fn action(container: &str, op: &str) -> anyhow::Result<String> {
     if container.is_empty() {
         anyhow::bail!("missing 'container'");
     }
-    super::run(&[op, container], None).await
+    super::run(&[op, container]).await
 }
 
 /// One row from `docker stats --no-stream --format '{{json .}}'`.
@@ -180,7 +180,7 @@ fn parse_size_to_bytes(s: &str) -> u64 {
 
 /// `docker stats --no-stream --format '{{json .}}'` for all running containers.
 pub async fn live_stats() -> anyhow::Result<Vec<ContainerLiveStats>> {
-    let out = super::run(&["stats", "--no-stream", "--format", "{{json .}}"], None).await?;
+    let out = super::run(&["stats", "--no-stream", "--format", "{{json .}}"]).await?;
 
     let mut result = Vec::new();
     for line in out.lines().filter(|l| !l.trim().is_empty()) {

@@ -65,6 +65,10 @@ pub struct Runtime {
     /// the stacks root only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub data_roots: Vec<String>,
+    /// Directories outside the stacks roots whose labelled compose projects
+    /// may be discovered; empty means the stacks roots only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discovery_roots: Vec<String>,
     /// Image registries deployed workloads may pull from; empty allows any.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub registries: Vec<String>,
@@ -125,6 +129,10 @@ fn joined(row: EndpointRow) -> Result<Runtime> {
             Some(raw) => plugin_toolkit::serde_json::from_str(&raw)?,
             None => Vec::new(),
         },
+        discovery_roots: match setting("discovery_roots")? {
+            Some(raw) => plugin_toolkit::serde_json::from_str(&raw)?,
+            None => Vec::new(),
+        },
         registries: match setting("registries")? {
             Some(raw) => plugin_toolkit::serde_json::from_str(&raw)?,
             None => Vec::new(),
@@ -148,6 +156,14 @@ fn store_settings(rt: &Runtime) -> Result<()> {
             DbValue::Null
         } else {
             DbValue::Text(plugin_toolkit::serde_json::to_string(&rt.data_roots)?)
+        },
+    );
+    row.insert(
+        "discovery_roots".to_string(),
+        if rt.discovery_roots.is_empty() {
+            DbValue::Null
+        } else {
+            DbValue::Text(plugin_toolkit::serde_json::to_string(&rt.discovery_roots)?)
         },
     );
     row.insert(
@@ -204,6 +220,18 @@ pub fn stacks_roots() -> Result<Vec<String>> {
     }
     if roots.is_empty() {
         roots.push(DEFAULT_STACKS_ROOT.to_string());
+    }
+    Ok(roots)
+}
+
+pub fn discovery_roots() -> Result<Vec<String>> {
+    let mut roots = Vec::new();
+    for rt in runtimes()? {
+        for root in rt.discovery_roots {
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
     }
     Ok(roots)
 }
@@ -349,6 +377,11 @@ pub struct DockerCreateArgs {
     #[arg(long = "data-root", action = plugin_toolkit::clap::ArgAction::Append)]
     #[serde(default, alias = "data_roots")]
     pub data_roots: Vec<String>,
+    /// Directory outside the stacks roots whose labelled compose projects
+    /// may be discovered. Repeatable; none means the stacks roots only.
+    #[arg(long = "discovery-root", action = plugin_toolkit::clap::ArgAction::Append)]
+    #[serde(default, alias = "discovery_roots")]
+    pub discovery_roots: Vec<String>,
     /// Image registry deployed workloads may pull from (e.g. `docker.io`,
     /// `ghcr.io`). Repeatable; none allows any.
     #[arg(long = "registry", action = plugin_toolkit::clap::ArgAction::Append)]
@@ -405,6 +438,7 @@ pub(crate) async fn docker_create(
         validate_stacks_root(root)?;
     }
     validate_data_roots(&args.data_roots)?;
+    validate_data_roots(&args.discovery_roots)?;
     if endpoint_db::get(&args.name)?.is_some() {
         bail!(
             "docker endpoint '{}' already exists; use docker.update",
@@ -418,6 +452,7 @@ pub(crate) async fn docker_create(
         url: args.url,
         stacks_root: args.stacks_root,
         data_roots: args.data_roots,
+        discovery_roots: args.discovery_roots,
         registries: args.registries,
         routes: Routes::from(args.routes),
         enabled: true,
@@ -467,6 +502,11 @@ pub struct DockerUpdateArgs {
     #[arg(long = "data-root", action = plugin_toolkit::clap::ArgAction::Append)]
     #[serde(default, alias = "data_roots")]
     pub data_roots: Vec<String>,
+    /// Directory outside the stacks roots whose labelled compose projects
+    /// may be discovered. Repeatable; none means the stacks roots only.
+    #[arg(long = "discovery-root", action = plugin_toolkit::clap::ArgAction::Append)]
+    #[serde(default, alias = "discovery_roots")]
+    pub discovery_roots: Vec<String>,
     /// Image registry deployed workloads may pull from (e.g. `docker.io`,
     /// `ghcr.io`). Repeatable; none allows any.
     #[arg(long = "registry", action = plugin_toolkit::clap::ArgAction::Append)]
@@ -514,7 +554,10 @@ pub struct DockerUpdateOutput {
     execute_gated = false,
     dry_run_aware = true
 )]
-async fn docker_update(args: DockerUpdateArgs, ctx: &ToolCtx) -> Result<DockerUpdateOutput> {
+pub(crate) async fn docker_update(
+    args: DockerUpdateArgs,
+    ctx: &ToolCtx,
+) -> Result<DockerUpdateOutput> {
     let args = DockerUpdateArgs {
         dry_run: args.dry_run || ctx.dry_run(),
         ..args
@@ -524,6 +567,7 @@ async fn docker_update(args: DockerUpdateArgs, ctx: &ToolCtx) -> Result<DockerUp
         validate_stacks_root(root)?;
     }
     validate_data_roots(&args.data_roots)?;
+    validate_data_roots(&args.discovery_roots)?;
     let mut rt = runtime(&args.name)?
         .ok_or_else(|| plugin_toolkit::runtime::missing_row_error("docker", &args.name))?;
     let mut applied = Vec::new();
@@ -541,6 +585,10 @@ async fn docker_update(args: DockerUpdateArgs, ctx: &ToolCtx) -> Result<DockerUp
     if !args.data_roots.is_empty() {
         rt.data_roots = args.data_roots;
         applied.push("data_roots".to_string());
+    }
+    if !args.discovery_roots.is_empty() {
+        rt.discovery_roots = args.discovery_roots;
+        applied.push("discovery_roots".to_string());
     }
     if !args.registries.is_empty() {
         rt.registries = args.registries;
@@ -809,6 +857,7 @@ mod registry_tests {
             url: None,
             stacks_root: Some("/srv/stacks".into()),
             data_roots: Vec::new(),
+            discovery_roots: Vec::new(),
             registries: Vec::new(),
             routes: Vec::new(),
             dry_run: !execute,
@@ -823,6 +872,7 @@ mod registry_tests {
             url: None,
             stacks_root: Some("/srv/other".into()),
             data_roots: Vec::new(),
+            discovery_roots: Vec::new(),
             registries: Vec::new(),
             routes: Vec::new(),
             enabled: None,
@@ -939,6 +989,7 @@ mod registry_tests {
             url: None,
             stacks_root: None,
             data_roots: Vec::new(),
+            discovery_roots: Vec::new(),
             registries: Vec::new(),
             routes: Routes::from(Vec::new()),
             enabled,

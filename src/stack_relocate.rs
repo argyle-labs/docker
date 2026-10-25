@@ -70,7 +70,7 @@ fn dir_forms(row: &StackRow) -> Vec<PathBuf> {
 
 fn user_files(row: &StackRow) -> Result<Vec<PathBuf>> {
     Ok(row
-        .compose()?
+        .compose(&crate::stacks::allowed_roots()?)?
         .without_orca()
         .files()
         .into_iter()
@@ -113,15 +113,16 @@ async fn docker_stack_bindings(
         Some(name) => vec![stacks::find_here(name).await?],
         None => stacks::all_here().await?,
     };
+    let roots = stacks::allowed_roots()?;
     let mut out = Vec::new();
     for row in rows {
         let (bindings, error) = match bindings_of(&row).await {
             Ok(b) => (b, None),
-            Err(e) => (Vec::new(), Some(row.redact(&format!("{e:#}")))),
+            Err(e) => (Vec::new(), Some(row.redact(&format!("{e:#}"), &roots))),
         };
         out.push(StackBindings {
+            dir: row.emitted_dir(&roots).unwrap_or_default(),
             stack: row.name,
-            dir: row.dir,
             bindings,
             error,
         });
@@ -440,7 +441,7 @@ async fn plan(args: &DockerStackRelocateArgs) -> Result<Plan> {
         .iter()
         .filter_map(|f| f.file_name().map(|n| n.to_string_lossy().into_owned()))
         .collect();
-    if row.read_env().is_some() {
+    if row.read_env(&roots).is_some() {
         names.push(stacks::ENV_FILE.to_owned());
     }
     let dir = StackDir::open(&row.dir, &roots, false)?
@@ -460,8 +461,8 @@ async fn plan(args: &DockerStackRelocateArgs) -> Result<Plan> {
         rewrites: found
             .iter()
             .map(|r| Rewrite {
-                before: row.redact(&r.before),
-                after: row.redact(&r.after),
+                before: row.redact(&r.before, &roots),
+                after: row.redact(&r.after, &roots),
                 ..r.clone()
             })
             .collect(),
@@ -541,7 +542,7 @@ async fn relocate(args: &DockerStackRelocateArgs) -> Result<RelocateOutput> {
     }
     let new_str = p.new_dir.to_string_lossy().into_owned();
     p.row
-        .compose()?
+        .compose(&crate::stacks::allowed_roots()?)?
         .run_action("down", None, None)
         .await
         .map_err(|e| anyhow!("compose down at {}: {e}", p.row.dir))?;

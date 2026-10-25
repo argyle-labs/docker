@@ -1769,7 +1769,7 @@ async fn resolved(
 }
 
 pub async fn user_cfg(row: &StackRow) -> Result<Value> {
-    let compose = row.compose()?;
+    let compose = row.compose(&crate::stacks::allowed_roots()?)?;
     Ok(resolved(row, &compose).await?.3)
 }
 
@@ -1807,7 +1807,7 @@ impl Checked {
         let file = tmp.write("config.json", self.config.as_bytes())?;
         let args = checked_args(&self.project, &self.dir, &file, sub);
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-        crate::run(&argv, None).await
+        crate::run(&argv).await
     }
 
     pub fn config(&self) -> &str {
@@ -1880,7 +1880,7 @@ pub async fn gate(
 /// What `row` runs now that needs a grant, for an admin to approve. Fails on
 /// anything no grant can admit.
 async fn current_grants(docker: Option<&bollard::Docker>, row: &StackRow) -> Result<Vec<Grant>> {
-    let compose = row.compose()?;
+    let compose = row.compose(&crate::stacks::allowed_roots()?)?;
     let compose = if Path::new(&row.dir).join(compose::ORCA_FILE).is_file() {
         compose.with_orca()
     } else {
@@ -2332,6 +2332,7 @@ fn adoptable(args: &DockerStackAllowArgs) -> Result<StackRow> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use plugin_toolkit::contract::OrcaToolDef;
@@ -2998,6 +2999,7 @@ mod tests {
             url: None,
             stacks_root: Some(root.to_string_lossy().into_owned()),
             data_roots: Vec::new(),
+            discovery_roots: Vec::new(),
             registries: Vec::new(),
             routes: Vec::new(),
             dry_run: false,
@@ -3104,7 +3106,9 @@ mod tests {
         crate::test_support::with_db(|| {
             let host = "services:\n  app:\n    image: x:1\n    network_mode: host\n";
             let row = registered(&root, host);
-            let compose = row.compose().unwrap();
+            let compose = row
+                .compose(&crate::stacks::allowed_roots().unwrap())
+                .unwrap();
             let err =
                 plugin_toolkit::reactor::block_on(gate(Some(&docker), &row, &compose)).unwrap_err();
             assert!(err.to_string().contains("|network_mode:host'"), "{err}");
@@ -3247,11 +3251,13 @@ mod tests {
             assert_eq!(plan.normalized, ["app: container_name=web"]);
             assert_eq!(done.normalized, plan.normalized);
             assert!(
-                row.read_compose()
+                row.read_compose(&crate::stacks::allowed_roots().unwrap())
                     .unwrap()
                     .contains("container_name: \"web\"")
             );
-            let compose = row.compose().unwrap();
+            let compose = row
+                .compose(&crate::stacks::allowed_roots().unwrap())
+                .unwrap();
             plugin_toolkit::reactor::block_on(gate(Some(&docker), &row, &compose)).unwrap();
 
             let again = adopt(&docker, Some(&dir), Vec::new(), false).unwrap();
@@ -3646,7 +3652,9 @@ mod tests {
         crate::test_support::with_db(|| {
             let row = registered(&root, "services:\n  app:\n    image: x:1\n");
             std::fs::write(root.join("web/.env"), "IMG=y:2\n").unwrap();
-            let compose = row.compose().unwrap();
+            let compose = row
+                .compose(&crate::stacks::allowed_roots().unwrap())
+                .unwrap();
             let checked =
                 plugin_toolkit::reactor::block_on(gate(Some(&docker), &row, &compose)).unwrap();
             std::fs::write(
@@ -3678,7 +3686,9 @@ mod tests {
                 &root,
                 "services:\n  app:\n    image: x:1\n    command: [echo, \"a$$b\"]\n    labels:\n      l: \"c$$d\"\n    environment:\n      E: \"e$$f\"\n    volumes: [\"./d$$x:/x\"]\n",
             );
-            let compose = row.compose().unwrap();
+            let compose = row
+                .compose(&crate::stacks::allowed_roots().unwrap())
+                .unwrap();
             let (_, _, cfg, _) =
                 plugin_toolkit::reactor::block_on(resolved(&row, &compose)).unwrap();
             let checked =
@@ -3911,7 +3921,9 @@ mod tests {
             );
             std::fs::create_dir_all(root.join("web/proj/src")).unwrap();
             std::fs::write(root.join("web/proj/src/Dockerfile"), "FROM x\n").unwrap();
-            let compose = row.compose().unwrap();
+            let compose = row
+                .compose(&crate::stacks::allowed_roots().unwrap())
+                .unwrap();
             let fake = crate::test_engine::FakeEngine::routed(routes(
                 &root.join("web/proj").to_string_lossy(),
             ));
@@ -4142,7 +4154,9 @@ mod tests {
                 "services:\n  app:\n    image: x:1\n    env_file: [app.env]\n    environment:\n      B: own\n",
             );
             std::fs::write(root.join("web/app.env"), "A='pa$s'\nB=file\n").unwrap();
-            let compose = row.compose().unwrap();
+            let compose = row
+                .compose(&crate::stacks::allowed_roots().unwrap())
+                .unwrap();
             let (dir, _, cfg, _) =
                 plugin_toolkit::reactor::block_on(resolved(&row, &compose)).unwrap();
             let app = &cfg["services"]["app"];
@@ -4320,10 +4334,15 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         let raw = crate::test_support::with_db(|| {
-            plugin_toolkit::reactor::block_on(crate::run(
-                &["compose", "-p", "web", "-f", &file, "config", "--hash=web"],
-                None,
-            ))
+            plugin_toolkit::reactor::block_on(crate::run(&[
+                "compose",
+                "-p",
+                "web",
+                "-f",
+                &file,
+                "config",
+                "--hash=web",
+            ]))
         })
         .0
         .unwrap();
