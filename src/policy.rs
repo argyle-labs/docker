@@ -1880,9 +1880,10 @@ pub async fn gate(
 /// What `row` runs now that needs a grant, for an admin to approve. Fails on
 /// anything no grant can admit.
 async fn current_grants(docker: Option<&bollard::Docker>, row: &StackRow) -> Result<Vec<Grant>> {
-    let compose = row.compose(&crate::stacks::allowed_roots()?)?;
+    let allowed = crate::stacks::allowed_roots()?;
+    let compose = row.compose(&allowed)?;
     let compose = if Path::new(&row.dir).join(compose::ORCA_FILE).is_file() {
-        compose.with_orca()
+        compose.with_orca(&allowed)?
     } else {
         compose
     };

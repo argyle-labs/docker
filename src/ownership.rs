@@ -473,7 +473,10 @@ pub async fn write_with(
     let networks = engine_networks(docker, &cfg).await?;
     let rendered = render(&cfg, &row.name, conversions, &engine, &networks);
     write_orca(row, &rendered.text)?;
-    Ok((compose.with_orca(), rendered.notes))
+    Ok((
+        compose.with_orca(&crate::stacks::allowed_roots()?)?,
+        rendered.notes,
+    ))
 }
 
 fn client() -> Result<Docker> {
@@ -1123,9 +1126,10 @@ impl Migrator for ComposeMigrator<'_> {
         Box::pin(async move {
             // The override on disk is what this step means to apply: a
             // regeneration here would undo a restored one.
-            let compose = self.row.compose(&crate::stacks::allowed_roots()?)?;
+            let allowed = crate::stacks::allowed_roots()?;
+            let compose = self.row.compose(&allowed)?;
             let compose = if Path::new(&self.row.dir).join(ORCA_FILE).exists() {
-                compose.with_orca()
+                compose.with_orca(&allowed)?
             } else {
                 compose
             };

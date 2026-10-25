@@ -772,7 +772,7 @@ impl DockerUnitProvider {
             .map(|e| stacks::env_values(&e))
             .unwrap_or_default();
         let checked = async {
-            let sets = staged.compose_sets(row);
+            let sets = staged.compose_sets(row, &roots);
             let Some(plain) = sets.first() else {
                 return Ok(());
             };
@@ -2706,7 +2706,9 @@ async fn exec_scope(
         .compose(&roots)
         .map_err(|e| format!("stack {}: {e}", row.name))?;
     let compose = if std::path::Path::new(&row.dir).join(ORCA_FILE).is_file() {
-        compose.with_orca()
+        compose
+            .with_orca(&roots)
+            .map_err(|e| format!("stack {}: {e}", row.name))?
     } else {
         compose
     };

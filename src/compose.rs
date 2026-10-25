@@ -161,11 +161,21 @@ impl Compose {
     }
 
     /// The project with [`ORCA_FILE`] (next to the compose file) passed last.
-    pub fn with_orca(&self) -> Compose {
-        Compose {
-            orca_file: self.file.parent().map(|d| d.join(ORCA_FILE)),
-            ..self.clone()
+    pub fn with_orca(&self, roots: &[String]) -> Result<Compose, ComposeError> {
+        let orca_file = self.file.parent().map(|d| d.join(ORCA_FILE));
+        if let Some(f) = &orca_file
+            && f.symlink_metadata().is_ok()
+            && !crate::stacks::regular_file_in_roots(f, roots)
+        {
+            return Err(ComposeError::Refused(anyhow::anyhow!(
+                "{} is not a regular file inside the stacks roots",
+                f.display()
+            )));
         }
+        Ok(Compose {
+            orca_file,
+            ..self.clone()
+        })
     }
 
     /// The compose files in `-f` order: the compose file, its override, then
@@ -491,12 +501,36 @@ mod tests {
         std::fs::write(dir.path().join(ORCA_FILE), "{}").unwrap();
         let c = Compose::find(dir.path()).unwrap();
         assert_eq!(c.files().len(), 2);
-        let with = c.with_orca();
+        let roots = [dir.path().to_string_lossy().into_owned()];
+        let with = c.with_orca(&roots).unwrap();
         let files = with.files();
         assert_eq!(files.len(), 3);
         assert!(files[1].ends_with("compose.override.yaml"));
         assert!(files[2].ends_with(ORCA_FILE));
-        assert_eq!(c.with_orca().without_orca().files().len(), 2);
+        assert_eq!(c.with_orca(&roots).unwrap().without_orca().files().len(), 2);
+    }
+
+    #[test]
+    fn an_orca_file_symlinked_out_of_the_roots_is_refused() {
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let roots = [root
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()];
+        let dir = root.path().join("web");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("compose.yaml"), "services: {}").unwrap();
+        let c = Compose::find(&dir).unwrap();
+        assert!(c.with_orca(&roots).is_ok(), "a missing orca file is passed");
+        std::fs::write(outside.path().join("evil.yaml"), "{}").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("evil.yaml"), dir.join(ORCA_FILE)).unwrap();
+        assert!(c.with_orca(&roots).is_err());
+        std::fs::remove_file(dir.join(ORCA_FILE)).unwrap();
+        std::fs::write(dir.join(ORCA_FILE), "{}").unwrap();
+        assert!(c.with_orca(&roots).is_ok());
     }
 
     #[test]

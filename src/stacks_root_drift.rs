@@ -71,8 +71,9 @@ pub async fn working_dirs(docker: &Docker) -> Result<Vec<String>> {
         .map_err(|e| anyhow!("list containers: {e}"))?;
     Ok(list
         .iter()
-        .filter_map(|c| c.labels.as_ref()?.get(WORKING_DIR_LABEL).cloned())
-        .filter(|d| !d.is_empty())
+        .filter_map(|c| c.labels.as_ref()?.get(WORKING_DIR_LABEL))
+        .filter_map(|d| crate::lifecycle::resolve(Path::new(d)).ok())
+        .map(|d| d.to_string_lossy().into_owned())
         .collect())
 }
 
@@ -150,6 +151,34 @@ mod tests {
         assert!(judge(&configured, &[s(root.join("stacks/mylar3"))]).is_none());
         let drift = judge(&configured, &[s(root.join("stacks/app"))]).unwrap();
         assert_eq!(drift.outside, vec![s(root.join("stacks/app"))]);
+    }
+
+    #[test]
+    fn working_dirs_are_canonical_and_unresolvable_labels_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().canonicalize().unwrap().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let real_s = real.to_string_lossy().into_owned();
+        let body = [
+            link.to_string_lossy().into_owned(),
+            format!("{real_s}/../real"),
+            "relative".to_string(),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, d)| format!(r#"{{"Id":"{i}","Labels":{{"{WORKING_DIR_LABEL}":"{d}"}}}}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+        let e = FakeEngine::routed(vec![Route::new(
+            "GET",
+            "/containers/json",
+            200,
+            format!("[{body}]"),
+        )]);
+        let dirs = plugin_toolkit::reactor::block_on(working_dirs(&e.client())).unwrap();
+        assert_eq!(dirs, vec![real_s]);
     }
 
     #[test]

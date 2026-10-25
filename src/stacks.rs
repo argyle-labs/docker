@@ -727,22 +727,17 @@ impl StagedRestore {
     /// The compose files in the staged dir that `row` would run, in `-f`
     /// order, without and then with [`crate::compose::ORCA_FILE`] when the
     /// archive holds one. Empty when it holds no compose file.
-    pub fn compose_sets(&self, row: &StackRow) -> Vec<Vec<PathBuf>> {
+    pub fn compose_sets(&self, row: &StackRow, roots: &[String]) -> Vec<Vec<PathBuf>> {
         let named = self.staged.join(&row.file);
         let Some(compose) = Compose::at(&named).or_else(|| Compose::find(&self.staged)) else {
             return Vec::new();
         };
         let plain: Vec<PathBuf> = compose.files().into_iter().map(Path::to_path_buf).collect();
         let mut sets = vec![plain];
-        if self.staged.join(crate::compose::ORCA_FILE).is_file() {
-            sets.push(
-                compose
-                    .with_orca()
-                    .files()
-                    .into_iter()
-                    .map(Path::to_path_buf)
-                    .collect(),
-            );
+        if self.staged.join(crate::compose::ORCA_FILE).is_file()
+            && let Ok(with) = compose.with_orca(roots)
+        {
+            sets.push(with.files().into_iter().map(Path::to_path_buf).collect());
         }
         sets
     }
@@ -2406,7 +2401,7 @@ mod tests {
         let staged = StagedRestore::stage(&f.row(), &mut file, &f.roots).unwrap();
         assert_eq!(staged.env_file(), Some(staged.path().join(".env")));
         assert_eq!(
-            staged.compose_sets(&f.row()),
+            staged.compose_sets(&f.row(), &f.roots),
             vec![vec![staged.path().join("compose.yaml")]]
         );
         assert_eq!(staged.swap().unwrap(), None);
