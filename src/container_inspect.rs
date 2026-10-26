@@ -1,16 +1,48 @@
 use std::collections::BTreeMap;
+use std::path::{Component, Path};
 
 use bollard::Docker;
 use bollard::models::ContainerInspectResponse;
 use bollard::query_parameters::InspectContainerOptionsBuilder;
 use plugin_toolkit::prelude::*;
+use plugin_toolkit::scrub::{is_secret, is_secret_value, is_sensitive_key, scrub_line};
 use plugin_toolkit::serde_json::{self, Value, json};
 
 const REDACTED: &str = "***";
-const SECRET_MARKERS: [&str; 9] = [
-    "TOKEN", "SECRET", "PASSWORD", "KEY", "PASS", "CRED", "AUTH", "CLAIM", "PRIVATE",
+pub const RUNTIME_SOCKETS: [&str; 8] = [
+    "/var/run/docker.sock",
+    "/run/docker.sock",
+    "/run/podman/podman.sock",
+    "/var/run/podman/podman.sock",
+    "/run/containerd/containerd.sock",
+    "/var/run/containerd/containerd.sock",
+    "/run/crio/crio.sock",
+    "/var/run/crio/crio.sock",
+];
+const RUNTIME_SOCKET_MARKERS: [&str; 4] = ["docker", "podman", "containerd", "crio"];
+const SENSITIVE_HOST_PATHS: [&str; 15] = [
+    "/run",
+    "/var/run",
+    "/",
+    "/etc",
+    "/root",
+    "/proc",
+    "/sys",
+    "/boot",
+    "/dev",
+    "/var/lib/docker",
+    "/var/lib/containers",
+    "/var/lib/containerd",
+    "/var/lib/kubelet",
+    "/var/lib/lxc",
+    "/usr",
 ];
 const COMPOSE_LABEL_PREFIX: &str = "com.docker.compose.";
+const COMPOSE_PATH_LABELS: [&str; 3] = [
+    "com.docker.compose.project.working_dir",
+    "com.docker.compose.project.config_files",
+    "com.docker.compose.project.environment_file",
+];
 const DEFAULT_SHM_SIZE: i64 = 64 * 1024 * 1024;
 
 #[orca_struct(args)]
@@ -51,6 +83,15 @@ pub struct MountInfo {
     pub read_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_name: Option<String>,
+}
+
+#[orca_struct]
+#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SensitiveBind {
+    pub source: String,
+    pub class: String,
+    pub read_only: bool,
 }
 
 #[orca_struct]
@@ -115,6 +156,8 @@ pub struct ContainerInspectOutput {
     pub image: String,
     pub image_id: String,
     pub repo_digests: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_digests_error: Option<String>,
     pub command: Vec<String>,
     pub entrypoint: Vec<String>,
     pub env: Vec<EnvVar>,
@@ -122,6 +165,7 @@ pub struct ContainerInspectOutput {
     pub networks: Vec<String>,
     pub ports: Vec<PortMapping>,
     pub mounts: Vec<MountInfo>,
+    pub sensitive_binds: Vec<SensitiveBind>,
     pub restart_policy: RestartInfo,
     pub device_requests: Vec<DeviceRequestInfo>,
     pub devices: Vec<DeviceInfo>,
@@ -172,26 +216,21 @@ pub struct ContainerComposeOutput {
     pub yaml: String,
 }
 
-pub fn is_secret_name(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    SECRET_MARKERS.iter().any(|m| upper.contains(m))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    Admin,
+    Reader,
+    Names,
 }
 
-pub fn is_secret_value(value: &str) -> bool {
-    if value.starts_with('/') && is_secret_name(value) {
-        return true;
+impl View {
+    pub fn of(ctx: &ToolCtx) -> Self {
+        if crate::execute::require_admin("docker.container_compose", ctx).is_ok() {
+            View::Admin
+        } else {
+            View::Reader
+        }
     }
-    let Some((_, rest)) = value.split_once("://") else {
-        return false;
-    };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    authority
-        .rsplit_once('@')
-        .is_some_and(|(userinfo, _)| userinfo.contains(':'))
-}
-
-fn is_secret(name: &str, value: &str) -> bool {
-    is_secret_name(name) || is_secret_value(value)
 }
 
 fn redact_args(args: &[String], replace: impl Fn(&str) -> String) -> Vec<String> {
@@ -202,20 +241,66 @@ fn redact_args(args: &[String], replace: impl Fn(&str) -> String) -> Vec<String>
             out.push(replace(&flag));
             continue;
         }
-        if let Some((name, value)) = arg.split_once('=')
+        if arg.contains(char::is_whitespace) {
+            out.push(redact_command_string(arg, &replace));
+        } else if let Some((name, value)) = arg.split_once('=')
             && is_secret(name, value)
         {
             out.push(format!("{name}={}", replace(name)));
         } else if is_secret_value(arg) {
             out.push(replace("ARG"));
         } else {
-            if arg.starts_with('-') && is_secret_name(arg) {
+            if arg.starts_with('-') && is_sensitive_key(arg) {
                 pending = Some(arg.clone());
             }
             out.push(arg.clone());
         }
     }
     out
+}
+
+fn redact_command_string(arg: &str, replace: &impl Fn(&str) -> String) -> String {
+    let scrubbed = scrub_line(arg);
+    let mut changed = matches!(scrubbed, std::borrow::Cow::Owned(_));
+    let mut pending: Option<&str> = None;
+    let mut out: Vec<String> = Vec::new();
+    for tok in scrubbed.split_whitespace() {
+        if let Some(flag) = pending.take() {
+            out.push(replace(flag));
+            changed = true;
+            continue;
+        }
+        let bare = tok.trim_start_matches('-');
+        if let Some((name, value)) = bare.split_once('=')
+            && is_secret(name, value)
+        {
+            out.push(format!(
+                "{}{name}={}",
+                &tok[..tok.len() - bare.len()],
+                replace(name)
+            ));
+            changed = true;
+        } else if is_secret_value(tok) {
+            out.push(replace("ARG"));
+            changed = true;
+        } else if tok.len() > 2
+            && tok.starts_with("-p")
+            && !tok[2..].starts_with(|c: char| c.is_ascii_digit() || c == '-')
+        {
+            out.push(format!("-p{}", replace("-p")));
+            changed = true;
+        } else {
+            if tok.starts_with('-') && (tok == "-a" || is_sensitive_key(bare)) {
+                pending = Some(tok);
+            }
+            out.push(tok.to_owned());
+        }
+    }
+    if changed {
+        out.join(" ")
+    } else {
+        arg.to_owned()
+    }
 }
 
 fn env_ref(name: &str) -> String {
@@ -238,16 +323,110 @@ fn env_ref(name: &str) -> String {
     format!("${{SECRET_{clean}}}")
 }
 
+fn normalize_path(path: &str) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    let mut absolute = false;
+    for component in Path::new(path).components() {
+        match component {
+            Component::RootDir => absolute = true,
+            Component::Normal(part) => parts.push(part.to_str()?),
+            Component::ParentDir => {
+                parts.pop()?;
+            }
+            Component::CurDir | Component::Prefix(_) => {}
+        }
+    }
+    let joined = parts.join("/");
+    Some(if absolute {
+        format!("/{joined}")
+    } else {
+        joined
+    })
+}
+
+fn is_runtime_socket_file(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let base = lower.rsplit('/').next().unwrap_or("");
+    base.contains(".sock") && RUNTIME_SOCKET_MARKERS.iter().any(|m| lower.contains(m))
+}
+
+fn is_home_ssh(path: &str) -> bool {
+    let mut parts = path.strip_prefix("/home/").unwrap_or("").split('/');
+    matches!((parts.next(), parts.next()), (Some(user), Some(".ssh")) if !user.is_empty())
+}
+
+fn is_rootless_socket(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/run/user") else {
+        return false;
+    };
+    if rest.is_empty() {
+        return true;
+    }
+    let Some((uid, tail)) = rest
+        .strip_prefix('/')
+        .map(|r| r.split_once('/').unwrap_or((r, "")))
+    else {
+        return false;
+    };
+    !uid.is_empty()
+        && uid.chars().all(|c| c.is_ascii_digit())
+        && matches!(tail, "" | "podman" | "podman/podman.sock" | "docker.sock")
+}
+
+fn classify_normalized(s: &str) -> Option<&'static str> {
+    if RUNTIME_SOCKETS
+        .iter()
+        .any(|sock| *sock == s || sock.starts_with(&format!("{s}/")))
+        || is_rootless_socket(s)
+        || is_runtime_socket_file(s)
+    {
+        Some("runtimeSocket")
+    } else if SENSITIVE_HOST_PATHS
+        .iter()
+        .any(|p| s == *p || (*p != "/" && s.starts_with(&format!("{p}/"))))
+        || is_home_ssh(s)
+    {
+        Some("sensitivePath")
+    } else {
+        None
+    }
+}
+
+pub fn classify_bind(source: &str) -> Option<&'static str> {
+    let Some(lexical) = normalize_path(source) else {
+        return Some("sensitivePath");
+    };
+    let resolved = Path::new(source)
+        .is_absolute()
+        .then(|| std::fs::canonicalize(source).ok())
+        .flatten()
+        .and_then(|p| p.to_str().map(str::to_owned))
+        .filter(|real| *real != lexical);
+    let classes = [
+        classify_normalized(&lexical),
+        resolved.as_deref().and_then(classify_normalized),
+    ];
+    classes
+        .into_iter()
+        .find(|c| *c == Some("runtimeSocket"))
+        .or_else(|| classes.into_iter().find(|c| c.is_some()))
+        .flatten()
+}
+
 fn is_anonymous_volume(name: &str) -> bool {
     name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-pub fn env_var(raw: &str) -> EnvVar {
+pub fn env_var(raw: &str, view: View) -> EnvVar {
     let (name, value) = raw.split_once('=').unwrap_or((raw, ""));
-    let redacted = is_secret(name, value);
+    let secret = is_secret(name, value);
+    let redacted = match view {
+        View::Admin => false,
+        View::Reader | View::Names => secret,
+    };
     EnvVar {
         name: name.to_owned(),
-        value: if redacted {
+        value: if redacted || view == View::Names {
             REDACTED.to_owned()
         } else {
             value.to_owned()
@@ -256,7 +435,7 @@ pub fn env_var(raw: &str) -> EnvVar {
     }
 }
 
-pub fn describe(c: &ContainerInspectResponse) -> ContainerInspectOutput {
+pub fn describe(c: &ContainerInspectResponse, view: View) -> ContainerInspectOutput {
     let config = c.config.clone().unwrap_or_default();
     let host = c.host_config.clone().unwrap_or_default();
     let mut ports: Vec<PortMapping> = host
@@ -289,6 +468,20 @@ pub fn describe(c: &ContainerInspectResponse) -> ContainerInspectOutput {
         .map(|n| n.keys().cloned().collect())
         .unwrap_or_default();
     networks.sort();
+    let mounts_raw = c.mounts.clone().unwrap_or_default();
+    let mut sensitive_binds: Vec<SensitiveBind> = mounts_raw
+        .iter()
+        .filter(|m| m.typ.as_deref() == Some("bind"))
+        .filter_map(|m| {
+            let source = m.source.clone().unwrap_or_default();
+            classify_bind(&source).map(|class| SensitiveBind {
+                source,
+                class: class.to_owned(),
+                read_only: !m.rw.unwrap_or(true),
+            })
+        })
+        .collect();
+    sensitive_binds.sort_by(|a, b| a.source.cmp(&b.source));
     let restart = host.restart_policy.unwrap_or_default();
     let mut redacted_labels = Vec::new();
     let labels = config
@@ -298,6 +491,8 @@ pub fn describe(c: &ContainerInspectResponse) -> ContainerInspectOutput {
         .map(|(k, v)| {
             if is_secret(&k, &v) {
                 redacted_labels.push(k.clone());
+                (k, REDACTED.to_owned())
+            } else if view != View::Admin && COMPOSE_PATH_LABELS.contains(&k.as_str()) {
                 (k, REDACTED.to_owned())
             } else {
                 (k, v)
@@ -332,30 +527,32 @@ pub fn describe(c: &ContainerInspectResponse) -> ContainerInspectOutput {
         image: config.image.unwrap_or_default(),
         image_id: c.image.clone().unwrap_or_default(),
         repo_digests: Vec::new(),
+        repo_digests_error: None,
         command: masked(config.cmd.unwrap_or_default()),
         entrypoint: masked(config.entrypoint.unwrap_or_default()),
         env: config
             .env
             .unwrap_or_default()
             .iter()
-            .map(|e| env_var(e))
+            .map(|e| env_var(e, view))
             .collect(),
         network_mode: host.network_mode.unwrap_or_default(),
         networks,
         ports,
-        mounts: c
-            .mounts
-            .clone()
-            .unwrap_or_default()
+        mounts: mounts_raw
             .into_iter()
             .map(|m| MountInfo {
                 kind: m.typ.map(|t| t.to_string()).unwrap_or_default(),
-                source: m.source.unwrap_or_default(),
+                source: match view {
+                    View::Admin => m.source.unwrap_or_default(),
+                    View::Reader | View::Names => REDACTED.to_owned(),
+                },
                 target: m.destination.unwrap_or_default(),
                 read_only: !m.rw.unwrap_or(true),
                 volume_name: m.name.filter(|s| !s.is_empty()),
             })
             .collect(),
+        sensitive_binds,
         restart_policy: RestartInfo {
             name: restart.name.map(|n| n.to_string()).unwrap_or_default(),
             maximum_retry_count: restart.maximum_retry_count.filter(|n| *n > 0),
@@ -497,7 +694,7 @@ pub fn service_value(c: &ContainerInspectOutput) -> Value {
             .env
             .iter()
             .map(|e| {
-                let v = if e.redacted {
+                let v = if e.redacted || is_secret(&e.name, &e.value) {
                     env_ref(&e.name)
                 } else {
                     lit(&e.value)
@@ -645,6 +842,7 @@ pub fn service_value(c: &ContainerInspectOutput) -> Value {
                     (Some(v), "volume") if is_anonymous_volume(v) => String::new(),
                     (Some(v), "volume") => lit(v),
                     (_, "volume") => String::new(),
+                    _ if m.source == REDACTED => env_ref(&format!("source{}", m.target)),
                     _ => lit(&m.source),
                 };
                 let mut v = serde_json::Map::new();
@@ -881,17 +1079,27 @@ pub fn compose_yaml(c: &ContainerInspectOutput) -> ContainerComposeOutput {
     ContainerComposeOutput { service, yaml }
 }
 
-pub async fn inspect(docker: &Docker, container: &str) -> Result<ContainerInspectOutput> {
+pub async fn inspect(
+    docker: &Docker,
+    container: &str,
+    view: View,
+) -> Result<ContainerInspectOutput> {
     let target = crate::container_delete::parse_name(container)?;
     let opts = InspectContainerOptionsBuilder::new().build();
     match docker.inspect_container(&target, Some(opts)).await {
         Ok(c) => {
-            let mut out = describe(&c);
-            if !out.image_id.is_empty()
-                && let Ok(image) = docker.inspect_image(&out.image_id).await
-            {
-                out.repo_digests = image.repo_digests.unwrap_or_default();
-                out.repo_digests.sort();
+            let mut out = describe(&c, view);
+            if !out.image_id.is_empty() {
+                match docker.inspect_image(&out.image_id).await {
+                    Ok(image) => {
+                        out.repo_digests = image.repo_digests.unwrap_or_default();
+                        out.repo_digests.sort();
+                    }
+                    Err(e) => {
+                        out.repo_digests_error =
+                            Some(format!("inspect image {}: {e}", out.image_id));
+                    }
+                }
             }
             Ok(out)
         }
@@ -908,10 +1116,15 @@ fn client() -> Result<Docker> {
         .map_err(|e| anyhow!("{e}"))
 }
 
-/// **Inspect a container** by name or id: image, command, env (secret-looking
-/// values shown as `***`), networks, ports, mounts, restart policy, devices,
-/// GPU requests, capabilities, labels, user, working dir, healthcheck.
-/// Read-only.
+/// **Inspect a container** by name or id: image, image id and repo digests
+/// (`repoDigestsError` when the image lookup fails), command, entrypoint, env
+/// names, networks, ports, mounts, restart policy, devices, GPU requests,
+/// capabilities, privileged, read-only rootfs, PID/IPC/UTS modes, labels, user,
+/// working dir, healthcheck. Every caller gets env names only (each value is
+/// `***`, `redacted` marks a secret-looking one) and `***` for every mount
+/// source and compose project path label; bind mounts of runtime sockets and sensitive host paths are listed
+/// in `sensitiveBinds`. Callable by plugins through `tool.call`; the unfiltered
+/// form is `docker.container_inspect_raw`. Read-only.
 #[orca_tool(
     domain = "docker",
     verb = "container_inspect",
@@ -923,11 +1136,29 @@ async fn docker_container_inspect(
     args: DockerContainerInspectArgs,
     _ctx: &ToolCtx,
 ) -> Result<ContainerInspectOutput> {
-    inspect(&client()?, &args.container).await
+    inspect(&client()?, &args.container, View::Names).await
+}
+
+/// **Inspect a container, unfiltered**: `docker.container_inspect` with the
+/// real env values and mount sources. Admin only; not callable through
+/// `tool.call`. Read-only.
+#[orca_tool(
+    domain = "docker",
+    verb = "container_inspect_raw",
+    role = "admin",
+    execute_gated = false
+)]
+async fn docker_container_inspect_raw(
+    args: DockerContainerInspectArgs,
+    ctx: &ToolCtx,
+) -> Result<ContainerInspectOutput> {
+    crate::execute::require_admin("docker.container_inspect_raw", ctx)?;
+    inspect(&client()?, &args.container, View::Admin).await
 }
 
 /// **Render a container as a Compose service** by name or id. Secret-looking
-/// env values become `${NAME}` references. Read-only.
+/// env values become `${NAME}` references; bind-mount sources become
+/// `${SECRET_SOURCE_…}` references unless an admin calls directly. Read-only.
 #[orca_tool(
     domain = "docker",
     verb = "container_compose",
@@ -936,9 +1167,11 @@ async fn docker_container_inspect(
 )]
 async fn docker_container_compose(
     args: DockerContainerInspectArgs,
-    _ctx: &ToolCtx,
+    ctx: &ToolCtx,
 ) -> Result<ContainerComposeOutput> {
-    Ok(compose_yaml(&inspect(&client()?, &args.container).await?))
+    Ok(compose_yaml(
+        &inspect(&client()?, &args.container, View::of(ctx)).await?,
+    ))
 }
 
 #[cfg(test)]
@@ -947,7 +1180,23 @@ mod tests {
     use crate::test_engine::{FakeEngine, Route};
 
     fn engine() -> FakeEngine {
-        FakeEngine::routed(vec![Route::new(
+        FakeEngine::routed(vec![
+            plex_route(),
+            Route::new(
+                "GET",
+                "/images/sha256:feed/json",
+                200,
+                json!({
+                    "Id": "sha256:feed",
+                    "RepoDigests": ["plexinc/pms-docker@sha256:beef", "mirror/pms@sha256:abba"]
+                })
+                .to_string(),
+            ),
+        ])
+    }
+
+    fn plex_route() -> Route {
+        Route::new(
             "GET",
             "/containers/plex/json",
             200,
@@ -992,16 +1241,7 @@ mod tests {
                 "NetworkSettings": { "Networks": { "media": {} } }
             })
             .to_string(),
-        ), Route::new(
-            "GET",
-            "/images/sha256:feed/json",
-            200,
-            json!({
-                "Id": "sha256:feed",
-                "RepoDigests": ["plexinc/pms-docker@sha256:beef", "mirror/pms@sha256:abba"]
-            })
-            .to_string(),
-        )])
+        )
     }
 
     #[test]
@@ -1020,8 +1260,271 @@ mod tests {
     }
 
     fn inspected() -> ContainerInspectOutput {
+        inspected_as(View::Reader)
+    }
+
+    fn inspected_as(view: View) -> ContainerInspectOutput {
         let e = engine();
-        plugin_toolkit::reactor::block_on(inspect(&e.client(), "plex")).unwrap()
+        plugin_toolkit::reactor::block_on(inspect(&e.client(), "plex", view)).unwrap()
+    }
+
+    fn with_image_status(status: u16) -> ContainerInspectOutput {
+        let e = FakeEngine::routed(vec![
+            plex_route(),
+            Route::new(
+                "GET",
+                "/images/sha256:feed/json",
+                status,
+                json!({ "message": "image lookup failed" }).to_string(),
+            ),
+        ]);
+        plugin_toolkit::reactor::block_on(inspect(&e.client(), "plex", View::Reader)).unwrap()
+    }
+
+    #[test]
+    fn a_failed_image_lookup_is_reported_not_hidden() {
+        for status in [404, 500] {
+            let out = with_image_status(status);
+            assert!(out.repo_digests.is_empty(), "{status}");
+            let err = out.repo_digests_error.as_deref().unwrap_or_default();
+            assert!(
+                err.starts_with("inspect image sha256:feed: "),
+                "{status}: {err}"
+            );
+            assert!(err.contains("image lookup failed"), "{status}: {err}");
+        }
+        assert_eq!(inspected().repo_digests_error, None);
+        let json = serde_json::to_value(with_image_status(500)).unwrap();
+        assert!(json["repoDigestsError"].is_string(), "{json}");
+    }
+
+    #[test]
+    fn an_admin_direct_call_sees_raw_env_and_mount_sources() {
+        let out = inspected_as(View::Admin);
+        let by: BTreeMap<_, _> = out.env.iter().map(|e| (e.name.as_str(), e)).collect();
+        assert_eq!(by["DB_PASSWORD"].value, "hunter2");
+        assert!(!by["DB_PASSWORD"].redacted);
+        assert_eq!(out.mounts[0].source, "/mnt/media");
+        let y = compose_yaml(&out).yaml;
+        assert!(!y.contains("hunter2"), "{y}");
+        assert!(y.contains("DB_PASSWORD: \"${DB_PASSWORD}\""), "{y}");
+    }
+
+    #[test]
+    fn a_reader_sees_no_mount_sources() {
+        let out = inspected();
+        assert!(
+            out.mounts.iter().all(|m| m.source == REDACTED),
+            "{:?}",
+            out.mounts
+        );
+        assert_eq!(out.mounts[0].target, "/media");
+        let y = compose_yaml(&out).yaml;
+        assert!(y.contains("source: \"${SECRET_SOURCE_MEDIA}\""), "{y}");
+        assert!(!y.contains("/mnt/media"), "{y}");
+    }
+
+    #[test]
+    fn the_names_view_hides_values_but_keeps_the_secret_flag() {
+        let out = inspected_as(View::Names);
+        let names: Vec<_> = out.env.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["TZ", "PLEX_CLAIM", "DB_PASSWORD", "api_key", "COST"]
+        );
+        assert!(out.env.iter().all(|e| e.value == REDACTED));
+        let flagged: Vec<_> = out
+            .env
+            .iter()
+            .filter(|e| e.redacted)
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(flagged, ["PLEX_CLAIM", "DB_PASSWORD", "api_key"]);
+        assert!(out.mounts.iter().all(|m| m.source == REDACTED));
+        assert!(!serde_json::to_string(&out).unwrap().contains("/mnt/media"));
+    }
+
+    #[test]
+    fn compose_path_labels_are_masked_outside_the_admin_view() {
+        let mut c = serde_json::from_value::<ContainerInspectResponse>(json!({
+            "Id": "x",
+            "Config": { "Labels": {
+                "com.docker.compose.project": "media",
+                "com.docker.compose.service": "plex",
+                "com.docker.compose.version": "2.29.0",
+                "com.docker.compose.project.working_dir": "/opt/stacks/x",
+                "com.docker.compose.project.config_files": "/mnt/secret/x.yml",
+                "com.docker.compose.project.environment_file": "/opt/stacks/x/.env"
+            } }
+        }))
+        .unwrap();
+        for view in [View::Reader, View::Names] {
+            let labels = describe(&c, view).labels;
+            for key in COMPOSE_PATH_LABELS {
+                assert_eq!(labels[key], REDACTED, "{view:?} {key}");
+            }
+            assert_eq!(labels["com.docker.compose.project"], "media");
+            assert_eq!(labels["com.docker.compose.service"], "plex");
+            assert_eq!(labels["com.docker.compose.version"], "2.29.0");
+            let json = serde_json::to_string(&describe(&c, view)).unwrap();
+            for leak in ["/opt/stacks", "/mnt/secret"] {
+                assert!(!json.contains(leak), "{view:?} {leak}");
+            }
+        }
+        let admin = describe(&c, View::Admin).labels;
+        assert_eq!(
+            admin["com.docker.compose.project.working_dir"],
+            "/opt/stacks/x"
+        );
+        assert_eq!(
+            admin["com.docker.compose.project.config_files"],
+            "/mnt/secret/x.yml"
+        );
+        c.config = None;
+        assert!(describe(&c, View::Names).labels.is_empty());
+    }
+
+    #[test]
+    fn the_raw_inspect_tool_refuses_a_non_admin_caller() {
+        for ctx in crate::test_support::non_admins() {
+            let err = plugin_toolkit::reactor::block_on(docker_container_inspect_raw(
+                DockerContainerInspectArgs {
+                    container: "plex".into(),
+                },
+                &ctx,
+            ))
+            .unwrap_err();
+            crate::test_support::assert_admin_refusal(&err.to_string());
+        }
+    }
+
+    #[test]
+    fn only_the_scrubbed_inspect_tool_is_callable_through_tool_call() {
+        use plugin_toolkit::contract::OrcaToolDef;
+        assert_eq!(DockerContainerInspect::NAME, "docker.container_inspect");
+        const { assert!(DockerContainerInspect::TOOL_CALLABLE) };
+        assert_eq!(
+            DockerContainerInspectRaw::NAME,
+            "docker.container_inspect_raw"
+        );
+        const { assert!(!DockerContainerInspectRaw::TOOL_CALLABLE) };
+    }
+
+    #[test]
+    fn symlinked_bind_sources_classify_by_their_real_target() {
+        let dir = std::env::temp_dir().join(format!("orca-inspect-link-{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("docker.sock");
+        std::fs::write(&sock, "").unwrap();
+        let to_sock = dir.join("innocent");
+        let to_root = dir.join("rootlink");
+        std::os::unix::fs::symlink(&sock, &to_sock).unwrap();
+        std::os::unix::fs::symlink("/", &to_root).unwrap();
+        assert_eq!(
+            classify_bind(to_sock.to_str().unwrap()),
+            Some("runtimeSocket")
+        );
+        assert_eq!(
+            classify_bind(to_root.to_str().unwrap()),
+            Some("sensitivePath")
+        );
+        assert_eq!(classify_bind("/definitely/not/a/real/dir"), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn bind_sources_are_classified_without_exposing_ordinary_paths() {
+        for (path, class) in [
+            ("/var/run/docker.sock", Some("runtimeSocket")),
+            ("/run/user/1000/podman/podman.sock", Some("runtimeSocket")),
+            ("/var/run", Some("runtimeSocket")),
+            ("/etc/ssh", Some("sensitivePath")),
+            ("/", Some("sensitivePath")),
+            ("/mnt/media", None),
+            ("/home/app", None),
+            ("/run/user/1000", Some("runtimeSocket")),
+            ("/run/user/1000/pulse", Some("sensitivePath")),
+            ("/run/dbus", Some("sensitivePath")),
+            ("/etcetera", None),
+            ("/srv/app/docker.sock", Some("runtimeSocket")),
+            ("/var/lib/containerd/io", Some("sensitivePath")),
+            ("/var/lib/kubelet", Some("sensitivePath")),
+            ("/var/lib/lxc/101", Some("sensitivePath")),
+            ("/usr/local/bin", Some("sensitivePath")),
+            ("/home/alice/.ssh", Some("sensitivePath")),
+            ("/home/alice/.ssh/id_ed25519", Some("sensitivePath")),
+            ("/home/alice/.sshx", None),
+            ("/home/alice/data", None),
+            ("/etc/pve/nodes", Some("sensitivePath")),
+            (
+                "/Users/a/.colima/default/docker.sock",
+                Some("runtimeSocket"),
+            ),
+            (
+                "/run/host-services/docker.proxy.sock",
+                Some("runtimeSocket"),
+            ),
+            ("/var/run/docker.sock.raw", Some("runtimeSocket")),
+            ("/run/k3s/containerd/containerd.sock", Some("runtimeSocket")),
+            ("/run/crio/crio.sock", Some("runtimeSocket")),
+            ("/srv/app/app.sock", None),
+            ("/srv/docker-data", None),
+            ("//etc//ssh", Some("sensitivePath")),
+            ("/mnt/./media/../../etc", Some("sensitivePath")),
+            ("/mnt/media/../../../etc", Some("sensitivePath")),
+            ("/mnt/../../mnt", Some("sensitivePath")),
+            ("/mnt/media/", None),
+            ("/mnt//media/./x", None),
+            ("/var//run///docker.sock", Some("runtimeSocket")),
+        ] {
+            assert_eq!(classify_bind(path), class, "{path}");
+        }
+        let mut c = serde_json::from_value::<ContainerInspectResponse>(json!({
+            "Id": "x",
+            "Mounts": [
+                { "Type": "bind", "Source": "/var/run/docker.sock", "Destination": "/s", "RW": true },
+                { "Type": "bind", "Source": "/etc", "Destination": "/e", "RW": false },
+                { "Type": "bind", "Source": "/mnt/media", "Destination": "/m", "RW": true },
+                { "Type": "volume", "Name": "etc", "Source": "/etc", "Destination": "/v", "RW": true }
+            ]
+        }))
+        .unwrap();
+        let out = describe(&c, View::Names);
+        assert_eq!(
+            out.sensitive_binds,
+            vec![
+                SensitiveBind {
+                    source: "/etc".into(),
+                    class: "sensitivePath".into(),
+                    read_only: true
+                },
+                SensitiveBind {
+                    source: "/var/run/docker.sock".into(),
+                    class: "runtimeSocket".into(),
+                    read_only: false
+                },
+            ]
+        );
+        c.mounts = None;
+        assert!(describe(&c, View::Names).sensitive_binds.is_empty());
+    }
+
+    #[test]
+    fn only_an_admin_gets_the_unfiltered_view_for_compose() {
+        use crate::test_support::{admin, caller, test_ctx};
+        assert_eq!(View::of(&test_ctx()), View::Reader);
+        assert_eq!(
+            View::of(&test_ctx().with_auth(caller("read"))),
+            View::Reader
+        );
+        assert_eq!(
+            View::of(&test_ctx().with_auth(caller("user"))),
+            View::Reader
+        );
+        assert_eq!(View::of(&admin()), View::Admin);
     }
 
     #[test]
@@ -1035,10 +1538,10 @@ mod tests {
             "AWS_CREDS",
             "Passphrase",
         ] {
-            assert!(is_secret_name(name), "{name}");
+            assert!(is_sensitive_key(name), "{name}");
         }
         for name in ["TZ", "PUID", "HOME", "PATH"] {
-            assert!(!is_secret_name(name), "{name}");
+            assert!(!is_sensitive_key(name), "{name}");
         }
     }
 
@@ -1052,7 +1555,7 @@ mod tests {
         assert_eq!(by["api_key"].value, REDACTED);
         assert_eq!(by["PLEX_CLAIM"].value, REDACTED);
         assert!(!out.env.iter().any(|e| e.value == "hunter2"));
-        assert_eq!(env_var("NOVALUE").value, "");
+        assert_eq!(env_var("NOVALUE", View::Reader).value, "");
     }
 
     #[test]
@@ -1063,14 +1566,14 @@ mod tests {
             "DATABASE_URL=postgres://app:hunter2@db:5432/app",
             "UPSTREAM=https://u:p@host/path?x=1",
         ] {
-            assert_eq!(env_var(raw).value, REDACTED, "{raw}");
+            assert_eq!(env_var(raw, View::Reader).value, REDACTED, "{raw}");
         }
         for raw in [
             "URL=https://host/a@b",
             "HOME=/home/app",
             "DSN=redis://cache:6379",
         ] {
-            assert!(!env_var(raw).redacted, "{raw}");
+            assert!(!env_var(raw, View::Reader).redacted, "{raw}");
         }
     }
 
@@ -1095,6 +1598,26 @@ mod tests {
             );
         }
         assert_eq!(masked[6], "80");
+        for (cmd, leak) in [
+            (vec!["CMD-SHELL", "mysqladmin -phunter2 ping"], "hunter2"),
+            (vec!["sh", "-c", "redis-cli -a hunter2"], "hunter2"),
+            (
+                vec!["curl", "-H", "Authorization: Bearer xyz", "http://h/"],
+                "xyz",
+            ),
+        ] {
+            let cmd: Vec<String> = cmd.into_iter().map(String::from).collect();
+            let masked = redact_args(&cmd, |_| REDACTED.to_owned());
+            assert!(
+                !masked.iter().any(|a| a.contains(leak)),
+                "{leak} in {masked:?}"
+            );
+        }
+        let benign: Vec<String> = ["sh", "-c", "nginx -g  'daemon off;' -p 80"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(redact_args(&benign, |_| REDACTED.to_owned()), benign);
         c.command = masked;
         c.labels.insert(
             "traefik.http.middlewares.a.basicauth.users".into(),
@@ -1218,7 +1741,7 @@ mod tests {
 
     #[test]
     fn compose_renders_the_service_shape() {
-        let y = compose_yaml(&inspected()).yaml;
+        let y = compose_yaml(&inspected_as(View::Admin)).yaml;
         for want in [
             "services:\n  plex:\n    cap_add:\n      - \"NET_ADMIN\"\n",
             "    image: \"plexinc/pms-docker:latest\"\n",
@@ -1284,7 +1807,8 @@ mod tests {
             })
             .to_string(),
         )]);
-        let out = plugin_toolkit::reactor::block_on(inspect(&e.client(), "tuned")).unwrap();
+        let out =
+            plugin_toolkit::reactor::block_on(inspect(&e.client(), "tuned", View::Reader)).unwrap();
         let y = compose_yaml(&out).yaml;
         (out, y)
     }
@@ -1438,7 +1962,8 @@ mod tests {
     #[test]
     fn a_missing_container_is_an_error() {
         let e = FakeEngine::routed(vec![]);
-        let err = plugin_toolkit::reactor::block_on(inspect(&e.client(), "gone")).unwrap_err();
+        let err = plugin_toolkit::reactor::block_on(inspect(&e.client(), "gone", View::Reader))
+            .unwrap_err();
         assert!(err.to_string().contains("no container 'gone'"), "{err}");
     }
 }
