@@ -904,12 +904,7 @@ impl DockerUnitProvider {
                 p.name
             ));
         }
-        if current.is_none() && stacks::discovered_here(&p.name).await.is_some() {
-            return Err(anyhow::anyhow!(
-                "stack '{}' is a discovered compose project, not a registered one; adopt it with docker.stack_adopt before deploying over it",
-                p.name
-            ));
-        }
+        stacks::require_not_discovered(&p.name, self.adapter.present_client().as_ref()).await?;
         let source = current.clone();
         // Grants are set only through the admin-only `docker.stack_allow`,
         // and stay bound to the services and images they name.

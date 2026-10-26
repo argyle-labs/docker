@@ -1720,6 +1720,20 @@ pub async fn require_registered(
     Err(anyhow::anyhow!("no managed stack named '{name}'"))
 }
 
+/// Fails when `name` is not registered but a discovered compose project
+/// carries it: a deploy would take that project over without adoption.
+pub async fn require_not_discovered(name: &str, docker: Option<&bollard::Docker>) -> Result<()> {
+    if get(name)?.is_none()
+        && let Some(docker) = docker
+        && discovered(docker, name).await.is_some()
+    {
+        anyhow::bail!(
+            "stack '{name}' is a discovered compose project, not a registered one; adopt it with docker.stack_adopt before deploying over it"
+        );
+    }
+    Ok(())
+}
+
 pub async fn require_registered_here(name: &str, adoption: Adoption) -> Result<StackRow> {
     require_registered(
         name,
@@ -2761,6 +2775,37 @@ mod tests {
             project.get("not_null").is_none(),
             "core adds a nullable column to existing tables with ADD COLUMN"
         );
+    }
+
+    #[test]
+    fn deploying_over_a_discovered_project_needs_adoption_first() {
+        crate::test_support::with_db(|| {
+            let r = Roots::new(&["immich", "fresh"]);
+            register_root(&r.roots[0], &[]);
+            let e = discovered_engine("immich", &r.path("immich"));
+            let docker = e.client();
+            let err =
+                plugin_toolkit::reactor::block_on(require_not_discovered("immich", Some(&docker)))
+                    .unwrap_err()
+                    .to_string();
+            assert!(err.contains("docker.stack_adopt"), "{err}");
+            plugin_toolkit::reactor::block_on(require_not_discovered("fresh", Some(&docker)))
+                .unwrap();
+            plugin_toolkit::reactor::block_on(require_not_discovered("immich", None)).unwrap();
+            put(&StackRow {
+                name: "immich".into(),
+                dir: r.path("immich"),
+                file: "compose.yaml".into(),
+                enabled: true,
+                allow: Vec::new(),
+                files: Vec::new(),
+                env_files: Vec::new(),
+                project: None,
+            })
+            .unwrap();
+            plugin_toolkit::reactor::block_on(require_not_discovered("immich", Some(&docker)))
+                .unwrap();
+        });
     }
 
     #[test]
