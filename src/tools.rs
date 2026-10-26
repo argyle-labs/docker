@@ -213,12 +213,13 @@ pub(crate) fn host_parents() -> Result<Vec<PathBuf>> {
     #[cfg_attr(not(test), allow(unused_mut))]
     let mut extra: Vec<String> = HOST_PARENTS.iter().map(|p| p.to_string()).collect();
     #[cfg(test)]
-    extra.extend(
-        std::env::temp_dir()
-            .canonicalize()
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned()),
-    );
+    {
+        let tmp = std::env::temp_dir();
+        extra.push(tmp.to_string_lossy().into_owned());
+        if let Ok(canonical) = tmp.canonicalize() {
+            extra.push(canonical.to_string_lossy().into_owned());
+        }
+    }
     let refs: Vec<&str> = extra.iter().map(String::as_str).collect();
     Ok(plugin_toolkit::host_paths::allowed_parents(&refs)?)
 }
