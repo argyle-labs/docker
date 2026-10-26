@@ -1290,28 +1290,19 @@ impl StackConfigs {
     /// Read `compose`'s refs. `Err` is why they cannot be.
     async fn read(
         &mut self,
+        dir: &Path,
         compose: &crate::compose::Compose,
         label: &str,
     ) -> std::result::Result<(), String> {
-        let (raw, stderr) = compose_config(compose, &crate::compose::CONFIG_JSON_ARGS)
+        let (raw, stderr) = compose_config(dir, compose, &[])
             .await
             .map_err(|e| format!("{label}: {e}"))?;
         let unset = unset_variables(&stderr);
         if !unset.is_empty() {
-            let literal = compose_config(
-                compose,
-                &[
-                    "--profile",
-                    "*",
-                    "config",
-                    "--no-interpolate",
-                    "--format",
-                    "json",
-                ],
-            )
-            .await
-            .map(|(raw, _)| raw)
-            .unwrap_or_default();
+            let literal = compose_config(dir, compose, &["--no-interpolate"])
+                .await
+                .map(|(raw, _)| raw)
+                .unwrap_or_default();
             if literal.is_empty() || touches_refs(&literal, &unset) {
                 return Err(format!(
                     "{label}: unset variables {} name images, volumes or networks",
@@ -1328,12 +1319,12 @@ impl StackConfigs {
 }
 
 async fn compose_config(
+    dir: &Path,
     compose: &crate::compose::Compose,
-    sub: &[&str],
+    extra: &[&str],
 ) -> Result<(String, String)> {
-    let mut args = vec!["compose".to_string()];
-    args.extend(compose.args());
-    args.extend(sub.iter().map(|s| s.to_string()));
+    let mut args = crate::stacks::config_args(dir, compose);
+    args.extend(extra.iter().map(|s| s.to_string()));
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     crate::run_with_stderr(&argv).await
 }
@@ -1361,8 +1352,12 @@ fn assess(
     let mut w = Withheld::default();
     for o in outcomes {
         match o {
+            Discovery::Ok(p) if !p.problems.is_empty() => {
+                w.refs
+                    .push(format!("project {}: {}", p.name, p.problems.join("; ")))
+            }
             Discovery::Ok(p) => ok.push(p.clone()),
-            Discovery::Conflict { name, detail } => {
+            Discovery::Conflict { name, detail, .. } => {
                 w.refs.push(format!("project {name}: {detail}"))
             }
             Discovery::Unreadable {
@@ -1382,6 +1377,29 @@ fn assess(
         }
     }
     (ok, w)
+}
+
+/// Every dir inside `roots` that any outcome names, so the root scan does
+/// not read a project discovery already judged.
+fn known_dirs(outcomes: &[crate::stacks::Discovery], roots: &[String]) -> Vec<PathBuf> {
+    use crate::stacks::Discovery;
+    let roots: Vec<PathBuf> = roots
+        .iter()
+        .filter_map(|r| Path::new(r).canonicalize().ok())
+        .collect();
+    let mut out: Vec<PathBuf> = outcomes
+        .iter()
+        .flat_map(|o| match o {
+            Discovery::Ok(p) => vec![p.dir.clone()],
+            Discovery::Conflict { dirs, .. } => dirs.clone(),
+            Discovery::Unreadable { dir, .. } => vec![dir.clone()],
+        })
+        .filter_map(|d| d.canonicalize().ok())
+        .filter(|d| roots.iter().any(|r| d.starts_with(r) && d != r))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn unset_variables(stderr: &str) -> Vec<String> {
@@ -1408,13 +1426,17 @@ fn touches_refs(raw: &str, vars: &[String]) -> bool {
     else {
         return true;
     };
-    let mut texts: Vec<&str> = Vec::new();
+    let mut texts: Vec<&str> = v["name"].as_str().into_iter().collect();
     for svc in v["services"]
         .as_object()
         .into_iter()
         .flat_map(|m| m.values())
     {
         texts.extend(svc["image"].as_str());
+        texts.extend(svc["build"].as_str());
+        for key in ["context", "dockerfile"] {
+            texts.extend(svc["build"][key].as_str());
+        }
         for vol in svc["volumes"].as_array().into_iter().flatten() {
             texts.extend(vol["source"].as_str().or_else(|| vol.as_str()));
         }
@@ -1465,7 +1487,7 @@ async fn stack_configs(docker: &Docker) -> Result<StackConfigs> {
     for row in crate::stacks::list()? {
         let label = format!("stack {} ({})", row.name, row.dir);
         let read = match row.compose(&roots) {
-            Ok(compose) => out.read(&compose, &label).await,
+            Ok(compose) => out.read(Path::new(&row.dir), &compose, &label).await,
             Err(e) => Err(format!("{label}: {e}")),
         };
         match read {
@@ -1483,12 +1505,13 @@ async fn stack_configs(docker: &Docker) -> Result<StackConfigs> {
             let (projects, withheld) = assess(&outcomes);
             out.protection.withheld.refs.extend(withheld.refs);
             out.protection.withheld.reported.extend(withheld.reported);
+            known.extend(known_dirs(&outcomes, &roots));
             for p in projects {
-                known.insert(p.dir.clone());
                 let label = format!("project {} ({})", p.name, p.dir.display());
+                let dir = p.dir.clone();
                 let row: crate::stacks::StackRow = p.into();
                 let read = match row.compose(&roots) {
-                    Ok(compose) => out.read(&compose, &label).await,
+                    Ok(compose) => out.read(&dir, &compose, &label).await,
                     Err(e) => Err(format!("{label}: {e}")),
                 };
                 match read {
@@ -1510,7 +1533,7 @@ async fn stack_configs(docker: &Docker) -> Result<StackConfigs> {
                     continue;
                 };
                 let label = format!("compose project {}", dir.display());
-                match out.read(&compose, &label).await {
+                match out.read(&dir, &compose, &label).await {
                     Ok(()) => out.protection.scanned += 1,
                     Err(why) => out.withhold_all(why),
                 }
@@ -3209,6 +3232,7 @@ mod tests {
         let withheld = assess(&[crate::stacks::Discovery::Conflict {
             name: "dup".into(),
             detail: "two working dirs".into(),
+            dirs: Vec::new(),
         }])
         .1;
         assert!(withheld.refs[0].contains("dup") && withheld.refs[0].contains("two working dirs"));
@@ -3347,5 +3371,65 @@ mod tests {
             );
             assert!(!keys(&f).contains(&act_key().as_str()), "{f:?}");
         });
+    }
+
+    #[test]
+    fn an_env_file_problem_withholds_refs_for_that_project() {
+        let ok = crate::stacks::Discovery::Ok(crate::stacks::DiscoveredProject {
+            name: "web".into(),
+            dir: PathBuf::from("/opt/stacks/web"),
+            files: vec![PathBuf::from("/opt/stacks/web/compose.yaml")],
+            env_files: vec![PathBuf::from("/etc/shadow")],
+            problems: vec!["/etc/shadow: not a regular file inside the stacks roots".into()],
+        });
+        let (projects, withheld) = assess(&[ok]);
+        assert!(projects.is_empty());
+        assert!(
+            withheld.refs[0].contains("web") && withheld.refs[0].contains("/etc/shadow"),
+            "{withheld:?}"
+        );
+        assert!(withheld.networks.is_empty());
+    }
+
+    #[test]
+    fn every_in_root_dir_any_outcome_names_is_known() {
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path().canonicalize().unwrap();
+        for d in ["a", "b"] {
+            std::fs::create_dir(r.join(d)).unwrap();
+        }
+        let outcomes = [
+            unreadable("a", &r.join("a").to_string_lossy(), "/x", true),
+            crate::stacks::Discovery::Conflict {
+                name: "b".into(),
+                detail: "x".into(),
+                dirs: vec![r.join("b")],
+            },
+            unreadable("c", "/etc", "/etc/passwd", true),
+        ];
+        let roots = vec![r.to_string_lossy().into_owned()];
+        let mut known = known_dirs(&outcomes, &roots);
+        known.sort();
+        assert_eq!(known, vec![r.join("a"), r.join("b")]);
+    }
+
+    #[test]
+    fn touches_refs_covers_the_project_name_and_build() {
+        let raw = r#"{"name":"${PROJ}","services":{"web":{"build":{"context":"${CTX}","dockerfile":"${DF}"}},"api":{"build":"${SHORT}"}}}"#;
+        for v in ["PROJ", "CTX", "DF", "SHORT"] {
+            assert!(touches_refs(raw, &[v.to_string()]), "{v}");
+        }
+        assert!(!touches_refs(raw, &["OTHER".to_string()]));
+    }
+
+    #[test]
+    fn an_unset_variable_in_a_volume_name_withholds() {
+        let raw = r#"{"volumes":{"data":{"name":"${DATA_NAME}"}}}"#;
+        assert!(touches_refs(
+            raw,
+            &unset_variables(
+                "level=warning msg=\"The \\\"DATA_NAME\\\" variable is not set. Defaulting to a blank string.\""
+            )
+        ));
     }
 }

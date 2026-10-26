@@ -68,22 +68,18 @@ fn dir_forms(row: &StackRow) -> Vec<PathBuf> {
     dirs
 }
 
-fn user_files(row: &StackRow) -> Result<Vec<PathBuf>> {
+fn user_compose(row: &StackRow) -> Result<crate::compose::Compose> {
     Ok(row
         .compose(&crate::stacks::allowed_roots()?)?
-        .without_orca()
-        .files()
-        .into_iter()
-        .map(Path::to_path_buf)
-        .collect())
+        .without_orca())
 }
 
-async fn config_at(dir: &Path, files: &[PathBuf]) -> Result<ComposeConfig> {
-    ComposeConfig::parse(&stacks::resolved_config(dir, files, None).await?)
+async fn config_at(dir: &Path, compose: &crate::compose::Compose) -> Result<ComposeConfig> {
+    ComposeConfig::parse(&stacks::resolved_config(dir, compose).await?)
 }
 
 pub async fn bindings_of(row: &StackRow) -> Result<Vec<StackBinding>> {
-    let cfg = config_at(Path::new(&row.dir), &user_files(row)?).await?;
+    let cfg = config_at(Path::new(&row.dir), &user_compose(row)?).await?;
     Ok(classify(&cfg, &dir_forms(row)))
 }
 
@@ -429,7 +425,7 @@ async fn plan(args: &DockerStackRelocateArgs) -> Result<Plan> {
     }
     stacks::check_dir_free(&row.name, &new_dir)?;
     let forms = dir_forms(&row);
-    let cfg = config_at(Path::new(&row.dir), &user_files(&row)?).await?;
+    let cfg = config_at(Path::new(&row.dir), &user_compose(&row)?).await?;
     let bindings = classify(&cfg, &forms);
     let old_forms: Vec<String> = forms
         .iter()
@@ -437,7 +433,8 @@ async fn plan(args: &DockerStackRelocateArgs) -> Result<Plan> {
         .collect();
     let new_str = new_dir.to_string_lossy().into_owned();
     let mut found = Vec::new();
-    let mut names: Vec<String> = user_files(&row)?
+    let mut names: Vec<String> = user_compose(&row)?
+        .files()
         .iter()
         .filter_map(|f| f.file_name().map(|n| n.to_string_lossy().into_owned()))
         .collect();
@@ -502,7 +499,7 @@ async fn stage(p: &Plan) -> Result<()> {
             dir: p.new_dir.to_string_lossy().into_owned(),
             ..p.row.clone()
         };
-        let cfg = config_at(&p.new_dir, &user_files(&moved)?).await?;
+        let cfg = config_at(&p.new_dir, &user_compose(&moved)?).await?;
         let olds: Vec<PathBuf> = p.old_forms.iter().map(PathBuf::from).collect();
         if let Some(b) = classify(&cfg, &olds).iter().find(|b| b.inside_stack_dir) {
             bail!(

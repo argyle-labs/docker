@@ -144,17 +144,21 @@ impl Compose {
         })
     }
 
-    /// Exactly `files` in order, with `env_files` and the project name, as a
-    /// running project's labels list them; nothing is auto-loaded.
-    pub fn listed(files: &[PathBuf], env_files: &[PathBuf], project: &str) -> Option<Compose> {
-        let (file, extra) = files.split_first()?;
+    /// Exactly `files` in order, with `env_files` and, when given, the
+    /// project name; nothing is auto-loaded.
+    pub fn new(
+        files: Vec<PathBuf>,
+        env_files: Vec<PathBuf>,
+        project: Option<String>,
+    ) -> Option<Compose> {
+        let mut files = files.into_iter();
         Some(Compose {
-            file: file.clone(),
+            file: files.next()?,
             override_file: None,
             orca_file: None,
-            extra_files: extra.to_vec(),
-            env_files: env_files.to_vec(),
-            project: Some(project.to_string()),
+            extra_files: files.collect(),
+            env_files,
+            project,
         })
     }
 

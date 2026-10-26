@@ -114,8 +114,12 @@ impl StackRow {
                 })
                 .collect()
         };
-        Compose::listed(&check(&self.files)?, &check(&self.env_files)?, &self.name)
-            .ok_or_else(|| crate::ComposeError::NoComposeFile(PathBuf::from(&self.dir)))
+        Compose::new(
+            check(&self.files)?,
+            check(&self.env_files)?,
+            Some(self.name.clone()),
+        )
+        .ok_or_else(|| crate::ComposeError::NoComposeFile(PathBuf::from(&self.dir)))
     }
 
     pub fn emitted_dir(&self, roots: &[String]) -> Option<String> {
@@ -429,21 +433,17 @@ pub fn redact(text: &str, values: &[String]) -> String {
     })
 }
 
-/// `compose config` over exactly `files`, as the project in `dir`, with
-/// every profile enabled. Env files are left unread, so the policy sees their
-/// paths rather than their contents.
-fn config_args(dir: &Path, files: &[PathBuf], env_file: Option<&Path>) -> Vec<String> {
+/// `compose config` of `compose` (its files, env files and project name) as
+/// the project in `dir`, with every profile enabled: the one way every verb
+/// reads a stack. Env files are left unread, so the policy sees their paths
+/// rather than their contents.
+pub fn config_args(dir: &Path, compose: &Compose) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "compose".into(),
         "--project-directory".into(),
         dir.to_string_lossy().into_owned(),
     ];
-    for f in files {
-        args.extend(["-f".into(), f.to_string_lossy().into_owned()]);
-    }
-    if let Some(env) = env_file {
-        args.extend(["--env-file".into(), env.to_string_lossy().into_owned()]);
-    }
+    args.extend(compose.args());
     args.extend(
         [
             "--profile",
@@ -458,15 +458,10 @@ fn config_args(dir: &Path, files: &[PathBuf], env_file: Option<&Path>) -> Vec<St
     args
 }
 
-/// The resolved config of exactly `files` run as the project in `dir`, with
-/// `env_file` in place of the dir's `.env` when given. Also the validation:
-/// compose rejects files it cannot run.
-pub async fn resolved_config(
-    dir: &Path,
-    files: &[PathBuf],
-    env_file: Option<&Path>,
-) -> Result<String> {
-    let args = config_args(dir, files, env_file);
+/// The resolved config of `compose` run as the project in `dir`. Also the
+/// validation: compose rejects files it cannot run.
+pub async fn resolved_config(dir: &Path, compose: &Compose) -> Result<String> {
+    let args = config_args(dir, compose);
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     crate::run(&argv)
         .await
@@ -478,7 +473,13 @@ pub async fn resolved_config(
 pub async fn config_json(dir: &Path, file: &Path, env_file: Option<&Path>) -> Result<String> {
     let mut files = vec![file.to_path_buf()];
     files.extend(crate::compose::override_in(dir));
-    resolved_config(dir, &files, env_file)
+    let compose = Compose::new(
+        files,
+        env_file.map(Path::to_path_buf).into_iter().collect(),
+        None,
+    )
+    .context("no compose file")?;
+    resolved_config(dir, &compose)
         .await
         .context("nothing was written")
 }
@@ -965,7 +966,19 @@ fn to_dbrow(row: &StackRow) -> DbRow {
         "allow".to_string(),
         DbValue::Text(plugin_toolkit::serde_json::to_string(&row.allow).unwrap_or_default()),
     );
+    for (key, list) in [("files", &row.files), ("env_files", &row.env_files)] {
+        m.insert(
+            key.to_string(),
+            DbValue::Text(plugin_toolkit::serde_json::to_string(list).unwrap_or_default()),
+        );
+    }
     m
+}
+
+fn list_from_row(m: &DbRow, key: &str) -> Result<Vec<String>> {
+    Ok(field_from_row::<Option<String>>(m, key)?
+        .and_then(|raw| plugin_toolkit::serde_json::from_str(&raw).ok())
+        .unwrap_or_default())
 }
 
 fn from_dbrow(m: &DbRow) -> Result<StackRow> {
@@ -977,8 +990,8 @@ fn from_dbrow(m: &DbRow) -> Result<StackRow> {
         allow: field_from_row::<Option<String>>(m, "allow")?
             .and_then(|raw| plugin_toolkit::serde_json::from_str(&raw).ok())
             .unwrap_or_default(),
-        files: Vec::new(),
-        env_files: Vec::new(),
+        files: list_from_row(m, "files")?,
+        env_files: list_from_row(m, "env_files")?,
     })
 }
 
@@ -1031,6 +1044,9 @@ pub struct DiscoveredProject {
     pub dir: PathBuf,
     pub files: Vec<PathBuf>,
     pub env_files: Vec<PathBuf>,
+    /// Env files that fail the root or open check: compose verbs refuse the
+    /// project, and prune cannot read its refs.
+    pub problems: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1040,6 +1056,7 @@ pub enum Discovery {
     Conflict {
         name: String,
         detail: String,
+        dirs: Vec<PathBuf>,
     },
     /// A label is missing, or a path it names is outside the roots, relative,
     /// has `..`, or is not a readable regular file.
@@ -1169,17 +1186,19 @@ fn one_project(
         }
     }
     let mut env_files = Vec::new();
+    let mut problems = Vec::new();
     for f in label_list(envs) {
-        match listed_file(f, roots) {
-            Ok(p) => env_files.push(p),
-            Err(cause) => return unreadable(Path::new(f), cause),
+        if let Err(cause) = listed_file(f, roots) {
+            problems.push(format!("{f}: {cause}"));
         }
+        env_files.push(PathBuf::from(f));
     }
     Some(Discovery::Ok(DiscoveredProject {
         name: name.to_string(),
         dir: real,
         files: checked,
         env_files,
+        problems,
     }))
 }
 
@@ -1214,10 +1233,16 @@ pub fn from_labels(
         .filter(|(name, _)| !registered.iter().any(|r| &r.name == *name))
         .filter_map(|(name, (sets, running))| {
             if sets.len() > 1 {
+                let mut dirs: Vec<PathBuf> = sets
+                    .iter()
+                    .filter_map(|(dir, _, _)| canonical_in_roots(dir.as_ref()?, roots))
+                    .collect();
+                dirs.dedup();
                 return Some(Discovery::Conflict {
                     name: name.clone(),
                     detail: "its containers disagree on the working dir, config files or env files"
                         .to_string(),
+                    dirs,
                 });
             }
             let set = sets.into_iter().next()?;
@@ -1386,6 +1411,12 @@ async fn discovered(docker: &bollard::Docker, name: &str) -> Option<StackRow> {
             None
         }
     }
+}
+
+/// The discovered project named `name` on the local engine, if any.
+pub async fn discovered_here(name: &str) -> Option<StackRow> {
+    let docker = crate::registration::adapter().present_client()?;
+    discovered(&docker, name).await
 }
 
 pub async fn require_registered(name: &str, docker: Option<&bollard::Docker>) -> Result<StackRow> {
@@ -1697,6 +1728,104 @@ mod tests {
             env_files: Vec::new(),
         }];
         assert!(from_labels(&containers, &registered, &r.roots).is_empty());
+    }
+
+    fn with_env(r: &Roots, env: &str) -> Vec<Discovery> {
+        let containers: Vec<bollard::models::ContainerSummary> =
+            plugin_toolkit::serde_json::from_value(plugin_toolkit::serde_json::json!([{
+                "Id": "c1",
+                "State": "running",
+                "Labels": {
+                    "com.docker.compose.project": "web",
+                    "com.docker.compose.project.working_dir": r.path("web"),
+                    "com.docker.compose.project.config_files": r.path("web/compose.yaml"),
+                    "com.docker.compose.project.environment_file": env,
+                }
+            }]))
+            .unwrap();
+        from_labels(&containers, &[], &r.roots)
+    }
+
+    #[test]
+    fn an_env_file_outside_the_roots_keeps_the_project_and_refuses_compose() {
+        let r = Roots::new(&["web"]);
+        let outside = tempdir().unwrap();
+        let env = outside.path().join(".env");
+        std::fs::write(&env, "A=1\n").unwrap();
+        let outcomes = with_env(&r, &env.to_string_lossy());
+        let [Discovery::Ok(p)] = &outcomes[..] else {
+            panic!("{outcomes:?}");
+        };
+        assert_eq!(p.env_files, vec![env.clone()]);
+        assert_eq!(p.problems.len(), 1, "{p:?}");
+        assert!(p.problems[0].contains(".env"), "{p:?}");
+        let row: StackRow = p.clone().into();
+        let err = row.compose(&r.roots).unwrap_err().to_string();
+        assert!(err.contains(".env"), "{err}");
+    }
+
+    #[test]
+    fn an_unreadable_env_file_keeps_the_project_with_a_problem() {
+        use std::os::unix::fs::PermissionsExt;
+        let r = Roots::new(&["web"]);
+        let env = PathBuf::from(r.path("web/.env"));
+        std::fs::write(&env, "A=1\n").unwrap();
+        std::fs::set_permissions(&env, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&env).is_ok() {
+            return;
+        }
+        let outcomes = with_env(&r, &r.path("web/.env"));
+        let [Discovery::Ok(p)] = &outcomes[..] else {
+            panic!("{outcomes:?}");
+        };
+        assert!(p.problems[0].contains("cannot be opened"), "{p:?}");
+    }
+
+    #[test]
+    fn the_deploy_gate_reads_a_discovered_row_like_every_verb() {
+        let r = Roots::new(&["web"]);
+        std::fs::write(PathBuf::from(r.path("web/extra.yaml")), "services: {}\n").unwrap();
+        std::fs::write(PathBuf::from(r.path("web/.env")), "A=1\n").unwrap();
+        let row = StackRow {
+            name: "web".into(),
+            dir: r.path("web"),
+            file: "compose.yaml".into(),
+            enabled: true,
+            allow: Vec::new(),
+            files: vec![r.path("web/compose.yaml"), r.path("web/extra.yaml")],
+            env_files: vec![r.path("web/.env")],
+        };
+        let compose = row.compose(&r.roots).unwrap();
+        let args = config_args(Path::new(&row.dir), &compose);
+        let has = |pair: [&str; 2]| args.windows(2).any(|w| w == pair);
+        assert!(has(["--project-directory", &r.path("web")]), "{args:?}");
+        assert!(has(["-p", "web"]), "{args:?}");
+        assert!(has(["-f", &r.path("web/extra.yaml")]), "{args:?}");
+        assert!(has(["--env-file", &r.path("web/.env")]), "{args:?}");
+        assert!(has(["--profile", "*"]), "{args:?}");
+        assert_eq!(&args[..1], ["compose"]);
+    }
+
+    #[test]
+    fn listed_files_survive_the_db_round_trip() {
+        crate::test_support::with_db(|| {
+            let row = StackRow {
+                name: "web".into(),
+                dir: "/opt/stacks/web".into(),
+                file: "compose.yaml".into(),
+                enabled: true,
+                allow: Vec::new(),
+                files: vec![
+                    "/opt/stacks/web/compose.yaml".into(),
+                    "/opt/stacks/web/x.yaml".into(),
+                ],
+                env_files: vec!["/opt/stacks/web/.env".into()],
+            };
+            put(&row).unwrap();
+            let back = require("web").unwrap();
+            assert_eq!(back.files, row.files);
+            assert_eq!(back.env_files, row.env_files);
+        });
     }
 
     #[test]
@@ -2450,23 +2579,21 @@ mod tests {
             PathBuf::from("/s/web/compose.yaml"),
             PathBuf::from("/s/web/compose.orca.yaml"),
         ];
-        let a = config_args(
-            Path::new("/s/web"),
-            &files,
-            Some(Path::new("/s/web/.env.tmp")),
-        );
+        let compose =
+            Compose::new(files.to_vec(), vec![PathBuf::from("/s/web/.env.tmp")], None).unwrap();
+        let a = config_args(Path::new("/s/web"), &compose);
         assert_eq!(
             a,
             [
                 "compose",
                 "--project-directory",
                 "/s/web",
+                "--env-file",
+                "/s/web/.env.tmp",
                 "-f",
                 "/s/web/compose.yaml",
                 "-f",
                 "/s/web/compose.orca.yaml",
-                "--env-file",
-                "/s/web/.env.tmp",
                 "--profile",
                 "*",
                 "config",

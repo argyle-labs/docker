@@ -784,10 +784,14 @@ impl DockerUnitProvider {
             // Env files are read from the staging dir, where the paths will
             // be once it is swapped in.
             let dir = staged.dir()?;
-            let user_raw = stacks::resolved_config(&live, plain, env.as_deref()).await?;
+            let at = |files: &Vec<std::path::PathBuf>| {
+                crate::compose::Compose::new(files.clone(), env.clone().into_iter().collect(), None)
+                    .ok_or_else(|| anyhow::anyhow!("no compose file"))
+            };
+            let user_raw = stacks::resolved_config(&live, &at(plain)?).await?;
             let user_cfg = policy::prepare(&user_raw, &live, &dir)?;
             for files in &sets {
-                let raw = stacks::resolved_config(&live, files, env.as_deref()).await?;
+                let raw = stacks::resolved_config(&live, &at(files)?).await?;
                 let cfg = policy::prepare(&raw, &live, &dir)?;
                 policy::check_stack(docker, &cfg, &user_cfg, row, &live, &roots).await?;
             }
@@ -1744,9 +1748,14 @@ async fn stack_findings(row: &StackRow, roots: &[String]) -> Result<Vec<Finding>
             .map_err(adapter_err)?,
     )
     .await?;
-    Ok(lint::audit(&cfg, &row.dir, roots, &|p| p.exists(), &|p| {
+    let mut findings = lint::audit(&cfg, &row.dir, roots, &|p| p.exists(), &|p| {
         lint::is_taken(p, &bound)
-    }))
+    });
+    findings.extend(lint::ignored_overrides(
+        std::path::Path::new(&row.dir),
+        &row.files,
+    ));
+    Ok(findings)
 }
 
 /// Host paths bind-mounted by any container on this engine.
@@ -2543,7 +2552,7 @@ fn inspected_id(info: &bollard::models::ContainerInspectResponse, asked: &str) -
         .ok_or_else(|| anyhow::anyhow!("inspect {asked}: no container id"))
 }
 
-const COMPOSE_WORKING_DIR_LABEL: &str = "com.docker.compose.project.working_dir";
+use crate::stacks_root_drift::WORKING_DIR_LABEL as COMPOSE_WORKING_DIR_LABEL;
 const COMPOSE_CONFIG_HASH_LABEL: &str = "com.docker.compose.config-hash";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

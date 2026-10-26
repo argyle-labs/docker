@@ -430,7 +430,9 @@ pub async fn plan_inline(
     let tmp = crate::fsat::PrivateDir::new("orca-normalize-")?;
     let file = tmp.write("compose.yaml", yaml.as_bytes())?;
     let project_dir = if dir.is_dir() { dir } else { tmp.path() };
-    let raw = stacks::resolved_config(project_dir, &[file], None).await?;
+    let compose = crate::compose::Compose::new(vec![file], Vec::new(), None)
+        .ok_or_else(|| plugin_toolkit::anyhow::anyhow!("no compose file"))?;
+    let raw = stacks::resolved_config(project_dir, &compose).await?;
     let cfg: Value = plugin_toolkit::serde_json::from_str(&raw)?;
     Ok(plan_text(name, yaml.to_string(), cfg, docker).await)
 }

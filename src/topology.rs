@@ -84,7 +84,7 @@ const COMPOSE_PROJECT_LABEL: &str = "com.docker.compose.project";
 
 /// Compose project working-directory label — the strongest `service_identity`
 /// signal (`/opt/stacks/<project>`); byte-for-byte the same path dockge manages.
-const COMPOSE_WORKING_DIR_LABEL: &str = "com.docker.compose.project.working_dir";
+use crate::stacks_root_drift::WORKING_DIR_LABEL as COMPOSE_WORKING_DIR_LABEL;
 
 /// Enumerate local containers via the `docker` CLI and build claims.
 pub async fn collect_claims() -> anyhow::Result<Vec<TopologyClaim>> {

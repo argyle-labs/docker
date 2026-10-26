@@ -1740,15 +1740,13 @@ async fn resolved(
     let roots = crate::tools::stacks_roots()?;
     let dir = StackDir::open(&row.dir, &roots, false)?
         .ok_or_else(|| anyhow!("stack dir {} does not exist", row.dir))?;
-    let files =
-        |c: &Compose| -> Vec<PathBuf> { c.files().into_iter().map(Path::to_path_buf).collect() };
-    let raw = stacks::resolved_config(dir.path(), &files(compose), None).await?;
+    let raw = stacks::resolved_config(dir.path(), compose).await?;
     let cfg = prepare(&raw, dir.path(), &dir)?;
     let user = compose.without_orca();
     let user_cfg = if user.files() == compose.files() {
         cfg.clone()
     } else {
-        let raw = stacks::resolved_config(dir.path(), &files(&user), None).await?;
+        let raw = stacks::resolved_config(dir.path(), &user).await?;
         prepare(&raw, dir.path(), &dir)?
     };
     Ok((dir, roots, cfg, user_cfg))
@@ -2099,7 +2097,11 @@ async fn stack_allow(
             refuse_move(&row, &args)?;
             (row, false)
         }
-        None => (adoptable(&args)?, true),
+        None => {
+            let mut row = adoptable(&args)?;
+            carry_listed(&mut row, stacks::discovered_here(&args.name).await.as_ref());
+            (row, true)
+        }
     };
     let mut after = match mode {
         AllowMode::Replace => given,
@@ -2269,6 +2271,17 @@ fn refuse_move(row: &StackRow, args: &DockerStackAllowArgs) -> Result<()> {
     Ok(())
 }
 
+/// A discovered project's listed files and env files, carried onto the row
+/// adopting it when both name the same dir.
+fn carry_listed(row: &mut StackRow, discovered: Option<&StackRow>) {
+    if let Some(d) = discovered
+        && Path::new(&d.dir) == Path::new(&row.dir)
+    {
+        row.files = d.files.clone();
+        row.env_files = d.env_files.clone();
+    }
+}
+
 /// The row adopting `args.name` would register: enabled, no grants yet, at
 /// `args.dir` inside a stacks root, its compose file a regular file there.
 fn adoptable(args: &DockerStackAllowArgs) -> Result<StackRow> {
@@ -2333,6 +2346,35 @@ mod tests {
             bail!("'{}' cannot be resolved", p.display());
         }
         Ok(p.components().collect())
+    }
+
+    #[test]
+    fn adoption_carries_a_discovered_projects_listed_files() {
+        let mut row = StackRow {
+            name: "web".into(),
+            dir: STACK.into(),
+            file: "compose.yaml".into(),
+            enabled: true,
+            allow: Vec::new(),
+            files: Vec::new(),
+            env_files: Vec::new(),
+        };
+        let discovered = StackRow {
+            files: vec![format!("{STACK}/compose.yaml"), format!("{STACK}/x.yaml")],
+            env_files: vec![format!("{STACK}/.env")],
+            ..row.clone()
+        };
+        carry_listed(&mut row, Some(&discovered));
+        assert_eq!(row.files, discovered.files);
+        assert_eq!(row.env_files, discovered.env_files);
+        let mut elsewhere = StackRow {
+            dir: "/opt/stacks/other".into(),
+            files: Vec::new(),
+            env_files: Vec::new(),
+            ..row.clone()
+        };
+        carry_listed(&mut elsewhere, Some(&discovered));
+        assert!(elsewhere.files.is_empty());
     }
 
     const STACK: &str = "/opt/stacks/web";
