@@ -15,9 +15,10 @@
 //! generic five-verb + `action` surface) and as lifecycle tools in
 //! [`crate::lifecycle`]. This module owns only the runtime registry.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 
 use plugin_toolkit::abi::{DbOp, DbRow, DbValue};
+use plugin_toolkit::host_paths::ValidatedRoot;
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::route::{Route, Routes};
 use plugin_toolkit::runtime::{db_op, field_from_row};
@@ -206,10 +207,30 @@ pub fn runtime(name: &str) -> Result<Option<Runtime>> {
     endpoint_db::get(name)?.map(joined).transpose()
 }
 
-/// The stacks roots of every registered runtime, disabled ones included
-/// (a root is configuration, not liveness), else [`DEFAULT_STACKS_ROOT`].
-/// Stack dirs must resolve inside one of these.
-pub fn stacks_roots() -> Result<Vec<String>> {
+const HOST_PARENTS: &[&str] = &["/mnt", "/media", "/data", "/home", "/Users"];
+
+pub(crate) fn host_parents() -> Result<Vec<PathBuf>> {
+    #[cfg_attr(not(test), allow(unused_mut))]
+    let mut extra: Vec<String> = HOST_PARENTS.iter().map(|p| p.to_string()).collect();
+    #[cfg(test)]
+    extra.extend(
+        std::env::temp_dir()
+            .canonicalize()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned()),
+    );
+    let refs: Vec<&str> = extra.iter().map(String::as_str).collect();
+    Ok(plugin_toolkit::host_paths::allowed_parents(&refs)?)
+}
+
+pub(crate) fn validated_roots(roots: &[String]) -> Vec<ValidatedRoot> {
+    let Ok(parents) = host_parents() else {
+        return Vec::new();
+    };
+    plugin_toolkit::host_paths::valid_planned_roots("stacks_root", roots, &parents).0
+}
+
+pub fn configured_stacks_roots() -> Result<Vec<String>> {
     let mut roots = Vec::new();
     for rt in runtimes()? {
         if let Some(root) = rt.stacks_root
@@ -224,10 +245,33 @@ pub fn stacks_roots() -> Result<Vec<String>> {
     Ok(roots)
 }
 
-/// Every runtime's discovery roots that still pass
-/// [`validate_discovery_roots`]; one that no longer does is dropped and
-/// logged.
-pub fn discovery_roots() -> Result<Vec<String>> {
+/// The stacks roots of every registered runtime, disabled ones included
+/// (a root is configuration, not liveness), else [`DEFAULT_STACKS_ROOT`],
+/// each canonical and still passing the toolkit's root validation; one that
+/// no longer does is dropped and logged. Stack dirs must resolve inside one
+/// of these.
+pub fn validated_stacks_roots() -> Result<Vec<ValidatedRoot>> {
+    let (ok, bad) = plugin_toolkit::host_paths::valid_planned_roots(
+        "stacks_root",
+        &configured_stacks_roots()?,
+        &host_parents()?,
+    );
+    for e in bad {
+        plugin_toolkit::tracing::warn!(error = %e, "docker: configured stacks root ignored");
+    }
+    Ok(ok)
+}
+
+pub fn stacks_roots() -> Result<Vec<String>> {
+    Ok(validated_stacks_roots()?
+        .iter()
+        .map(ValidatedRoot::to_string_lossy)
+        .collect())
+}
+
+/// Every runtime's discovery roots that still pass the toolkit's root
+/// validation; one that no longer does is dropped and logged.
+pub fn validated_discovery_roots() -> Result<Vec<ValidatedRoot>> {
     let mut roots = Vec::new();
     for rt in runtimes()? {
         for root in rt.discovery_roots {
@@ -236,66 +280,38 @@ pub fn discovery_roots() -> Result<Vec<String>> {
             }
         }
     }
-    let parents = discovery_parents();
-    let allowed: Vec<&Path> = parents.iter().map(PathBuf::as_path).collect();
-    let (ok, bad) = plugin_toolkit::host_paths::valid_roots("discovery_root", &roots, &allowed);
+    let (ok, bad) =
+        plugin_toolkit::host_paths::valid_roots("discovery_root", &roots, &host_parents()?);
     for e in bad {
         plugin_toolkit::tracing::warn!(error = %e, "docker: stored discovery root ignored");
     }
     Ok(ok)
 }
 
-fn discovery_parents() -> Vec<PathBuf> {
-    #[cfg(test)]
-    let extra = std::env::temp_dir()
-        .canonicalize()
-        .into_iter()
-        .collect::<Vec<_>>();
-    #[cfg(not(test))]
-    let extra = Vec::new();
-    plugin_toolkit::host_paths::allowed_parents(&extra)
+pub fn discovery_roots() -> Result<Vec<String>> {
+    Ok(validated_discovery_roots()?
+        .iter()
+        .map(ValidatedRoot::to_string_lossy)
+        .collect())
 }
 
 pub(crate) fn validate_data_roots(roots: &[String]) -> Result<()> {
+    let parents = host_parents()?;
     for root in roots {
-        let path = Path::new(root);
-        if !path.is_absolute()
-            || path
-                .components()
-                .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
-        {
-            bail!("data_root '{root}' must be an absolute path without '.' or '..'");
-        }
+        plugin_toolkit::host_paths::validate_planned_root("data_root", root, &parents)?;
     }
     Ok(())
 }
 
 pub(crate) fn validate_stacks_root(root: &str) -> Result<()> {
-    let path = Path::new(root);
-    if !path.is_absolute() {
-        bail!("stacks_root '{root}' is not an absolute path");
-    }
-    if path
-        .components()
-        .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
-        || root.split('/').any(|seg| seg == "." || seg == "..")
-    {
-        bail!("stacks_root '{root}' contains '.' or '..'");
-    }
-    if path.parent().is_none() {
-        bail!("stacks_root '/' would admit every host path");
-    }
+    plugin_toolkit::host_paths::validate_planned_root("stacks_root", root, &host_parents()?)?;
     Ok(())
 }
 
-/// Each root an existing dir, reached through no symlink, strictly inside
-/// one of the toolkit's allowed parents: adoption grants what compose
-/// projects there run.
 pub(crate) fn validate_discovery_roots(roots: &[String]) -> Result<()> {
-    let parents = discovery_parents();
-    let allowed: Vec<&Path> = parents.iter().map(PathBuf::as_path).collect();
+    let parents = host_parents()?;
     for root in roots {
-        plugin_toolkit::host_paths::validate_root("discovery_root", root, &allowed)?;
+        plugin_toolkit::host_paths::validate_root("discovery_root", root, &parents)?;
     }
     Ok(())
 }
@@ -945,13 +961,29 @@ mod registry_tests {
     use plugin_toolkit::contract::OrcaToolDef;
     use plugin_toolkit::reactor::block_on;
 
+    fn base() -> PathBuf {
+        static BASE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        BASE.get_or_init(|| tempfile::tempdir().unwrap())
+            .path()
+            .canonicalize()
+            .unwrap()
+    }
+
+    fn first_root() -> String {
+        base().join("stacks").to_string_lossy().into_owned()
+    }
+
+    fn other_root() -> String {
+        base().join("other").to_string_lossy().into_owned()
+    }
+
     fn create_args(execute: bool) -> DockerCreateArgs {
         DockerCreateArgs {
             name: "local".into(),
             socket_path: Some("/var/run/test-docker.sock".into()),
             host: None,
             url: None,
-            stacks_root: Some("/srv/stacks".into()),
+            stacks_root: Some(first_root()),
             data_roots: Vec::new(),
             discovery_roots: Vec::new(),
             registries: Vec::new(),
@@ -966,7 +998,7 @@ mod registry_tests {
             socket_path: None,
             host: None,
             url: None,
-            stacks_root: Some("/srv/other".into()),
+            stacks_root: Some(other_root()),
             data_roots: Vec::new(),
             discovery_roots: Vec::new(),
             registries: Vec::new(),
@@ -1020,9 +1052,9 @@ mod registry_tests {
                 let ctx = admin();
                 let out = docker_create(create_args(false), &ctx).await.unwrap();
                 assert!(out.dry_run && out.how_to_execute.is_some());
-                assert_eq!(out.endpoint.stacks_root.as_deref(), Some("/srv/stacks"));
+                assert_eq!(out.endpoint.stacks_root, Some(first_root()));
                 assert!(runtimes().unwrap().is_empty());
-                assert_eq!(stacks_roots().unwrap(), [DEFAULT_STACKS_ROOT]);
+                assert_eq!(configured_stacks_roots().unwrap(), [DEFAULT_STACKS_ROOT]);
 
                 let out = docker_create(create_args(true), &ctx).await.unwrap();
                 assert!(!out.dry_run && out.endpoint.enabled);
@@ -1031,17 +1063,17 @@ mod registry_tests {
                     out.endpoint.socket_path.as_deref(),
                     Some("/var/run/test-docker.sock")
                 );
-                assert_eq!(stacks_roots().unwrap(), ["/srv/stacks"]);
+                assert_eq!(stacks_roots().unwrap(), [first_root()]);
 
                 let out = docker_update(update_args(false), &ctx).await.unwrap();
                 assert!(out.dry_run);
                 assert_eq!(out.applied, ["stacks_root"]);
-                assert_eq!(out.endpoint.stacks_root.as_deref(), Some("/srv/other"));
-                assert_eq!(stacks_roots().unwrap(), ["/srv/stacks"]);
+                assert_eq!(out.endpoint.stacks_root, Some(other_root()));
+                assert_eq!(stacks_roots().unwrap(), [first_root()]);
 
                 let out = docker_update(update_args(true), &ctx).await.unwrap();
                 assert_eq!(Some(out.endpoint.clone()), runtime("local").unwrap());
-                assert_eq!(out.endpoint.stacks_root.as_deref(), Some("/srv/other"));
+                assert_eq!(out.endpoint.stacks_root, Some(other_root()));
                 assert_eq!(
                     out.endpoint.socket_path.as_deref(),
                     Some("/var/run/test-docker.sock"),
@@ -1054,7 +1086,7 @@ mod registry_tests {
                 docker_update(disable, &ctx).await.unwrap();
                 assert_eq!(
                     stacks_roots().unwrap(),
-                    ["/srv/other"],
+                    [other_root()],
                     "a disabled runtime's root still counts"
                 );
 
@@ -1071,7 +1103,7 @@ mod registry_tests {
                     dry_run: false,
                 };
                 assert!(docker_delete(args, &ctx).await.unwrap().changed);
-                assert_eq!(stacks_roots().unwrap(), [DEFAULT_STACKS_ROOT]);
+                assert_eq!(configured_stacks_roots().unwrap(), [DEFAULT_STACKS_ROOT]);
             })
         });
         assert!(tables.values().all(Vec::is_empty), "{tables:?}");

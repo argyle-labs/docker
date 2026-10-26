@@ -18,50 +18,6 @@ use crate::unit_provider::{DockerUnitProvider, StackDeployPayload, stack_remove}
 
 const INVOKE_PREFIX: &str = "docker.__deploy";
 
-const DENIED: &[&str] = &[
-    "/etc",
-    "/root",
-    "/proc",
-    "/sys",
-    "/dev",
-    "/boot",
-    "/run",
-    "/var/run",
-    "/var/lib/docker",
-    "/usr",
-    "/bin",
-    "/sbin",
-    "/lib",
-    "/lib64",
-    "/opt/orca",
-    "/var/spool",
-    "/var/lib/containerd",
-    "/var/lib/containers",
-    "/var/lib/lxc",
-    "/var/lib/libvirt",
-    "/var/lib/orca",
-    "/private/etc",
-    "/private/var/root",
-    "/private/var/db",
-    "/Library/Keychains",
-];
-
-const DENIED_SEGMENTS: &[&[&str]] = &[
-    &[".ssh"],
-    &[".gnupg"],
-    &[".orca"],
-    &[".aws"],
-    &[".docker"],
-    &[".kube"],
-    &[".config", "gcloud"],
-    &[".netrc"],
-    &[".password-store"],
-    &[".local", "share", "keyrings"],
-    &["library", "keychains"],
-];
-
-const HOME_PARENTS: &[&str] = &["/home", "/Users"];
-
 pub struct DockerDeployTarget {
     host: String,
     root: String,
@@ -238,67 +194,9 @@ fn orca_home() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".orca")))
 }
 
-fn resolved(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
-fn folded_segments(path: &Path) -> Vec<String> {
-    path.components()
-        .filter_map(|c| match c {
-            Component::Normal(s) => Some(s.to_string_lossy().to_ascii_lowercase()),
-            _ => None,
-        })
-        .collect()
-}
-
-fn folded_starts_with(path: &Path, prefix: &Path) -> bool {
-    let (p, pre) = (folded_segments(path), folded_segments(prefix));
-    p.len() >= pre.len() && p.iter().zip(pre.iter()).all(|(a, b)| a == b)
-}
-
-fn has_denied_segment(path: &Path) -> bool {
-    let segments = folded_segments(path);
-    DENIED_SEGMENTS.iter().any(|pat| {
-        segments
-            .windows(pat.len())
-            .any(|w| w.iter().zip(pat.iter()).all(|(a, b)| a == b))
-    })
-}
-
-fn shadows_denied_segment(path: &Path) -> bool {
-    DENIED_SEGMENTS
-        .iter()
-        .any(|pat| folded_child_exists(path, pat))
-}
-
-fn folded_child_exists(dir: &Path, rest: &[&str]) -> bool {
-    let Some((head, tail)) = rest.split_first() else {
-        return true;
-    };
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
-    };
-    entries.filter_map(|e| e.ok()).any(|e| {
-        e.file_name().to_string_lossy().eq_ignore_ascii_case(head)
-            && folded_child_exists(&e.path(), tail)
-    })
-}
-
 fn denied(path: &Path, orca_home: Option<&Path>) -> bool {
-    if path.parent().is_none() {
-        return true;
-    }
-    let mut deny: Vec<PathBuf> = DENIED.iter().map(PathBuf::from).collect();
-    deny.extend(orca_home.map(Path::to_path_buf));
-    let deny_hit = deny
-        .iter()
-        .flat_map(|d| [d.clone(), resolved(d)])
-        .any(|d| folded_starts_with(path, &d) || folded_starts_with(&d, path));
-    let bare_home = HOME_PARENTS
-        .iter()
-        .flat_map(|h| [PathBuf::from(h), resolved(Path::new(h))])
-        .any(|h| path == h || path.parent() == Some(h.as_path()));
-    deny_hit || bare_home || has_denied_segment(path) || shadows_denied_segment(path)
+    let extra: Vec<PathBuf> = orca_home.map(Path::to_path_buf).into_iter().collect();
+    plugin_toolkit::host_paths::is_denied(path, &extra)
 }
 
 fn create_under(root: &Path, existing: &Path, rest: &[String]) -> Result<PathBuf, DeployError> {

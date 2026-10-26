@@ -1371,7 +1371,9 @@ fn normalized(dir: &str) -> PathBuf {
         .unwrap_or_else(|_| Path::new(dir).components().collect())
 }
 
-use plugin_toolkit::host_paths::canonical_in_roots;
+fn canonical_in_roots(dir: &str, roots: &[String]) -> Option<PathBuf> {
+    plugin_toolkit::host_paths::canonical_in_roots(dir, &crate::tools::validated_roots(roots))
+}
 
 pub async fn discover(docker: &bollard::Docker) -> Result<Vec<Discovery>> {
     let filters = std::collections::HashMap::from([(
