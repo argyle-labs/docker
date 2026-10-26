@@ -34,6 +34,7 @@ use plugin_toolkit::prelude::*;
 use plugin_toolkit::serde_json::{self, Value};
 
 use crate::compose::{self, Compose};
+use crate::image_ref::ImageRef;
 use crate::stacks::{self, StackDir, StackRow};
 use crate::{engine_state, execute, fsat};
 
@@ -377,7 +378,7 @@ pub struct Roots {
 }
 
 /// An image a granted service runs: `stack`'s `service` holds a grant while
-/// running `image` (normalized, see [`norm_image`]).
+/// running `image` (see [`ImageRef::canonical`]).
 #[derive(Debug, Clone)]
 pub struct GrantedImage {
     pub image: String,
@@ -1254,22 +1255,6 @@ fn service(name: &str, svc: &Value, c: &mut Collector<'_>, roots: &Roots, resolv
     }
 }
 
-/// `image` in one spelling: no `docker.io/` or `library/` prefix, and
-/// `:latest` when it names no tag or digest.
-pub fn norm_image(image: &str) -> String {
-    let i = image
-        .strip_prefix("docker.io/")
-        .or_else(|| image.strip_prefix("index.docker.io/"))
-        .unwrap_or(image);
-    let i = i.strip_prefix("library/").unwrap_or(i);
-    let last = i.rsplit('/').next().unwrap_or(i);
-    if last.contains(':') || i.contains('@') {
-        i.to_string()
-    } else {
-        format!("{i}:latest")
-    }
-}
-
 /// Refuse a build that would tag an image a granted service runs, and any
 /// other stack naming one: building or pulling it under that name would
 /// change what the granted service runs.
@@ -1284,13 +1269,14 @@ fn image_names(name: &str, svc: &Value, c: &mut Collector<'_>, roots: &Roots) {
                 .map(|t| t.as_str().unwrap_or("")),
         )
         .filter(|n| !n.is_empty())
-        .map(norm_image)
+        .map(str::to_string)
         .collect();
     for n in named {
+        let canonical = ImageRef::parse(&n).canonical();
         let why = roots
             .granted_images
             .iter()
-            .filter(|g| g.image == n)
+            .filter(|g| g.image == canonical)
             .find_map(|g| {
                 if builds {
                     Some(format!(
@@ -1677,7 +1663,7 @@ fn granted_images(row: &StackRow, others: &[StackRow]) -> Vec<GrantedImage> {
         .chain(std::iter::once(row))
         .flat_map(|r| {
             r.allow.iter().map(|g| GrantedImage {
-                image: norm_image(&g.image),
+                image: ImageRef::parse(&g.image).canonical(),
                 stack: r.name.clone(),
                 service: g.service.clone(),
             })
@@ -1754,15 +1740,13 @@ async fn resolved(
     let roots = crate::tools::stacks_roots()?;
     let dir = StackDir::open(&row.dir, &roots, false)?
         .ok_or_else(|| anyhow!("stack dir {} does not exist", row.dir))?;
-    let files =
-        |c: &Compose| -> Vec<PathBuf> { c.files().into_iter().map(Path::to_path_buf).collect() };
-    let raw = stacks::resolved_config(dir.path(), &files(compose), None).await?;
+    let raw = stacks::resolved_config(dir.path(), compose).await?;
     let cfg = prepare(&raw, dir.path(), &dir)?;
     let user = compose.without_orca();
     let user_cfg = if user.files() == compose.files() {
         cfg.clone()
     } else {
-        let raw = stacks::resolved_config(dir.path(), &files(&user), None).await?;
+        let raw = stacks::resolved_config(dir.path(), &user).await?;
         prepare(&raw, dir.path(), &dir)?
     };
     Ok((dir, roots, cfg, user_cfg))
@@ -2113,7 +2097,15 @@ async fn stack_allow(
             refuse_move(&row, &args)?;
             (row, false)
         }
-        None => (adoptable(&args)?, true),
+        None => {
+            let mut row = adoptable(&args)?;
+            stacks::carry_listed(
+                &mut row,
+                stacks::discovered_here(&args.name).await.as_ref(),
+                &crate::tools::stacks_roots()?,
+            );
+            (row, true)
+        }
     };
     let mut after = match mode {
         AllowMode::Replace => given,
@@ -2329,6 +2321,8 @@ fn adoptable(args: &DockerStackAllowArgs) -> Result<StackRow> {
         file,
         enabled: true,
         allow: Vec::new(),
+        files: Vec::new(),
+        env_files: Vec::new(),
     })
 }
 
@@ -2345,6 +2339,39 @@ mod tests {
             bail!("'{}' cannot be resolved", p.display());
         }
         Ok(p.components().collect())
+    }
+
+    #[test]
+    fn adoption_carries_a_discovered_projects_listed_files() {
+        let mut row = StackRow {
+            name: "web".into(),
+            dir: STACK.into(),
+            file: "compose.yaml".into(),
+            enabled: true,
+            allow: Vec::new(),
+            files: Vec::new(),
+            env_files: Vec::new(),
+        };
+        let discovered = StackRow {
+            files: vec![format!("{STACK}/compose.yaml"), format!("{STACK}/x.yaml")],
+            env_files: vec![format!("{STACK}/.env")],
+            ..row.clone()
+        };
+        stacks::carry_listed(&mut row, Some(&discovered), &["/opt/stacks".to_string()]);
+        assert_eq!(row.files, discovered.files);
+        assert_eq!(row.env_files, discovered.env_files);
+        let mut elsewhere = StackRow {
+            dir: "/opt/stacks/other".into(),
+            files: Vec::new(),
+            env_files: Vec::new(),
+            ..row.clone()
+        };
+        stacks::carry_listed(
+            &mut elsewhere,
+            Some(&discovered),
+            &["/opt/stacks".to_string()],
+        );
+        assert!(elsewhere.files.is_empty());
     }
 
     const STACK: &str = "/opt/stacks/web";
@@ -2985,6 +3012,8 @@ mod tests {
             file: "compose.yaml".into(),
             enabled: true,
             allow: Vec::new(),
+            files: Vec::new(),
+            env_files: Vec::new(),
         };
         stacks::put(&row).unwrap();
         row
@@ -3047,6 +3076,70 @@ mod tests {
 
     const PULLED: &str = "registry.example/x@sha256:1111111111111111111111111111111111111111111111111111111111111111";
     const REPUSHED: &str = "registry.example/x@sha256:2222222222222222222222222222222222222222222222222222222222222222";
+
+    #[test]
+    fn the_deploy_gate_checks_every_listed_file() {
+        if !crate::test_support::have_compose() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let fake = engine(&[]);
+        let docker = fake.client();
+        crate::test_support::with_db(|| {
+            let mut row = registered(&root, "services:\n  app:\n    image: x:1\n");
+            let dir = PathBuf::from(&row.dir);
+            row.files = vec![
+                dir.join("compose.yaml").to_string_lossy().into_owned(),
+                dir.join("extra.yaml").to_string_lossy().into_owned(),
+            ];
+            stacks::put(&row).unwrap();
+            let roots = crate::tools::stacks_roots().unwrap();
+            for (extra, want) in [
+                (
+                    "services:\n  sidecar:\n    image: y:1\n    privileged: true\n",
+                    "privileged: true",
+                ),
+                (
+                    "services:\n  sidecar:\n    image: y:1\n    volumes: [\"/etc:/host-etc\"]\n",
+                    "/etc",
+                ),
+            ] {
+                std::fs::write(dir.join("extra.yaml"), extra).unwrap();
+                let err = plugin_toolkit::reactor::block_on(row.write_checked(
+                    Some("services:\n  app:\n    image: x:1\n"),
+                    None,
+                    &roots,
+                    Some(&docker),
+                ))
+                .unwrap_err();
+                assert!(format!("{err:#}").contains(want), "{extra}: {err:#}");
+            }
+        });
+    }
+
+    #[test]
+    fn an_env_payload_is_refused_when_the_listed_env_files_leave_out_dot_env() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        crate::test_support::with_db(|| {
+            let mut row = registered(&root, "services:\n  app:\n    image: x:1\n");
+            let dir = PathBuf::from(&row.dir);
+            std::fs::write(dir.join("prod.env"), "A=1\n").unwrap();
+            row.files = vec![dir.join("compose.yaml").to_string_lossy().into_owned()];
+            row.env_files = vec![dir.join("prod.env").to_string_lossy().into_owned()];
+            let roots = crate::tools::stacks_roots().unwrap();
+            let err = plugin_toolkit::reactor::block_on(row.write_checked(
+                None,
+                Some("A=2\n"),
+                &roots,
+                None,
+            ))
+            .unwrap_err();
+            assert!(format!("{err:#}").contains("prod.env"), "{err:#}");
+            assert!(!dir.join(".env").exists());
+        });
+    }
 
     #[test]
     fn real_compose_config_feeds_profiles_env_files_and_dotdot_binds_to_the_policy() {
@@ -4216,12 +4309,12 @@ mod tests {
                 "web",
                 vec![
                     GrantedImage {
-                        image: norm_image("x:1"),
+                        image: ImageRef::parse("x:1").canonical(),
                         stack: "web".into(),
                         service: "app".into(),
                     },
                     GrantedImage {
-                        image: norm_image("docker.io/library/ha"),
+                        image: ImageRef::parse("docker.io/library/ha").canonical(),
                         stack: "home".into(),
                         service: "ha".into(),
                     },
@@ -4255,9 +4348,6 @@ mod tests {
         ok(
             json!({"name": "web", "services": {"b": {"image": "y:1", "build": {"context": STACK}}}}),
         );
-        assert_eq!(norm_image("docker.io/library/ha"), "ha:latest");
-        assert_eq!(norm_image("ghcr.io/a/b:2"), "ghcr.io/a/b:2");
-        assert_eq!(norm_image("localhost:5000/b"), "localhost:5000/b:latest");
     }
 
     #[test]

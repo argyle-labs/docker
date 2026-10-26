@@ -100,12 +100,18 @@ pub fn override_in(dir: &Path) -> Option<PathBuf> {
         .find(|o| o.exists())
 }
 
+pub const CONFIG_JSON_ARGS: [&str; 5] = ["--profile", "*", "config", "--format", "json"];
+
 /// A located compose project.
 #[derive(Debug, Clone)]
 pub struct Compose {
     file: PathBuf,
     override_file: Option<PathBuf>,
     orca_file: Option<PathBuf>,
+    extra_files: Vec<PathBuf>,
+    env_files: Vec<PathBuf>,
+    project: Option<String>,
+    project_dir: Option<PathBuf>,
 }
 
 impl Compose {
@@ -133,6 +139,29 @@ impl Compose {
             file: file.to_path_buf(),
             override_file,
             orca_file: None,
+            extra_files: Vec::new(),
+            env_files: Vec::new(),
+            project: None,
+            project_dir: None,
+        })
+    }
+
+    /// Exactly `files` in order, with `env_files` and, when given, the
+    /// project name; nothing is auto-loaded.
+    pub fn new(
+        files: Vec<PathBuf>,
+        env_files: Vec<PathBuf>,
+        project: Option<String>,
+    ) -> Option<Compose> {
+        let mut files = files.into_iter();
+        Some(Compose {
+            file: files.next()?,
+            override_file: None,
+            orca_file: None,
+            extra_files: files.collect(),
+            env_files,
+            project,
+            project_dir: None,
         })
     }
 
@@ -183,6 +212,7 @@ impl Compose {
     pub fn files(&self) -> Vec<&Path> {
         std::iter::once(self.file.as_path())
             .chain(self.override_file.as_deref())
+            .chain(self.extra_files.iter().map(PathBuf::as_path))
             .chain(self.orca_file.as_deref())
             .collect()
     }
@@ -193,6 +223,60 @@ impl Compose {
             .into_iter()
             .flat_map(|f| ["-f".to_string(), f.to_string_lossy().into_owned()])
             .collect()
+    }
+
+    /// The same project with every file and env file passed through `f`.
+    pub fn map_paths(&self, f: impl Fn(&Path) -> PathBuf) -> Compose {
+        Compose {
+            file: f(&self.file),
+            override_file: self.override_file.as_deref().map(&f),
+            orca_file: self.orca_file.as_deref().map(&f),
+            extra_files: self.extra_files.iter().map(|p| f(p)).collect(),
+            env_files: self.env_files.iter().map(|p| f(p)).collect(),
+            project: self.project.clone(),
+            project_dir: self.project_dir.clone(),
+        }
+    }
+
+    /// The project run from `dir` (`--project-directory`), where compose
+    /// reads the default `.env` and resolves relative paths.
+    pub fn with_project_dir(mut self, dir: PathBuf) -> Compose {
+        self.project_dir = Some(dir);
+        self
+    }
+
+    pub fn project_dir(&self) -> Option<&Path> {
+        self.project_dir.as_deref()
+    }
+
+    pub fn env_files(&self) -> &[PathBuf] {
+        &self.env_files
+    }
+
+    /// The project with `env` passed as an env file after any listed ones.
+    pub fn with_env_file(mut self, env: PathBuf) -> Compose {
+        self.env_files.push(env);
+        self
+    }
+
+    /// The global `compose` arguments: the project name and env files when
+    /// listed, then [`file_args`](Self::file_args).
+    pub fn args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if let Some(d) = &self.project_dir {
+            args.extend([
+                "--project-directory".to_string(),
+                d.to_string_lossy().into_owned(),
+            ]);
+        }
+        if let Some(p) = &self.project {
+            args.extend(["-p".to_string(), p.clone()]);
+        }
+        for env in &self.env_files {
+            args.extend(["--env-file".to_string(), env.to_string_lossy().into_owned()]);
+        }
+        args.extend(self.file_args());
+        args
     }
 
     /// Service names declared in the compose file.
@@ -244,11 +328,11 @@ impl Compose {
             .collect())
     }
 
-    /// `docker compose config --format json`: the file as compose resolves
-    /// it, with interpolation applied, paths made absolute and mounts in long
-    /// syntax.
+    /// `docker compose config --format json` with every profile enabled: the
+    /// file as compose resolves it, with interpolation applied, paths made
+    /// absolute and mounts in long syntax.
     pub async fn config_json(&self) -> Result<String, ComposeError> {
-        Ok(self.docker(&["config", "--format", "json"]).await?)
+        Ok(self.docker(&CONFIG_JSON_ARGS).await?)
     }
 
     /// The project name from the resolved config: the value the engine stamps
@@ -355,7 +439,7 @@ impl Compose {
     }
 
     async fn docker(&self, sub: &[&str]) -> Result<String, anyhow::Error> {
-        let files = self.file_args();
+        let files = self.args();
         let mut args: Vec<&str> = vec!["compose"];
         args.extend(files.iter().map(String::as_str));
         args.extend_from_slice(sub);
@@ -404,6 +488,40 @@ pub fn parse_external_networks(raw: &str) -> Vec<String> {
     nets.iter()
         .filter(|(_, n)| n["external"].as_bool() == Some(true))
         .map(|(key, n)| n["name"].as_str().unwrap_or(key).to_string())
+        .collect()
+}
+
+/// Engine-side names of every volume a resolved config declares, external or
+/// named by `name:` included (its `name`, else its key).
+pub fn parse_stack_volumes(raw: &str) -> Vec<String> {
+    let Ok(v): Result<Value, _> = serde_json::from_str(raw) else {
+        return Vec::new();
+    };
+    let Some(vols) = v["volumes"].as_object() else {
+        return Vec::new();
+    };
+    vols.iter()
+        .map(|(key, n)| n["name"].as_str().unwrap_or(key).to_string())
+        .collect()
+}
+
+/// Image refs a resolved config's services use: each `image`, else for a
+/// service with only `build`, the `<project>-<service>` name compose builds.
+pub fn parse_stack_images(raw: &str) -> Vec<String> {
+    let Ok(v): Result<Value, _> = serde_json::from_str(raw) else {
+        return Vec::new();
+    };
+    let project = v["name"].as_str().unwrap_or_default();
+    let Some(services) = v["services"].as_object() else {
+        return Vec::new();
+    };
+    services
+        .iter()
+        .filter_map(|(name, svc)| match svc["image"].as_str() {
+            Some(image) => Some(image.to_string()),
+            None if !svc["build"].is_null() => Some(format!("{project}-{name}")),
+            None => None,
+        })
         .collect()
 }
 
@@ -594,6 +712,40 @@ mod tests {
         nets.sort();
         assert_eq!(nets, vec!["bare", "caddy_proxy"]);
         assert!(parse_external_networks(r#"{"services":{}}"#).is_empty());
+    }
+
+    #[test]
+    fn parse_stack_volumes_reads_external_and_named_volumes() {
+        let raw = r#"{"name":"media","volumes":{"data":{"name":"media_data"},"shared":{"name":"shared_ext","external":true},"pinned":{"name":"my-pinned"}}}"#;
+        let mut vols = parse_stack_volumes(raw);
+        vols.sort();
+        assert_eq!(vols, vec!["media_data", "my-pinned", "shared_ext"]);
+        assert!(parse_stack_volumes(r#"{"services":{}}"#).is_empty());
+    }
+
+    #[test]
+    fn parse_stack_images_reads_pulled_and_built_images() {
+        let raw = r#"{"name":"media","services":{"web":{"image":"nginx:1"},"app":{"build":{"context":"."}},"tool":{"build":{"context":"."},"image":"mytool:dev"}}}"#;
+        let mut imgs = parse_stack_images(raw);
+        imgs.sort();
+        assert_eq!(imgs, vec!["media-app", "mytool:dev", "nginx:1"]);
+    }
+
+    #[test]
+    fn a_restore_keeps_checking_from_the_live_project_dir() {
+        let live = Compose::new(vec![PathBuf::from("/s/web/compose.yaml")], Vec::new(), None)
+            .unwrap()
+            .with_project_dir(PathBuf::from("/s/web"));
+        let staged = live.map_paths(|p| Path::new("/s/.web.staged").join(p.file_name().unwrap()));
+        assert_eq!(staged.file(), Path::new("/s/.web.staged/compose.yaml"));
+        assert_eq!(staged.project_dir(), Some(Path::new("/s/web")));
+        let args = staged.args();
+        assert_eq!(&args[..2], ["--project-directory", "/s/web"]);
+    }
+
+    #[test]
+    fn config_json_enables_every_profile() {
+        assert!(CONFIG_JSON_ARGS.windows(2).any(|w| w == ["--profile", "*"]));
     }
 
     #[test]

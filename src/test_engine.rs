@@ -17,6 +17,7 @@ pub struct Route {
     pub query: Option<String>,
     pub status: u16,
     pub body: String,
+    pub times: Option<usize>,
 }
 
 impl Route {
@@ -32,7 +33,13 @@ impl Route {
             query: None,
             status,
             body: body.into(),
+            times: None,
         }
+    }
+
+    pub fn times(mut self, n: usize) -> Self {
+        self.times = Some(n);
+        self
     }
 
     pub fn when_query(mut self, contains: impl Into<String>) -> Self {
@@ -71,7 +78,7 @@ pub struct FakeEngine {
 
 impl FakeEngine {
     /// Unmatched requests get a 404 with docker's error envelope.
-    pub fn routed(routes: Vec<Route>) -> Self {
+    pub fn routed(mut routes: Vec<Route>) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("docker.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
@@ -118,13 +125,17 @@ impl FakeEngine {
                 let path = target.split('?').next().unwrap_or_default();
                 let query = decode(target.split_once('?').map(|(_, q)| q).unwrap_or_default());
                 let (status, body) = routes
-                    .iter()
+                    .iter_mut()
                     .find(|r| {
                         r.method == method
                             && path.ends_with(&r.path)
                             && r.query.as_ref().is_none_or(|q| query.contains(q.as_str()))
+                            && r.times != Some(0)
                     })
-                    .map(|r| (r.status, r.body.clone()))
+                    .map(|r| {
+                        r.times = r.times.map(|n| n - 1);
+                        (r.status, r.body.clone())
+                    })
                     .unwrap_or((404, r#"{"message":"no such route"}"#.to_string()));
                 let response = format!(
                     "HTTP/1.1 {status} Fake\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

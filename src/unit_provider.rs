@@ -417,20 +417,21 @@ impl DockerUnitProvider {
         let planned = match &p.compose_yaml {
             Some(yaml) => crate::normalize::plan_inline(&p.name, &dir, yaml, docker.as_ref()).await,
             None => {
-                let row = StackRow {
-                    name: p.name.clone(),
-                    dir: dir.to_string_lossy().into_owned(),
-                    file: p
-                        .file
+                let source = stacks::listed_source(&p.name).await;
+                let row = stacks::payload_row(
+                    &p.name,
+                    &dir,
+                    p.file
                         .clone()
                         .unwrap_or_else(|| stacks::DEFAULT_COMPOSE_FILE.to_string()),
-                    enabled: true,
-                    allow: stacks::get(&p.name)
+                    stacks::get(&p.name)
                         .ok()
                         .flatten()
                         .map(|r| r.allow)
                         .unwrap_or_default(),
-                };
+                    source.as_ref(),
+                    &crate::stacks::allowed_roots().unwrap_or_default(),
+                );
                 if !crate::stacks::allowed_roots()
                     .and_then(|roots| row.compose_path(&roots))
                     .is_ok_and(|p| p.is_file())
@@ -766,13 +767,12 @@ impl DockerUnitProvider {
         let roots = crate::tools::stacks_roots()?;
         let mut staged = StagedRestore::stage(row, &mut file, &roots)?;
         let live = stacks::stack_dir_in_roots(&row.dir, &roots)?;
-        let env = staged.env_file();
         let staged_secrets = staged
             .read_env()
             .map(|e| stacks::env_values(&e))
             .unwrap_or_default();
         let checked = async {
-            let sets = staged.compose_sets(row, &roots);
+            let sets = staged.compose_sets(row, &roots)?;
             let Some(plain) = sets.first() else {
                 return Ok(());
             };
@@ -782,10 +782,10 @@ impl DockerUnitProvider {
             // Env files are read from the staging dir, where the paths will
             // be once it is swapped in.
             let dir = staged.dir()?;
-            let user_raw = stacks::resolved_config(&live, plain, env.as_deref()).await?;
+            let user_raw = stacks::resolved_config(&live, plain).await?;
             let user_cfg = policy::prepare(&user_raw, &live, &dir)?;
-            for files in &sets {
-                let raw = stacks::resolved_config(&live, files, env.as_deref()).await?;
+            for compose in &sets {
+                let raw = stacks::resolved_config(&live, compose).await?;
                 let cfg = policy::prepare(&raw, &live, &dir)?;
                 policy::check_stack(docker, &cfg, &user_cfg, row, &live, &roots).await?;
             }
@@ -890,18 +890,23 @@ impl DockerUnitProvider {
                 p.name
             ));
         }
-        let row = StackRow {
-            name: p.name.clone(),
-            dir: dir.to_string_lossy().into_owned(),
+        let source = match &current {
+            Some(row) => Some(row.clone()),
+            None => stacks::discovered_here(&p.name).await,
+        };
+        // Grants are set only through the admin-only `docker.stack_allow`,
+        // and stay bound to the services and images they name.
+        let row = stacks::payload_row(
+            &p.name,
+            &dir,
             file,
-            enabled: true,
-            // Grants are set only through the admin-only `docker.stack_allow`,
-            // and stay bound to the services and images they name.
-            allow: current
+            current
                 .as_ref()
                 .map(|r| r.allow.clone())
                 .unwrap_or_default(),
-        };
+            source.as_ref(),
+            &crate::stacks::allowed_roots()?,
+        );
         row.write_checked(
             p.compose_yaml.as_deref(),
             p.compose_env.as_deref(),
@@ -1740,9 +1745,14 @@ async fn stack_findings(row: &StackRow, roots: &[String]) -> Result<Vec<Finding>
             .map_err(adapter_err)?,
     )
     .await?;
-    Ok(lint::audit(&cfg, &row.dir, roots, &|p| p.exists(), &|p| {
+    let mut findings = lint::audit(&cfg, &row.dir, roots, &|p| p.exists(), &|p| {
         lint::is_taken(p, &bound)
-    }))
+    });
+    findings.extend(lint::ignored_overrides(
+        std::path::Path::new(&row.dir),
+        &row.files,
+    ));
+    Ok(findings)
 }
 
 /// Host paths bind-mounted by any container on this engine.
@@ -2539,7 +2549,7 @@ fn inspected_id(info: &bollard::models::ContainerInspectResponse, asked: &str) -
         .ok_or_else(|| anyhow::anyhow!("inspect {asked}: no container id"))
 }
 
-const COMPOSE_WORKING_DIR_LABEL: &str = "com.docker.compose.project.working_dir";
+use crate::stacks_root_drift::WORKING_DIR_LABEL as COMPOSE_WORKING_DIR_LABEL;
 const COMPOSE_CONFIG_HASH_LABEL: &str = "com.docker.compose.config-hash";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3780,6 +3790,8 @@ mod tests {
             file: "compose.yaml".into(),
             enabled: true,
             allow: Vec::new(),
+            files: Vec::new(),
+            env_files: Vec::new(),
         };
         let summary = |id: &str, wd: Option<&str>| bollard::models::ContainerSummary {
             id: Some(id.into()),
@@ -3819,6 +3831,8 @@ mod tests {
             file: "compose.yaml".into(),
             enabled: true,
             allow: Vec::new(),
+            files: Vec::new(),
+            env_files: Vec::new(),
         };
         let summary = |id: &str, wd: &std::path::Path| bollard::models::ContainerSummary {
             id: Some(id.into()),
@@ -4564,6 +4578,8 @@ mod tests {
             file: "compose.yaml".into(),
             enabled: true,
             allow: Vec::new(),
+            files: Vec::new(),
+            env_files: Vec::new(),
         };
         stacks::put(&row).unwrap();
         row
@@ -4758,6 +4774,49 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join("compose.yaml")).unwrap(),
             yaml
+        );
+    }
+
+    #[test]
+    fn restore_checks_every_listed_file() {
+        if !crate::test_support::have_compose() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let yaml = "services:\n  app:\n    image: x:1\n";
+        let dir = root.join("web");
+        let ((), _) = crate::test_support::with_db(|| {
+            register_root(&root);
+            let mut row = registered_stack(&dir, yaml, None);
+            std::fs::write(dir.join("extra.yaml"), "services: {}\n").unwrap();
+            row.files = vec![
+                path(&dir.join("compose.yaml")),
+                path(&dir.join("extra.yaml")),
+            ];
+            stacks::put(&row).unwrap();
+            for (extra, want) in [
+                (
+                    "services:\n  sidecar:\n    image: y:1\n    privileged: true\n",
+                    "privileged: true",
+                ),
+                (
+                    "services:\n  sidecar:\n    image: y:1\n    volumes: [\"/etc:/host-etc\"]\n",
+                    "/etc",
+                ),
+            ] {
+                let restore =
+                    stack_archive(&root, &[("compose.yaml", yaml), ("extra.yaml", extra)]);
+                let err = err_of(stack_update(ACTION_RESTORE, Some(restore)));
+                assert!(
+                    err.contains("restore refused") && err.contains(want),
+                    "{err}"
+                );
+            }
+        });
+        assert_eq!(
+            std::fs::read_to_string(dir.join("extra.yaml")).unwrap(),
+            "services: {}\n"
         );
     }
 
@@ -5605,6 +5664,8 @@ mod tests {
             file: "compose.yaml".into(),
             enabled: true,
             allow: Vec::new(),
+            files: Vec::new(),
+            env_files: Vec::new(),
         };
         let c = &snap("sha256:old").containers[0];
         let plain = planned_image(&row, c, vec!["sha256:a".into()], Ok("sha256:b".into()));

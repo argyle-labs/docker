@@ -20,40 +20,11 @@ use bollard::models::{ContainerSummary, DistributionInspect};
 use bollard::query_parameters::{InspectContainerOptionsBuilder, ListContainersOptionsBuilder};
 use plugin_toolkit::prelude::*;
 
+use crate::image_ref::repository;
 use crate::prune::COMPOSE_PROJECT_LABEL;
 
 pub const COMPOSE_SERVICE_LABEL: &str = "com.docker.compose.service";
 pub const COMPOSE_ONEOFF_LABEL: &str = "com.docker.compose.oneoff";
-
-const DOCKER_HUB: &str = "docker.io";
-
-/// `registry/path` of an image reference with its tag and digest removed,
-/// with Docker Hub's implied registry and `library/` namespace filled in.
-pub fn repository(reference: &str) -> String {
-    let name = reference.split('@').next().unwrap_or(reference);
-    // A `:` after the last `/` is a tag; before it, a registry port.
-    let name = match name.rfind(':') {
-        Some(i) if !name[i..].contains('/') => &name[..i],
-        _ => name,
-    };
-    let (registry, path) = match name.split_once('/') {
-        Some((first, rest))
-            if first.contains('.') || first.contains(':') || first == "localhost" =>
-        {
-            (first, rest)
-        }
-        _ => (DOCKER_HUB, name),
-    };
-    let registry = match registry {
-        "index.docker.io" | "registry-1.docker.io" => DOCKER_HUB,
-        r => r,
-    };
-    if registry == DOCKER_HUB && !path.contains('/') {
-        format!("{DOCKER_HUB}/library/{path}")
-    } else {
-        format!("{registry}/{path}")
-    }
-}
 
 /// The registry host of `reference`, normalized as in [`repository`].
 pub fn registry_host(reference: &str) -> String {
@@ -510,37 +481,6 @@ mod tests {
         format!(
             r#"{{"Descriptor":{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{digest}","size":1000}},"Platforms":[{{"architecture":"amd64","os":"linux"}}]}}"#
         )
-    }
-
-    #[test]
-    fn repository_normalizes_hub_and_strips_tag_and_digest() {
-        assert_eq!(repository("nginx"), "docker.io/library/nginx");
-        assert_eq!(repository("nginx:1.27"), "docker.io/library/nginx");
-        assert_eq!(
-            repository("docker.io/library/nginx:latest"),
-            "docker.io/library/nginx"
-        );
-        assert_eq!(
-            repository("index.docker.io/grafana/grafana"),
-            "docker.io/grafana/grafana"
-        );
-        assert_eq!(
-            repository("grafana/grafana:11"),
-            "docker.io/grafana/grafana"
-        );
-        assert_eq!(
-            repository("lscr.io/linuxserver/sonarr:latest"),
-            "lscr.io/linuxserver/sonarr"
-        );
-        assert_eq!(
-            repository(&format!("ghcr.io/org/app@{INDEX}")),
-            "ghcr.io/org/app"
-        );
-        assert_eq!(
-            repository("gitea.example:3000/org/app:v1"),
-            "gitea.example:3000/org/app"
-        );
-        assert_eq!(repository("localhost/app"), "localhost/app");
     }
 
     #[test]

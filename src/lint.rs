@@ -81,6 +81,9 @@ pub enum FindingKind {
     BindWholeRoot,
     /// Data on a named volume, outside the stack's bind-mounted paths.
     NamedVolume,
+    /// An override file next to the compose file that the running project's
+    /// labels do not list, so compose does not load it for this project.
+    IgnoredOverride,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -98,6 +101,29 @@ pub struct Finding {
     pub proposed: Option<String>,
     /// Whether `fix` can rewrite it.
     pub fixable: bool,
+}
+
+/// A warning for each override file in `dir` that `listed` (a discovered
+/// project's config files) leaves out. None when nothing is listed.
+pub fn ignored_overrides(dir: &Path, listed: &[String]) -> Vec<Finding> {
+    if listed.is_empty() {
+        return Vec::new();
+    }
+    crate::compose::OVERRIDE_FILES
+        .iter()
+        .map(|name| dir.join(name))
+        .filter(|p| p.is_file())
+        .filter(|p| !listed.iter().any(|f| Path::new(f) == p.as_path()))
+        .map(|p| Finding {
+            id: format!("override:{}", p.display()),
+            kind: FindingKind::IgnoredOverride,
+            service: String::new(),
+            detail: "an override file sits next to the compose file but the project's labels do not list it, so compose does not load it".to_string(),
+            current: p.to_string_lossy().into_owned(),
+            proposed: None,
+            fixable: false,
+        })
+        .collect()
 }
 
 /// Whether `path` is `root` or below it, by whole components. A path with a
@@ -468,7 +494,9 @@ fn set_in_override(lines: &[String], f: &Finding) -> bool {
                     .any(|l| rewrite_volume_source(l, &f.current, "").is_some())
             })
         }
-        FindingKind::NamedVolume | FindingKind::BindWholeRoot => false,
+        FindingKind::NamedVolume | FindingKind::BindWholeRoot | FindingKind::IgnoredOverride => {
+            false
+        }
     }
 }
 
@@ -1073,5 +1101,26 @@ services:
         let d = diff("a\nb\nc\n", "a\nB\nc\n");
         assert_eq!(d, " a\n-b\n+B\n c\n");
         assert_eq!(diff("same\n", "same\n"), "");
+    }
+
+    #[test]
+    fn an_override_left_off_the_labels_is_a_warning_finding() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::write(d.join("compose.yaml"), "").unwrap();
+        std::fs::write(d.join("compose.override.yaml"), "").unwrap();
+        let listed = vec![d.join("compose.yaml").to_string_lossy().into_owned()];
+        let found = ignored_overrides(d, &listed);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].kind, FindingKind::IgnoredOverride);
+        assert!(found[0].current.ends_with("compose.override.yaml"));
+        assert!(ignored_overrides(d, &[]).is_empty());
+        let both = vec![
+            listed[0].clone(),
+            d.join("compose.override.yaml")
+                .to_string_lossy()
+                .into_owned(),
+        ];
+        assert!(ignored_overrides(d, &both).is_empty());
     }
 }

@@ -1801,6 +1801,8 @@ mod tests {
             file: "docker-compose.yml".into(),
             enabled: true,
             allow: Vec::new(),
+            files: Vec::new(),
+            env_files: Vec::new(),
         };
         let target = DockerDeployTarget::new("host-a", root);
         let adopt = || {

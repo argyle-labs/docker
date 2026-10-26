@@ -10,31 +10,11 @@ use bollard::models::{ContainerInspectResponse, ContainerSummary};
 use bollard::query_parameters::{InspectContainerOptionsBuilder, ListContainersOptionsBuilder};
 use plugin_toolkit::prelude::*;
 
+use crate::image_ref::{repository, written_repository};
 use crate::prune::COMPOSE_PROJECT_LABEL;
 
 const TOOL: &str = "docker.stack_manifest";
 const COMPOSE_SERVICE_LABEL: &str = "com.docker.compose.service";
-
-/// `ref` without its tag or digest: `ghcr.io/a/b:1` → `ghcr.io/a/b`.
-pub fn repo_of(reference: &str) -> &str {
-    let no_digest = reference.split('@').next().unwrap_or(reference);
-    let slash = no_digest.rfind('/').map_or(0, |i| i + 1);
-    match no_digest[slash..].rfind(':') {
-        Some(i) => &no_digest[..slash + i],
-        None => no_digest,
-    }
-}
-
-/// `docker.io/library/redis`, `index.docker.io/library/redis` and `redis`
-/// name the same repository.
-pub(crate) fn normalize(repo: &str) -> &str {
-    let r = repo
-        .strip_prefix("docker.io/")
-        .or_else(|| repo.strip_prefix("index.docker.io/"))
-        .or_else(|| repo.strip_prefix("registry-1.docker.io/"))
-        .unwrap_or(repo);
-    r.strip_prefix("library/").unwrap_or(r)
-}
 
 /// `reference` pinned to the digest among `repo_digests` for its repository,
 /// or why it cannot be.
@@ -42,13 +22,13 @@ pub fn pin(reference: &str, repo_digests: &[String]) -> std::result::Result<Stri
     if reference.contains("@sha256:") {
         return Ok(reference.to_owned());
     }
-    let repo = normalize(repo_of(reference));
+    let repo = repository(reference);
     let found = repo_digests
         .iter()
-        .find(|d| normalize(repo_of(d)) == repo)
+        .find(|d| repository(d) == repo)
         .and_then(|d| d.split_once('@'));
     match found {
-        Some((_, digest)) => Ok(format!("{}@{digest}", repo_of(reference))),
+        Some((_, digest)) => Ok(format!("{}@{digest}", written_repository(reference))),
         None if repo_digests.is_empty() => {
             Err("no registry digest: built locally or never pulled".into())
         }
@@ -235,15 +215,6 @@ async fn docker_stack_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn repo_of_strips_tag_and_digest_but_not_registry_port() {
-        assert_eq!(repo_of("redis:7"), "redis");
-        assert_eq!(repo_of("ghcr.io/a/b:1.2"), "ghcr.io/a/b");
-        assert_eq!(repo_of("reg:5000/app"), "reg:5000/app");
-        assert_eq!(repo_of("reg:5000/app:v1"), "reg:5000/app");
-        assert_eq!(repo_of("app@sha256:abc"), "app");
-    }
 
     #[test]
     fn pins_by_the_matching_repository_digest() {

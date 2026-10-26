@@ -166,6 +166,8 @@ pub fn overlapping_dirs(root: &std::path::Path) -> Vec<std::path::PathBuf> {
         file: "compose.yaml".into(),
         enabled: true,
         allow: vec![bind.parse().unwrap()],
+        files: Vec::new(),
+        env_files: Vec::new(),
     })
     .unwrap();
     let dirs = [

@@ -15,25 +15,65 @@
 //! Networks that any managed stack declares `external: true` are never
 //! candidates. When a stack's config cannot be read, no network is a
 //! candidate, because any of them might be that stack's external network.
+//! The same holds for orphan volumes and unused images, and for dangling
+//! images pinned by digest: a volume any stack's config declares, and an
+//! image any of its services uses or builds, is never one. The stacks are the
+//! registered ones, those containers name (with every config and env file
+//! their labels list), and every compose project directly under the stacks
+//! roots (see [`crate::stacks::from_labels`]); each config is resolved with
+//! every profile, its env files and its project name. The plan names each
+//! project, path and cause that withholds anything. A registered or
+//! root-scanned stack that cannot be read withholds networks too; a running
+//! project only the refs it could add beyond what its containers already
+//! use, and a stopped one whose dir is gone is only reported. Unset
+//! variables are listed, and withhold only when they appear in an image,
+//! volume or network name. With Swarm active, every service's image is
+//! protected too, and services that cannot be listed withhold the refs.
 //!
-//! `dry_run` returns the plan, which lists every candidate by key. Execute takes
-//! those keys back, recomputes the candidates, and removes only keys present
-//! in both. The engine still refuses to remove anything in use, which is
-//! reported as skipped.
+//! Opt-in, host-wide only: `unusedImages` adds tagged images that no
+//! container, running or stopped, uses directly or through a parent or child
+//! image, last pulled or tagged (`Metadata.LastTagTime`) at least
+//! `minPullAgeDays` (default 1) and, if set, `olderThanDays` ago, and only the
+//! oldest-created until the unused ones left fit `keepBytes`; `buildCache`
+//! prunes the build cache down to `buildCacheKeepBytes`, which must be given;
+//! `orphanVolumes` adds named volumes no container mounts that carry no
+//! `com.docker.*` ownership label (compose, Swarm) or `orca.stack` label and
+//! were created at least `orphanVolumeMinAgeDays` (default 7) ago. A volume
+//! the engine reports no creation time for is never a candidate. Image bytes count only layers no other image shares.
+//!
+//! An image is removed by one DELETE of its id without force, which the engine
+//! refuses atomically when anything uses it. An image with several tags is
+//! refused that way too; unless an image is built on it, it is then untagged
+//! one tag at a time (not on the containerd image store, where an untagged
+//! image's content can go with its last tag, so it is skipped), each right
+//! after re-checking that no container uses it, stopping at the first that
+//! does.
+//!
+//! `dry_run` returns the plan, which lists every candidate by key. A volume's
+//! key carries its creation time and the build cache's its reclaimable size,
+//! so a recreated volume or a changed cache is not what was planned. Execute
+//! takes those keys back, recomputes the candidates, and removes only keys
+//! present in both. The engine still refuses to remove anything in use, which
+//! is reported as skipped.
 #![allow(clippy::disallowed_types)]
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use bollard::Docker;
-use bollard::models::{ContainerSummary, ImageSummary, Network, Volume};
+use bollard::models::{ContainerSummary, ImageSummary, LocalNodeState, Network, Volume};
 use bollard::query_parameters::{
-    ListContainersOptionsBuilder, ListImagesOptionsBuilder, ListNetworksOptionsBuilder,
-    ListVolumesOptionsBuilder, RemoveImageOptionsBuilder, RemoveVolumeOptionsBuilder,
+    DataUsageOptions, ListContainersOptionsBuilder, ListImagesOptionsBuilder,
+    ListNetworksOptionsBuilder, ListVolumesOptionsBuilder, PruneBuildOptionsBuilder,
+    RemoveImageOptionsBuilder, RemoveVolumeOptionsBuilder,
 };
 use plugin_toolkit::contract::plan::{ExecutionPlan, PlannedChange};
 use plugin_toolkit::prelude::*;
 
 use crate::execute;
+use crate::image_ref::ImageRef;
 
 pub const ANONYMOUS_VOLUME_LABEL: &str = "com.docker.volume.anonymous";
 pub const COMPOSE_PROJECT_LABEL: &str = "com.docker.compose.project";
@@ -50,6 +90,7 @@ pub enum ResourceKind {
     Image,
     Volume,
     Network,
+    BuildCache,
 }
 
 impl ResourceKind {
@@ -58,6 +99,7 @@ impl ResourceKind {
             ResourceKind::Image => "image",
             ResourceKind::Volume => "volume",
             ResourceKind::Network => "network",
+            ResourceKind::BuildCache => "buildcache",
         }
     }
 }
@@ -73,6 +115,8 @@ pub struct Candidate {
     /// Engine id (images, networks) or name (volumes) used to remove it.
     pub id: String,
     pub detail: String,
+    #[serde(default)]
+    pub bytes: i64,
 }
 
 impl Candidate {
@@ -82,6 +126,7 @@ impl Candidate {
             kind,
             id: id.to_string(),
             detail,
+            bytes: 0,
         }
     }
 }
@@ -94,6 +139,340 @@ pub struct Scope<'a> {
     /// Networks managed stacks declare `external: true`, by name or id.
     /// `None` means unknown, so no network is a candidate.
     pub external_networks: Option<&'a HashSet<String>>,
+    /// What managed stacks reference. `None` means unknown, so no orphan
+    /// volume or unused image is a candidate.
+    pub stack_refs: Option<&'a StackRefs>,
+    pub extras: Extras,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StackRefs {
+    pub volumes: HashSet<String>,
+    pub images: HashSet<String>,
+}
+
+fn referenced_by_stacks(i: &ImageSummary, refs: &HashSet<String>) -> bool {
+    refs.iter()
+        .any(|r| i.id == *r || ImageRef::parse(r).matches(&i.repo_tags, &i.repo_digests))
+}
+
+/// What a plan's protection covers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Protection {
+    pub stacks: usize,
+    pub scanned: usize,
+    pub roots: Vec<String>,
+    pub swarm_services: usize,
+    pub withheld: Withheld,
+    pub unset: Vec<String>,
+}
+
+fn plural(n: usize, word: &str) -> String {
+    if n == 1 {
+        format!("{n} {word}")
+    } else {
+        format!("{n} {word}s")
+    }
+}
+
+impl Protection {
+    fn describe(&self) -> String {
+        let mut parts = vec![format!(
+            "protected: the images and volumes of {} and {} under {}, and the images of {}",
+            plural(self.stacks, "managed or running stack"),
+            plural(self.scanned, "compose project"),
+            self.roots.join(", "),
+            plural(self.swarm_services, "swarm service")
+        )];
+        let w = &self.withheld;
+        for (list, label) in [
+            (
+                &w.refs,
+                "orphan volumes, unused images and digest-pinned dangling images not considered",
+            ),
+            (&w.networks, "networks not considered"),
+            (&w.reported, "reported"),
+            (&self.unset, "unset variables"),
+        ] {
+            if !list.is_empty() {
+                parts.push(format!("{label}: {}", list.join("; ")));
+            }
+        }
+        parts.join("; ")
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UnusedImages {
+    pub now: i64,
+    pub older_than_secs: Option<i64>,
+    pub keep_bytes: Option<i64>,
+    pub min_pull_age_secs: i64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OrphanVolumes {
+    pub now: i64,
+    pub min_age_secs: i64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Extras {
+    pub unused_images: Option<UnusedImages>,
+    pub build_cache_keep_bytes: Option<i64>,
+    pub orphan_volumes: Option<OrphanVolumes>,
+}
+
+const DAY: u64 = 86_400;
+const DEFAULT_MIN_PULL_AGE_DAYS: u64 = 1;
+const DEFAULT_ORPHAN_VOLUME_MIN_AGE_DAYS: u64 = 7;
+
+fn epoch(date: Option<&str>) -> Option<i64> {
+    plugin_toolkit::time::Timestamp::parse_rfc3339(date?)
+        .ok()
+        .map(|t| t.unix_seconds())
+        .filter(|&t| t > 0)
+}
+
+fn unique_bytes(i: &ImageSummary) -> i64 {
+    if i.shared_size < 0 {
+        i.size.max(0)
+    } else {
+        (i.size - i.shared_size).max(0)
+    }
+}
+
+fn container_image_ids<'a>(
+    images: &'a [ImageSummary],
+    containers: &'a [ContainerSummary],
+) -> HashSet<&'a str> {
+    let mut used = HashSet::new();
+    for c in containers {
+        if let Some(id) = c.image_id.as_deref().filter(|id| !id.is_empty()) {
+            used.insert(id);
+            continue;
+        }
+        let Some(name) = c.image.as_deref() else {
+            continue;
+        };
+        let wanted = ImageRef::parse(name);
+        if let Some(i) = images
+            .iter()
+            .find(|i| i.id == name || wanted.matches(&i.repo_tags, &i.repo_digests))
+        {
+            used.insert(i.id.as_str());
+        }
+    }
+    used
+}
+
+fn protected_images<'a>(
+    images: &'a [ImageSummary],
+    containers: &'a [ContainerSummary],
+    refs: &HashSet<String>,
+) -> HashSet<&'a str> {
+    let parent: HashMap<&str, &str> = images
+        .iter()
+        .filter(|i| !i.parent_id.is_empty())
+        .map(|i| (i.id.as_str(), i.parent_id.as_str()))
+        .collect();
+    let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (child, p) in &parent {
+        children.entry(p).or_default().push(child);
+    }
+    let mut used = container_image_ids(images, containers);
+    used.extend(
+        images
+            .iter()
+            .filter(|i| referenced_by_stacks(i, refs))
+            .map(|i| i.id.as_str()),
+    );
+    let mut out: HashSet<&str> = HashSet::new();
+    for &id in &used {
+        let mut cur = id;
+        while let Some(&p) = parent.get(cur) {
+            if !out.insert(p) {
+                break;
+            }
+            cur = p;
+        }
+        let mut stack = vec![id];
+        while let Some(n) = stack.pop() {
+            if out.insert(n) {
+                stack.extend(children.get(n).into_iter().flatten().copied());
+            }
+        }
+    }
+    out
+}
+
+fn unused_images<'a>(
+    images: &'a [ImageSummary],
+    containers: &[ContainerSummary],
+    refs: &HashSet<String>,
+) -> Vec<&'a ImageSummary> {
+    let protected = protected_images(images, containers, refs);
+    images
+        .iter()
+        .filter(|i| !is_dangling_image(i) && !protected.contains(i.id.as_str()))
+        .collect()
+}
+
+pub fn unused_image_candidates(
+    images: &[ImageSummary],
+    containers: &[ContainerSummary],
+    u: UnusedImages,
+    tagged_at: &HashMap<String, i64>,
+    refs: &HashSet<String>,
+) -> Vec<Candidate> {
+    let unused = unused_images(images, containers, refs);
+    let min_age = u.older_than_secs.unwrap_or(0).max(u.min_pull_age_secs);
+    let mut eligible: Vec<&ImageSummary> = unused
+        .iter()
+        .copied()
+        .filter(|i| tagged_at.get(&i.id).is_some_and(|&t| t <= u.now - min_age))
+        .collect();
+    eligible.sort_by(|a, b| a.created.cmp(&b.created).then_with(|| a.id.cmp(&b.id)));
+    if let Some(budget) = u.keep_bytes {
+        let mut total: i64 = unused.iter().map(|i| unique_bytes(i)).sum();
+        eligible.retain(|i| {
+            if total <= budget {
+                return false;
+            }
+            total -= unique_bytes(i);
+            true
+        });
+    }
+    eligible
+        .into_iter()
+        .map(|i| Candidate {
+            bytes: unique_bytes(i),
+            ..Candidate::new(
+                ResourceKind::Image,
+                &i.id,
+                format!(
+                    "unused image {}, created {}d ago, last pulled or tagged {}d ago, {} unique bytes",
+                    i.repo_tags.join(", "),
+                    (u.now - i.created).max(0) / 86_400,
+                    tagged_at.get(&i.id).map_or(0, |t| (u.now - t).max(0) / 86_400),
+                    unique_bytes(i)
+                ),
+            )
+        })
+        .collect()
+}
+
+fn volume_candidate(v: &Volume, detail: &str) -> Option<Candidate> {
+    let created = v.created_at.as_deref().filter(|c| !c.is_empty())?;
+    let mut c = Candidate::new(ResourceKind::Volume, &v.name, detail.to_string());
+    c.key = format!("{}@{created}", c.key);
+    Some(c)
+}
+
+fn owned(v: &Volume) -> bool {
+    v.labels.contains_key(crate::labels::STACK)
+        || v.labels
+            .keys()
+            .any(|k| k.starts_with("com.docker.") && k != ANONYMOUS_VOLUME_LABEL)
+}
+
+pub fn orphan_volume_candidates(
+    volumes: &[Volume],
+    project: Option<&str>,
+    mounts: &HashMap<String, String>,
+    o: OrphanVolumes,
+    referenced: &HashSet<String>,
+) -> Vec<Candidate> {
+    volumes
+        .iter()
+        .filter(|v| {
+            !v.labels.contains_key(ANONYMOUS_VOLUME_LABEL)
+                || v.labels.contains_key(COMPOSE_VOLUME_LABEL)
+        })
+        .filter(|v| !owned(v) && !referenced.contains(&v.name))
+        .filter(|v| epoch(v.created_at.as_deref()).is_some_and(|t| t <= o.now - o.min_age_secs))
+        .filter(|v| match project {
+            Some(p) => crate::label_audit::volume_owner(v, mounts).as_deref() == Some(p),
+            None => true,
+        })
+        .filter_map(|v| volume_candidate(v, "orphaned named volume, no container mounts it"))
+        .collect()
+}
+
+fn as_bytes(name: &str, v: u64) -> Result<i64> {
+    i64::try_from(v).map_err(|_| anyhow!("{TOOL}: `{name}` is too large"))
+}
+
+fn days(name: &str, d: u64) -> Result<i64> {
+    as_bytes(name, d.saturating_mul(DAY))
+}
+
+pub fn extras(args: &DockerPruneArgs, now: i64) -> Result<Extras> {
+    if !args.unused_images
+        && (args.older_than_days.is_some()
+            || args.keep_bytes.is_some()
+            || args.min_pull_age_days.is_some())
+    {
+        bail!("{TOOL}: `olderThanDays`, `minPullAgeDays` and `keepBytes` need `unusedImages`");
+    }
+    if !args.orphan_volumes && args.orphan_volume_min_age_days.is_some() {
+        bail!("{TOOL}: `orphanVolumeMinAgeDays` needs `orphanVolumes`");
+    }
+    if !args.build_cache && args.build_cache_keep_bytes.is_some() {
+        bail!("{TOOL}: `buildCacheKeepBytes` needs `buildCache`");
+    }
+    if args.build_cache && args.build_cache_keep_bytes.is_none() {
+        bail!("{TOOL}: `buildCache` needs `buildCacheKeepBytes`; pass 0 to empty the cache");
+    }
+    if args.stack.is_some() && (args.unused_images || args.build_cache || args.orphan_volumes) {
+        bail!(
+            "{TOOL}: `unusedImages`, `buildCache` and `orphanVolumes` are host-wide; drop `stack`"
+        );
+    }
+    let unused_images = if args.unused_images {
+        Some(UnusedImages {
+            now,
+            older_than_secs: args
+                .older_than_days
+                .map(|d| days("olderThanDays", d))
+                .transpose()?,
+            keep_bytes: args
+                .keep_bytes
+                .map(|b| as_bytes("keepBytes", b))
+                .transpose()?,
+            min_pull_age_secs: days(
+                "minPullAgeDays",
+                args.min_pull_age_days.unwrap_or(DEFAULT_MIN_PULL_AGE_DAYS),
+            )?,
+        })
+    } else {
+        None
+    };
+    let build_cache_keep_bytes = if args.build_cache {
+        Some(as_bytes(
+            "buildCacheKeepBytes",
+            args.build_cache_keep_bytes.unwrap_or_default(),
+        )?)
+    } else {
+        None
+    };
+    let orphan_volumes = if args.orphan_volumes {
+        Some(OrphanVolumes {
+            now,
+            min_age_secs: days(
+                "orphanVolumeMinAgeDays",
+                args.orphan_volume_min_age_days
+                    .unwrap_or(DEFAULT_ORPHAN_VOLUME_MIN_AGE_DAYS),
+            )?,
+        })
+    } else {
+        None
+    };
+    Ok(Extras {
+        unused_images,
+        build_cache_keep_bytes,
+        orphan_volumes,
+    })
 }
 
 /// Untagged images, including ones pulled by digest only.
@@ -102,19 +481,26 @@ fn is_dangling_image(img: &ImageSummary) -> bool {
 }
 
 /// Dangling images. Images carry no compose project, so a project-scoped
-/// prune has none.
-pub fn image_candidates(images: &[ImageSummary], project: Option<&str>) -> Vec<Candidate> {
+/// prune has none. One pinned by digest is left out when `refs` names it or
+/// is unknown.
+pub fn image_candidates(
+    images: &[ImageSummary],
+    project: Option<&str>,
+    refs: Option<&HashSet<String>>,
+) -> Vec<Candidate> {
     if project.is_some() {
         return Vec::new();
     }
     images
         .iter()
         .filter(|i| is_dangling_image(i))
-        .map(|i| {
-            Candidate::new(
+        .filter(|i| i.repo_digests.is_empty() || refs.is_some_and(|r| !referenced_by_stacks(i, r)))
+        .map(|i| Candidate {
+            bytes: unique_bytes(i),
+            ..Candidate::new(
                 ResourceKind::Image,
                 &i.id,
-                format!("dangling image, {} bytes", i.size),
+                format!("dangling image, {} unique bytes", unique_bytes(i)),
             )
         })
         .collect()
@@ -136,13 +522,7 @@ pub fn volume_candidates(
             Some(p) => crate::label_audit::volume_owner(v, mounts).as_deref() == Some(p),
             None => true,
         })
-        .map(|v| {
-            Candidate::new(
-                ResourceKind::Volume,
-                &v.name,
-                "dangling anonymous volume".to_string(),
-            )
-        })
+        .filter_map(|v| volume_candidate(v, "dangling anonymous volume"))
         .collect()
 }
 
@@ -199,6 +579,79 @@ fn engine_err(what: &str, e: bollard::errors::Error) -> plugin_toolkit::anyhow::
     anyhow!("{what}: {e}")
 }
 
+const ATTEMPTS: u32 = 3;
+const CALL_TIMEOUT: Duration = Duration::from_secs(120);
+const PRUNE_BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const MIN_RESERVED_SPACE_API: (u32, u32) = (1, 48);
+
+fn retryable(e: &bollard::errors::Error, mutating: bool) -> bool {
+    match e {
+        bollard::errors::Error::DockerResponseServerError { status_code, .. } => {
+            *status_code >= 500
+        }
+        bollard::errors::Error::RequestTimeoutError => !mutating,
+        _ => true,
+    }
+}
+
+async fn attempt<T, F, Fut>(
+    f: F,
+    mutating: bool,
+) -> (u32, std::result::Result<T, bollard::errors::Error>)
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = std::result::Result<T, bollard::errors::Error>>,
+{
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let r = plugin_toolkit::time::timeout(CALL_TIMEOUT, f())
+            .await
+            .unwrap_or(Err(bollard::errors::Error::RequestTimeoutError));
+        match r {
+            Err(e) if attempt < ATTEMPTS && retryable(&e, mutating) => {
+                plugin_toolkit::time::sleep(Duration::from_millis(250 << attempt)).await
+            }
+            r => return (attempt, r),
+        }
+    }
+}
+
+async fn call<T, F, Fut>(f: F) -> std::result::Result<T, bollard::errors::Error>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = std::result::Result<T, bollard::errors::Error>>,
+{
+    attempt(f, false).await.1
+}
+
+async fn delete<T, F, Fut>(f: F) -> std::result::Result<(), bollard::errors::Error>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = std::result::Result<T, bollard::errors::Error>>,
+{
+    match attempt(f, true).await {
+        (_, Ok(_)) => Ok(()),
+        (n, Err(e)) if n > 1 && is_404(&e) => Ok(()),
+        (_, Err(e)) => Err(e),
+    }
+}
+
+fn is_404(e: &bollard::errors::Error) -> bool {
+    matches!(
+        e,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            ..
+        }
+    )
+}
+
+fn api_at_least(version: &str, min: (u32, u32)) -> bool {
+    let mut parts = version.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+    (parts.next().unwrap_or(0), parts.next().unwrap_or(0)) >= min
+}
+
 fn label_filter(project: Option<&str>) -> HashMap<&'static str, Vec<String>> {
     let label = match project {
         Some(p) => format!("{COMPOSE_PROJECT_LABEL}={p}"),
@@ -212,53 +665,181 @@ fn dangling_filter() -> HashMap<&'static str, Vec<&'static str>> {
 }
 
 /// The dangling-image candidates alone.
-pub async fn dangling_images(docker: &Docker) -> Result<Vec<Candidate>> {
-    let images = docker
-        .list_images(Some(
+pub async fn dangling_images(
+    docker: &Docker,
+    refs: Option<&HashSet<String>>,
+) -> Result<Vec<Candidate>> {
+    let images = call(|| {
+        docker.list_images(Some(
             ListImagesOptionsBuilder::new()
                 .filters(&dangling_filter())
+                .shared_size(true)
                 .build(),
         ))
+    })
+    .await
+    .map_err(|e| engine_err("list images", e))?;
+    Ok(image_candidates(&images, None, refs))
+}
+
+async fn list_containers(docker: &Docker) -> Result<Vec<ContainerSummary>> {
+    call(|| docker.list_containers(Some(ListContainersOptionsBuilder::new().all(true).build())))
         .await
-        .map_err(|e| engine_err("list images", e))?;
-    Ok(image_candidates(&images, None))
+        .map_err(|e| engine_err("list containers", e))
+}
+
+async fn build_cache_candidate(docker: &Docker, keep: i64) -> Result<Option<Candidate>> {
+    let usage = call(|| docker.df(Some(DataUsageOptions::default())))
+        .await
+        .map_err(|e| engine_err("build cache usage", e))?
+        .build_cache_usage;
+    let id = keep.to_string();
+    let Some(reclaimable) = usage.and_then(|u| u.reclaimable) else {
+        return Ok(Some(Candidate::new(
+            ResourceKind::BuildCache,
+            &id,
+            format!("build cache down to {keep} bytes; the engine reports no reclaimable size"),
+        )));
+    };
+    let bytes = (reclaimable - keep).max(0);
+    Ok((bytes > 0).then(|| {
+        let mut c = Candidate {
+            bytes,
+            ..Candidate::new(
+                ResourceKind::BuildCache,
+                &id,
+                format!("build cache down to {keep} bytes, at most {bytes} bytes reclaimed"),
+            )
+        };
+        c.key = format!("{}@{reclaimable}", c.key);
+        c
+    }))
+}
+
+fn swarm_state(info: &bollard::models::SystemInfo) -> Option<LocalNodeState> {
+    info.swarm.as_ref().and_then(|s| s.local_node_state)
+}
+
+fn containerd_store(info: &bollard::models::SystemInfo) -> bool {
+    info.driver_status
+        .iter()
+        .flatten()
+        .flatten()
+        .any(|v| v.starts_with("io.containerd.snapshotter"))
+}
+
+/// `configs` plus every swarm service's image; services that cannot be
+/// read withhold the refs.
+async fn with_swarm(docker: &Docker, mut configs: StackConfigs) -> Result<StackConfigs> {
+    let info = call(|| docker.info())
+        .await
+        .map_err(|e| engine_err("engine info", e))?;
+    match swarm_state(&info) {
+        None | Some(LocalNodeState::EMPTY | LocalNodeState::INACTIVE) => {}
+        Some(LocalNodeState::ACTIVE) => match call(|| docker.list_services(None)).await {
+            Ok(services) => {
+                configs.protection.swarm_services = services.len();
+                configs.refs.images.extend(
+                    services
+                        .into_iter()
+                        .filter_map(|s| s.spec?.task_template?.container_spec?.image),
+                );
+            }
+            Err(e) => configs
+                .protection
+                .withheld
+                .refs
+                .push(format!("swarm services could not be listed: {e}")),
+        },
+        Some(state) => configs.protection.withheld.refs.push(format!(
+            "swarm is {state:?}, so its services cannot be listed"
+        )),
+    }
+    Ok(configs)
 }
 
 /// Every current candidate within `scope`.
 pub async fn candidates(docker: &Docker, scope: Scope<'_>) -> Result<Vec<Candidate>> {
     let project = scope.project;
     let dangling = dangling_filter();
-    let volumes = docker
-        .list_volumes(Some(
+    let volumes = call(|| {
+        docker.list_volumes(Some(
             ListVolumesOptionsBuilder::new().filters(&dangling).build(),
         ))
-        .await
-        .map_err(|e| engine_err("list volumes", e))?
-        .volumes
-        .unwrap_or_default();
-    let networks = docker
-        .list_networks(Some(
+    })
+    .await
+    .map_err(|e| engine_err("list volumes", e))?
+    .volumes
+    .unwrap_or_default();
+    let networks = call(|| {
+        docker.list_networks(Some(
             ListNetworksOptionsBuilder::new()
                 .filters(&label_filter(project))
                 .build(),
         ))
-        .await
-        .map_err(|e| engine_err("list networks", e))?;
-    let containers = docker
-        .list_containers(Some(ListContainersOptionsBuilder::new().all(true).build()))
-        .await
-        .map_err(|e| engine_err("list containers", e))?;
-
-    let mut out = match project {
-        Some(_) => Vec::new(),
-        None => dangling_images(docker).await?,
+    })
+    .await
+    .map_err(|e| engine_err("list networks", e))?;
+    let containers = list_containers(docker).await?;
+    let refs = match project {
+        Some(_) => None,
+        None => scope.stack_refs,
     };
-    out.extend(volume_candidates(
-        &volumes,
-        project,
-        &crate::label_audit::mount_owners(&containers),
-    ));
+
+    let mut out = match (project, scope.extras.unused_images, refs) {
+        (Some(_), _, _) => Vec::new(),
+        (None, None, refs) | (None, Some(_), refs @ None) => {
+            dangling_images(docker, refs.map(|r| &r.images)).await?
+        }
+        (None, Some(u), Some(refs)) => {
+            let images = call(|| {
+                docker.list_images(Some(
+                    ListImagesOptionsBuilder::new().shared_size(true).build(),
+                ))
+            })
+            .await
+            .map_err(|e| engine_err("list images", e))?;
+            let mut tagged_at = HashMap::new();
+            for i in unused_images(&images, &containers, &refs.images) {
+                let inspected = match call(|| docker.inspect_image(&i.id)).await {
+                    Ok(inspected) => inspected,
+                    Err(e) if is_404(&e) => continue,
+                    Err(e) => return Err(engine_err("inspect image", e)),
+                };
+                let last_tag = inspected
+                    .metadata
+                    .and_then(|m| m.last_tag_time)
+                    .and_then(|t| epoch(Some(&t)));
+                if let Some(t) = last_tag {
+                    tagged_at.insert(i.id.clone(), t);
+                }
+            }
+            let mut found = image_candidates(&images, None, Some(&refs.images));
+            found.extend(unused_image_candidates(
+                &images,
+                &containers,
+                u,
+                &tagged_at,
+                &refs.images,
+            ));
+            found
+        }
+    };
+    let mounts = crate::label_audit::mount_owners(&containers);
+    out.extend(volume_candidates(&volumes, project, &mounts));
+    if let (Some(o), Some(refs)) = (scope.extras.orphan_volumes, refs) {
+        out.extend(orphan_volume_candidates(
+            &volumes,
+            project,
+            &mounts,
+            o,
+            &refs.volumes,
+        ));
+    }
     out.extend(network_candidates(&networks, &containers, scope));
+    if let (None, Some(keep)) = (project, scope.extras.build_cache_keep_bytes) {
+        out.extend(build_cache_candidate(docker, keep).await?);
+    }
     Ok(out)
 }
 
@@ -284,6 +865,7 @@ pub struct PruneApplied {
     /// or refused by the engine as in use.
     pub skipped: Vec<Skipped>,
     pub failed: Vec<Skipped>,
+    pub bytes_freed: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -297,43 +879,180 @@ pub enum PruneChange {
 
 /// Whether any container, running or stopped, is attached to network `id`.
 /// The engine itself lets a network go when only stopped containers use it.
-async fn network_in_use(docker: &Docker, id: &str) -> Result<bool> {
-    let filters = HashMap::from([("network", vec![id])]);
-    let attached = docker
-        .list_containers(Some(
+async fn containers_where(docker: &Docker, key: &str, id: &str) -> Result<bool> {
+    let filters = HashMap::from([(key, vec![id])]);
+    let found = call(|| {
+        docker.list_containers(Some(
             ListContainersOptionsBuilder::new()
                 .all(true)
                 .filters(&filters)
                 .build(),
         ))
-        .await
-        .map_err(|e| engine_err("list containers on network", e))?;
-    Ok(!attached.is_empty())
+    })
+    .await
+    .map_err(|e| engine_err(&format!("list containers by {key}"), e))?;
+    Ok(!found.is_empty())
 }
 
-// Removal is by id without force, so the engine refuses anything in use. Two
-// windows of one round trip remain between the last check and the DELETE: a
-// container attaching to a network, and an image being tagged (an image with
-// one tag is untagged and deleted by an id DELETE).
-async fn remove(docker: &Docker, c: &Candidate) -> std::result::Result<(), bollard::errors::Error> {
-    match c.kind {
-        ResourceKind::Image => docker
-            .remove_image(
-                &c.id,
-                Some(RemoveImageOptionsBuilder::new().force(false).build()),
-                None,
-            )
+async fn network_in_use(docker: &Docker, id: &str) -> Result<bool> {
+    containers_where(docker, "network", id).await
+}
+
+enum Recheck {
+    Remove(Vec<String>),
+    Skip(&'static str),
+}
+
+const IN_USE: &str = "in use: a container uses it or an image built from it";
+
+async fn recheck_image(docker: &Docker, id: &str) -> Result<Recheck> {
+    let tags = match call(|| docker.inspect_image(id)).await {
+        Ok(i) => i
+            .repo_tags
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|t| t != "<none>:<none>")
+            .collect(),
+        Err(e) if is_404(&e) => return Ok(Recheck::Skip("already gone")),
+        Err(e) => return Err(engine_err("inspect image", e)),
+    };
+    if containers_where(docker, "ancestor", id).await? {
+        return Ok(Recheck::Skip(IN_USE));
+    }
+    Ok(Recheck::Remove(tags))
+}
+
+fn remove_image_opts() -> bollard::query_parameters::RemoveImageOptions {
+    RemoveImageOptionsBuilder::new().force(false).build()
+}
+
+enum Removal {
+    Removed(i64),
+    Skipped(String),
+}
+
+fn is_multi_ref(e: &bollard::errors::Error) -> bool {
+    matches!(
+        e,
+        bollard::errors::Error::DockerResponseServerError { status_code: 409, message }
+            if message.contains("multiple repositories")
+    )
+}
+
+async fn remove_image(
+    docker: &Docker,
+    c: &Candidate,
+    tags: &[String],
+) -> std::result::Result<Removal, bollard::errors::Error> {
+    match delete(|| docker.remove_image(&c.id, Some(remove_image_opts()), None)).await {
+        Ok(()) => return Ok(Removal::Removed(c.bytes)),
+        Err(e) if is_multi_ref(&e) => {}
+        Err(e) => return Err(e),
+    }
+    if containerd_store(&call(|| docker.info()).await?) {
+        return Ok(Removal::Skipped(
+            "in use: tagged under several names on the containerd image store, where tags are not removed one by one".to_string(),
+        ));
+    }
+    let all = call(|| docker.list_images(Some(ListImagesOptionsBuilder::new().all(true).build())))
+        .await?;
+    if all.iter().any(|i| i.parent_id == c.id) {
+        return Ok(Removal::Skipped(
+            "in use: an image is built on it (dependent child images)".to_string(),
+        ));
+    }
+    let mut untagged = Vec::new();
+    for tag in tags {
+        let still_ours = match call(|| docker.inspect_image(tag)).await {
+            Ok(i) => i.id.as_deref() == Some(c.id.as_str()),
+            Err(e) if is_404(&e) => false,
+            Err(e) => return Err(e),
+        };
+        if !still_ours {
+            continue;
+        }
+        let in_use = containers_where(docker, "ancestor", &c.id)
             .await
-            .map(|_| ()),
+            .map_err(|e| bollard::errors::Error::IOError {
+                err: std::io::Error::other(e.to_string()),
+            })?;
+        if in_use {
+            return Ok(Removal::Skipped(if untagged.is_empty() {
+                IN_USE.to_string()
+            } else {
+                format!("{IN_USE}; already untagged {}", untagged.join(", "))
+            }));
+        }
+        match delete(|| docker.remove_image(tag, Some(remove_image_opts()), None)).await {
+            Ok(()) => untagged.push(tag.clone()),
+            Err(e) if is_404(&e) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    match delete(|| docker.remove_image(&c.id, Some(remove_image_opts()), None)).await {
+        Ok(()) => Ok(Removal::Removed(c.bytes)),
+        Err(e) if is_404(&e) => Ok(Removal::Removed(c.bytes)),
+        Err(e) => Err(e),
+    }
+}
+
+async fn prune_build_cache(
+    docker: &Docker,
+    keep: i64,
+) -> std::result::Result<Removal, bollard::errors::Error> {
+    let api = call(|| docker.version())
+        .await?
+        .api_version
+        .unwrap_or_default();
+    if !api_at_least(&api, MIN_RESERVED_SPACE_API) {
+        return Err(bollard::errors::Error::IOError {
+            err: std::io::Error::other(format!(
+                "engine API {api} predates 1.48 and ignores reserved-space; refusing to prune the whole build cache"
+            )),
+        });
+    }
+    let docker = docker.clone().with_timeout(PRUNE_BUILD_TIMEOUT);
+    let r = plugin_toolkit::time::timeout(
+        PRUNE_BUILD_TIMEOUT,
+        docker.prune_build(Some(
+            PruneBuildOptionsBuilder::new()
+                .reserved_space(keep)
+                .all(true)
+                .build(),
+        )),
+    )
+    .await
+    .unwrap_or(Err(bollard::errors::Error::RequestTimeoutError))?;
+    Ok(Removal::Removed(r.space_reclaimed.unwrap_or(0)))
+}
+
+// Removal is by id without force, so the engine refuses anything in use. A
+// window of one round trip remains between the last check and the DELETE for
+// a container attaching to a network.
+async fn remove(
+    docker: &Docker,
+    c: &Candidate,
+    tags: &[String],
+) -> std::result::Result<Removal, bollard::errors::Error> {
+    match c.kind {
+        ResourceKind::Image => remove_image(docker, c, tags).await,
         ResourceKind::Volume => {
-            docker
-                .remove_volume(
+            delete(|| {
+                docker.remove_volume(
                     &c.id,
                     Some(RemoveVolumeOptionsBuilder::new().force(false).build()),
                 )
-                .await
+            })
+            .await?;
+            Ok(Removal::Removed(0))
         }
-        ResourceKind::Network => docker.remove_network(&c.id).await,
+        ResourceKind::Network => {
+            delete(|| docker.remove_network(&c.id)).await?;
+            Ok(Removal::Removed(0))
+        }
+        ResourceKind::BuildCache => {
+            prune_build_cache(docker, c.id.parse::<i64>().unwrap_or(0)).await
+        }
     }
 }
 
@@ -361,6 +1080,26 @@ pub async fn apply(
         let Some(c) = current.iter().find(|c| c.key == key) else {
             continue;
         };
+        let mut tags = Vec::new();
+        if c.kind == ResourceKind::Image {
+            match recheck_image(docker, &c.id).await {
+                Ok(Recheck::Remove(t)) => tags = t,
+                Ok(Recheck::Skip(reason)) => {
+                    applied.skipped.push(Skipped {
+                        item: key,
+                        reason: reason.into(),
+                    });
+                    continue;
+                }
+                Err(e) => {
+                    applied.failed.push(Skipped {
+                        item: key,
+                        reason: e.to_string(),
+                    });
+                    continue;
+                }
+            }
+        }
         if c.kind == ResourceKind::Network {
             match network_in_use(docker, &c.id).await {
                 Ok(false) => {}
@@ -380,8 +1119,12 @@ pub async fn apply(
                 }
             }
         }
-        match remove(docker, c).await {
-            Ok(()) => applied.removed.push(key),
+        match remove(docker, c, &tags).await {
+            Ok(Removal::Removed(bytes)) => {
+                applied.bytes_freed += bytes;
+                applied.removed.push(key);
+            }
+            Ok(Removal::Skipped(reason)) => applied.skipped.push(Skipped { item: key, reason }),
             Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 404, ..
             }) => applied.skipped.push(Skipped {
@@ -417,24 +1160,39 @@ pub fn plan<A: Serialize>(
     args: &A,
     scope: Option<&str>,
     candidates: &[Candidate],
-    networks_withheld: bool,
+    protection: &Protection,
 ) -> Result<ExecutionPlan> {
     let inputs = plugin_toolkit::serde_json::to_value(args)?;
     let where_ = scope
         .map(|s| format!(" in stack '{s}'"))
         .unwrap_or_default();
+    let bytes_of = |kind| -> i64 {
+        candidates
+            .iter()
+            .filter(|c| c.kind == kind)
+            .map(|c| c.bytes)
+            .sum()
+    };
+    let freed: Vec<String> = [
+        (ResourceKind::Image, "at least {} bytes of images"),
+        (ResourceKind::BuildCache, "at most {} bytes of build cache"),
+    ]
+    .into_iter()
+    .filter(|(kind, _)| candidates.iter().any(|c| c.kind == *kind))
+    .map(|(kind, label)| label.replace("{}", &bytes_of(kind).to_string()))
+    .collect();
     let summary = if candidates.is_empty() {
         format!("nothing to prune{where_}")
-    } else {
+    } else if freed.is_empty() {
         format!("remove {} orphaned resource(s){where_}", candidates.len())
-    };
-    let summary = if networks_withheld {
-        format!(
-            "{summary}; networks not considered: a managed stack's compose config could not be read"
-        )
     } else {
-        summary
+        format!(
+            "remove {} orphaned resource(s){where_}, freeing {}",
+            candidates.len(),
+            freed.join(" and ")
+        )
     };
+    let summary = format!("{summary}; {}", protection.describe());
     let changes = candidates
         .iter()
         .map(|c| PlannedChange::new(&c.key, "remove").with_detail(&c.detail))
@@ -461,6 +1219,40 @@ pub struct DockerPruneArgs {
     #[arg(long)]
     #[serde(default, rename = "dryRun", alias = "dry_run")]
     pub dry_run: bool,
+    /// Also remove tagged images no container, running or stopped, uses.
+    #[arg(long)]
+    #[serde(default, rename = "unusedImages")]
+    pub unused_images: bool,
+    /// With `unusedImages`: only images last pulled or tagged more than this
+    /// many days ago. `minPullAgeDays` (default 1) is a floor on the same age.
+    #[arg(long)]
+    #[serde(default, rename = "olderThanDays")]
+    pub older_than_days: Option<u64>,
+    #[arg(long)]
+    #[serde(default, rename = "minPullAgeDays")]
+    pub min_pull_age_days: Option<u64>,
+    /// With `unusedImages`: remove the oldest-created unused images until the
+    /// unused images left total at most this many bytes.
+    #[arg(long)]
+    #[serde(default, rename = "keepBytes")]
+    pub keep_bytes: Option<u64>,
+    /// Also prune the build cache down to `buildCacheKeepBytes`, which is
+    /// required; 0 empties it.
+    #[arg(long)]
+    #[serde(default, rename = "buildCache")]
+    pub build_cache: bool,
+    #[arg(long)]
+    #[serde(default, rename = "buildCacheKeepBytes")]
+    pub build_cache_keep_bytes: Option<u64>,
+    /// Also remove named volumes no container, running or stopped, mounts,
+    /// with no compose project or `orca.stack` label, created at least
+    /// `orphanVolumeMinAgeDays` (default 7) days ago.
+    #[arg(long)]
+    #[serde(default, rename = "orphanVolumes")]
+    pub orphan_volumes: bool,
+    #[arg(long)]
+    #[serde(default, rename = "orphanVolumeMinAgeDays")]
+    pub orphan_volume_min_age_days: Option<u64>,
 }
 
 async fn project_for(stack: &str) -> Result<String> {
@@ -471,25 +1263,297 @@ async fn project_for(stack: &str) -> Result<String> {
         .await?)
 }
 
-/// Networks every managed stack declares external, or `None` when any
-/// stack's config cannot be read.
-async fn external_networks() -> Result<Option<HashSet<String>>> {
-    let mut out = HashSet::new();
-    for row in crate::stacks::all_here().await? {
-        let Ok(compose) = row.compose(&crate::stacks::allowed_roots()?) else {
-            return Ok(None);
-        };
-        match compose.config_json().await {
-            Ok(raw) => out.extend(crate::compose::parse_external_networks(&raw)),
-            Err(_) => return Ok(None),
+#[derive(Debug, Default)]
+struct StackConfigs {
+    networks: HashSet<String>,
+    refs: StackRefs,
+    protection: Protection,
+}
+
+impl StackConfigs {
+    fn absorb(&mut self, raw: &str) {
+        self.networks
+            .extend(crate::compose::parse_external_networks(raw));
+        self.refs
+            .volumes
+            .extend(crate::compose::parse_stack_volumes(raw));
+        self.refs
+            .images
+            .extend(crate::compose::parse_stack_images(raw));
+    }
+
+    fn withhold_all(&mut self, why: String) {
+        self.protection.withheld.networks.push(why.clone());
+        self.protection.withheld.refs.push(why);
+    }
+
+    /// Read `compose`'s refs. `Err` is why they cannot be.
+    async fn read(
+        &mut self,
+        dir: &Path,
+        compose: &crate::compose::Compose,
+        label: &str,
+    ) -> std::result::Result<(), String> {
+        let (raw, stderr) = compose_config(dir, compose, &[])
+            .await
+            .map_err(|e| format!("{label}: {e}"))?;
+        let unset = unset_variables(&stderr);
+        if !unset.is_empty() {
+            let literal = compose_config(dir, compose, &["--no-interpolate"])
+                .await
+                .map(|(raw, _)| raw)
+                .unwrap_or_default();
+            if literal.is_empty() || touches_refs(&literal, &unset) {
+                return Err(format!(
+                    "{label}: unset variables {} name images, volumes or networks",
+                    unset.join(", ")
+                ));
+            }
+            self.protection
+                .unset
+                .push(format!("{label}: {}", unset.join(", ")));
+        }
+        self.absorb(&raw);
+        Ok(())
+    }
+}
+
+async fn compose_config(
+    dir: &Path,
+    compose: &crate::compose::Compose,
+    extra: &[&str],
+) -> Result<(String, String)> {
+    let mut args = crate::stacks::config_args(dir, compose);
+    args.extend(extra.iter().map(|s| s.to_string()));
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    crate::run_with_stderr(&argv).await
+}
+
+/// Why some stack refs or networks are not known, and what was only noted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Withheld {
+    /// Each withholds orphan volumes, unused images and digest-pinned
+    /// dangling images.
+    pub refs: Vec<String>,
+    /// Each withholds every network.
+    pub networks: Vec<String>,
+    pub reported: Vec<String>,
+}
+
+/// The discovered projects to read, and what the rest withhold. A project
+/// with containers keeps their networks, volumes and images in use itself,
+/// so only the refs it could add beyond those are withheld; one whose
+/// containers are all stopped and whose dir is gone is only reported.
+fn assess(
+    outcomes: &[crate::stacks::Discovery],
+) -> (Vec<crate::stacks::DiscoveredProject>, Withheld) {
+    use crate::stacks::Discovery;
+    let mut ok = Vec::new();
+    let mut w = Withheld::default();
+    for o in outcomes {
+        match o {
+            Discovery::Ok(p) if !p.problems.is_empty() => {
+                w.refs
+                    .push(format!("project {}: {}", p.name, p.problems.join("; ")))
+            }
+            Discovery::Ok(p) => ok.push(p.clone()),
+            Discovery::Conflict { name, detail, .. } => {
+                w.refs.push(format!("project {name}: {detail}"))
+            }
+            Discovery::Unreadable {
+                name,
+                dir,
+                running: false,
+                ..
+            } if !dir.as_os_str().is_empty() && !dir.exists() => w.reported.push(format!(
+                "project {name}: {} is gone and its containers are stopped",
+                dir.display()
+            )),
+            Discovery::Unreadable {
+                name, path, cause, ..
+            } => w
+                .refs
+                .push(format!("project {name}: {}: {cause}", path.display())),
         }
     }
-    Ok(Some(out))
+    (ok, w)
+}
+
+/// Every dir inside `roots` that any outcome names, so the root scan does
+/// not read a project discovery already judged.
+fn known_dirs(outcomes: &[crate::stacks::Discovery], roots: &[String]) -> Vec<PathBuf> {
+    use crate::stacks::Discovery;
+    let roots: Vec<PathBuf> = roots
+        .iter()
+        .filter_map(|r| Path::new(r).canonicalize().ok())
+        .collect();
+    let mut out: Vec<PathBuf> = outcomes
+        .iter()
+        .flat_map(|o| match o {
+            Discovery::Ok(p) => vec![p.dir.clone()],
+            Discovery::Conflict { dirs, .. } => dirs.clone(),
+            Discovery::Unreadable { dir, .. } => vec![dir.clone()],
+        })
+        .filter_map(|d| d.canonicalize().ok())
+        .filter(|d| roots.iter().any(|r| d.starts_with(r) && d != r))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn unset_variables(stderr: &str) -> Vec<String> {
+    stderr
+        .lines()
+        .filter(|l| l.contains("variable is not set"))
+        .filter_map(|l| {
+            let after = l.split("The ").nth(1)?;
+            let name = after.split("variable is not set").next()?;
+            Some(
+                name.trim()
+                    .trim_matches(|c| c == '"' || c == '\\')
+                    .to_string(),
+            )
+        })
+        .filter(|n| !n.is_empty())
+        .collect()
+}
+
+/// Whether any of `vars` appears in an image, volume source or name, or
+/// network name of an uninterpolated config.
+fn touches_refs(raw: &str, vars: &[String]) -> bool {
+    let Ok(v) = plugin_toolkit::serde_json::from_str::<plugin_toolkit::serde_json::Value>(raw)
+    else {
+        return true;
+    };
+    let mut texts: Vec<&str> = v["name"].as_str().into_iter().collect();
+    for svc in v["services"]
+        .as_object()
+        .into_iter()
+        .flat_map(|m| m.values())
+    {
+        texts.extend(svc["image"].as_str());
+        texts.extend(svc["build"].as_str());
+        for key in ["context", "dockerfile"] {
+            texts.extend(svc["build"][key].as_str());
+        }
+        for vol in svc["volumes"].as_array().into_iter().flatten() {
+            texts.extend(vol["source"].as_str().or_else(|| vol.as_str()));
+        }
+    }
+    for section in ["volumes", "networks"] {
+        for item in v[section].as_object().into_iter().flat_map(|m| m.values()) {
+            texts.extend(item["name"].as_str());
+        }
+    }
+    texts.iter().any(|t| {
+        vars.iter()
+            .any(|var| t.contains(&format!("${{{var}")) || t.contains(&format!("${var}")))
+    })
+}
+
+/// Compose project dirs directly under `roots` and not in `known`,
+/// canonical, or `None` when a root exists but cannot be listed.
+fn compose_dirs(roots: &[String], known: &HashSet<PathBuf>) -> Option<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for root in roots {
+        let entries = match std::fs::read_dir(root) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+        };
+        for entry in entries {
+            let Ok(dir) = entry.ok()?.path().canonicalize() else {
+                continue;
+            };
+            if dir.is_dir()
+                && !known.contains(&dir)
+                && !out.contains(&dir)
+                && crate::compose::Compose::find(&dir).is_some()
+            {
+                out.push(dir);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// What every stack references, and what could not be read and so is
+/// withheld.
+async fn stack_configs(docker: &Docker) -> Result<StackConfigs> {
+    let roots = crate::stacks::allowed_roots()?;
+    let mut out = StackConfigs::default();
+    let mut known = HashSet::new();
+    for row in crate::stacks::list()? {
+        let label = format!("stack {} ({})", row.name, row.dir);
+        let read = match row.compose(&roots) {
+            Ok(compose) => out.read(Path::new(&row.dir), &compose, &label).await,
+            Err(e) => Err(format!("{label}: {e}")),
+        };
+        match read {
+            Ok(()) => out.protection.stacks += 1,
+            Err(why) => out.withhold_all(why),
+        }
+        known.insert(
+            Path::new(&row.dir)
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(&row.dir)),
+        );
+    }
+    match crate::stacks::discover(docker).await {
+        Ok(outcomes) => {
+            let (projects, withheld) = assess(&outcomes);
+            out.protection.withheld.refs.extend(withheld.refs);
+            out.protection.withheld.reported.extend(withheld.reported);
+            known.extend(known_dirs(&outcomes, &roots));
+            for p in projects {
+                let label = format!("project {} ({})", p.name, p.dir.display());
+                let dir = p.dir.clone();
+                let row: crate::stacks::StackRow = p.into();
+                let read = match row.compose(&roots) {
+                    Ok(compose) => out.read(&dir, &compose, &label).await,
+                    Err(e) => Err(format!("{label}: {e}")),
+                };
+                match read {
+                    Ok(()) => out.protection.stacks += 1,
+                    Err(why) => out.protection.withheld.refs.push(why),
+                }
+            }
+        }
+        Err(e) => out
+            .protection
+            .withheld
+            .refs
+            .push(format!("compose projects could not be listed: {e}")),
+    }
+    match compose_dirs(&roots, &known) {
+        Some(dirs) => {
+            for dir in dirs {
+                let Some(compose) = crate::compose::Compose::find(&dir) else {
+                    continue;
+                };
+                let label = format!("compose project {}", dir.display());
+                match out.read(&dir, &compose, &label).await {
+                    Ok(()) => out.protection.scanned += 1,
+                    Err(why) => out.withhold_all(why),
+                }
+            }
+        }
+        None => out.withhold_all(format!(
+            "a stacks root under {} could not be listed",
+            roots.join(", ")
+        )),
+    }
+    out.protection.roots = roots;
+    Ok(out)
 }
 
 /// **Remove orphaned engine resources**: dangling images, dangling anonymous
-/// volumes and compose networks no container uses. Named volumes are never
-/// removed. With `dry_run`, returns the candidates and changes nothing.
+/// volumes and compose networks no container uses; opt-in, unused tagged
+/// images (`unusedImages`, `olderThanDays`, `keepBytes`), the build cache
+/// (`buildCache`, `buildCacheKeepBytes`) and orphaned named volumes
+/// (`orphanVolumes`). With `dry_run`, returns the candidates and the bytes
+/// they free, and changes nothing.
 #[orca_tool(
     domain = "docker",
     verb = "prune",
@@ -503,6 +1567,11 @@ async fn docker_prune(args: DockerPruneArgs, ctx: &ToolCtx) -> Result<PruneChang
         ..args
     };
     execute::require_admin(TOOL, ctx)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| anyhow!("{e}"))?
+        .as_secs() as i64;
+    let extras = extras(&args, now)?;
     let project = match &args.stack {
         Some(s) => Some(project_for(s).await?),
         None => None,
@@ -510,10 +1579,13 @@ async fn docker_prune(args: DockerPruneArgs, ctx: &ToolCtx) -> Result<PruneChang
     let docker = &crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
-    let external = external_networks().await?;
+    let configs = with_swarm(docker, stack_configs(docker).await?).await?;
+    let withheld = &configs.protection.withheld;
     let scope = Scope {
         project: project.as_deref(),
-        external_networks: external.as_ref(),
+        external_networks: withheld.networks.is_empty().then_some(&configs.networks),
+        stack_refs: withheld.refs.is_empty().then_some(&configs.refs),
+        extras,
     };
     if !args.dry_run {
         return Ok(PruneChange::Applied(
@@ -525,7 +1597,7 @@ async fn docker_prune(args: DockerPruneArgs, ctx: &ToolCtx) -> Result<PruneChang
         &args,
         args.stack.as_deref(),
         &found,
-        external.is_none(),
+        &configs.protection,
     )?))
 }
 
@@ -545,9 +1617,24 @@ mod tests {
     fn volume(name: &str, labels: &[(&str, &str)]) -> String {
         let labels: HashMap<&str, &str> = labels.iter().copied().collect();
         format!(
-            r#"{{"Name":"{name}","Driver":"local","Mountpoint":"/var/lib/docker/volumes/{name}/_data","Labels":{},"Scope":"local","Options":{{}}}}"#,
+            r#"{{"Name":"{name}","Driver":"local","Mountpoint":"/var/lib/docker/volumes/{name}/_data","CreatedAt":"2026-01-01T00:00:00Z","Labels":{},"Scope":"local","Options":{{}}}}"#,
             plugin_toolkit::serde_json::to_string(&labels).unwrap()
         )
+    }
+
+    fn volume_at(name: &str, labels: &[(&str, &str)], created: i64) -> String {
+        let labels: HashMap<&str, &str> = labels.iter().copied().collect();
+        format!(
+            r#"{{"Name":"{name}","Driver":"local","Mountpoint":"/var/lib/docker/volumes/{name}/_data","CreatedAt":"{}","Labels":{},"Scope":"local","Options":{{}}}}"#,
+            rfc3339(created),
+            plugin_toolkit::serde_json::to_string(&labels).unwrap()
+        )
+    }
+
+    fn rfc3339(secs: i64) -> String {
+        plugin_toolkit::time::Timestamp::from_unix_seconds(secs)
+            .unwrap()
+            .to_rfc3339()
     }
 
     fn network(id: &str, name: &str, project: Option<&str>) -> String {
@@ -602,8 +1689,16 @@ mod tests {
         );
         let mut routes = extra;
         routes.extend([
+            Route::new("GET", "/info", 200, INFO),
             // The pre-DELETE re-check filters by network; nothing attached.
             Route::new("GET", "/containers/json", 200, "[]").when_query(r#""network""#),
+            Route::new("GET", "/containers/json", 200, "[]").when_query("ancestor"),
+            Route::new(
+                "GET",
+                "/images/sha256:dead/json",
+                200,
+                r#"{"Id":"sha256:dead","RepoTags":[]}"#,
+            ),
             Route::new("GET", "/images/json", 200, images),
             Route::new("GET", "/volumes", 200, volumes),
             Route::new("GET", "/networks", 200, networks),
@@ -612,14 +1707,21 @@ mod tests {
         FakeEngine::routed(routes)
     }
 
+    const INFO: &str =
+        r#"{"Driver":"overlay2","DriverStatus":[],"Swarm":{"LocalNodeState":"inactive"}}"#;
+
     fn external() -> HashSet<String> {
         ["proxy".to_string()].into()
     }
+
+    static NO_REFS: std::sync::LazyLock<StackRefs> = std::sync::LazyLock::new(StackRefs::default);
 
     fn all(ext: &HashSet<String>) -> Scope<'_> {
         Scope {
             project: None,
             external_networks: Some(ext),
+            stack_refs: Some(&NO_REFS),
+            extras: Extras::default(),
         }
     }
 
@@ -640,8 +1742,8 @@ mod tests {
             vec![
                 "image:sha256:dead",
                 "image:sha256:digestonly",
-                "volume:anon1",
-                "volume:anon2",
+                "volume:anon1@2026-01-01T00:00:00Z",
+                "volume:anon2@2026-01-01T00:00:00Z",
                 "network:n-media-orphan",
                 "network:n-orphan",
             ]
@@ -722,6 +1824,8 @@ mod tests {
         let scope = Scope {
             project: Some("media"),
             external_networks: Some(&ext),
+            stack_refs: Some(&NO_REFS),
+            extras: Extras::default(),
         };
         assert_eq!(keys(&found(&e, scope)), vec!["network:n-media-orphan"]);
     }
@@ -777,17 +1881,29 @@ mod tests {
             stack: None,
             items: vec![],
             dry_run: true,
+            ..Default::default()
         };
-        let p = plan(&args, None, &f, false).unwrap();
+        let p = plan(&args, None, &f, &Protection::default()).unwrap();
         assert!(p.dry_run && p.detailed);
         let targets: Vec<_> = p.changes.iter().map(|c| c.target.as_str()).collect();
         assert_eq!(targets, keys(&f));
         assert!(e.paths("DELETE").is_empty());
         assert!(
-            plan(&args, None, &f, true)
-                .unwrap()
-                .summary
-                .contains("networks not considered")
+            plan(
+                &args,
+                None,
+                &f,
+                &Protection {
+                    withheld: Withheld {
+                        refs: vec!["x".into()],
+                        ..Withheld::default()
+                    },
+                    ..Protection::default()
+                }
+            )
+            .unwrap()
+            .summary
+            .contains("unused images and digest-pinned dangling images not considered")
         );
     }
 
@@ -800,19 +1916,26 @@ mod tests {
         ]);
         let confirmed = vec![
             "image:sha256:dead".to_string(),
-            "volume:anon1".to_string(),
+            "volume:anon1@2026-01-01T00:00:00Z".to_string(),
             "network:n-orphan".to_string(),
-            "volume:gone-since-plan".to_string(),
+            "volume:gone-since-plan@2026-01-01T00:00:00Z".to_string(),
         ];
         let ext = external();
         let applied =
             plugin_toolkit::reactor::block_on(apply(&e.client(), all(&ext), &confirmed)).unwrap();
         assert_eq!(
             applied.removed,
-            vec!["image:sha256:dead", "volume:anon1", "network:n-orphan"]
+            vec![
+                "image:sha256:dead",
+                "volume:anon1@2026-01-01T00:00:00Z",
+                "network:n-orphan"
+            ]
         );
         assert_eq!(applied.skipped.len(), 1);
-        assert_eq!(applied.skipped[0].item, "volume:gone-since-plan");
+        assert_eq!(
+            applied.skipped[0].item,
+            "volume:gone-since-plan@2026-01-01T00:00:00Z"
+        );
         // Candidates that were not confirmed are untouched.
         let deletes = e.paths("DELETE");
         assert_eq!(deletes.len(), 3, "{deletes:?}");
@@ -878,7 +2001,10 @@ mod tests {
         let applied = plugin_toolkit::reactor::block_on(apply(
             &e.client(),
             all(&ext),
-            &["volume:anon2".to_string(), "network:n-orphan".to_string()],
+            &[
+                "volume:anon2@2026-01-01T00:00:00Z".to_string(),
+                "network:n-orphan".to_string(),
+            ],
         ))
         .unwrap();
         assert!(applied.removed.is_empty());
@@ -919,8 +2045,9 @@ mod tests {
     fn execute_without_an_admin_caller_is_refused() {
         let args = DockerPruneArgs {
             stack: None,
-            items: vec!["volume:anon1".into()],
+            items: vec!["volume:anon1@2026-01-01T00:00:00Z".into()],
             dry_run: false,
+            ..Default::default()
         };
         let err = plugin_toolkit::reactor::block_on(docker_prune(args, &ctx_without_caller()))
             .unwrap_err();
@@ -934,9 +2061,1375 @@ mod tests {
                 stack: None,
                 items: vec![],
                 dry_run: true,
+                ..Default::default()
             };
             let err = plugin_toolkit::reactor::block_on(docker_prune(args, &ctx)).unwrap_err();
             crate::test_support::assert_admin_refusal(&err.to_string());
         }
+    }
+
+    fn img(id: &str, parent: &str, tags: &[&str], created: i64, size: i64) -> String {
+        format!(
+            r#"{{"Id":"{id}","ParentId":"{parent}","RepoTags":{},"RepoDigests":[],"Created":{created},"Size":{size},"SharedSize":-1,"Labels":{{}},"Containers":-1}}"#,
+            plugin_toolkit::serde_json::to_string(tags).unwrap()
+        )
+    }
+
+    fn uses(id: &str, state: &str, image: &str, image_id: &str) -> String {
+        format!(
+            r#"{{"Id":"{id}","Names":["/{id}"],"Image":"{image}","ImageID":"{image_id}","State":"{state}"}}"#
+        )
+    }
+
+    const DAY: i64 = 86_400;
+    const NOW: i64 = 100 * DAY;
+
+    fn parse<T: plugin_toolkit::serde::de::DeserializeOwned>(json: &str) -> T {
+        plugin_toolkit::serde_json::from_str(json).unwrap()
+    }
+
+    fn fleet_images() -> String {
+        format!(
+            "[{}]",
+            [
+                img("sha256:run", "", &["app:1"], NOW - 50 * DAY, 10),
+                img("sha256:stopped", "", &["job:1"], NOW - 60 * DAY, 10),
+                img("sha256:base", "", &["base:1"], NOW - 90 * DAY, 10),
+                img(
+                    "sha256:built",
+                    "sha256:base",
+                    &["built:1"],
+                    NOW - 80 * DAY,
+                    10
+                ),
+                img(
+                    "sha256:child",
+                    "sha256:run",
+                    &["child:1"],
+                    NOW - 40 * DAY,
+                    10
+                ),
+                img("sha256:byname", "", &["named:1"], NOW - 70 * DAY, 10),
+                img(
+                    "sha256:ci",
+                    "",
+                    &["ci-rust:1.95.0", "ci-rust:latest"],
+                    NOW - 30 * DAY,
+                    400
+                ),
+                img(
+                    "sha256:runner",
+                    "",
+                    &["gitea/runner-images:ubuntu-latest"],
+                    NOW - 20 * DAY,
+                    300
+                ),
+                img("sha256:fresh", "", &["busybox:latest"], NOW - DAY, 100),
+                img("sha256:dangle", "", &[], NOW - 99 * DAY, 5),
+            ]
+            .join(",")
+        )
+    }
+
+    fn fleet_containers() -> String {
+        format!(
+            "[{}]",
+            [
+                uses("a", "running", "app:1", "sha256:run"),
+                uses("b", "exited", "job:1", "sha256:stopped"),
+                uses("c", "created", "built:1", "sha256:built"),
+                uses("d", "exited", "named:1", ""),
+            ]
+            .join(",")
+        )
+    }
+
+    fn tagged_at_created(images: &[ImageSummary]) -> HashMap<String, i64> {
+        images.iter().map(|i| (i.id.clone(), i.created)).collect()
+    }
+
+    fn unused(u: UnusedImages) -> Vec<String> {
+        let images: Vec<ImageSummary> = parse(&fleet_images());
+        let containers: Vec<ContainerSummary> = parse(&fleet_containers());
+        unused_image_candidates(
+            &images,
+            &containers,
+            u,
+            &tagged_at_created(&images),
+            &HashSet::new(),
+        )
+        .into_iter()
+        .map(|c| c.key)
+        .collect()
+    }
+
+    fn every(now: i64) -> UnusedImages {
+        UnusedImages {
+            now,
+            older_than_secs: None,
+            keep_bytes: None,
+            min_pull_age_secs: 0,
+        }
+    }
+
+    #[test]
+    fn unused_images_are_tagged_images_no_container_uses_through_any_chain() {
+        assert_eq!(
+            unused(every(NOW)),
+            vec![
+                "image:sha256:ci",
+                "image:sha256:runner",
+                "image:sha256:fresh"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_stopped_or_created_container_keeps_its_image_and_its_parents() {
+        let keys = unused(every(NOW));
+        for kept in [
+            "sha256:stopped",
+            "sha256:built",
+            "sha256:base",
+            "sha256:byname",
+        ] {
+            assert!(
+                !keys.iter().any(|k| k.ends_with(kept)),
+                "{kept} in {keys:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_child_of_a_used_image_is_kept() {
+        assert!(
+            !unused(every(NOW))
+                .iter()
+                .any(|k| k.ends_with("sha256:child"))
+        );
+    }
+
+    #[test]
+    fn dangling_images_are_not_unused_image_candidates() {
+        assert!(
+            !unused(every(NOW))
+                .iter()
+                .any(|k| k.ends_with("sha256:dangle"))
+        );
+    }
+
+    #[test]
+    fn older_than_keeps_recent_images() {
+        let u = UnusedImages {
+            older_than_secs: Some(7 * DAY),
+            ..every(NOW)
+        };
+        assert_eq!(unused(u), vec!["image:sha256:ci", "image:sha256:runner"]);
+    }
+
+    #[test]
+    fn keep_bytes_evicts_oldest_created_first_until_within_budget() {
+        let u = UnusedImages {
+            keep_bytes: Some(350),
+            ..every(NOW)
+        };
+        assert_eq!(unused(u), vec!["image:sha256:ci", "image:sha256:runner"]);
+        let u = UnusedImages {
+            keep_bytes: Some(500),
+            ..every(NOW)
+        };
+        assert_eq!(unused(u), vec!["image:sha256:ci"]);
+    }
+
+    #[test]
+    fn keep_bytes_already_met_removes_nothing() {
+        let u = UnusedImages {
+            keep_bytes: Some(800),
+            ..every(NOW)
+        };
+        assert!(unused(u).is_empty());
+    }
+
+    #[test]
+    fn keep_bytes_with_older_than_only_evicts_old_enough_images() {
+        let u = UnusedImages {
+            keep_bytes: Some(0),
+            older_than_secs: Some(25 * DAY),
+            ..every(NOW)
+        };
+        assert_eq!(unused(u), vec!["image:sha256:ci"]);
+    }
+
+    #[test]
+    fn unused_candidates_carry_their_size() {
+        let images: Vec<ImageSummary> = parse(&fleet_images());
+        let containers: Vec<ContainerSummary> = parse(&fleet_containers());
+        let c = unused_image_candidates(
+            &images,
+            &containers,
+            every(NOW),
+            &tagged_at_created(&images),
+            &HashSet::new(),
+        );
+        assert_eq!(c[0].bytes, 400);
+        assert!(c[0].detail.contains("ci-rust:1.95.0"), "{}", c[0].detail);
+    }
+
+    fn extras_engine(extra: Vec<Route>) -> FakeEngine {
+        let volumes = format!(
+            r#"{{"Volumes":[{},{}],"Warnings":[]}}"#,
+            volume("anon1", &[(ANONYMOUS_VOLUME_LABEL, "")]),
+            volume_at("act-toolcache", &[], NOW - 30 * DAY),
+        );
+        let images: Vec<ImageSummary> = parse(&fleet_images());
+        let mut routes = extra;
+        for i in &images {
+            let body = format!(
+                r#"{{"Id":"{}","RepoTags":{},"Metadata":{{"LastTagTime":"{}"}}}}"#,
+                i.id,
+                plugin_toolkit::serde_json::to_string(&i.repo_tags).unwrap(),
+                rfc3339(i.created)
+            );
+            for name in i.repo_tags.iter().chain([&i.id]) {
+                routes.push(Route::new(
+                    "GET",
+                    format!("/images/{name}/json"),
+                    200,
+                    body.clone(),
+                ));
+            }
+        }
+        routes.extend([
+            Route::new("GET", "/containers/json", 200, "[]").when_query("ancestor"),
+            Route::new("GET", "/images/json", 200, fleet_images()),
+            Route::new("GET", "/volumes", 200, volumes),
+            Route::new("GET", "/networks", 200, "[]"),
+            Route::new("GET", "/containers/json", 200, fleet_containers()),
+            Route::new("GET", "/version", 200, r#"{"ApiVersion":"1.52"}"#),
+            Route::new("GET", "/info", 200, INFO),
+            Route::new(
+                "GET",
+                "/system/df",
+                200,
+                r#"{"BuildCacheUsage":{"ActiveCount":0,"TotalCount":3,"Reclaimable":5000,"TotalSize":6000}}"#,
+            ),
+        ]);
+        FakeEngine::routed(routes)
+    }
+
+    fn host_wide(ext: &HashSet<String>, extras: Extras) -> Scope<'_> {
+        Scope { extras, ..all(ext) }
+    }
+
+    fn opted_in() -> Extras {
+        Extras {
+            unused_images: Some(every(NOW)),
+            build_cache_keep_bytes: Some(1000),
+            orphan_volumes: Some(OrphanVolumes {
+                now: NOW,
+                min_age_secs: 7 * DAY,
+            }),
+        }
+    }
+
+    #[test]
+    fn opted_in_candidates_add_unused_images_build_cache_and_orphan_volumes() {
+        let e = extras_engine(vec![]);
+        let ext = external();
+        let f = found(&e, host_wide(&ext, opted_in()));
+        assert_eq!(
+            keys(&f),
+            vec![
+                "image:sha256:dangle",
+                "image:sha256:ci",
+                "image:sha256:runner",
+                "image:sha256:fresh",
+                "volume:anon1@2026-01-01T00:00:00Z",
+                &act_key(),
+                "buildcache:1000@5000",
+            ]
+        );
+        assert_eq!(f.last().unwrap().bytes, 4000);
+    }
+
+    #[test]
+    fn without_opt_in_no_tagged_image_build_cache_or_named_volume_is_a_candidate() {
+        let e = extras_engine(vec![]);
+        let ext = external();
+        let f = found(&e, all(&ext));
+        assert_eq!(
+            keys(&f),
+            vec!["image:sha256:dangle", "volume:anon1@2026-01-01T00:00:00Z"]
+        );
+        assert!(e.paths("GET").iter().all(|p| !p.ends_with("/system/df")));
+    }
+
+    fn act_key() -> String {
+        format!("volume:act-toolcache@{}", rfc3339(NOW - 30 * DAY))
+    }
+
+    #[test]
+    fn plan_reports_bytes_freed() {
+        let e = extras_engine(vec![]);
+        let ext = external();
+        let f = found(&e, host_wide(&ext, opted_in()));
+        let p = plan(
+            &DockerPruneArgs::default(),
+            None,
+            &f,
+            &Protection::default(),
+        )
+        .unwrap();
+        assert!(
+            p.summary.contains("at least 805 bytes of images")
+                && p.summary.contains("at most 4000 bytes of build cache"),
+            "{}",
+            p.summary
+        );
+        assert!(e.paths("DELETE").is_empty());
+        assert!(e.paths("POST").is_empty());
+    }
+
+    fn run_apply(e: &FakeEngine, extras: Extras, items: &[&str]) -> PruneApplied {
+        let ext = external();
+        let items: Vec<String> = items.iter().map(|s| s.to_string()).collect();
+        plugin_toolkit::reactor::block_on(apply(&e.client(), host_wide(&ext, extras), &items))
+            .unwrap()
+    }
+
+    const MULTI_REF: &str = r#"{"message":"conflict: unable to delete sha256:ci (must be forced) - image is referenced in multiple repositories"}"#;
+
+    #[test]
+    fn execute_deletes_by_id_first_then_each_tag_of_a_multi_tag_image() {
+        let e = extras_engine(vec![
+            Route::new("DELETE", "/images/sha256:ci", 409, MULTI_REF).times(1),
+            Route::new("DELETE", "/images/ci-rust:1.95.0", 200, "[]"),
+            Route::new("DELETE", "/images/ci-rust:latest", 200, "[]"),
+        ]);
+        let applied = run_apply(&e, opted_in(), &["image:sha256:ci"]);
+        assert_eq!(applied.removed, vec!["image:sha256:ci"], "{applied:?}");
+        assert_eq!(applied.bytes_freed, 400);
+        let deletes = e.paths("DELETE");
+        assert!(deletes[0].ends_with("/images/sha256:ci"), "{deletes:?}");
+        assert!(
+            deletes[1].ends_with("/images/ci-rust:1.95.0"),
+            "{deletes:?}"
+        );
+        assert!(
+            deletes[2].ends_with("/images/ci-rust:latest"),
+            "{deletes:?}"
+        );
+        assert!(
+            e.targets("DELETE")
+                .iter()
+                .all(|t| t.contains("force=false")),
+            "{:?}",
+            e.targets("DELETE")
+        );
+    }
+
+    #[test]
+    fn a_container_attaching_mid_prune_stops_a_multi_tag_removal_at_that_tag() {
+        let late = format!(
+            "[{}]",
+            uses("late", "created", "ci-rust:latest", "sha256:ci")
+        );
+        let e = extras_engine(vec![
+            Route::new("GET", "/containers/json", 200, "[]")
+                .when_query("ancestor")
+                .times(2),
+            Route::new("GET", "/containers/json", 200, late).when_query("ancestor"),
+            Route::new("DELETE", "/images/sha256:ci", 409, MULTI_REF),
+            Route::new("DELETE", "/images/ci-rust:1.95.0", 200, "[]"),
+            Route::new("DELETE", "/images/ci-rust:latest", 200, "[]"),
+        ]);
+        let applied = run_apply(&e, opted_in(), &["image:sha256:ci"]);
+        assert!(applied.removed.is_empty(), "{applied:?}");
+        assert!(applied.failed.is_empty(), "{applied:?}");
+        assert!(applied.skipped[0].reason.contains("in use"), "{applied:?}");
+        assert_eq!(applied.bytes_freed, 0);
+        let deletes = e.paths("DELETE");
+        assert_eq!(deletes.len(), 2, "{deletes:?}");
+        assert!(
+            !deletes
+                .iter()
+                .any(|d| d.ends_with("/images/ci-rust:latest"))
+        );
+    }
+
+    #[test]
+    fn a_tag_moved_to_another_image_since_the_plan_is_left_alone() {
+        let e = extras_engine(vec![
+            Route::new(
+                "GET",
+                "/images/ci-rust:1.95.0/json",
+                200,
+                r#"{"Id":"sha256:newpull","RepoTags":["ci-rust:1.95.0"]}"#,
+            ),
+            Route::new("DELETE", "/images/sha256:ci", 409, MULTI_REF).times(1),
+            Route::new("DELETE", "/images/ci-rust:latest", 200, "[]"),
+        ]);
+        let applied = run_apply(&e, opted_in(), &["image:sha256:ci"]);
+        assert_eq!(applied.removed, vec!["image:sha256:ci"], "{applied:?}");
+        assert!(
+            !e.paths("DELETE")
+                .iter()
+                .any(|d| d.ends_with("/images/ci-rust:1.95.0"))
+        );
+    }
+
+    #[test]
+    fn a_single_tag_image_is_removed_by_id_so_the_engine_checks_use_atomically() {
+        let e = extras_engine(vec![Route::new(
+            "DELETE",
+            "/images/sha256:fresh",
+            200,
+            "[]",
+        )]);
+        let applied = run_apply(&e, opted_in(), &["image:sha256:fresh"]);
+        assert_eq!(applied.removed, vec!["image:sha256:fresh"], "{applied:?}");
+        assert_eq!(e.paths("DELETE").len(), 1);
+    }
+
+    #[test]
+    fn an_image_a_container_started_using_since_the_plan_is_skipped() {
+        let late = format!(
+            "[{},{}]",
+            uses("a", "running", "app:1", "sha256:run"),
+            uses("late", "created", "ci-rust:latest", "sha256:ci"),
+        );
+        let e = extras_engine(vec![
+            Route::new("GET", "/containers/json", 200, late).when_query("ancestor"),
+        ]);
+        let applied = run_apply(&e, opted_in(), &["image:sha256:ci"]);
+        assert!(applied.removed.is_empty(), "{applied:?}");
+        assert!(applied.skipped[0].reason.contains("in use"), "{applied:?}");
+        assert!(applied.failed.is_empty());
+        assert!(e.paths("DELETE").is_empty());
+    }
+
+    #[test]
+    fn engine_refusing_an_in_use_image_is_skipped_not_failed() {
+        let e = extras_engine(vec![Route::new(
+            "DELETE",
+            "/images/sha256:runner",
+            409,
+            r#"{"message":"conflict: unable to remove repository reference: container abc is using its referenced image"}"#,
+        )]);
+        let applied = run_apply(&e, opted_in(), &["image:sha256:runner"]);
+        assert!(applied.removed.is_empty());
+        assert!(applied.failed.is_empty(), "{applied:?}");
+        assert!(applied.skipped[0].reason.contains("in use"), "{applied:?}");
+        assert_eq!(applied.bytes_freed, 0);
+    }
+
+    #[test]
+    fn an_image_gone_since_the_plan_is_skipped() {
+        let e = extras_engine(vec![Route::new(
+            "GET",
+            "/images/sha256:fresh/json",
+            404,
+            r#"{"message":"No such image"}"#,
+        )]);
+        let applied = run_apply(&e, opted_in(), &["image:sha256:fresh"]);
+        assert!(applied.removed.is_empty());
+        assert!(applied.failed.is_empty(), "{applied:?}");
+        assert!(e.paths("DELETE").is_empty());
+    }
+
+    #[test]
+    fn execute_prunes_build_cache_with_the_keep_cap() {
+        let e = extras_engine(vec![Route::new(
+            "POST",
+            "/build/prune",
+            200,
+            r#"{"CachesDeleted":["x"],"SpaceReclaimed":3500}"#,
+        )]);
+        let applied = run_apply(&e, opted_in(), &["buildcache:1000@5000"]);
+        assert_eq!(applied.removed, vec!["buildcache:1000@5000"]);
+        assert_eq!(applied.bytes_freed, 3500);
+        let t = e.targets("POST");
+        assert!(
+            t[0].contains("reserved-space=1000") && t[0].contains("all=true"),
+            "{t:?}"
+        );
+    }
+
+    #[test]
+    fn build_cache_prune_is_refused_on_an_engine_that_ignores_reserved_space() {
+        let e = extras_engine(vec![
+            Route::new("GET", "/version", 200, r#"{"ApiVersion":"1.47"}"#),
+            Route::new("POST", "/build/prune", 200, r#"{"SpaceReclaimed":1}"#),
+        ]);
+        let applied = run_apply(&e, opted_in(), &["buildcache:1000@5000"]);
+        assert!(applied.removed.is_empty(), "{applied:?}");
+        assert!(applied.failed[0].reason.contains("1.48"), "{applied:?}");
+        assert!(e.paths("POST").is_empty());
+    }
+
+    #[test]
+    fn a_build_cache_grown_since_the_plan_is_no_longer_the_planned_item() {
+        let e = extras_engine(vec![
+            Route::new(
+                "GET",
+                "/system/df",
+                200,
+                r#"{"BuildCacheUsage":{"Reclaimable":9000}}"#,
+            ),
+            Route::new("POST", "/build/prune", 200, r#"{"SpaceReclaimed":1}"#),
+        ]);
+        let applied = run_apply(&e, opted_in(), &["buildcache:1000@5000"]);
+        assert!(applied.removed.is_empty());
+        assert_eq!(applied.skipped[0].reason, "no longer a candidate");
+        assert!(e.paths("POST").is_empty());
+    }
+
+    #[test]
+    fn build_cache_prune_is_attempted_once() {
+        let e = extras_engine(vec![Route::new(
+            "POST",
+            "/build/prune",
+            500,
+            r#"{"message":"boom"}"#,
+        )]);
+        let applied = run_apply(&e, opted_in(), &["buildcache:1000@5000"]);
+        assert_eq!(applied.failed.len(), 1, "{applied:?}");
+        assert_eq!(e.paths("POST").len(), 1);
+    }
+
+    #[test]
+    fn mutations_never_retry_a_timeout() {
+        let timeout = bollard::errors::Error::RequestTimeoutError;
+        assert!(retryable(&timeout, false));
+        assert!(!retryable(&timeout, true));
+        let server = bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "boom".into(),
+        };
+        assert!(retryable(&server, true));
+    }
+
+    #[test]
+    fn a_404_after_a_retried_delete_counts_as_removed() {
+        let e = extras_engine(vec![
+            Route::new(
+                "DELETE",
+                "/images/sha256:fresh",
+                500,
+                r#"{"message":"boom"}"#,
+            )
+            .times(1),
+        ]);
+        let applied = run_apply(&e, opted_in(), &["image:sha256:fresh"]);
+        assert_eq!(applied.removed, vec!["image:sha256:fresh"], "{applied:?}");
+        assert_eq!(e.paths("DELETE").len(), 2);
+    }
+
+    #[test]
+    fn execute_removes_an_opted_in_orphan_named_volume() {
+        let e = extras_engine(vec![Route::new(
+            "DELETE",
+            "/volumes/act-toolcache",
+            204,
+            "",
+        )]);
+        let applied = run_apply(&e, opted_in(), &[&act_key()]);
+        assert_eq!(applied.removed, vec![act_key()]);
+        let without = run_apply(&e, Extras::default(), &[&act_key()]);
+        assert!(without.removed.is_empty());
+        assert_eq!(without.skipped[0].reason, "no longer a candidate");
+    }
+
+    #[test]
+    fn a_volume_recreated_since_the_plan_is_not_removed() {
+        let e = extras_engine(vec![Route::new(
+            "DELETE",
+            "/volumes/act-toolcache",
+            204,
+            "",
+        )]);
+        let stale = format!("volume:act-toolcache@{}", rfc3339(NOW - 40 * DAY));
+        let applied = run_apply(&e, opted_in(), &[&stale]);
+        assert!(applied.removed.is_empty());
+        assert_eq!(applied.skipped[0].reason, "no longer a candidate");
+        assert!(e.paths("DELETE").is_empty());
+    }
+
+    fn orphans(vols: &[String]) -> Vec<String> {
+        orphans_referenced(vols, &HashSet::new())
+    }
+
+    fn orphans_referenced(vols: &[String], referenced: &HashSet<String>) -> Vec<String> {
+        let vols: Vec<Volume> = vols.iter().map(|v| parse(v)).collect();
+        orphan_volume_candidates(
+            &vols,
+            None,
+            &HashMap::new(),
+            OrphanVolumes {
+                now: NOW,
+                min_age_secs: 7 * DAY,
+            },
+            referenced,
+        )
+        .into_iter()
+        .map(|c| c.id)
+        .collect()
+    }
+
+    #[test]
+    fn a_downed_stacks_named_volume_is_kept() {
+        let old = NOW - 30 * DAY;
+        assert_eq!(
+            orphans(&[
+                volume_at(
+                    "media_data",
+                    &[
+                        (COMPOSE_PROJECT_LABEL, "media"),
+                        (COMPOSE_VOLUME_LABEL, "data")
+                    ],
+                    old
+                ),
+                volume_at("orca_vol", &[(crate::labels::STACK, "media")], old),
+                volume_at("loose", &[], old),
+            ]),
+            vec!["loose"]
+        );
+    }
+
+    #[test]
+    fn a_young_or_undated_orphan_volume_is_kept() {
+        assert!(orphans(&[volume_at("young", &[], NOW - DAY), volume("undated", &[]),]).is_empty());
+    }
+
+    #[test]
+    fn olderthan_and_min_pull_age_gate_on_the_last_tag_time() {
+        let images: Vec<ImageSummary> = parse(&format!(
+            "[{},{}]",
+            img("sha256:repulled", "", &["old:1"], NOW - 90 * DAY, 10),
+            img("sha256:stale", "", &["old:2"], NOW - 90 * DAY, 10),
+        ));
+        let tagged = HashMap::from([
+            ("sha256:repulled".to_string(), NOW - 3600),
+            ("sha256:stale".to_string(), NOW - 30 * DAY),
+        ]);
+        let keys = |u| -> Vec<String> {
+            unused_image_candidates(&images, &[], u, &tagged, &HashSet::new())
+                .into_iter()
+                .map(|c| c.id)
+                .collect()
+        };
+        let older = UnusedImages {
+            older_than_secs: Some(7 * DAY),
+            ..every(NOW)
+        };
+        assert_eq!(keys(older), vec!["sha256:stale"]);
+        let pull_age = UnusedImages {
+            min_pull_age_secs: DAY,
+            ..every(NOW)
+        };
+        assert_eq!(keys(pull_age), vec!["sha256:stale"]);
+        let untagged_time = HashMap::new();
+        assert!(
+            unused_image_candidates(&images, &[], pull_age, &untagged_time, &HashSet::new())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn candidates_read_the_last_tag_time_from_inspect() {
+        let e = extras_engine(vec![Route::new(
+            "GET",
+            "/images/sha256:ci/json",
+            200,
+            format!(
+                r#"{{"Id":"sha256:ci","RepoTags":["ci-rust:1.95.0","ci-rust:latest"],"Metadata":{{"LastTagTime":"{}"}}}}"#,
+                rfc3339(NOW - 3600)
+            ),
+        )]);
+        let ext = external();
+        let extras = Extras {
+            unused_images: Some(UnusedImages {
+                min_pull_age_secs: DAY,
+                ..every(NOW)
+            }),
+            ..Extras::default()
+        };
+        let f = found(&e, host_wide(&ext, extras));
+        assert!(!keys(&f).contains(&"image:sha256:ci"), "{f:?}");
+        assert!(keys(&f).contains(&"image:sha256:runner"), "{f:?}");
+    }
+
+    #[test]
+    fn unique_bytes_exclude_layers_shared_with_other_images() {
+        let shared = |id: &str, created: i64| {
+            format!(
+                r#"{{"Id":"{id}","ParentId":"","RepoTags":["{id}:1"],"RepoDigests":[],"Created":{created},"Size":100,"SharedSize":60,"Labels":{{}},"Containers":-1}}"#
+            )
+        };
+        let images: Vec<ImageSummary> = parse(&format!(
+            "[{},{}]",
+            shared("a", NOW - 20 * DAY),
+            shared("b", NOW - 10 * DAY)
+        ));
+        let tagged = tagged_at_created(&images);
+        let all = unused_image_candidates(&images, &[], every(NOW), &tagged, &HashSet::new());
+        assert_eq!(
+            all.iter().map(|c| c.bytes).collect::<Vec<_>>(),
+            vec![40, 40]
+        );
+        let u = UnusedImages {
+            keep_bytes: Some(50),
+            ..every(NOW)
+        };
+        let ids: Vec<_> = unused_image_candidates(&images, &[], u, &tagged, &HashSet::new())
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(ids, vec!["a"]);
+    }
+
+    #[test]
+    fn image_listings_ask_for_shared_size() {
+        let e = extras_engine(vec![]);
+        let ext = external();
+        found(&e, host_wide(&ext, opted_in()));
+        assert!(
+            e.targets("GET")
+                .iter()
+                .filter(|t| t.contains("/images/json"))
+                .all(|t| t.contains("shared-size=true")),
+            "{:?}",
+            e.targets("GET")
+        );
+    }
+
+    #[test]
+    fn a_container_naming_its_image_by_digest_keeps_it() {
+        let images: Vec<ImageSummary> = parse(&format!(
+            "[{}]",
+            r#"{"Id":"sha256:pinned","ParentId":"","RepoTags":["app:1"],"RepoDigests":["app@sha256:abc"],"Created":0,"Size":10,"SharedSize":-1,"Labels":{},"Containers":-1}"#
+        ));
+        let containers: Vec<ContainerSummary> =
+            parse(&format!("[{}]", uses("p", "exited", "app@sha256:abc", "")));
+        assert!(
+            unused_image_candidates(
+                &images,
+                &containers,
+                every(NOW),
+                &tagged_at_created(&images),
+                &HashSet::new(),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_server_error_is_retried_then_reported() {
+        let e = FakeEngine::routed(vec![Route::new(
+            "GET",
+            "/images/json",
+            500,
+            r#"{"message":"boom"}"#,
+        )]);
+        let err =
+            plugin_toolkit::reactor::block_on(dangling_images(&e.client(), None)).unwrap_err();
+        assert!(err.to_string().contains("boom"), "{err}");
+        assert_eq!(e.paths("GET").len(), 3);
+    }
+
+    #[test]
+    fn a_client_error_is_not_retried() {
+        let e = FakeEngine::routed(vec![Route::new(
+            "GET",
+            "/images/json",
+            400,
+            r#"{"message":"bad filter"}"#,
+        )]);
+        assert!(plugin_toolkit::reactor::block_on(dangling_images(&e.client(), None)).is_err());
+        assert_eq!(e.paths("GET").len(), 1);
+    }
+
+    #[test]
+    fn extras_follow_the_args() {
+        let args = DockerPruneArgs {
+            unused_images: true,
+            older_than_days: Some(7),
+            keep_bytes: Some(2_000_000_000),
+            build_cache: true,
+            build_cache_keep_bytes: Some(0),
+            orphan_volumes: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            extras(&args, NOW).unwrap(),
+            Extras {
+                unused_images: Some(UnusedImages {
+                    now: NOW,
+                    older_than_secs: Some(7 * DAY),
+                    keep_bytes: Some(2_000_000_000),
+                    min_pull_age_secs: DAY,
+                }),
+                build_cache_keep_bytes: Some(0),
+                orphan_volumes: Some(OrphanVolumes {
+                    now: NOW,
+                    min_age_secs: 7 * DAY,
+                }),
+            }
+        );
+        assert_eq!(
+            extras(&DockerPruneArgs::default(), NOW).unwrap(),
+            Extras::default()
+        );
+    }
+
+    #[test]
+    fn image_filters_without_unused_images_are_refused() {
+        for args in [
+            DockerPruneArgs {
+                older_than_days: Some(1),
+                ..Default::default()
+            },
+            DockerPruneArgs {
+                keep_bytes: Some(1),
+                ..Default::default()
+            },
+            DockerPruneArgs {
+                build_cache_keep_bytes: Some(1),
+                ..Default::default()
+            },
+            DockerPruneArgs {
+                min_pull_age_days: Some(1),
+                ..Default::default()
+            },
+            DockerPruneArgs {
+                orphan_volume_min_age_days: Some(1),
+                ..Default::default()
+            },
+        ] {
+            assert!(extras(&args, NOW).is_err());
+        }
+    }
+
+    #[test]
+    fn host_wide_options_with_a_stack_are_refused() {
+        let args = DockerPruneArgs {
+            stack: Some("media".into()),
+            unused_images: true,
+            ..Default::default()
+        };
+        let err = extras(&args, NOW).unwrap_err();
+        assert!(err.to_string().contains("stack"), "{err}");
+    }
+
+    #[test]
+    fn an_oversized_budget_is_refused() {
+        let args = DockerPruneArgs {
+            unused_images: true,
+            keep_bytes: Some(u64::MAX),
+            ..Default::default()
+        };
+        assert!(extras(&args, NOW).is_err());
+    }
+
+    #[test]
+    fn an_external_volume_of_a_downed_stack_is_kept() {
+        let old = NOW - 30 * DAY;
+        let referenced: HashSet<String> = ["shared_ext".to_string()].into();
+        assert_eq!(
+            orphans_referenced(
+                &[
+                    volume_at("shared_ext", &[], old),
+                    volume_at("loose", &[], old)
+                ],
+                &referenced
+            ),
+            vec!["loose"]
+        );
+    }
+
+    #[test]
+    fn a_volume_named_by_a_stacks_name_key_is_kept() {
+        let old = NOW - 30 * DAY;
+        let referenced: HashSet<String> = ["my-pinned".to_string()].into();
+        assert!(orphans_referenced(&[volume_at("my-pinned", &[], old)], &referenced).is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_stack_config_withholds_every_orphan_volume_and_unused_image() {
+        let e = extras_engine(vec![]);
+        let ext = external();
+        let scope = Scope {
+            stack_refs: None,
+            ..host_wide(&ext, opted_in())
+        };
+        let f = found(&e, scope);
+        assert!(!keys(&f).contains(&act_key().as_str()), "{f:?}");
+        assert!(
+            !f.iter()
+                .any(|c| c.kind == ResourceKind::Image && c.id != "sha256:dangle"),
+            "{f:?}"
+        );
+        assert!(keys(&f).contains(&"image:sha256:dangle"), "{f:?}");
+    }
+
+    #[test]
+    fn images_of_a_downed_stack_built_or_pulled_are_kept() {
+        let images: Vec<ImageSummary> = parse(&format!(
+            "[{},{},{},{}]",
+            img("sha256:pulled", "", &["nginx:1"], NOW - 90 * DAY, 10),
+            img("sha256:base", "", &["base:1"], NOW - 90 * DAY, 10),
+            img(
+                "sha256:built",
+                "sha256:base",
+                &["media-app:latest"],
+                NOW - 90 * DAY,
+                10
+            ),
+            img("sha256:loose", "", &["loose:1"], NOW - 90 * DAY, 10),
+        ));
+        let refs: HashSet<String> = ["nginx:1".to_string(), "media-app".to_string()].into();
+        let ids: Vec<_> =
+            unused_image_candidates(&images, &[], every(NOW), &tagged_at_created(&images), &refs)
+                .into_iter()
+                .map(|c| c.id)
+                .collect();
+        assert_eq!(ids, vec!["sha256:loose"]);
+    }
+
+    #[test]
+    fn a_swarm_labelled_volume_is_kept() {
+        let old = NOW - 30 * DAY;
+        assert!(
+            orphans(&[volume_at(
+                "swarm_data",
+                &[("com.docker.stack.namespace", "swarm")],
+                old
+            )])
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_undated_anonymous_volume_is_withheld() {
+        let v: Volume = parse(
+            r#"{"Name":"anon","Driver":"local","Mountpoint":"/x","Labels":{"com.docker.volume.anonymous":""},"Scope":"local","Options":{}}"#,
+        );
+        assert!(volume_candidates(&[v], None, &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn build_cache_without_a_keep_value_is_refused() {
+        let args = DockerPruneArgs {
+            build_cache: true,
+            ..Default::default()
+        };
+        let err = extras(&args, NOW).unwrap_err();
+        assert!(err.to_string().contains("buildCacheKeepBytes"), "{err}");
+    }
+
+    #[test]
+    fn a_child_images_parent_tags_are_not_removed() {
+        let with_child = format!(
+            "[{}]",
+            img("sha256:kid", "sha256:ci", &["kid:1"], NOW - 10 * DAY, 10)
+        );
+        let e = extras_engine(vec![
+            Route::new("GET", "/images/json", 200, with_child).when_query("all=true"),
+            Route::new("DELETE", "/images/sha256:ci", 409, MULTI_REF),
+            Route::new("DELETE", "/images/ci-rust:1.95.0", 200, "[]"),
+            Route::new("DELETE", "/images/ci-rust:latest", 200, "[]"),
+        ]);
+        let applied = run_apply(&e, opted_in(), &["image:sha256:ci"]);
+        assert!(applied.removed.is_empty(), "{applied:?}");
+        assert!(applied.skipped[0].reason.contains("child"), "{applied:?}");
+        let deletes = e.paths("DELETE");
+        assert!(
+            !deletes.iter().any(|d| d.contains("ci-rust")),
+            "{deletes:?}"
+        );
+    }
+
+    #[test]
+    fn compose_dirs_under_the_roots_are_found_and_known_ones_skipped() {
+        let root = tempfile::tempdir().unwrap();
+        for (dir, file) in [
+            ("a", "compose.yaml"),
+            ("b", "docker-compose.yml"),
+            ("known", "compose.yaml"),
+        ] {
+            std::fs::create_dir(root.path().join(dir)).unwrap();
+            std::fs::write(root.path().join(dir).join(file), "services: {}\n").unwrap();
+        }
+        std::fs::create_dir(root.path().join("empty")).unwrap();
+        let known: HashSet<PathBuf> = [root.path().join("known").canonicalize().unwrap()].into();
+        let roots = vec![
+            root.path().to_string_lossy().into_owned(),
+            "/no/such/root".to_string(),
+        ];
+        let mut found = compose_dirs(&roots, &known).unwrap();
+        found.sort();
+        let names: Vec<_> = found
+            .iter()
+            .map(|d| d.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn the_plan_states_what_is_protected() {
+        let p = Protection {
+            stacks: 3,
+            scanned: 2,
+            roots: vec!["/opt/stacks".into()],
+            swarm_services: 1,
+            ..Protection::default()
+        };
+        let plan = plan(&DockerPruneArgs::default(), None, &[], &p).unwrap();
+        assert!(
+            plan.summary.contains(
+                "protected: the images and volumes of 3 managed or running stacks and 2 compose projects under /opt/stacks, and the images of 1 swarm service"
+            ),
+            "{}",
+            plan.summary
+        );
+    }
+
+    #[test]
+    fn a_digest_pinned_image_a_stack_uses_is_not_dangling_prey() {
+        let images: Vec<ImageSummary> = parse(&format!(
+            "[{},{}]",
+            image("sha256:pinned", &[], &["app@sha256:abc"]),
+            image("sha256:dead", &[], &[]),
+        ));
+        let refs: HashSet<String> = ["docker.io/library/app@sha256:abc".to_string()].into();
+        let ids = |refs| -> Vec<String> {
+            image_candidates(&images, None, refs)
+                .into_iter()
+                .map(|c| c.id)
+                .collect()
+        };
+        assert_eq!(ids(Some(&refs)), vec!["sha256:dead"]);
+        assert_eq!(ids(None), vec!["sha256:dead"]);
+        assert_eq!(
+            ids(Some(&HashSet::new())),
+            vec!["sha256:pinned", "sha256:dead"]
+        );
+    }
+
+    #[test]
+    fn the_containerd_store_skips_tag_by_tag_untagging() {
+        let e = extras_engine(vec![
+            Route::new(
+                "GET",
+                "/info",
+                200,
+                r#"{"Driver":"overlayfs","DriverStatus":[["driver-type","io.containerd.snapshotter.v1"]],"Swarm":{"LocalNodeState":"inactive"}}"#,
+            ),
+            Route::new("DELETE", "/images/sha256:ci", 409, MULTI_REF),
+            Route::new("DELETE", "/images/ci-rust:1.95.0", 200, "[]"),
+        ]);
+        let applied = run_apply(&e, opted_in(), &["image:sha256:ci"]);
+        assert!(applied.removed.is_empty(), "{applied:?}");
+        assert!(
+            applied.skipped[0].reason.contains("containerd"),
+            "{applied:?}"
+        );
+        assert_eq!(e.paths("DELETE").len(), 1);
+    }
+
+    fn swarmed(e: &FakeEngine) -> StackConfigs {
+        plugin_toolkit::reactor::block_on(with_swarm(&e.client(), StackConfigs::default())).unwrap()
+    }
+
+    fn swarm_engine(services: Route) -> FakeEngine {
+        extras_engine(vec![
+            Route::new(
+                "GET",
+                "/info",
+                200,
+                r#"{"Driver":"overlay2","DriverStatus":[],"Swarm":{"LocalNodeState":"active","ControlAvailable":true}}"#,
+            ),
+            services,
+        ])
+    }
+
+    #[test]
+    fn swarm_service_images_are_protected() {
+        let e = swarm_engine(Route::new(
+            "GET",
+            "/services",
+            200,
+            r#"[{"ID":"s1","Spec":{"TaskTemplate":{"ContainerSpec":{"Image":"gitea/runner-images:ubuntu-latest"}}}}]"#,
+        ));
+        let configs = swarmed(&e);
+        assert_eq!(configs.protection.swarm_services, 1);
+        let ext = external();
+        let f = found(
+            &e,
+            Scope {
+                stack_refs: Some(&configs.refs),
+                ..host_wide(&ext, opted_in())
+            },
+        );
+        assert!(!keys(&f).contains(&"image:sha256:runner"), "{f:?}");
+        assert!(keys(&f).contains(&"image:sha256:ci"), "{f:?}");
+    }
+
+    #[test]
+    fn unlistable_swarm_services_withhold_unused_images() {
+        let e = swarm_engine(Route::new(
+            "GET",
+            "/services",
+            503,
+            r#"{"message":"This node is not a swarm manager"}"#,
+        ));
+        assert!(!swarmed(&e).protection.withheld.refs.is_empty());
+    }
+
+    fn unreadable(name: &str, dir: &str, path: &str, running: bool) -> crate::stacks::Discovery {
+        crate::stacks::Discovery::Unreadable {
+            name: name.into(),
+            dir: PathBuf::from(dir),
+            path: PathBuf::from(path),
+            cause: "no such file".into(),
+            running,
+        }
+    }
+
+    #[test]
+    fn an_unreadable_running_project_withholds_only_the_refs_it_could_add() {
+        let withheld = assess(&[unreadable(
+            "media",
+            "/opt/stacks/media",
+            "/opt/stacks/media/extra.yaml",
+            true,
+        )])
+        .1;
+        assert!(withheld.networks.is_empty(), "{withheld:?}");
+        assert_eq!(withheld.refs.len(), 1, "{withheld:?}");
+        let why = &withheld.refs[0];
+        assert!(
+            why.contains("media")
+                && why.contains("/opt/stacks/media/extra.yaml")
+                && why.contains("no such file"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn a_stopped_project_whose_dir_is_gone_is_reported_not_blocking() {
+        let dir = "/opt/stacks/definitely-not-here-0b7f";
+        let withheld = assess(&[unreadable("old", dir, dir, false)]).1;
+        assert!(
+            withheld.refs.is_empty() && withheld.networks.is_empty(),
+            "{withheld:?}"
+        );
+        assert!(withheld.reported[0].contains("old"), "{withheld:?}");
+    }
+
+    #[test]
+    fn a_label_conflict_withholds_refs_and_names_the_project() {
+        let withheld = assess(&[crate::stacks::Discovery::Conflict {
+            name: "dup".into(),
+            detail: "two working dirs".into(),
+            dirs: Vec::new(),
+        }])
+        .1;
+        assert!(withheld.refs[0].contains("dup") && withheld.refs[0].contains("two working dirs"));
+        assert!(withheld.networks.is_empty());
+    }
+
+    #[test]
+    fn unset_variables_are_listed() {
+        let stderr = "time=\"x\" level=warning msg=\"The \\\"TAG\\\" variable is not set. Defaulting to a blank string.\"\nlevel=warning msg=\"The \\\"PORT\\\" variable is not set. Defaulting to a blank string.\"\n";
+        assert_eq!(unset_variables(stderr), vec!["TAG", "PORT"]);
+        assert!(unset_variables("level=warning msg=\"version is obsolete\"").is_empty());
+    }
+
+    #[test]
+    fn unset_variables_block_only_when_they_touch_image_volume_or_network_keys() {
+        let raw = r#"{"services":{"web":{"image":"app:${TAG}","ports":[{"published":"${PORT}"}],"volumes":[{"type":"volume","source":"${VOL}"}]}},"volumes":{"d":{"name":"${DATA}"}},"networks":{"n":{"name":"${NET}"}}}"#;
+        let touch = |v: &str| touches_refs(raw, &[v.to_string()]);
+        assert!(touch("TAG"));
+        assert!(touch("VOL"));
+        assert!(touch("DATA"));
+        assert!(touch("NET"));
+        assert!(!touch("PORT"));
+    }
+
+    #[test]
+    fn the_plan_names_what_is_withheld_reported_and_unset() {
+        let p = Protection {
+            stacks: 1,
+            scanned: 0,
+            roots: vec!["/opt/stacks".into()],
+            swarm_services: 0,
+            withheld: Withheld {
+                refs: vec!["project media: /x/extra.yaml: no such file".into()],
+                networks: vec!["stack web (/opt/stacks/web): refused".into()],
+                reported: vec!["project old: dir gone, containers stopped".into()],
+            },
+            unset: vec!["stack web: PORT".into()],
+        };
+        let s = plan(&DockerPruneArgs::default(), None, &[], &p)
+            .unwrap()
+            .summary;
+        for want in [
+            "orphan volumes, unused images and digest-pinned dangling images not considered: project media: /x/extra.yaml: no such file",
+            "networks not considered: stack web (/opt/stacks/web): refused",
+            "reported: project old: dir gone, containers stopped",
+            "unset variables: stack web: PORT",
+        ] {
+            assert!(s.contains(want), "{want} not in {s}");
+        }
+    }
+
+    #[test]
+    fn a_conflicting_project_withholds_refs() {
+        let r = tempfile::tempdir().unwrap();
+        let dir = r.path().canonicalize().unwrap();
+        std::fs::create_dir(dir.join("web")).unwrap();
+        for f in ["compose.yaml", "other.yaml"] {
+            std::fs::write(dir.join("web").join(f), "services: {}\n").unwrap();
+        }
+        let roots = vec![dir.to_string_lossy().into_owned()];
+        let at = |f: &str| dir.join("web").join(f).to_string_lossy().into_owned();
+        let web = at("");
+        let containers: Vec<ContainerSummary> = parse(&format!(
+            r#"[{{"Id":"a","Labels":{{"{COMPOSE_PROJECT_LABEL}":"web","com.docker.compose.project.working_dir":"{web}","com.docker.compose.project.config_files":"{}"}}}},{{"Id":"b","Labels":{{"{COMPOSE_PROJECT_LABEL}":"web","com.docker.compose.project.working_dir":"{web}","com.docker.compose.project.config_files":"{}"}}}}]"#,
+            at("compose.yaml"),
+            at("other.yaml")
+        ));
+        let outcomes = crate::stacks::from_labels(&containers, &[], &roots);
+        let withheld = assess(&outcomes).1;
+        assert!(
+            withheld.refs.iter().any(|w| w.contains("web")),
+            "{withheld:?}"
+        );
+        assert!(withheld.networks.is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_labelled_project_withholds_unused_images_and_orphan_volumes() {
+        crate::test_support::with_db(|| {
+            let root = tempfile::tempdir().unwrap();
+            let root_s = root
+                .path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            plugin_toolkit::reactor::block_on(crate::tools::docker_create(
+                crate::tools::DockerCreateArgs {
+                    name: "local".into(),
+                    socket_path: None,
+                    host: None,
+                    url: None,
+                    stacks_root: Some(root_s.clone()),
+                    data_roots: Vec::new(),
+                    discovery_roots: Vec::new(),
+                    registries: Vec::new(),
+                    routes: Vec::new(),
+                    dry_run: false,
+                },
+                &crate::test_support::admin(),
+            ))
+            .unwrap();
+            let web = format!("{root_s}/web");
+            std::fs::create_dir(&web).unwrap();
+            let labelled = format!(
+                r#"[{{"Id":"w","State":"running","Labels":{{"{COMPOSE_PROJECT_LABEL}":"web","com.docker.compose.project.working_dir":"{web}","com.docker.compose.project.config_files":"{web}/missing.yaml"}}}}]"#
+            );
+            let e = extras_engine(vec![
+                Route::new("GET", "/containers/json", 200, labelled)
+                    .when_query(r#""label":["com.docker.compose.project"]"#),
+            ]);
+            let docker = e.client();
+            let configs = plugin_toolkit::reactor::block_on(with_swarm(
+                &docker,
+                plugin_toolkit::reactor::block_on(stack_configs(&docker)).unwrap(),
+            ))
+            .unwrap();
+            let w = &configs.protection.withheld;
+            assert!(
+                w.refs
+                    .iter()
+                    .any(|r| r.contains("web") && r.contains("missing.yaml")),
+                "{w:?}"
+            );
+            assert!(w.networks.is_empty(), "{w:?}");
+            let ext = external();
+            let scope = Scope {
+                stack_refs: w.refs.is_empty().then_some(&configs.refs),
+                ..host_wide(&ext, opted_in())
+            };
+            let f = found(&e, scope);
+            assert!(
+                !f.iter()
+                    .any(|c| c.kind == ResourceKind::Image && c.id != "sha256:dangle"),
+                "{f:?}"
+            );
+            assert!(!keys(&f).contains(&act_key().as_str()), "{f:?}");
+        });
+    }
+
+    #[test]
+    fn an_env_file_problem_withholds_refs_for_that_project() {
+        let ok = crate::stacks::Discovery::Ok(crate::stacks::DiscoveredProject {
+            name: "web".into(),
+            dir: PathBuf::from("/opt/stacks/web"),
+            files: vec![PathBuf::from("/opt/stacks/web/compose.yaml")],
+            env_files: vec![PathBuf::from("/etc/shadow")],
+            problems: vec!["/etc/shadow: not a regular file inside the stacks roots".into()],
+        });
+        let (projects, withheld) = assess(&[ok]);
+        assert!(projects.is_empty());
+        assert!(
+            withheld.refs[0].contains("web") && withheld.refs[0].contains("/etc/shadow"),
+            "{withheld:?}"
+        );
+        assert!(withheld.networks.is_empty());
+    }
+
+    #[test]
+    fn every_in_root_dir_any_outcome_names_is_known() {
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path().canonicalize().unwrap();
+        for d in ["a", "b"] {
+            std::fs::create_dir(r.join(d)).unwrap();
+        }
+        let outcomes = [
+            unreadable("a", &r.join("a").to_string_lossy(), "/x", true),
+            crate::stacks::Discovery::Conflict {
+                name: "b".into(),
+                detail: "x".into(),
+                dirs: vec![r.join("b")],
+            },
+            unreadable("c", "/etc", "/etc/passwd", true),
+        ];
+        let roots = vec![r.to_string_lossy().into_owned()];
+        let mut known = known_dirs(&outcomes, &roots);
+        known.sort();
+        assert_eq!(known, vec![r.join("a"), r.join("b")]);
+    }
+
+    #[test]
+    fn touches_refs_covers_the_project_name_and_build() {
+        let raw = r#"{"name":"${PROJ}","services":{"web":{"build":{"context":"${CTX}","dockerfile":"${DF}"}},"api":{"build":"${SHORT}"}}}"#;
+        for v in ["PROJ", "CTX", "DF", "SHORT"] {
+            assert!(touches_refs(raw, &[v.to_string()]), "{v}");
+        }
+        assert!(!touches_refs(raw, &["OTHER".to_string()]));
+    }
+
+    #[test]
+    fn an_unset_variable_in_a_volume_name_withholds() {
+        let raw = r#"{"volumes":{"data":{"name":"${DATA_NAME}"}}}"#;
+        assert!(touches_refs(
+            raw,
+            &unset_variables(
+                "level=warning msg=\"The \\\"DATA_NAME\\\" variable is not set. Defaulting to a blank string.\""
+            )
+        ));
     }
 }
