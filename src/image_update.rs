@@ -449,6 +449,13 @@ pub fn targets(
         })
         .collect();
     for d in discovered {
+        let name = match &d {
+            Discovery::Ok(p) => &p.name,
+            Discovery::Conflict { name, .. } | Discovery::Unreadable { name, .. } => name,
+        };
+        if out.iter().any(|t| &t.project == name || &t.stack == name) {
+            continue;
+        }
         out.push(match d {
             Discovery::Ok(p) => Target {
                 stack: p.name.clone(),
@@ -496,10 +503,11 @@ fn container_name(c: &ContainerSummary) -> String {
     c.names
         .iter()
         .flatten()
-        .next()
-        .map(|n| n.trim_start_matches('/').to_string())
-        .or_else(|| c.id.clone())
-        .unwrap_or_default()
+        .map(|n| n.trim_start_matches('/'))
+        .find(|n| !n.is_empty())
+        .or(c.id.as_deref().filter(|i| !i.is_empty()))
+        .unwrap_or("(unnamed)")
+        .to_string()
 }
 
 async fn all_containers(docker: &Docker) -> Result<Vec<ContainerSummary>> {
@@ -1035,6 +1043,13 @@ mod tests {
     fn targets_cover_every_stack_outcome_and_unclaimed_project() {
         let discovered = vec![
             Discovery::Ok(crate::stacks::DiscoveredProject {
+                name: "renamed".into(),
+                dir: "/opt/stacks/elsewhere".into(),
+                files: vec!["/opt/stacks/elsewhere/compose.yaml".into()],
+                env_files: Vec::new(),
+                problems: Vec::new(),
+            }),
+            Discovery::Ok(crate::stacks::DiscoveredProject {
                 name: "found".into(),
                 dir: "/opt/stacks/found".into(),
                 files: vec!["/opt/stacks/found/compose.yaml".into()],
@@ -1102,6 +1117,7 @@ mod tests {
                 .unwrap()
                 .starts_with("/mnt/user/appdata/locked: ")
         );
+        assert_eq!(t.iter().filter(|t| t.project == "renamed").count(), 1);
     }
 
     #[test]
@@ -1168,6 +1184,9 @@ mod tests {
         assert_eq!(sync.service, "syncthing");
         assert_eq!(sync.image, "syncthing/syncthing:1");
         assert_eq!(sync.update_available, Some(false));
+        let nameless: ContainerSummary =
+            plugin_toolkit::serde_json::from_str(r#"{"Names":["/"],"Id":""}"#).unwrap();
+        assert_eq!(container_name(&nameless), "(unnamed)");
         let none = plugin_toolkit::reactor::block_on(report(&e.client(), Vec::new(), &all, false));
         assert!(none.standalone.is_empty());
     }

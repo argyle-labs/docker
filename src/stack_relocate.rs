@@ -400,8 +400,8 @@ struct Plan {
     out: RelocateOutput,
 }
 
-async fn plan(args: &DockerStackRelocateArgs) -> Result<Plan> {
-    let row = stacks::require_registered_here(&args.stack).await?;
+async fn plan(args: &DockerStackRelocateArgs, adoption: stacks::Adoption) -> Result<Plan> {
+    let row = stacks::require_registered_here(&args.stack, adoption).await?;
     if !fsat::is_single_component(&row.name) {
         bail!("stack name '{}' is not a plain dir name", row.name);
     }
@@ -416,7 +416,7 @@ async fn plan(args: &DockerStackRelocateArgs) -> Result<Plan> {
         );
     }
     let new_dir = new_root.join(&row.name);
-    stacks::stack_dir_in_roots(&new_dir.to_string_lossy(), &roots)?;
+    stacks::stack_dir_in_roots(&new_dir.to_string_lossy(), &crate::tools::stacks_roots()?)?;
     if std::fs::symlink_metadata(&new_dir).is_ok() {
         bail!("{} already exists", new_dir.display());
     }
@@ -532,8 +532,11 @@ async fn bring_back(row: &StackRow) -> String {
     }
 }
 
-async fn relocate(args: &DockerStackRelocateArgs) -> Result<RelocateOutput> {
-    let p = plan(args).await?;
+async fn relocate(
+    args: &DockerStackRelocateArgs,
+    admin: Option<crate::execute::Admin>,
+) -> Result<RelocateOutput> {
+    let p = plan(args, stacks::Adoption::for_call(args.dry_run, admin)).await?;
     if args.dry_run {
         return Ok(p.out);
     }
@@ -597,8 +600,8 @@ async fn docker_stack_relocate(
         dry_run: args.dry_run || ctx.dry_run(),
         ..args
     };
-    crate::execute::require_admin(TOOL, ctx)?;
-    relocate(&args).await
+    let admin = crate::execute::require_admin(TOOL, ctx)?;
+    relocate(&args, Some(admin)).await
 }
 
 #[cfg(test)]
@@ -769,7 +772,7 @@ mod tests {
                 rewrite: false,
                 dry_run: true,
             };
-            let run = |a| plugin_toolkit::reactor::block_on(relocate(&a));
+            let run = |a| plugin_toolkit::reactor::block_on(relocate(&a, None));
             assert!(
                 run(args("ghost", "/srv/stacks"))
                     .unwrap_err()

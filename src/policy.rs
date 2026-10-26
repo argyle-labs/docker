@@ -2225,6 +2225,7 @@ pub async fn adopt(
     row: &StackRow,
     docker: &bollard::Docker,
     dry_run: bool,
+    _admin: execute::Admin,
 ) -> Result<DockerStackAllowOutput> {
     stack_allow_from(
         DockerStackAllowArgs {
@@ -2286,54 +2287,19 @@ async fn docker_stack_adopt(
     args: DockerStackAdoptArgs,
     ctx: &ToolCtx,
 ) -> Result<DockerStackAdoptOutput> {
-    execute::require_admin("docker.stack_adopt", ctx)?;
+    let admin = execute::require_admin("docker.stack_adopt", ctx)?;
     let docker = &crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
     let found = stacks::discover(docker).await?;
-    Ok(adopt_all(found, docker, args.dry_run || ctx.dry_run()).await)
-}
-
-pub const ADOPT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
-
-pub fn adoption_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
-    last.is_none_or(|l| now.duration_since(l) >= ADOPT_INTERVAL)
-}
-
-/// Adopt every discovered project as the system, at most once per
-/// [`ADOPT_INTERVAL`]; driven by the reconciler's container probe.
-pub async fn reconcile_adoption(docker: &bollard::Docker) {
-    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
-    let now = std::time::Instant::now();
-    {
-        let Ok(mut last) = LAST.lock() else {
-            return;
-        };
-        if !adoption_due(*last, now) {
-            return;
-        }
-        *last = Some(now);
-    }
-    let found = match stacks::discover(docker).await {
-        Ok(found) => found,
-        Err(e) => {
-            plugin_toolkit::tracing::warn!(error = %e, "docker stacks: adoption discovery failed");
-            return;
-        }
-    };
-    let out = adopt_all(found, docker, false).await;
-    for a in &out.adopted {
-        plugin_toolkit::tracing::info!(stack = %a.name, "docker stacks: adopted");
-    }
-    for r in &out.refused {
-        plugin_toolkit::tracing::debug!(stack = %r.name, reason = %r.reason, "docker stacks: not adopted");
-    }
+    Ok(adopt_all(found, docker, args.dry_run || ctx.dry_run(), admin).await)
 }
 
 pub async fn adopt_all(
     found: Vec<stacks::Discovery>,
     docker: &bollard::Docker,
     dry_run: bool,
+    admin: execute::Admin,
 ) -> DockerStackAdoptOutput {
     let mut out = DockerStackAdoptOutput {
         dry_run,
@@ -2345,7 +2311,7 @@ pub async fn adopt_all(
         match d {
             stacks::Discovery::Ok(p) => {
                 let row = StackRow::from(p);
-                match adopt(&row, docker, dry_run).await {
+                match adopt(&row, docker, dry_run, admin).await {
                     Ok(o) => out.adopted.push(o),
                     Err(e) => out.refused.push(refusal(row.name, format!("{e:#}"))),
                 }
@@ -3513,12 +3479,24 @@ mod tests {
         });
     }
 
+    fn admin() -> execute::Admin {
+        execute::verified_admin("test", Some(&crate::test_support::caller("admin"))).unwrap()
+    }
+
     #[test]
-    fn adoption_runs_once_per_interval() {
-        let t = std::time::Instant::now();
-        assert!(adoption_due(None, t));
-        assert!(!adoption_due(Some(t), t + ADOPT_INTERVAL / 2));
-        assert!(adoption_due(Some(t), t + ADOPT_INTERVAL));
+    fn stack_adopt_refuses_a_non_admin_caller() {
+        crate::test_support::with_db(|| {
+            for ctx in crate::test_support::non_admins() {
+                let err = plugin_toolkit::reactor::block_on(docker_stack_adopt(
+                    DockerStackAdoptArgs { dry_run: true },
+                    &ctx,
+                ))
+                .unwrap_err()
+                .to_string();
+                crate::test_support::assert_admin_refusal(&err);
+            }
+            assert!(stacks::list().unwrap().is_empty());
+        });
     }
 
     #[test]
@@ -3557,11 +3535,13 @@ mod tests {
                     },
                 ]
             };
-            let plan = plugin_toolkit::reactor::block_on(adopt_all(found(), &docker, true));
+            let plan =
+                plugin_toolkit::reactor::block_on(adopt_all(found(), &docker, true, admin()));
             assert!(plan.dry_run);
             assert_eq!(plan.adopted.len(), 1);
             assert!(stacks::get("web").unwrap().is_none());
-            let done = plugin_toolkit::reactor::block_on(adopt_all(found(), &docker, false));
+            let done =
+                plugin_toolkit::reactor::block_on(adopt_all(found(), &docker, false, admin()));
             assert!(done.adopted[0].adopted && !done.adopted[0].dry_run);
             let web = stacks::require("web").unwrap();
             assert_eq!(web.dir, dir.to_string_lossy());

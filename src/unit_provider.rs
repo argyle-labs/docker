@@ -321,10 +321,14 @@ impl DockerUnitProvider {
 
     /// **edit** (rewrite YAML/env, no deploy) or a compose lifecycle action.
     pub(crate) async fn stack_update(&self, args: UpdateArgs) -> Result<VerbOutcome> {
+        let dry_run = SELF_PLANNING.contains(&args.action.as_str())
+            && split_dry_run(args.payload.clone()).is_ok_and(|(d, _)| d);
+        let admin =
+            crate::execute::verified_admin("docker stack update", args.caller.as_ref()).ok();
         let row = stacks::require_registered(
             &args.id.id,
             self.adapter.present_client().as_ref(),
-            args.caller.is_some(),
+            stacks::Adoption::for_call(dry_run, admin),
         )
         .await?;
         match args.action.as_str() {
@@ -412,7 +416,7 @@ impl DockerUnitProvider {
         if !p.normalize {
             return String::new();
         }
-        let Ok(dir) = crate::stacks::allowed_roots()
+        let Ok(dir) = crate::tools::stacks_roots()
             .and_then(|roots| stacks::stack_dir_in_roots(&p.dir, &roots))
         else {
             return String::new();
@@ -883,7 +887,7 @@ impl DockerUnitProvider {
             .clone()
             .unwrap_or_else(|| stacks::DEFAULT_COMPOSE_FILE.to_string());
         stacks::check_file_name(&file)?;
-        let roots = crate::stacks::allowed_roots()?;
+        let roots = crate::tools::stacks_roots()?;
         let dir = stacks::stack_dir_in_roots(&p.dir, &roots)?;
         stacks::check_dir_free(&p.name, &dir)?;
         let current = stacks::get(&p.name)?;
@@ -1175,8 +1179,12 @@ impl DockerUnitProvider {
             args.caller.as_ref(),
         )?;
         if args.id.kind == STACK_KIND {
-            stacks::require_registered(&args.id.id, self.adapter.present_client().as_ref(), false)
-                .await?;
+            stacks::require_registered(
+                &args.id.id,
+                self.adapter.present_client().as_ref(),
+                stacks::Adoption::Preview,
+            )
+            .await?;
             let plan = format!(
                 "tear down stack '{}' (`compose down`) and deregister it; apply with update action={ACTION_REMOVE}",
                 args.id.id

@@ -229,9 +229,6 @@ impl RuntimeAdapter for DockerAdapter {
             return Ok(Vec::new());
         }
         let (client, host) = self.engine()?;
-        if self.fixed.is_none() {
-            crate::policy::reconcile_adoption(&client).await;
-        }
         let err = |e: bollard::errors::Error| at(&host, map_bollard_err(e));
         let opts = ListContainersOptionsBuilder::new().all(filter.all).build();
         let summaries = client.list_containers(Some(opts)).await.map_err(err)?;

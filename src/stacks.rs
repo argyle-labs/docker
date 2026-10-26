@@ -1293,6 +1293,17 @@ pub fn from_labels(
     registered: &[StackRow],
     roots: &[String],
 ) -> Vec<Discovery> {
+    from_labels_claimed(containers, registered, &[], roots)
+}
+
+/// [`from_labels`], also leaving out the compose projects in `claimed`, the
+/// names registered stacks run as.
+pub fn from_labels_claimed(
+    containers: &[bollard::models::ContainerSummary],
+    registered: &[StackRow],
+    claimed: &[String],
+    roots: &[String],
+) -> Vec<Discovery> {
     let mut groups: std::collections::BTreeMap<
         &String,
         (std::collections::BTreeSet<LabelSet<'_>>, bool),
@@ -1314,7 +1325,9 @@ pub fn from_labels(
     }
     groups
         .into_iter()
-        .filter(|(name, _)| !registered.iter().any(|r| &r.name == *name))
+        .filter(|(name, _)| {
+            !registered.iter().any(|r| &r.name == *name) && !claimed.contains(*name)
+        })
         .filter_map(|(name, (sets, running))| {
             if sets.len() > 1 {
                 let mut dirs: Vec<PathBuf> = sets
@@ -1376,7 +1389,33 @@ pub async fn discover(docker: &bollard::Docker) -> Result<Vec<Discovery>> {
         ))
         .await
         .map_err(|e| anyhow::anyhow!("list compose containers: {e}"))?;
-    Ok(from_labels(&containers, &list()?, &allowed_roots()?))
+    let registered = list()?;
+    let roots = allowed_roots()?;
+    let claimed = claimed_projects(&registered, &roots).await;
+    Ok(from_labels_claimed(
+        &containers,
+        &registered,
+        &claimed,
+        &roots,
+    ))
+}
+
+/// The compose project each registered row runs as: its name when its files
+/// are listed, else what compose resolves, else its name.
+pub async fn claimed_projects(rows: &[StackRow], roots: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for row in rows {
+        let resolved = if row.files.is_empty() {
+            match row.compose(roots) {
+                Ok(c) => c.project_name().await.ok(),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        out.push(resolved.unwrap_or_else(|| row.name.clone()));
+    }
+    out
 }
 
 pub async fn all(docker: Option<&bollard::Docker>) -> Result<Vec<StackRow>> {
@@ -1581,12 +1620,32 @@ pub async fn discovered_here(name: &str) -> Option<StackRow> {
     discovered(&docker, name).await
 }
 
-/// The registered stack `name`; with `adopt`, a discovered project of that
-/// name is adopted first, so only admin-caller paths may pass it.
+/// What [`require_registered`] does with a discovered, unregistered project.
+#[derive(Debug, Clone, Copy)]
+pub enum Adoption {
+    Refuse,
+    /// Return the discovered row unregistered, for a dry run.
+    Preview,
+    Adopt(crate::execute::Admin),
+}
+
+impl Adoption {
+    /// `Preview` for a dry run, `Adopt` for a verified admin, else `Refuse`.
+    pub fn for_call(dry_run: bool, admin: Option<crate::execute::Admin>) -> Self {
+        match (dry_run, admin) {
+            (true, _) => Adoption::Preview,
+            (false, Some(a)) => Adoption::Adopt(a),
+            (false, None) => Adoption::Refuse,
+        }
+    }
+}
+
+/// The registered stack `name`, or the discovered project of that name as
+/// `adoption` says.
 pub async fn require_registered(
     name: &str,
     docker: Option<&bollard::Docker>,
-    adopt: bool,
+    adoption: Adoption,
 ) -> Result<StackRow> {
     if let Some(row) = get(name)? {
         return Ok(row);
@@ -1594,28 +1653,29 @@ pub async fn require_registered(
     if let Some(docker) = docker
         && let Some(row) = discovered(docker, name).await
     {
-        if !adopt {
-            anyhow::bail!(
+        return match adoption {
+            Adoption::Refuse => Err(anyhow::anyhow!(
                 "stack '{name}' is a discovered compose project, not a registered one; adopt it with docker.stack_adopt or an admin stack verb"
-            );
-        }
-        crate::policy::adopt(&row, docker, false)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "stack '{name}' is a discovered compose project and adopting it failed: {e:#}"
-                )
-            })?;
-        return require(name);
+            )),
+            Adoption::Preview => Ok(row),
+            Adoption::Adopt(admin) => match crate::policy::adopt(&row, docker, false, admin).await {
+                Ok(_) => require(name),
+                Err(e) => get(name)?.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "stack '{name}' is a discovered compose project and adopting it failed: {e:#}"
+                    )
+                }),
+            },
+        };
     }
     Err(anyhow::anyhow!("no managed stack named '{name}'"))
 }
 
-pub async fn require_registered_here(name: &str) -> Result<StackRow> {
+pub async fn require_registered_here(name: &str, adoption: Adoption) -> Result<StackRow> {
     require_registered(
         name,
         crate::registration::adapter().present_client().as_ref(),
-        true,
+        adoption,
     )
     .await
 }
@@ -2534,7 +2594,7 @@ mod tests {
             let row = plugin_toolkit::reactor::block_on(require_registered(
                 "legacy",
                 Some(&docker),
-                true,
+                Adoption::Adopt(admin()),
             ))
             .unwrap();
             assert_eq!(row.dir, extra.path("legacy"));
@@ -2558,6 +2618,10 @@ mod tests {
         });
     }
 
+    fn admin() -> crate::execute::Admin {
+        crate::execute::verified_admin("test", Some(&crate::test_support::caller("admin"))).unwrap()
+    }
+
     #[test]
     fn changing_a_discovered_project_adopts_it_first() {
         crate::test_support::with_db(|| {
@@ -2569,16 +2633,30 @@ mod tests {
             let err = plugin_toolkit::reactor::block_on(require_registered(
                 "immich",
                 Some(&docker),
-                false,
+                Adoption::for_call(
+                    false,
+                    crate::execute::verified_admin(
+                        "test",
+                        Some(&crate::test_support::caller("user")),
+                    )
+                    .ok(),
+                ),
             ))
             .unwrap_err()
             .to_string();
             assert!(err.contains("docker.stack_adopt"), "{err}");
-            assert!(get("immich").unwrap().is_none());
+            let preview = plugin_toolkit::reactor::block_on(require_registered(
+                "immich",
+                Some(&docker),
+                Adoption::for_call(true, Some(admin())),
+            ))
+            .unwrap();
+            assert_eq!(preview.dir, r.path("immich"));
+            assert!(get("immich").unwrap().is_none(), "a dry run adopts nothing");
             let row = plugin_toolkit::reactor::block_on(require_registered(
                 "immich",
                 Some(&docker),
-                true,
+                Adoption::for_call(false, Some(admin())),
             ))
             .unwrap();
             assert_eq!(row.dir, r.path("immich"));
@@ -2586,7 +2664,7 @@ mod tests {
             let err = plugin_toolkit::reactor::block_on(require_registered(
                 "absent",
                 Some(&docker),
-                true,
+                Adoption::Adopt(admin()),
             ))
             .unwrap_err()
             .to_string();
@@ -2602,6 +2680,29 @@ mod tests {
         let roots = vec![s(&root.path().canonicalize().unwrap())];
         let dir = PathBuf::from(&roots[0]).join("web");
         assert!(StackDir::open(&s(&dir), &roots, true).is_err());
+    }
+
+    #[test]
+    fn a_project_a_registered_stack_runs_as_is_not_discovered_again() {
+        let r = Roots::new(&["web", "elsewhere"]);
+        let containers = summaries(&[(
+            "webapp",
+            &r.path("elsewhere"),
+            &r.path("elsewhere/compose.yaml"),
+        )]);
+        let registered = vec![StackRow {
+            name: "web".into(),
+            dir: r.path("web"),
+            file: "compose.yaml".into(),
+            enabled: true,
+            allow: Vec::new(),
+            files: Vec::new(),
+            env_files: Vec::new(),
+        }];
+        assert_eq!(from_labels(&containers, &registered, &r.roots).len(), 1);
+        assert!(
+            from_labels_claimed(&containers, &registered, &["webapp".into()], &r.roots).is_empty()
+        );
     }
 
     #[test]
