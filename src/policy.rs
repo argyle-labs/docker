@@ -2199,9 +2199,9 @@ async fn stack_allow_from(
     if adopted {
         // Insert, not put: a stack registered under this name since the
         // lookup fails the write instead of being overwritten.
-        stacks::insert(&row)?;
+        stacks::store_new(&mut row).await?;
     } else {
-        stacks::put(&row)?;
+        stacks::store(&mut row).await?;
     }
     if let Some(Ok(plan)) = &normalize
         && let Err(e) = crate::normalize::write(&mut row, plan, Some(docker)).await
@@ -2272,9 +2272,9 @@ pub struct DockerStackAdoptOutput {
     pub dry_run: bool,
     pub adopted: Vec<DockerStackAllowOutput>,
     pub refused: Vec<AdoptRefusal>,
-    /// Registered stacks whose compose project name was resolved and stored.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub backfilled: Vec<String>,
+    /// Stored compose project names of registered stacks, re-resolved;
+    /// planned only on a dry run.
+    pub backfill: stacks::Backfill,
 }
 
 /// [MUTATES STATE] Adopt every compose project discovered on this host as a
@@ -2299,14 +2299,10 @@ async fn docker_stack_adopt(
         .client()
         .map_err(|e| anyhow!("{e}"))?;
     let dry_run = args.dry_run || ctx.dry_run();
-    let backfilled = if dry_run {
-        Vec::new()
-    } else {
-        stacks::backfill_projects().await?
-    };
+    let backfill = stacks::backfill_projects(dry_run).await?;
     let found = stacks::discover(docker).await?;
     Ok(DockerStackAdoptOutput {
-        backfilled,
+        backfill,
         ..adopt_all(found, docker, dry_run, admin).await
     })
 }
@@ -2321,7 +2317,7 @@ pub async fn adopt_all(
         dry_run,
         adopted: Vec::new(),
         refused: Vec::new(),
-        backfilled: Vec::new(),
+        backfill: stacks::Backfill::default(),
     };
     for d in found {
         let refusal = |name: String, reason: String| AdoptRefusal { name, reason };

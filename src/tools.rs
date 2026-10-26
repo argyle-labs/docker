@@ -15,7 +15,7 @@
 //! generic five-verb + `action` surface) and as lifecycle tools in
 //! [`crate::lifecycle`]. This module owns only the runtime registry.
 
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use plugin_toolkit::abi::{DbOp, DbRow, DbValue};
 use plugin_toolkit::prelude::*;
@@ -224,6 +224,9 @@ pub fn stacks_roots() -> Result<Vec<String>> {
     Ok(roots)
 }
 
+/// Every runtime's discovery roots that still pass
+/// [`validate_discovery_roots`]; one that no longer does is dropped and
+/// logged.
 pub fn discovery_roots() -> Result<Vec<String>> {
     let mut roots = Vec::new();
     for rt in runtimes()? {
@@ -233,7 +236,24 @@ pub fn discovery_roots() -> Result<Vec<String>> {
             }
         }
     }
-    Ok(roots)
+    let parents = discovery_parents();
+    let allowed: Vec<&Path> = parents.iter().map(PathBuf::as_path).collect();
+    let (ok, bad) = plugin_toolkit::host_paths::valid_roots("discovery_root", &roots, &allowed);
+    for e in bad {
+        plugin_toolkit::tracing::warn!(error = %e, "docker: stored discovery root ignored");
+    }
+    Ok(ok)
+}
+
+fn discovery_parents() -> Vec<PathBuf> {
+    #[cfg(test)]
+    let extra = std::env::temp_dir()
+        .canonicalize()
+        .into_iter()
+        .collect::<Vec<_>>();
+    #[cfg(not(test))]
+    let extra = Vec::new();
+    plugin_toolkit::host_paths::allowed_parents(&extra)
 }
 
 pub(crate) fn validate_data_roots(roots: &[String]) -> Result<()> {
@@ -251,57 +271,31 @@ pub(crate) fn validate_data_roots(roots: &[String]) -> Result<()> {
 }
 
 pub(crate) fn validate_stacks_root(root: &str) -> Result<()> {
-    validate_root("stacks_root", root)
-}
-
-fn validate_root(kind: &str, root: &str) -> Result<()> {
     let path = Path::new(root);
     if !path.is_absolute() {
-        bail!("{kind} '{root}' is not an absolute path");
+        bail!("stacks_root '{root}' is not an absolute path");
     }
     if path
         .components()
         .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
         || root.split('/').any(|seg| seg == "." || seg == "..")
     {
-        bail!("{kind} '{root}' contains '.' or '..'");
+        bail!("stacks_root '{root}' contains '.' or '..'");
     }
     if path.parent().is_none() {
-        bail!("{kind} '/' would admit every host path");
+        bail!("stacks_root '/' would admit every host path");
     }
     Ok(())
 }
 
-/// Host dirs a discovery root may neither be, sit under nor contain:
-/// adoption grants what compose projects there run.
-pub const SYSTEM_DIRS: &[&str] = &[
-    "/bin",
-    "/boot",
-    "/dev",
-    "/etc",
-    "/lib",
-    "/lib64",
-    "/proc",
-    "/root",
-    "/run",
-    "/sbin",
-    "/sys",
-    "/usr",
-    "/var/lib/docker",
-    "/var/lib/containerd",
-    "/var/run",
-];
-
+/// Each root an existing dir, reached through no symlink, strictly inside
+/// one of the toolkit's allowed parents: adoption grants what compose
+/// projects there run.
 pub(crate) fn validate_discovery_roots(roots: &[String]) -> Result<()> {
+    let parents = discovery_parents();
+    let allowed: Vec<&Path> = parents.iter().map(PathBuf::as_path).collect();
     for root in roots {
-        validate_root("discovery_root", root)?;
-        let path = Path::new(root);
-        if let Some(dir) = SYSTEM_DIRS
-            .iter()
-            .find(|d| path.starts_with(d) || Path::new(d).starts_with(path))
-        {
-            bail!("discovery_root '{root}' overlaps the system dir {dir}");
-        }
+        plugin_toolkit::host_paths::validate_root("discovery_root", root, &allowed)?;
     }
     Ok(())
 }
@@ -904,12 +898,48 @@ mod registry_tests {
                 "{bad}"
             );
         }
-        validate_discovery_roots(&[
-            "/mnt/user/appdata/dockge/stacks".to_string(),
-            "/srv/legacy".to_string(),
-            "/var/lib/stacks".to_string(),
-        ])
-        .unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let good = base.join("stacks");
+        std::fs::create_dir(&good).unwrap();
+        validate_discovery_roots(&[good.to_string_lossy().into_owned()]).unwrap();
+        for (name, target) in [("sock", "/var/run"), ("slash", "/"), ("inner", "stacks")] {
+            let link = base.join(name);
+            let target = if target.starts_with('/') {
+                PathBuf::from(target)
+            } else {
+                good.clone()
+            };
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert!(
+                validate_discovery_roots(&[link.to_string_lossy().into_owned()]).is_err(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn stored_discovery_roots_that_no_longer_pass_are_dropped() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let good = base.join("legacy");
+        std::fs::create_dir(&good).unwrap();
+        with_db(|| {
+            let args: DockerCreateArgs =
+                plugin_toolkit::serde_json::from_value(plugin_toolkit::serde_json::json!({
+                    "name": "local",
+                    "discoveryRoots": [good.to_string_lossy()],
+                }))
+                .unwrap();
+            block_on(docker_create(args, &admin())).unwrap();
+            let mut rt = runtime("local").unwrap().unwrap();
+            rt.discovery_roots.push("/var".into());
+            store_settings(&rt).unwrap();
+            assert_eq!(
+                discovery_roots().unwrap(),
+                [good.to_string_lossy().into_owned()]
+            );
+        });
     }
     use crate::test_support::{admin, assert_admin_refusal, non_admins, with_db};
     use plugin_toolkit::contract::OrcaToolDef;

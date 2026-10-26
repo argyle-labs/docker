@@ -457,7 +457,7 @@ pub async fn write(row: &mut StackRow, plan: &Plan, docker: Option<&Docker>) -> 
         .await?;
     *row = rebound;
     if stacks::get(&row.name)?.is_some() {
-        stacks::put(row)?;
+        stacks::store(row).await?;
     }
     Ok(())
 }

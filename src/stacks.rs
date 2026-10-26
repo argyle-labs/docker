@@ -1371,25 +1371,7 @@ fn normalized(dir: &str) -> PathBuf {
         .unwrap_or_else(|_| Path::new(dir).components().collect())
 }
 
-fn canonical_in_roots(dir: &str, roots: &[String]) -> Option<PathBuf> {
-    let path = Path::new(dir);
-    if !path.is_absolute()
-        || path
-            .components()
-            .any(|c| c == std::path::Component::ParentDir)
-    {
-        return None;
-    }
-    let real = path.canonicalize().ok().filter(|p| p.is_dir())?;
-    roots
-        .iter()
-        .filter_map(|r| Path::new(r).canonicalize().ok())
-        .any(|r| {
-            real.strip_prefix(&r)
-                .is_ok_and(|rel| rel.components().next().is_some())
-        })
-        .then_some(real)
-}
+use plugin_toolkit::host_paths::canonical_in_roots;
 
 pub async fn discover(docker: &bollard::Docker) -> Result<Vec<Discovery>> {
     let filters = std::collections::HashMap::from([(
@@ -1421,30 +1403,76 @@ pub fn claimed_projects(rows: &[StackRow]) -> Vec<String> {
     rows.iter().map(StackRow::project_name).collect()
 }
 
-/// Resolve and store the compose project of every registered row that has
-/// none, returning the names filled in.
-pub async fn backfill_projects() -> Result<Vec<String>> {
-    let roots = allowed_roots()?;
-    let mut filled = Vec::new();
+/// The compose project `row` runs as, resolved by compose from its files.
+pub async fn resolve_project(row: &StackRow) -> Result<String> {
+    let compose = row
+        .compose(&allowed_roots()?)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    compose
+        .project_name()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// [`put`] `row` with its compose project resolved; a failed resolution
+/// keeps the stored one.
+pub async fn store(row: &mut StackRow) -> Result<()> {
+    if let Ok(p) = resolve_project(row).await {
+        row.project = Some(p);
+    }
+    put(row)
+}
+
+/// [`insert`] `row` with its compose project resolved, as [`store`].
+pub async fn store_new(row: &mut StackRow) -> Result<()> {
+    if let Ok(p) = resolve_project(row).await {
+        row.project = Some(p);
+    }
+    insert(row)
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    plugin_toolkit::schemars::JsonSchema,
+)]
+#[serde(crate = "plugin_toolkit::serde")]
+#[schemars(crate = "plugin_toolkit::schemars")]
+#[serde(rename_all = "camelCase")]
+pub struct Backfill {
+    /// `<stack>: <old> -> <new>` for each stored project name that changes.
+    pub changed: Vec<String>,
+    /// `<stack>: <error>` for each stack whose project could not be resolved.
+    pub errors: Vec<String>,
+}
+
+/// Re-resolve the compose project of every registered row, storing each that
+/// changed unless `dry_run`. One row's failure never stops the rest.
+pub async fn backfill_projects(dry_run: bool) -> Result<Backfill> {
+    let mut out = Backfill::default();
     for mut row in list()? {
-        if row.project.is_some() {
-            continue;
-        }
-        let project = if row.files.is_empty() {
-            match row.compose(&roots) {
-                Ok(c) => c.project_name().await.ok(),
-                Err(_) => None,
+        match resolve_project(&row).await {
+            Ok(p) if row.project.as_deref() == Some(p.as_str()) => {}
+            Ok(p) => {
+                out.changed.push(format!(
+                    "{}: {} -> {p}",
+                    row.name,
+                    row.project.as_deref().unwrap_or("(unset)")
+                ));
+                row.project = Some(p);
+                if !dry_run && let Err(e) = put(&row) {
+                    out.errors.push(format!("{}: {e:#}", row.name));
+                }
             }
-        } else {
-            Some(row.name.clone())
-        };
-        if let Some(p) = project {
-            row.project = Some(p);
-            put(&row)?;
-            filled.push(row.name);
+            Err(e) => out.errors.push(format!("{}: {e:#}", row.name)),
         }
     }
-    Ok(filled)
+    Ok(out)
 }
 
 pub async fn all(docker: Option<&bollard::Docker>) -> Result<Vec<StackRow>> {
@@ -2654,11 +2682,11 @@ mod tests {
     }
 
     #[test]
-    fn stored_projects_are_claimed_and_backfilled_once() {
+    fn backfill_reports_each_failure_and_plans_on_a_dry_run() {
         crate::test_support::with_db(|| {
             let r = Roots::new(&["web"]);
             register_root(&r.roots[0], &[]);
-            let row = StackRow {
+            let web = StackRow {
                 name: "web".into(),
                 dir: r.path("web"),
                 file: "compose.yaml".into(),
@@ -2668,22 +2696,71 @@ mod tests {
                 env_files: Vec::new(),
                 project: None,
             };
-            put(&row).unwrap();
-            assert_eq!(claimed_projects(&list().unwrap()), ["web"]);
-            let filled = plugin_toolkit::reactor::block_on(backfill_projects()).unwrap();
-            assert_eq!(filled, ["web"]);
-            assert_eq!(require("web").unwrap().project.as_deref(), Some("web"));
+            let gone = StackRow {
+                name: "gone".into(),
+                dir: r.path("gone"),
+                files: Vec::new(),
+                ..web.clone()
+            };
+            put(&web).unwrap();
+            put(&gone).unwrap();
+            let mut claimed = claimed_projects(&list().unwrap());
+            claimed.sort();
+            assert_eq!(claimed, ["gone", "web"]);
+            let plan = plugin_toolkit::reactor::block_on(backfill_projects(true)).unwrap();
             assert!(
-                plugin_toolkit::reactor::block_on(backfill_projects())
-                    .unwrap()
-                    .is_empty()
+                plan.errors.iter().any(|e| e.starts_with("gone: ")),
+                "{plan:?}"
             );
+            assert!(
+                require("web").unwrap().project.is_none(),
+                "a dry run stores nothing"
+            );
+            if crate::test_support::have_compose() {
+                assert_eq!(plan.changed, ["web: (unset) -> web"]);
+                let done = plugin_toolkit::reactor::block_on(backfill_projects(false)).unwrap();
+                assert_eq!(done.changed, plan.changed);
+                assert_eq!(require("web").unwrap().project.as_deref(), Some("web"));
+                let again = plugin_toolkit::reactor::block_on(backfill_projects(false)).unwrap();
+                assert!(again.changed.is_empty());
+            }
             let renamed = StackRow {
                 project: Some("webapp".into()),
-                ..row
+                ..web
             };
             assert_eq!(claimed_projects(&[renamed]), ["webapp"]);
         });
+    }
+
+    #[test]
+    fn a_row_stored_before_the_project_column_reads_as_unset() {
+        let mut legacy = to_dbrow(&StackRow {
+            name: "web".into(),
+            dir: "/opt/stacks/web".into(),
+            file: "compose.yaml".into(),
+            enabled: true,
+            allow: Vec::new(),
+            files: Vec::new(),
+            env_files: Vec::new(),
+            project: None,
+        });
+        legacy.remove("project");
+        let row = from_dbrow(&legacy).unwrap();
+        assert_eq!(row.project, None);
+        assert_eq!(row.project_name(), "web");
+        let schema: plugin_toolkit::serde_json::Value =
+            plugin_toolkit::serde_json::from_str(&crate::registration::schema_json()).unwrap();
+        let project = schema["tables"][0]["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "project")
+            .unwrap();
+        assert_eq!(project["sql_type"], "TEXT");
+        assert!(
+            project.get("not_null").is_none(),
+            "core adds a nullable column to existing tables with ADD COLUMN"
+        );
     }
 
     #[test]

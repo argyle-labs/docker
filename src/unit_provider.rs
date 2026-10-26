@@ -355,6 +355,7 @@ impl DockerUnitProvider {
                     self.adapter.client().ok().as_ref(),
                 )
                 .await?;
+                stacks::store(&mut row.clone()).await?;
                 // A stale orca override naming a removed service breaks every
                 // compose command, so regenerate the one that exists.
                 let mut message = format!("edited stack '{}'", row.name);
@@ -903,10 +904,13 @@ impl DockerUnitProvider {
                 p.name
             ));
         }
-        let source = match &current {
-            Some(row) => Some(row.clone()),
-            None => stacks::discovered_here(&p.name).await,
-        };
+        if current.is_none() && stacks::discovered_here(&p.name).await.is_some() {
+            return Err(anyhow::anyhow!(
+                "stack '{}' is a discovered compose project, not a registered one; adopt it with docker.stack_adopt before deploying over it",
+                p.name
+            ));
+        }
+        let source = current.clone();
         // Grants are set only through the admin-only `docker.stack_allow`,
         // and stay bound to the services and images they name.
         let row = stacks::payload_row(
@@ -927,8 +931,8 @@ impl DockerUnitProvider {
             self.adapter.client().ok().as_ref(),
         )
         .await?;
-        stacks::put(&row)?;
         let mut row = row;
+        stacks::store(&mut row).await?;
         let normalized = if p.normalize && row.compose_path(&roots).is_ok_and(|p| p.is_file()) {
             crate::normalize::normalize(&mut row, self.adapter.client().ok().as_ref()).await
         } else {

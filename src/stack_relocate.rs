@@ -547,11 +547,11 @@ async fn relocate(args: &DockerStackRelocateArgs) -> Result<RelocateOutput> {
         let back = bring_back(&p.row).await;
         return Err(e.context(format!("relocate refused; nothing moved{back}")));
     }
-    let moved = StackRow {
+    let mut moved = StackRow {
         dir: new_str.clone(),
         ..p.row.clone()
     };
-    stacks::put(&moved)?;
+    stacks::store(&mut moved).await?;
     if let Err(e) = crate::ownership::up(&moved, &[]).await {
         let restored = match stacks::put(&p.row) {
             Ok(()) => bring_back(&p.row).await,
