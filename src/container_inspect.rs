@@ -113,6 +113,8 @@ pub struct ContainerInspectOutput {
     pub id: String,
     pub name: String,
     pub image: String,
+    pub image_id: String,
+    pub repo_digests: Vec<String>,
     pub command: Vec<String>,
     pub entrypoint: Vec<String>,
     pub env: Vec<EnvVar>,
@@ -126,6 +128,7 @@ pub struct ContainerInspectOutput {
     pub cap_add: Vec<String>,
     pub cap_drop: Vec<String>,
     pub privileged: bool,
+    pub read_only_rootfs: bool,
     pub labels: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub redacted_labels: Vec<String>,
@@ -143,6 +146,7 @@ pub struct ContainerInspectOutput {
     pub extra_hosts: Vec<String>,
     pub pid_mode: String,
     pub ipc_mode: String,
+    pub uts_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nano_cpus: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -326,6 +330,8 @@ pub fn describe(c: &ContainerInspectResponse) -> ContainerInspectOutput {
             .map(|n| n.trim_start_matches('/').to_owned())
             .unwrap_or_default(),
         image: config.image.unwrap_or_default(),
+        image_id: c.image.clone().unwrap_or_default(),
+        repo_digests: Vec::new(),
         command: masked(config.cmd.unwrap_or_default()),
         entrypoint: masked(config.entrypoint.unwrap_or_default()),
         env: config
@@ -378,6 +384,7 @@ pub fn describe(c: &ContainerInspectResponse) -> ContainerInspectOutput {
         cap_add: host.cap_add.unwrap_or_default(),
         cap_drop: host.cap_drop.unwrap_or_default(),
         privileged: host.privileged.unwrap_or(false),
+        read_only_rootfs: host.readonly_rootfs.unwrap_or(false),
         labels,
         redacted_labels,
         init: host.init.unwrap_or(false),
@@ -410,6 +417,7 @@ pub fn describe(c: &ContainerInspectResponse) -> ContainerInspectOutput {
         extra_hosts: host.extra_hosts.unwrap_or_default(),
         pid_mode: host.pid_mode.unwrap_or_default(),
         ipc_mode: host.ipc_mode.unwrap_or_default(),
+        uts_mode: host.uts_mode.unwrap_or_default(),
         nano_cpus: host.nano_cpus.filter(|n| *n > 0),
         memory: host.memory.filter(|n| *n > 0),
         pids_limit: host.pids_limit.filter(|n| *n > 0),
@@ -877,7 +885,16 @@ pub async fn inspect(docker: &Docker, container: &str) -> Result<ContainerInspec
     let target = crate::container_delete::parse_name(container)?;
     let opts = InspectContainerOptionsBuilder::new().build();
     match docker.inspect_container(&target, Some(opts)).await {
-        Ok(c) => Ok(describe(&c)),
+        Ok(c) => {
+            let mut out = describe(&c);
+            if !out.image_id.is_empty()
+                && let Ok(image) = docker.inspect_image(&out.image_id).await
+            {
+                out.repo_digests = image.repo_digests.unwrap_or_default();
+                out.repo_digests.sort();
+            }
+            Ok(out)
+        }
         Err(bollard::errors::Error::DockerResponseServerError {
             status_code: 404, ..
         }) => bail!("no container '{target}'"),
@@ -899,7 +916,8 @@ fn client() -> Result<Docker> {
     domain = "docker",
     verb = "container_inspect",
     role = "read",
-    execute_gated = false
+    execute_gated = false,
+    tool_callable = true
 )]
 async fn docker_container_inspect(
     args: DockerContainerInspectArgs,
@@ -936,6 +954,7 @@ mod tests {
             json!({
                 "Id": "abc123",
                 "Name": "/plex",
+                "Image": "sha256:feed",
                 "Config": {
                     "Image": "plexinc/pms-docker:latest",
                     "Cmd": ["--verbose"],
@@ -959,7 +978,12 @@ mod tests {
                     "Devices": [{ "PathOnHost": "/dev/dri", "PathInContainer": "/dev/dri", "CgroupPermissions": "rwm" }],
                     "CapAdd": ["NET_ADMIN"],
                     "CapDrop": ["ALL"],
-                    "Privileged": false
+                    "Privileged": false,
+                    "ReadonlyRootfs": true,
+                    "UTSMode": "host",
+                    "PidMode": "host",
+                    "IpcMode": "private",
+                    "SecurityOpt": ["no-new-privileges:true"]
                 },
                 "Mounts": [
                     { "Type": "bind", "Source": "/mnt/media", "Destination": "/media", "RW": false },
@@ -968,7 +992,31 @@ mod tests {
                 "NetworkSettings": { "Networks": { "media": {} } }
             })
             .to_string(),
+        ), Route::new(
+            "GET",
+            "/images/sha256:feed/json",
+            200,
+            json!({
+                "Id": "sha256:feed",
+                "RepoDigests": ["plexinc/pms-docker@sha256:beef", "mirror/pms@sha256:abba"]
+            })
+            .to_string(),
         )])
+    }
+
+    #[test]
+    fn hardening_fields_and_image_digests_are_reported() {
+        let out = inspected();
+        assert!(out.read_only_rootfs);
+        assert_eq!(out.uts_mode, "host");
+        assert_eq!(out.pid_mode, "host");
+        assert_eq!(out.ipc_mode, "private");
+        assert_eq!(out.security_opt, ["no-new-privileges:true"]);
+        assert_eq!(out.image_id, "sha256:feed");
+        assert_eq!(
+            out.repo_digests,
+            ["mirror/pms@sha256:abba", "plexinc/pms-docker@sha256:beef"]
+        );
     }
 
     fn inspected() -> ContainerInspectOutput {
