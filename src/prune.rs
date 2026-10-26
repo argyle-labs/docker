@@ -1323,7 +1323,7 @@ async fn compose_config(
     compose: &crate::compose::Compose,
     extra: &[&str],
 ) -> Result<(String, String)> {
-    let mut args = crate::stacks::config_args(dir, compose);
+    let mut args = crate::stacks::config_args(dir, compose)?;
     args.extend(extra.iter().map(|s| s.to_string()));
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     crate::run_with_stderr(&argv).await
