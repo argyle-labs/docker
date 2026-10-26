@@ -222,6 +222,28 @@ impl Compose {
             .collect()
     }
 
+    /// The same project with every file and env file passed through `f`.
+    pub fn map_paths(&self, f: impl Fn(&Path) -> PathBuf) -> Compose {
+        Compose {
+            file: f(&self.file),
+            override_file: self.override_file.as_deref().map(&f),
+            orca_file: self.orca_file.as_deref().map(&f),
+            extra_files: self.extra_files.iter().map(|p| f(p)).collect(),
+            env_files: self.env_files.iter().map(|p| f(p)).collect(),
+            project: self.project.clone(),
+        }
+    }
+
+    pub fn env_files(&self) -> &[PathBuf] {
+        &self.env_files
+    }
+
+    /// The project with `env` passed as an env file after any listed ones.
+    pub fn with_env_file(mut self, env: PathBuf) -> Compose {
+        self.env_files.push(env);
+        self
+    }
+
     /// The global `compose` arguments: the project name and env files when
     /// listed, then [`file_args`](Self::file_args).
     pub fn args(&self) -> Vec<String> {

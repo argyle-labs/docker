@@ -2099,7 +2099,11 @@ async fn stack_allow(
         }
         None => {
             let mut row = adoptable(&args)?;
-            stacks::carry_listed(&mut row, stacks::discovered_here(&args.name).await.as_ref());
+            stacks::carry_listed(
+                &mut row,
+                stacks::discovered_here(&args.name).await.as_ref(),
+                &crate::tools::stacks_roots()?,
+            );
             (row, true)
         }
     };
@@ -2353,7 +2357,7 @@ mod tests {
             env_files: vec![format!("{STACK}/.env")],
             ..row.clone()
         };
-        stacks::carry_listed(&mut row, Some(&discovered));
+        stacks::carry_listed(&mut row, Some(&discovered), &["/opt/stacks".to_string()]);
         assert_eq!(row.files, discovered.files);
         assert_eq!(row.env_files, discovered.env_files);
         let mut elsewhere = StackRow {
@@ -2362,7 +2366,11 @@ mod tests {
             env_files: Vec::new(),
             ..row.clone()
         };
-        stacks::carry_listed(&mut elsewhere, Some(&discovered));
+        stacks::carry_listed(
+            &mut elsewhere,
+            Some(&discovered),
+            &["/opt/stacks".to_string()],
+        );
         assert!(elsewhere.files.is_empty());
     }
 
@@ -3068,6 +3076,70 @@ mod tests {
 
     const PULLED: &str = "registry.example/x@sha256:1111111111111111111111111111111111111111111111111111111111111111";
     const REPUSHED: &str = "registry.example/x@sha256:2222222222222222222222222222222222222222222222222222222222222222";
+
+    #[test]
+    fn the_deploy_gate_checks_every_listed_file() {
+        if !crate::test_support::have_compose() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let fake = engine(&[]);
+        let docker = fake.client();
+        crate::test_support::with_db(|| {
+            let mut row = registered(&root, "services:\n  app:\n    image: x:1\n");
+            let dir = PathBuf::from(&row.dir);
+            row.files = vec![
+                dir.join("compose.yaml").to_string_lossy().into_owned(),
+                dir.join("extra.yaml").to_string_lossy().into_owned(),
+            ];
+            stacks::put(&row).unwrap();
+            let roots = crate::tools::stacks_roots().unwrap();
+            for (extra, want) in [
+                (
+                    "services:\n  sidecar:\n    image: y:1\n    privileged: true\n",
+                    "privileged: true",
+                ),
+                (
+                    "services:\n  sidecar:\n    image: y:1\n    volumes: [\"/etc:/host-etc\"]\n",
+                    "/etc",
+                ),
+            ] {
+                std::fs::write(dir.join("extra.yaml"), extra).unwrap();
+                let err = plugin_toolkit::reactor::block_on(row.write_checked(
+                    Some("services:\n  app:\n    image: x:1\n"),
+                    None,
+                    &roots,
+                    Some(&docker),
+                ))
+                .unwrap_err();
+                assert!(format!("{err:#}").contains(want), "{extra}: {err:#}");
+            }
+        });
+    }
+
+    #[test]
+    fn an_env_payload_is_refused_when_the_listed_env_files_leave_out_dot_env() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        crate::test_support::with_db(|| {
+            let mut row = registered(&root, "services:\n  app:\n    image: x:1\n");
+            let dir = PathBuf::from(&row.dir);
+            std::fs::write(dir.join("prod.env"), "A=1\n").unwrap();
+            row.files = vec![dir.join("compose.yaml").to_string_lossy().into_owned()];
+            row.env_files = vec![dir.join("prod.env").to_string_lossy().into_owned()];
+            let roots = crate::tools::stacks_roots().unwrap();
+            let err = plugin_toolkit::reactor::block_on(row.write_checked(
+                None,
+                Some("A=2\n"),
+                &roots,
+                None,
+            ))
+            .unwrap_err();
+            assert!(format!("{err:#}").contains("prod.env"), "{err:#}");
+            assert!(!dir.join(".env").exists());
+        });
+    }
 
     #[test]
     fn real_compose_config_feeds_profiles_env_files_and_dotdot_binds_to_the_policy() {

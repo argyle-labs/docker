@@ -201,7 +201,11 @@ impl StackRow {
             },
         };
         let env_file = env.as_ref().map(StagedWrite::temp_path);
-        let raw = config_json(dir.path(), &file, env_file.as_deref()).await?;
+        let checked =
+            self.checked_compose(dir.path(), &name, &file, env_file.as_deref(), stacks_roots)?;
+        let raw = resolved_config(dir.path(), &checked)
+            .await
+            .context("nothing was written")?;
         let cfg = policy::prepare(&raw, dir.path(), &dir)?;
         policy::check_stack(docker, &cfg, &cfg, self, dir.path(), stacks_roots).await?;
         if let Some(staged) = compose {
@@ -211,6 +215,67 @@ impl StackRow {
             staged.commit()?;
         }
         Ok(())
+    }
+
+    /// The project this row runs from `dir`, with `file` (the compose file
+    /// `name`, possibly staged) and `env` (a staged `.env`) in place of the
+    /// live ones: exactly what a write will run.
+    fn checked_compose(
+        &self,
+        dir: &Path,
+        name: &str,
+        file: &Path,
+        env: Option<&Path>,
+        roots: &[String],
+    ) -> Result<Compose> {
+        let live_file = anchored(&dir.join(name));
+        if self.files.is_empty() {
+            let mut files = vec![file.to_path_buf()];
+            files.extend(crate::compose::override_in(dir));
+            return Compose::new(
+                files,
+                env.map(Path::to_path_buf).into_iter().collect(),
+                None,
+            )
+            .context("no compose file");
+        }
+        let listed = self.compose(roots)?;
+        if anchored(file) != live_file && !listed.files().iter().any(|f| anchored(f) == live_file) {
+            anyhow::bail!(
+                "compose file {} is not one of the files the stack runs",
+                live_file.display()
+            );
+        }
+        let live_env = anchored(&dir.join(ENV_FILE));
+        if env.is_some()
+            && !listed.env_files().is_empty()
+            && !listed.env_files().iter().any(|e| anchored(e) == live_env)
+        {
+            anyhow::bail!(
+                "the stack runs with env files {}, not {}; a .env would not take effect",
+                listed
+                    .env_files()
+                    .iter()
+                    .map(|e| e.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                live_env.display()
+            );
+        }
+        let swapped = listed.map_paths(|p| {
+            let a = anchored(p);
+            if a == live_file {
+                file.to_path_buf()
+            } else if let Some(env) = env.filter(|_| a == live_env) {
+                env.to_path_buf()
+            } else {
+                p.to_path_buf()
+            }
+        });
+        Ok(match env {
+            Some(env) if swapped.env_files().is_empty() => swapped.with_env_file(env.to_path_buf()),
+            _ => swapped,
+        })
     }
 
     /// Rewrite the compose file for `fix`: refused when the file on disk no
@@ -235,7 +300,11 @@ impl StackRow {
             );
         }
         let staged = StagedWrite::new(&dir, &name, yaml)?;
-        let raw = config_json(dir.path(), &staged.temp_path(), None).await?;
+        let checked =
+            self.checked_compose(dir.path(), &name, &staged.temp_path(), None, stacks_roots)?;
+        let raw = resolved_config(dir.path(), &checked)
+            .await
+            .context("nothing was written")?;
         let cfg = policy::prepare(&raw, dir.path(), &dir)?;
         policy::check_stack(docker, &cfg, &cfg, self, dir.path(), stacks_roots).await?;
         staged.commit()
@@ -466,22 +535,6 @@ pub async fn resolved_config(dir: &Path, compose: &Compose) -> Result<String> {
     crate::run(&argv)
         .await
         .context("compose rejects the stack's config")
-}
-
-/// The resolved config `compose up` would run with `file` in place of the
-/// stack's compose file, plus the override compose would load from `dir`.
-pub async fn config_json(dir: &Path, file: &Path, env_file: Option<&Path>) -> Result<String> {
-    let mut files = vec![file.to_path_buf()];
-    files.extend(crate::compose::override_in(dir));
-    let compose = Compose::new(
-        files,
-        env_file.map(Path::to_path_buf).into_iter().collect(),
-        None,
-    )
-    .context("no compose file")?;
-    resolved_config(dir, &compose)
-        .await
-        .context("nothing was written")
 }
 
 /// `(root, dir relative to it)` for `dir` resolved, symlinks included, when it
@@ -752,19 +805,39 @@ impl StagedRestore {
     /// The compose files in the staged dir that `row` would run, in `-f`
     /// order, without and then with [`crate::compose::ORCA_FILE`] when the
     /// archive holds one. Empty when it holds no compose file.
-    pub fn compose_sets(&self, row: &StackRow, roots: &[String]) -> Vec<Vec<PathBuf>> {
-        let named = self.staged.join(&row.file);
-        let Some(compose) = Compose::at(&named).or_else(|| Compose::find(&self.staged)) else {
-            return Vec::new();
+    pub fn compose_sets(&self, row: &StackRow, roots: &[String]) -> Result<Vec<Compose>> {
+        let env = self.env_file();
+        let compose = if row.files.is_empty() {
+            let named = self.staged.join(&row.file);
+            let Some(c) = Compose::at(&named).or_else(|| Compose::find(&self.staged)) else {
+                return Ok(Vec::new());
+            };
+            c.map_paths(Path::to_path_buf)
+        } else {
+            let live = anchored(Path::new(&row.dir));
+            let staged = row.compose(roots)?.map_paths(|p| {
+                let a = anchored(p);
+                match a.strip_prefix(&live) {
+                    Ok(rest) => self.staged.join(rest),
+                    Err(_) => p.to_path_buf(),
+                }
+            });
+            if !staged.file().is_file() {
+                return Ok(Vec::new());
+            }
+            staged
         };
-        let plain: Vec<PathBuf> = compose.files().into_iter().map(Path::to_path_buf).collect();
-        let mut sets = vec![plain];
+        let compose = match env {
+            Some(env) if compose.env_files().is_empty() => compose.with_env_file(env),
+            _ => compose,
+        };
+        let mut sets = vec![compose.clone()];
         if self.staged.join(crate::compose::ORCA_FILE).is_file()
             && let Ok(with) = compose.with_orca(roots)
         {
-            sets.push(with.files().into_iter().map(Path::to_path_buf).collect());
+            sets.push(with);
         }
-        sets
+        Ok(sets)
     }
 
     pub fn read_env(&self) -> Option<String> {
@@ -976,9 +1049,11 @@ fn to_dbrow(row: &StackRow) -> DbRow {
 }
 
 fn list_from_row(m: &DbRow, key: &str) -> Result<Vec<String>> {
-    Ok(field_from_row::<Option<String>>(m, key)?
-        .and_then(|raw| plugin_toolkit::serde_json::from_str(&raw).ok())
-        .unwrap_or_default())
+    match field_from_row::<Option<String>>(m, key)? {
+        Some(raw) if !raw.is_empty() => plugin_toolkit::serde_json::from_str(&raw)
+            .map_err(|e| anyhow::anyhow!("stack row `{key}` is not a JSON list: {e}")),
+        _ => Ok(Vec::new()),
+    }
 }
 
 fn from_dbrow(m: &DbRow) -> Result<StackRow> {
@@ -1237,6 +1312,7 @@ pub fn from_labels(
                     .iter()
                     .filter_map(|(dir, _, _)| canonical_in_roots(dir.as_ref()?, roots))
                     .collect();
+                dirs.sort();
                 dirs.dedup();
                 return Some(Discovery::Conflict {
                     name: name.clone(),
@@ -1415,9 +1491,15 @@ async fn discovered(docker: &bollard::Docker, name: &str) -> Option<StackRow> {
 
 /// `row` with `source`'s listed files and env files when both name the same
 /// dir, so no write drops a discovered project's files.
-pub fn carry_listed(row: &mut StackRow, source: Option<&StackRow>) {
+pub fn carry_listed(row: &mut StackRow, source: Option<&StackRow>, roots: &[String]) {
+    let dir = anchored(Path::new(&row.dir));
+    let in_roots = roots
+        .iter()
+        .map(|r| anchored(Path::new(r)))
+        .any(|r| dir.starts_with(&r) && dir != r);
     if let Some(s) = source
-        && normalized(&s.dir) == normalized(&row.dir)
+        && in_roots
+        && anchored(Path::new(&s.dir)) == dir
     {
         row.files = s.files.clone();
         row.env_files = s.env_files.clone();
@@ -1432,6 +1514,7 @@ pub fn payload_row(
     file: String,
     allow: Vec<policy::Grant>,
     source: Option<&StackRow>,
+    roots: &[String],
 ) -> StackRow {
     let mut row = StackRow {
         name: name.to_string(),
@@ -1442,8 +1525,28 @@ pub fn payload_row(
         files: Vec::new(),
         env_files: Vec::new(),
     };
-    carry_listed(&mut row, source);
+    carry_listed(&mut row, source, roots);
     row
+}
+
+/// `path` with its nearest existing ancestor canonicalized, so a dir not yet
+/// created compares equal through a symlinked root. `..` is kept lexically.
+fn anchored(path: &Path) -> PathBuf {
+    let lexical: PathBuf = path.components().collect();
+    let mut base = lexical.as_path();
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(real) = base.canonicalize() {
+            return rest.iter().rev().fold(real, |p, c| p.join(c));
+        }
+        match (base.parent(), base.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                base = parent;
+            }
+            _ => return lexical,
+        }
+    }
 }
 
 /// The registered row named `name`, else the discovered project.
@@ -1848,6 +1951,51 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_listed_files_are_an_error() {
+        let mut m = DbRow::new();
+        m.insert("files".into(), DbValue::Text("not json".into()));
+        assert!(list_from_row(&m, "files").is_err());
+        m.insert("files".into(), DbValue::Text(r#"["/a"]"#.into()));
+        assert_eq!(list_from_row(&m, "files").unwrap(), vec!["/a"]);
+        assert!(list_from_row(&DbRow::new(), "files").unwrap().is_empty());
+    }
+
+    #[test]
+    fn carrying_compares_through_symlinks_for_missing_dirs_and_checks_the_roots() {
+        let r = Roots::new(&["web"]);
+        let alias = tempdir().unwrap();
+        let link = alias.path().join("stacks");
+        symlink(&r.roots[0], &link).unwrap();
+        let source = StackRow {
+            name: "new".into(),
+            dir: r.path("new"),
+            file: "compose.yaml".into(),
+            enabled: true,
+            allow: Vec::new(),
+            files: vec![r.path("new/compose.yaml")],
+            env_files: Vec::new(),
+        };
+        let mut row = StackRow {
+            dir: link.join("new").to_string_lossy().into_owned(),
+            files: Vec::new(),
+            ..source.clone()
+        };
+        carry_listed(&mut row, Some(&source), &r.roots);
+        assert_eq!(row.files, source.files);
+        let outside = StackRow {
+            dir: "/etc".into(),
+            ..source.clone()
+        };
+        let mut at_etc = StackRow {
+            dir: "/etc".into(),
+            files: Vec::new(),
+            ..source.clone()
+        };
+        carry_listed(&mut at_etc, Some(&outside), &r.roots);
+        assert!(at_etc.files.is_empty());
+    }
+
+    #[test]
     fn normalizing_a_discovered_multi_file_stack_keeps_its_files() {
         let r = Roots::new(&["web"]);
         std::fs::write(PathBuf::from(r.path("web/extra.yaml")), "services: {}\n").unwrap();
@@ -1867,6 +2015,7 @@ mod tests {
             "compose.yaml".into(),
             Vec::new(),
             Some(&discovered),
+            &r.roots,
         );
         assert_eq!(row.files, discovered.files);
         let compose = row.compose(&r.roots).unwrap();
@@ -1875,7 +2024,14 @@ mod tests {
             dir: "/opt/stacks/other".into(),
             ..discovered.clone()
         };
-        let row = payload_row("web", &dir, "compose.yaml".into(), Vec::new(), Some(&other));
+        let row = payload_row(
+            "web",
+            &dir,
+            "compose.yaml".into(),
+            Vec::new(),
+            Some(&other),
+            &r.roots,
+        );
         assert!(row.files.is_empty());
     }
 
@@ -2963,10 +3119,10 @@ mod tests {
         );
         let staged = StagedRestore::stage(&f.row(), &mut file, &f.roots).unwrap();
         assert_eq!(staged.env_file(), Some(staged.path().join(".env")));
-        assert_eq!(
-            staged.compose_sets(&f.row(), &f.roots),
-            vec![vec![staged.path().join("compose.yaml")]]
-        );
+        let sets = staged.compose_sets(&f.row(), &f.roots).unwrap();
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].files(), vec![staged.path().join("compose.yaml")]);
+        assert_eq!(sets[0].env_files(), [staged.path().join(".env")]);
         assert_eq!(staged.swap().unwrap(), None);
         assert_eq!(
             std::fs::read_to_string(f.dir().join("compose.yaml")).unwrap(),

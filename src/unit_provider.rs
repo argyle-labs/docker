@@ -430,6 +430,7 @@ impl DockerUnitProvider {
                         .map(|r| r.allow)
                         .unwrap_or_default(),
                     source.as_ref(),
+                    &crate::stacks::allowed_roots().unwrap_or_default(),
                 );
                 if !crate::stacks::allowed_roots()
                     .and_then(|roots| row.compose_path(&roots))
@@ -766,13 +767,12 @@ impl DockerUnitProvider {
         let roots = crate::tools::stacks_roots()?;
         let mut staged = StagedRestore::stage(row, &mut file, &roots)?;
         let live = stacks::stack_dir_in_roots(&row.dir, &roots)?;
-        let env = staged.env_file();
         let staged_secrets = staged
             .read_env()
             .map(|e| stacks::env_values(&e))
             .unwrap_or_default();
         let checked = async {
-            let sets = staged.compose_sets(row, &roots);
+            let sets = staged.compose_sets(row, &roots)?;
             let Some(plain) = sets.first() else {
                 return Ok(());
             };
@@ -782,14 +782,10 @@ impl DockerUnitProvider {
             // Env files are read from the staging dir, where the paths will
             // be once it is swapped in.
             let dir = staged.dir()?;
-            let at = |files: &Vec<std::path::PathBuf>| {
-                crate::compose::Compose::new(files.clone(), env.clone().into_iter().collect(), None)
-                    .ok_or_else(|| anyhow::anyhow!("no compose file"))
-            };
-            let user_raw = stacks::resolved_config(&live, &at(plain)?).await?;
+            let user_raw = stacks::resolved_config(&live, plain).await?;
             let user_cfg = policy::prepare(&user_raw, &live, &dir)?;
-            for files in &sets {
-                let raw = stacks::resolved_config(&live, &at(files)?).await?;
+            for compose in &sets {
+                let raw = stacks::resolved_config(&live, compose).await?;
                 let cfg = policy::prepare(&raw, &live, &dir)?;
                 policy::check_stack(docker, &cfg, &user_cfg, row, &live, &roots).await?;
             }
@@ -909,6 +905,7 @@ impl DockerUnitProvider {
                 .map(|r| r.allow.clone())
                 .unwrap_or_default(),
             source.as_ref(),
+            &crate::stacks::allowed_roots()?,
         );
         row.write_checked(
             p.compose_yaml.as_deref(),
@@ -4777,6 +4774,49 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join("compose.yaml")).unwrap(),
             yaml
+        );
+    }
+
+    #[test]
+    fn restore_checks_every_listed_file() {
+        if !crate::test_support::have_compose() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let yaml = "services:\n  app:\n    image: x:1\n";
+        let dir = root.join("web");
+        let ((), _) = crate::test_support::with_db(|| {
+            register_root(&root);
+            let mut row = registered_stack(&dir, yaml, None);
+            std::fs::write(dir.join("extra.yaml"), "services: {}\n").unwrap();
+            row.files = vec![
+                path(&dir.join("compose.yaml")),
+                path(&dir.join("extra.yaml")),
+            ];
+            stacks::put(&row).unwrap();
+            for (extra, want) in [
+                (
+                    "services:\n  sidecar:\n    image: y:1\n    privileged: true\n",
+                    "privileged: true",
+                ),
+                (
+                    "services:\n  sidecar:\n    image: y:1\n    volumes: [\"/etc:/host-etc\"]\n",
+                    "/etc",
+                ),
+            ] {
+                let restore =
+                    stack_archive(&root, &[("compose.yaml", yaml), ("extra.yaml", extra)]);
+                let err = err_of(stack_update(ACTION_RESTORE, Some(restore)));
+                assert!(
+                    err.contains("restore refused") && err.contains(want),
+                    "{err}"
+                );
+            }
+        });
+        assert_eq!(
+            std::fs::read_to_string(dir.join("extra.yaml")).unwrap(),
+            "services: {}\n"
         );
     }
 
