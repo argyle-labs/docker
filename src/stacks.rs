@@ -232,7 +232,7 @@ impl StackRow {
         let live_file = entry(&dir.join(name));
         let listed = match self.compose(roots) {
             Ok(c) => c,
-            Err(_) if self.files.is_empty() => {
+            Err(crate::ComposeError::NoComposeFile(_)) if self.files.is_empty() => {
                 let mut files = vec![dir.join(name)];
                 files.extend(crate::compose::override_in(dir));
                 Compose::new(files, Vec::new(), None).context("no compose file")?
@@ -510,15 +510,18 @@ pub fn redact(text: &str, values: &[String]) -> String {
 /// the project in `dir`, with every profile enabled: the one way every verb
 /// reads a stack. Env files are left unread, so the policy sees their paths
 /// rather than their contents.
-pub fn config_args(dir: &Path, compose: &Compose) -> Vec<String> {
-    let mut args: Vec<String> = vec!["compose".into()];
-    if compose.project_dir().is_none() {
-        args.extend([
-            "--project-directory".into(),
-            dir.to_string_lossy().into_owned(),
-        ]);
+pub fn config_args(dir: &Path, compose: &Compose) -> Result<Vec<String>> {
+    if let Some(own) = compose.project_dir()
+        && anchored(own) != anchored(dir)
+    {
+        anyhow::bail!(
+            "compose project dir {} is not {}",
+            own.display(),
+            dir.display()
+        );
     }
-    args.extend(compose.args());
+    let mut args: Vec<String> = vec!["compose".into()];
+    args.extend(compose.clone().with_project_dir(dir.to_path_buf()).args());
     args.extend(
         [
             "--profile",
@@ -530,13 +533,13 @@ pub fn config_args(dir: &Path, compose: &Compose) -> Vec<String> {
         ]
         .map(String::from),
     );
-    args
+    Ok(args)
 }
 
 /// The resolved config of `compose` run as the project in `dir`. Also the
 /// validation: compose rejects files it cannot run.
 pub async fn resolved_config(dir: &Path, compose: &Compose) -> Result<String> {
-    let args = config_args(dir, compose);
+    let args = config_args(dir, compose)?;
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     crate::run(&argv)
         .await
@@ -1955,7 +1958,7 @@ mod tests {
             env_files: vec![r.path("web/.env")],
         };
         let compose = row.compose(&r.roots).unwrap();
-        let args = config_args(Path::new(&row.dir), &compose);
+        let args = config_args(Path::new(&row.dir), &compose).unwrap();
         let has = |pair: [&str; 2]| args.windows(2).any(|w| w == pair);
         assert!(has(["--project-directory", &r.path("web")]), "{args:?}");
         assert!(has(["-p", "web"]), "{args:?}");
@@ -2031,7 +2034,8 @@ mod tests {
                 .any(|w| w == ["--project-directory", &r.path("web")]),
             "{args:?}"
         );
-        let checked = config_args(Path::new(&r.path("web")), &compose);
+        let checked = config_args(Path::new(&r.path("web")), &compose).unwrap();
+        assert!(config_args(Path::new(&r.path("shared")), &compose).is_err());
         assert_eq!(
             checked
                 .iter()
@@ -2902,7 +2906,7 @@ mod tests {
         ];
         let compose =
             Compose::new(files.to_vec(), vec![PathBuf::from("/s/web/.env.tmp")], None).unwrap();
-        let a = config_args(Path::new("/s/web"), &compose);
+        let a = config_args(Path::new("/s/web"), &compose).unwrap();
         assert_eq!(
             a,
             [

@@ -34,8 +34,10 @@ path = "src/main.rs"
 # not in orca core (orca's `containers` crate is now a bollard-free generic
 # seam).
 #
-# Pinned to the orca git source; the committed `[patch]` in `.cargo/config.toml`
-# resolves this to the local in-tree toolkit alongside a checked-out orca repo.
+# Tracks orca's git main. orca's crates name their sibling deps with
+# `registry = "gitea"`, whose index comes from `CARGO_REGISTRIES_GITEA_INDEX` in
+# CI and from the user-level `~/.cargo/config.toml` locally; a local `[patch]`
+# onto an orca checkout goes in the git-ignored `.cargo/config.toml`.
 [dependencies]
 # Thin profile: docker talks to the engine via bollard (its own dep), not
 # HTTP-over-toolkit, so no `http`/`delegated-http`. It needs `tools`
