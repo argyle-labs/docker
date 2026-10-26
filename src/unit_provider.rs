@@ -417,22 +417,20 @@ impl DockerUnitProvider {
         let planned = match &p.compose_yaml {
             Some(yaml) => crate::normalize::plan_inline(&p.name, &dir, yaml, docker.as_ref()).await,
             None => {
-                let row = StackRow {
-                    name: p.name.clone(),
-                    dir: dir.to_string_lossy().into_owned(),
-                    file: p
-                        .file
+                let source = stacks::listed_source(&p.name).await;
+                let row = stacks::payload_row(
+                    &p.name,
+                    &dir,
+                    p.file
                         .clone()
                         .unwrap_or_else(|| stacks::DEFAULT_COMPOSE_FILE.to_string()),
-                    enabled: true,
-                    allow: stacks::get(&p.name)
+                    stacks::get(&p.name)
                         .ok()
                         .flatten()
                         .map(|r| r.allow)
                         .unwrap_or_default(),
-                    files: Vec::new(),
-                    env_files: Vec::new(),
-                };
+                    source.as_ref(),
+                );
                 if !crate::stacks::allowed_roots()
                     .and_then(|roots| row.compose_path(&roots))
                     .is_ok_and(|p| p.is_file())
@@ -896,20 +894,22 @@ impl DockerUnitProvider {
                 p.name
             ));
         }
-        let row = StackRow {
-            name: p.name.clone(),
-            dir: dir.to_string_lossy().into_owned(),
+        let source = match &current {
+            Some(row) => Some(row.clone()),
+            None => stacks::discovered_here(&p.name).await,
+        };
+        // Grants are set only through the admin-only `docker.stack_allow`,
+        // and stay bound to the services and images they name.
+        let row = stacks::payload_row(
+            &p.name,
+            &dir,
             file,
-            enabled: true,
-            // Grants are set only through the admin-only `docker.stack_allow`,
-            // and stay bound to the services and images they name.
-            allow: current
+            current
                 .as_ref()
                 .map(|r| r.allow.clone())
                 .unwrap_or_default(),
-            files: Vec::new(),
-            env_files: Vec::new(),
-        };
+            source.as_ref(),
+        );
         row.write_checked(
             p.compose_yaml.as_deref(),
             p.compose_env.as_deref(),

@@ -1413,6 +1413,47 @@ async fn discovered(docker: &bollard::Docker, name: &str) -> Option<StackRow> {
     }
 }
 
+/// `row` with `source`'s listed files and env files when both name the same
+/// dir, so no write drops a discovered project's files.
+pub fn carry_listed(row: &mut StackRow, source: Option<&StackRow>) {
+    if let Some(s) = source
+        && normalized(&s.dir) == normalized(&row.dir)
+    {
+        row.files = s.files.clone();
+        row.env_files = s.env_files.clone();
+    }
+}
+
+/// The row a deploy or normalize payload names, keeping `source`'s listed
+/// files.
+pub fn payload_row(
+    name: &str,
+    dir: &Path,
+    file: String,
+    allow: Vec<policy::Grant>,
+    source: Option<&StackRow>,
+) -> StackRow {
+    let mut row = StackRow {
+        name: name.to_string(),
+        dir: dir.to_string_lossy().into_owned(),
+        file,
+        enabled: true,
+        allow,
+        files: Vec::new(),
+        env_files: Vec::new(),
+    };
+    carry_listed(&mut row, source);
+    row
+}
+
+/// The registered row named `name`, else the discovered project.
+pub async fn listed_source(name: &str) -> Option<StackRow> {
+    match get(name) {
+        Ok(Some(row)) => Some(row),
+        _ => discovered_here(name).await,
+    }
+}
+
 /// The discovered project named `name` on the local engine, if any.
 pub async fn discovered_here(name: &str) -> Option<StackRow> {
     let docker = crate::registration::adapter().present_client()?;
@@ -1804,6 +1845,38 @@ mod tests {
         assert!(has(["--env-file", &r.path("web/.env")]), "{args:?}");
         assert!(has(["--profile", "*"]), "{args:?}");
         assert_eq!(&args[..1], ["compose"]);
+    }
+
+    #[test]
+    fn normalizing_a_discovered_multi_file_stack_keeps_its_files() {
+        let r = Roots::new(&["web"]);
+        std::fs::write(PathBuf::from(r.path("web/extra.yaml")), "services: {}\n").unwrap();
+        let discovered = StackRow {
+            name: "web".into(),
+            dir: r.path("web"),
+            file: "compose.yaml".into(),
+            enabled: true,
+            allow: Vec::new(),
+            files: vec![r.path("web/compose.yaml"), r.path("web/extra.yaml")],
+            env_files: Vec::new(),
+        };
+        let dir = PathBuf::from(format!("{}/./web", r.roots[0]));
+        let row = payload_row(
+            "web",
+            &dir,
+            "compose.yaml".into(),
+            Vec::new(),
+            Some(&discovered),
+        );
+        assert_eq!(row.files, discovered.files);
+        let compose = row.compose(&r.roots).unwrap();
+        assert_eq!(compose.files().len(), 2);
+        let other = StackRow {
+            dir: "/opt/stacks/other".into(),
+            ..discovered.clone()
+        };
+        let row = payload_row("web", &dir, "compose.yaml".into(), Vec::new(), Some(&other));
+        assert!(row.files.is_empty());
     }
 
     #[test]

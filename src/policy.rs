@@ -2099,7 +2099,7 @@ async fn stack_allow(
         }
         None => {
             let mut row = adoptable(&args)?;
-            carry_listed(&mut row, stacks::discovered_here(&args.name).await.as_ref());
+            stacks::carry_listed(&mut row, stacks::discovered_here(&args.name).await.as_ref());
             (row, true)
         }
     };
@@ -2271,17 +2271,6 @@ fn refuse_move(row: &StackRow, args: &DockerStackAllowArgs) -> Result<()> {
     Ok(())
 }
 
-/// A discovered project's listed files and env files, carried onto the row
-/// adopting it when both name the same dir.
-fn carry_listed(row: &mut StackRow, discovered: Option<&StackRow>) {
-    if let Some(d) = discovered
-        && Path::new(&d.dir) == Path::new(&row.dir)
-    {
-        row.files = d.files.clone();
-        row.env_files = d.env_files.clone();
-    }
-}
-
 /// The row adopting `args.name` would register: enabled, no grants yet, at
 /// `args.dir` inside a stacks root, its compose file a regular file there.
 fn adoptable(args: &DockerStackAllowArgs) -> Result<StackRow> {
@@ -2364,7 +2353,7 @@ mod tests {
             env_files: vec![format!("{STACK}/.env")],
             ..row.clone()
         };
-        carry_listed(&mut row, Some(&discovered));
+        stacks::carry_listed(&mut row, Some(&discovered));
         assert_eq!(row.files, discovered.files);
         assert_eq!(row.env_files, discovered.env_files);
         let mut elsewhere = StackRow {
@@ -2373,7 +2362,7 @@ mod tests {
             env_files: Vec::new(),
             ..row.clone()
         };
-        carry_listed(&mut elsewhere, Some(&discovered));
+        stacks::carry_listed(&mut elsewhere, Some(&discovered));
         assert!(elsewhere.files.is_empty());
     }
 
