@@ -451,13 +451,13 @@ pub async fn write(row: &mut StackRow, plan: &Plan, docker: Option<&Docker>) -> 
         .write_compose_if_unchanged(
             &plan.after,
             &plan.before,
-            &crate::tools::stacks_roots()?,
+            &crate::stacks::allowed_roots()?,
             docker,
         )
         .await?;
     *row = rebound;
     if stacks::get(&row.name)?.is_some() {
-        stacks::put(row)?;
+        stacks::store(row).await?;
     }
     Ok(())
 }

@@ -18,50 +18,6 @@ use crate::unit_provider::{DockerUnitProvider, StackDeployPayload, stack_remove}
 
 const INVOKE_PREFIX: &str = "docker.__deploy";
 
-const DENIED: &[&str] = &[
-    "/etc",
-    "/root",
-    "/proc",
-    "/sys",
-    "/dev",
-    "/boot",
-    "/run",
-    "/var/run",
-    "/var/lib/docker",
-    "/usr",
-    "/bin",
-    "/sbin",
-    "/lib",
-    "/lib64",
-    "/opt/orca",
-    "/var/spool",
-    "/var/lib/containerd",
-    "/var/lib/containers",
-    "/var/lib/lxc",
-    "/var/lib/libvirt",
-    "/var/lib/orca",
-    "/private/etc",
-    "/private/var/root",
-    "/private/var/db",
-    "/Library/Keychains",
-];
-
-const DENIED_SEGMENTS: &[&[&str]] = &[
-    &[".ssh"],
-    &[".gnupg"],
-    &[".orca"],
-    &[".aws"],
-    &[".docker"],
-    &[".kube"],
-    &[".config", "gcloud"],
-    &[".netrc"],
-    &[".password-store"],
-    &[".local", "share", "keyrings"],
-    &["library", "keychains"],
-];
-
-const HOME_PARENTS: &[&str] = &["/home", "/Users"];
-
 pub struct DockerDeployTarget {
     host: String,
     root: String,
@@ -237,6 +193,50 @@ fn orca_home() -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".orca")))
 }
+
+const DENIED: &[&str] = &[
+    "/etc",
+    "/root",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/boot",
+    "/run",
+    "/var/run",
+    "/var/lib/docker",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/opt/orca",
+    "/var/spool",
+    "/var/lib/containerd",
+    "/var/lib/containers",
+    "/var/lib/lxc",
+    "/var/lib/libvirt",
+    "/var/lib/orca",
+    "/private/etc",
+    "/private/var/root",
+    "/private/var/db",
+    "/Library/Keychains",
+];
+
+const DENIED_SEGMENTS: &[&[&str]] = &[
+    &[".ssh"],
+    &[".gnupg"],
+    &[".orca"],
+    &[".aws"],
+    &[".docker"],
+    &[".kube"],
+    &[".config", "gcloud"],
+    &[".netrc"],
+    &[".password-store"],
+    &[".local", "share", "keyrings"],
+    &["library", "keychains"],
+];
+
+const HOME_PARENTS: &[&str] = &["/home", "/Users"];
 
 fn resolved(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
@@ -1803,6 +1803,7 @@ mod tests {
             allow: Vec::new(),
             files: Vec::new(),
             env_files: Vec::new(),
+            project: None,
         };
         let target = DockerDeployTarget::new("host-a", root);
         let adopt = || {

@@ -1737,7 +1737,7 @@ async fn resolved(
     row: &StackRow,
     compose: &Compose,
 ) -> Result<(StackDir, Vec<String>, Value, Value)> {
-    let roots = crate::tools::stacks_roots()?;
+    let roots = crate::stacks::allowed_roots()?;
     let dir = StackDir::open(&row.dir, &roots, false)?
         .ok_or_else(|| anyhow!("stack dir {} does not exist", row.dir))?;
     let raw = stacks::resolved_config(dir.path(), compose).await?;
@@ -2077,6 +2077,18 @@ async fn stack_allow(
     args: DockerStackAllowArgs,
     docker: &bollard::Docker,
 ) -> Result<DockerStackAllowOutput> {
+    stack_allow_from(args, docker, None, true).await
+}
+
+/// [`stack_allow`] adopting with `source`'s listed files, else the
+/// discovered project's; an adoption rewrites its compose files only with
+/// `normalize`.
+async fn stack_allow_from(
+    args: DockerStackAllowArgs,
+    docker: &bollard::Docker,
+    source: Option<&StackRow>,
+    normalize: bool,
+) -> Result<DockerStackAllowOutput> {
     if args.allow.is_none() && !args.approve_current {
         bail!(
             "{ALLOW_TOOL}: needs `allow` or `approve_current`; to read a stack's grants use docker.stack_grants"
@@ -2099,11 +2111,11 @@ async fn stack_allow(
         }
         None => {
             let mut row = adoptable(&args)?;
-            stacks::carry_listed(
-                &mut row,
-                stacks::discovered_here(&args.name).await.as_ref(),
-                &crate::tools::stacks_roots()?,
-            );
+            let found = match source {
+                Some(s) => Some(s.clone()),
+                None => stacks::discovered_here(&args.name).await,
+            };
+            stacks::carry_listed(&mut row, found.as_ref(), &crate::stacks::allowed_roots()?);
             (row, true)
         }
     };
@@ -2146,7 +2158,7 @@ async fn stack_allow(
         .filter(|g| !planned.contains(g))
         .cloned()
         .collect();
-    let normalize = if adopted {
+    let normalize = if adopted && normalize {
         Some(crate::normalize::plan_stack(&row, Some(docker)).await)
     } else {
         None
@@ -2187,9 +2199,9 @@ async fn stack_allow(
     if adopted {
         // Insert, not put: a stack registered under this name since the
         // lookup fails the write instead of being overwritten.
-        stacks::insert(&row)?;
+        stacks::store_new(&mut row).await?;
     } else {
-        stacks::put(&row)?;
+        stacks::store(&mut row).await?;
     }
     if let Some(Ok(plan)) = &normalize
         && let Err(e) = crate::normalize::write(&mut row, plan, Some(docker)).await
@@ -2207,6 +2219,127 @@ async fn stack_allow(
         removed,
         how_to_execute: None,
     })
+}
+
+/// Adopt discovered `row` as `docker.stack_allow` does with `dir`, `file`
+/// and `approve_current`: the same policy checks, grants for what it runs now.
+pub async fn adopt(
+    row: &StackRow,
+    docker: &bollard::Docker,
+    dry_run: bool,
+    _admin: execute::Admin,
+) -> Result<DockerStackAllowOutput> {
+    stack_allow_from(
+        DockerStackAllowArgs {
+            name: row.name.clone(),
+            dir: Some(row.dir.clone()),
+            file: Some(row.file.clone()),
+            allow: None,
+            mode: None,
+            revoke_all: false,
+            approve_current: true,
+            items: Vec::new(),
+            dry_run,
+        },
+        docker,
+        Some(row),
+        false,
+    )
+    .await
+}
+
+#[orca_struct(args)]
+pub struct DockerStackAdoptArgs {
+    /// Return the plan and change nothing. Omitted, every adoptable stack is
+    /// registered.
+    #[arg(long)]
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
+    pub dry_run: bool,
+}
+
+#[orca_struct]
+#[serde(rename_all = "camelCase")]
+#[derive(Debug)]
+pub struct AdoptRefusal {
+    pub name: String,
+    pub reason: String,
+}
+
+#[orca_struct]
+#[serde(rename_all = "camelCase")]
+#[derive(Debug)]
+pub struct DockerStackAdoptOutput {
+    pub dry_run: bool,
+    pub adopted: Vec<DockerStackAllowOutput>,
+    pub refused: Vec<AdoptRefusal>,
+    /// Stored compose project names of registered stacks, re-resolved;
+    /// planned only on a dry run.
+    pub backfill: stacks::Backfill,
+}
+
+/// [MUTATES STATE] Adopt every compose project discovered on this host as a
+/// registered stack, each through `docker.stack_allow` with
+/// `approve_current`, so the stack verbs can change it. A project that fails
+/// discovery or the policy checks is listed under `refused` with the reason.
+/// Never starts or changes containers or files; normalizing stays
+/// the stack `normalize` action. Applies unless `dryRun` is set.
+#[orca_tool(
+    domain = "docker",
+    verb = "stack_adopt",
+    role = "admin",
+    execute_gated = false,
+    dry_run_aware = true
+)]
+async fn docker_stack_adopt(
+    args: DockerStackAdoptArgs,
+    ctx: &ToolCtx,
+) -> Result<DockerStackAdoptOutput> {
+    let admin = execute::require_admin("docker.stack_adopt", ctx)?;
+    let docker = &crate::registration::adapter()
+        .client()
+        .map_err(|e| anyhow!("{e}"))?;
+    let dry_run = args.dry_run || ctx.dry_run();
+    let backfill = stacks::backfill_projects(dry_run).await?;
+    let found = stacks::discover(docker).await?;
+    Ok(DockerStackAdoptOutput {
+        backfill,
+        ..adopt_all(found, docker, dry_run, admin).await
+    })
+}
+
+pub async fn adopt_all(
+    found: Vec<stacks::Discovery>,
+    docker: &bollard::Docker,
+    dry_run: bool,
+    admin: execute::Admin,
+) -> DockerStackAdoptOutput {
+    let mut out = DockerStackAdoptOutput {
+        dry_run,
+        adopted: Vec::new(),
+        refused: Vec::new(),
+        backfill: stacks::Backfill::default(),
+    };
+    for d in found {
+        let refusal = |name: String, reason: String| AdoptRefusal { name, reason };
+        match d {
+            stacks::Discovery::Ok(p) => {
+                let row = StackRow::from(p);
+                match adopt(&row, docker, dry_run, admin).await {
+                    Ok(o) => out.adopted.push(o),
+                    Err(e) => out.refused.push(refusal(row.name, format!("{e:#}"))),
+                }
+            }
+            stacks::Discovery::Conflict { name, detail, .. } => {
+                out.refused.push(refusal(name, detail))
+            }
+            stacks::Discovery::Unreadable {
+                name, path, cause, ..
+            } => out
+                .refused
+                .push(refusal(name, format!("{}: {cause}", path.display()))),
+        }
+    }
+    out
 }
 
 #[orca_struct(args)]
@@ -2295,7 +2428,7 @@ fn adoptable(args: &DockerStackAllowArgs) -> Result<StackRow> {
         .clone()
         .unwrap_or_else(|| stacks::DEFAULT_COMPOSE_FILE.to_string());
     stacks::check_file_name(&file)?;
-    let roots = crate::tools::stacks_roots()?;
+    let roots = crate::stacks::allowed_roots()?;
     let dir = stacks::stack_dir_in_roots(dir, &roots)?;
     stacks::check_dir_free(&args.name, &dir)?;
     let path = dir.join(&file);
@@ -2323,6 +2456,7 @@ fn adoptable(args: &DockerStackAllowArgs) -> Result<StackRow> {
         allow: Vec::new(),
         files: Vec::new(),
         env_files: Vec::new(),
+        project: None,
     })
 }
 
@@ -2351,6 +2485,7 @@ mod tests {
             allow: Vec::new(),
             files: Vec::new(),
             env_files: Vec::new(),
+            project: None,
         };
         let discovered = StackRow {
             files: vec![format!("{STACK}/compose.yaml"), format!("{STACK}/x.yaml")],
@@ -3014,6 +3149,7 @@ mod tests {
             allow: Vec::new(),
             files: Vec::new(),
             env_files: Vec::new(),
+            project: None,
         };
         stacks::put(&row).unwrap();
         row
@@ -3356,6 +3492,85 @@ mod tests {
 
             let again = adopt(&docker, Some(&dir), Vec::new(), false).unwrap();
             assert!(!again.adopted, "a registered stack is not adopted again");
+        });
+    }
+
+    fn admin() -> execute::Admin {
+        execute::verified_admin("test", Some(&crate::test_support::caller("admin"))).unwrap()
+    }
+
+    #[test]
+    fn stack_adopt_refuses_a_non_admin_caller() {
+        crate::test_support::with_db(|| {
+            for ctx in crate::test_support::non_admins() {
+                let err = plugin_toolkit::reactor::block_on(docker_stack_adopt(
+                    DockerStackAdoptArgs { dry_run: true },
+                    &ctx,
+                ))
+                .unwrap_err()
+                .to_string();
+                crate::test_support::assert_admin_refusal(&err);
+            }
+            assert!(stacks::list().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn adopt_all_registers_discovered_stacks_and_lists_refusals() {
+        if !crate::test_support::have_compose() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let fake = engine(&[PULLED]);
+        let docker = fake.client();
+        crate::test_support::with_db(|| {
+            let dir = unregistered(&root, "services:\n  app:\n    image: x:1\n");
+            let found = || {
+                vec![
+                    stacks::Discovery::Ok(stacks::DiscoveredProject {
+                        name: "web".into(),
+                        dir: dir.clone(),
+                        files: vec![dir.join("compose.yaml")],
+                        env_files: Vec::new(),
+                        problems: Vec::new(),
+                    }),
+                    stacks::Discovery::Ok(stacks::DiscoveredProject {
+                        name: "outside".into(),
+                        dir: PathBuf::from("/nonexistent/outside"),
+                        files: vec![PathBuf::from("/nonexistent/outside/compose.yaml")],
+                        env_files: Vec::new(),
+                        problems: Vec::new(),
+                    }),
+                    stacks::Discovery::Unreadable {
+                        name: "locked".into(),
+                        dir: PathBuf::from("/x"),
+                        path: PathBuf::from("/x"),
+                        cause: "no config_files label".into(),
+                        running: true,
+                    },
+                ]
+            };
+            let plan =
+                plugin_toolkit::reactor::block_on(adopt_all(found(), &docker, true, admin()));
+            assert!(plan.dry_run);
+            assert_eq!(plan.adopted.len(), 1);
+            assert!(stacks::get("web").unwrap().is_none());
+            let done =
+                plugin_toolkit::reactor::block_on(adopt_all(found(), &docker, false, admin()));
+            assert!(done.adopted[0].adopted && !done.adopted[0].dry_run);
+            let web = stacks::require("web").unwrap();
+            assert_eq!(web.dir, dir.to_string_lossy());
+            assert_eq!(web.files, [dir.join("compose.yaml").to_string_lossy()]);
+            assert_eq!(
+                std::fs::read_to_string(dir.join("compose.yaml")).unwrap(),
+                "services:\n  app:\n    image: x:1\n",
+                "adoption rewrites no compose file"
+            );
+            let refused: Vec<&str> = done.refused.iter().map(|r| r.name.as_str()).collect();
+            assert_eq!(refused, ["outside", "locked"]);
+            assert!(stacks::get("outside").unwrap().is_none());
+            assert_eq!(done.refused[1].reason, "/x: no config_files label");
         });
     }
 

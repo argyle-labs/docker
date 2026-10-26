@@ -400,13 +400,13 @@ struct Plan {
     out: RelocateOutput,
 }
 
-async fn plan(args: &DockerStackRelocateArgs) -> Result<Plan> {
-    let row = stacks::require_registered_here(&args.stack).await?;
+async fn plan(args: &DockerStackRelocateArgs, adoption: stacks::Adoption) -> Result<Plan> {
+    let row = stacks::require_registered_here(&args.stack, adoption).await?;
     if !fsat::is_single_component(&row.name) {
         bail!("stack name '{}' is not a plain dir name", row.name);
     }
     crate::tools::validate_stacks_root(&args.new_root)?;
-    let roots = crate::tools::stacks_roots()?;
+    let roots = crate::stacks::allowed_roots()?;
     let old_dir = stacks::stack_dir_in_roots(&row.dir, &roots)?;
     let new_root = crate::lifecycle::resolve(Path::new(&args.new_root))?;
     if !new_root.is_dir() {
@@ -416,7 +416,7 @@ async fn plan(args: &DockerStackRelocateArgs) -> Result<Plan> {
         );
     }
     let new_dir = new_root.join(&row.name);
-    stacks::stack_dir_in_roots(&new_dir.to_string_lossy(), &roots)?;
+    stacks::stack_dir_in_roots(&new_dir.to_string_lossy(), &crate::tools::stacks_roots()?)?;
     if std::fs::symlink_metadata(&new_dir).is_ok() {
         bail!("{} already exists", new_dir.display());
     }
@@ -533,7 +533,7 @@ async fn bring_back(row: &StackRow) -> String {
 }
 
 async fn relocate(args: &DockerStackRelocateArgs) -> Result<RelocateOutput> {
-    let p = plan(args).await?;
+    let p = plan(args, stacks::Adoption::for_call(args.dry_run)).await?;
     if args.dry_run {
         return Ok(p.out);
     }
@@ -547,11 +547,11 @@ async fn relocate(args: &DockerStackRelocateArgs) -> Result<RelocateOutput> {
         let back = bring_back(&p.row).await;
         return Err(e.context(format!("relocate refused; nothing moved{back}")));
     }
-    let moved = StackRow {
+    let mut moved = StackRow {
         dir: new_str.clone(),
         ..p.row.clone()
     };
-    stacks::put(&moved)?;
+    stacks::store(&mut moved).await?;
     if let Err(e) = crate::ownership::up(&moved, &[]).await {
         let restored = match stacks::put(&p.row) {
             Ok(()) => bring_back(&p.row).await,
@@ -784,6 +784,7 @@ mod tests {
                 allow: Vec::new(),
                 files: Vec::new(),
                 env_files: Vec::new(),
+                project: None,
             })
             .unwrap();
             for bad in ["relative", "/srv/../etc", "/"] {

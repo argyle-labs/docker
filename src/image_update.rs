@@ -22,6 +22,7 @@ use plugin_toolkit::prelude::*;
 
 use crate::image_ref::repository;
 use crate::prune::COMPOSE_PROJECT_LABEL;
+use crate::stacks::{Discovery, StackRow};
 
 pub const COMPOSE_SERVICE_LABEL: &str = "com.docker.compose.service";
 pub const COMPOSE_ONEOFF_LABEL: &str = "com.docker.compose.oneoff";
@@ -200,14 +201,32 @@ pub struct ServiceImageStatus {
     pub error: Option<String>,
 }
 
+/// How a stack's compose project was found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(crate = "plugin_toolkit::serde")]
+#[schemars(crate = "plugin_toolkit::schemars")]
+#[serde(rename_all = "lowercase")]
+pub enum StackSource {
+    Registered,
+    Discovered,
+    /// Its containers disagree on the project's dir or files.
+    Conflict,
+    /// A label is missing or names a path that cannot be read.
+    Unreadable,
+    /// Containers carry the project label but no stack claims it.
+    Unmatched,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(crate = "plugin_toolkit::serde")]
 #[schemars(crate = "plugin_toolkit::schemars")]
 #[serde(rename_all = "camelCase")]
 pub struct StackImageStatus {
     pub stack: String,
+    pub source: StackSource,
     pub services: Vec<ServiceImageStatus>,
-    /// Set when the stack's project or containers could not be read.
+    /// Set when the stack's project, files or containers could not be read;
+    /// services are still reported from their containers.
     pub error: Option<String>,
 }
 
@@ -216,6 +235,8 @@ pub struct StackImageStatus {
 #[schemars(crate = "plugin_toolkit::schemars")]
 pub struct ImageStatus {
     pub stacks: Vec<StackImageStatus>,
+    /// Containers that belong to no compose project, by container name.
+    pub standalone: Vec<ServiceImageStatus>,
 }
 
 pub type RemoteCache = HashMap<String, std::result::Result<RemoteDigest, String>>;
@@ -378,6 +399,7 @@ pub async fn stack_status(
 ) -> StackImageStatus {
     let mut out = StackImageStatus {
         stack: stack.to_string(),
+        source: StackSource::Registered,
         services: Vec::new(),
         error: None,
     };
@@ -393,12 +415,154 @@ pub async fn stack_status(
     out
 }
 
+/// One stack to report: its compose project and why it may be incomplete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    pub stack: String,
+    pub project: String,
+    pub source: StackSource,
+    pub error: Option<String>,
+}
+
+/// A target for every registered stack, every discovery outcome and every
+/// compose project in `projects` neither claims.
+pub fn targets(
+    registered: Vec<(StackRow, std::result::Result<String, String>)>,
+    discovered: Vec<Discovery>,
+    projects: &BTreeSet<String>,
+) -> Vec<Target> {
+    let mut out: Vec<Target> = registered
+        .into_iter()
+        .map(|(row, project)| match project {
+            Ok(project) => Target {
+                stack: row.name,
+                project,
+                source: StackSource::Registered,
+                error: None,
+            },
+            Err(e) => Target {
+                project: row.name.clone(),
+                stack: row.name,
+                source: StackSource::Registered,
+                error: Some(e),
+            },
+        })
+        .collect();
+    for d in discovered {
+        let name = match &d {
+            Discovery::Ok(p) => &p.name,
+            Discovery::Conflict { name, .. } | Discovery::Unreadable { name, .. } => name,
+        };
+        if out.iter().any(|t| &t.project == name || &t.stack == name) {
+            continue;
+        }
+        out.push(match d {
+            Discovery::Ok(p) => Target {
+                stack: p.name.clone(),
+                project: p.name,
+                source: StackSource::Discovered,
+                error: (!p.problems.is_empty()).then(|| p.problems.join("; ")),
+            },
+            Discovery::Conflict { name, detail, dirs } => {
+                let dirs: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
+                Target {
+                    stack: name.clone(),
+                    project: name,
+                    source: StackSource::Conflict,
+                    error: Some(format!("{detail} (dirs: {})", dirs.join(", "))),
+                }
+            }
+            Discovery::Unreadable {
+                name, path, cause, ..
+            } => Target {
+                stack: name.clone(),
+                project: name,
+                source: StackSource::Unreadable,
+                error: Some(format!("{}: {cause}", path.display())),
+            },
+        });
+    }
+    for p in projects {
+        if !out.iter().any(|t| &t.project == p) {
+            out.push(Target {
+                stack: p.clone(),
+                project: p.clone(),
+                source: StackSource::Unmatched,
+                error: Some("no registered or discovered stack claims this compose project".into()),
+            });
+        }
+    }
+    out
+}
+
+fn compose_project(c: &ContainerSummary) -> Option<&String> {
+    c.labels.as_ref()?.get(COMPOSE_PROJECT_LABEL)
+}
+
+fn container_name(c: &ContainerSummary) -> String {
+    c.names
+        .iter()
+        .flatten()
+        .map(|n| n.trim_start_matches('/'))
+        .find(|n| !n.is_empty())
+        .or(c.id.as_deref().filter(|i| !i.is_empty()))
+        .unwrap_or("(unnamed)")
+        .to_string()
+}
+
+async fn all_containers(docker: &Docker) -> Result<Vec<ContainerSummary>> {
+    docker
+        .list_containers(Some(ListContainersOptionsBuilder::new().all(true).build()))
+        .await
+        .map_err(|e| anyhow!("list containers: {e}"))
+}
+
+/// The status of every stack `targets` names and of every container outside
+/// a compose project, against `containers`.
+pub async fn report(
+    docker: &Docker,
+    targets: Vec<Target>,
+    containers: &[ContainerSummary],
+    standalone: bool,
+) -> ImageStatus {
+    let mut remote = RemoteCache::new();
+    let mut out = ImageStatus::default();
+    for t in targets {
+        let mut s = stack_status(docker, &t.stack, &t.project, &mut remote).await;
+        s.source = t.source;
+        s.error = match (t.error, s.error) {
+            (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+            (a, b) => a.or(b),
+        };
+        out.stacks.push(s);
+    }
+    if standalone {
+        for c in containers.iter().filter(|c| compose_project(c).is_none()) {
+            out.standalone.push(
+                service_status(
+                    docker,
+                    &container_name(c),
+                    std::slice::from_ref(c),
+                    &mut remote,
+                )
+                .await,
+            );
+        }
+    }
+    out
+}
+
 #[orca_struct(args)]
 pub struct DockerImageStatusArgs {
-    /// Limit to one managed stack.
+    /// Limit to one stack, registered or discovered.
     #[arg(long)]
     #[serde(default)]
     pub stack: Option<String>,
+    /// Leave out containers outside any compose project, saving their
+    /// registry lookups.
+    #[arg(long)]
+    #[serde(default, rename = "skipStandalone", alias = "skip_standalone")]
+    pub skip_standalone: bool,
 }
 
 fn require_docker(absent: bool) -> Result<()> {
@@ -410,13 +574,17 @@ fn require_docker(absent: bool) -> Result<()> {
     Ok(())
 }
 
-/// **Check managed stacks for image updates**: per service (running or
-/// stopped; one-off containers excluded), the local and registry digests of
-/// its image and whether they differ. A registry lookup that fails reports
-/// `updateAvailable: null` with the error, never "up to date". `basis` says
-/// whether the comparison was against a multi-platform index or a
-/// single-platform manifest; an index can change without this platform's
-/// image changing. Private registries authenticate with the secret
+/// **Check every container on the host for image updates**: each registered
+/// stack, each compose project discovered from container labels (`source`
+/// says which, or `conflict`/`unreadable`/`unmatched` with the reason in
+/// `error` while its services are still reported from their containers), and
+/// each container outside any compose project under `standalone`. Per
+/// service (running or stopped; one-off containers excluded), the local and
+/// registry digests of its image and whether they differ. A registry lookup
+/// that fails reports `updateAvailable: null` with the error, never "up to
+/// date". `basis` says whether the comparison was against a multi-platform
+/// index or a single-platform manifest; an index can change without this
+/// platform's image changing. Private registries authenticate with the secret
 /// `registry.<host>.auth` (`username:password`, host as in `ghcr.io` or
 /// `docker.io`); without one they report the access error. Each unpinned tag
 /// is a registry manifest lookup per run, which may count against Docker
@@ -432,27 +600,41 @@ async fn docker_image_status(args: DockerImageStatusArgs, _ctx: &ToolCtx) -> Res
     let docker = &crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
-    let rows = match &args.stack {
-        Some(s) => vec![crate::stacks::find(s, Some(docker)).await?],
-        None => crate::stacks::all(Some(docker)).await?,
-    };
-    let mut remote = RemoteCache::new();
-    let mut out = ImageStatus::default();
+    image_status(docker, &args).await
+}
+
+async fn image_status(docker: &Docker, args: &DockerImageStatusArgs) -> Result<ImageStatus> {
+    let containers = all_containers(docker).await?;
+    let roots = crate::stacks::allowed_roots()?;
+    let rows = crate::stacks::list()?;
+    let discovered = crate::stacks::from_labels(&containers, &rows, &roots);
+    let mut registered = Vec::new();
     for row in rows {
-        let project = match row.compose(&crate::stacks::allowed_roots()?) {
-            Ok(c) => c.project_name().await.map_err(|e| e.to_string()),
-            Err(e) => Err(e.to_string()),
-        };
-        out.stacks.push(match project {
-            Ok(p) => stack_status(docker, &row.name, &p, &mut remote).await,
-            Err(e) => StackImageStatus {
-                stack: row.name.clone(),
-                services: Vec::new(),
-                error: Some(e),
-            },
-        });
+        if args.stack.as_ref().is_some_and(|s| s != &row.name) {
+            continue;
+        }
+        let project = Ok(row.project_name());
+        registered.push((row, project));
     }
-    Ok(out)
+    let projects: BTreeSet<String> = containers
+        .iter()
+        .filter_map(compose_project)
+        .cloned()
+        .collect();
+    let mut found = targets(registered, discovered, &projects);
+    if let Some(s) = &args.stack {
+        found.retain(|t| &t.stack == s);
+        if found.is_empty() {
+            bail!("no stack named '{s}'");
+        }
+    }
+    Ok(report(
+        docker,
+        found,
+        &containers,
+        args.stack.is_none() && !args.skip_standalone,
+    )
+    .await)
 }
 
 #[cfg(test)]
@@ -855,5 +1037,219 @@ mod tests {
         )]);
         assert!(s.services.is_empty(), "{s:?}");
         assert!(!e.paths("GET").iter().any(|p| p.contains("c-run")));
+    }
+
+    fn row(name: &str) -> StackRow {
+        StackRow {
+            name: name.into(),
+            dir: format!("/opt/stacks/{name}"),
+            file: "compose.yaml".into(),
+            enabled: true,
+            allow: Vec::new(),
+            files: Vec::new(),
+            env_files: Vec::new(),
+            project: None,
+        }
+    }
+
+    #[test]
+    fn targets_cover_every_stack_outcome_and_unclaimed_project() {
+        let discovered = vec![
+            Discovery::Ok(crate::stacks::DiscoveredProject {
+                name: "renamed".into(),
+                dir: "/opt/stacks/elsewhere".into(),
+                files: vec!["/opt/stacks/elsewhere/compose.yaml".into()],
+                env_files: Vec::new(),
+                problems: Vec::new(),
+            }),
+            Discovery::Ok(crate::stacks::DiscoveredProject {
+                name: "found".into(),
+                dir: "/opt/stacks/found".into(),
+                files: vec!["/opt/stacks/found/compose.yaml".into()],
+                env_files: Vec::new(),
+                problems: vec!["/x/.env: cannot be opened".into()],
+            }),
+            Discovery::Conflict {
+                name: "split".into(),
+                detail: "its containers disagree".into(),
+                dirs: vec!["/opt/stacks/a".into(), "/opt/stacks/b".into()],
+            },
+            Discovery::Unreadable {
+                name: "locked".into(),
+                dir: "/mnt/user/appdata/locked".into(),
+                path: "/mnt/user/appdata/locked".into(),
+                cause: "the working dir is not a directory inside the stacks roots".into(),
+                running: true,
+            },
+        ];
+        let projects: BTreeSet<String> = ["web", "found", "split", "locked", "renamed", "stray"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let t = targets(
+            vec![
+                (row("web"), Ok("web".into())),
+                (row("broken"), Err("compose file unreadable".into())),
+                (row("other"), Ok("renamed".into())),
+            ],
+            discovered,
+            &projects,
+        );
+        let got: Vec<(&str, &str, StackSource, bool)> = t
+            .iter()
+            .map(|t| {
+                (
+                    t.stack.as_str(),
+                    t.project.as_str(),
+                    t.source,
+                    t.error.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("web", "web", StackSource::Registered, false),
+                ("broken", "broken", StackSource::Registered, true),
+                ("other", "renamed", StackSource::Registered, false),
+                ("found", "found", StackSource::Discovered, true),
+                ("split", "split", StackSource::Conflict, true),
+                ("locked", "locked", StackSource::Unreadable, true),
+                ("stray", "stray", StackSource::Unmatched, true),
+            ]
+        );
+        assert!(
+            t[4].error
+                .as_deref()
+                .unwrap()
+                .contains("/opt/stacks/a, /opt/stacks/b")
+        );
+        assert!(
+            t[5].error
+                .as_deref()
+                .unwrap()
+                .starts_with("/mnt/user/appdata/locked: ")
+        );
+        assert_eq!(t.iter().filter(|t| t.project == "renamed").count(), 1);
+    }
+
+    #[test]
+    fn report_keeps_unreadable_stacks_and_lists_standalone_containers() {
+        let compose = container(
+            "tv-1",
+            "tv",
+            "lscr.io/linuxserver/sonarr:latest",
+            Some("sha256:img-tv"),
+            "running",
+        );
+        let standalone = r#"{"Id":"c-sync","Names":["/syncthing"],"Image":"syncthing/syncthing:1","ImageID":"sha256:img-sync","State":"running","Labels":{}}"#;
+        let all: Vec<ContainerSummary> =
+            plugin_toolkit::serde_json::from_str(&format!("[{compose},{standalone}]")).unwrap();
+        let e = FakeEngine::routed(vec![
+            Route::new("GET", "/containers/json", 200, format!("[{compose}]")),
+            inspect("tv-1", "lscr.io/linuxserver/sonarr:latest"),
+            inspect("sync", "syncthing/syncthing:1"),
+            Route::new(
+                "GET",
+                "/images/sha256:img-tv/json",
+                200,
+                image(
+                    "sha256:img-tv",
+                    &[format!("lscr.io/linuxserver/sonarr@{OLD}")],
+                ),
+            ),
+            Route::new(
+                "GET",
+                "/images/sha256:img-sync/json",
+                200,
+                image("sha256:img-sync", &[format!("syncthing/syncthing@{INDEX}")]),
+            ),
+            Route::new(
+                "GET",
+                "/distribution/lscr.io/linuxserver/sonarr:latest/json",
+                200,
+                manifest_body(AMD64),
+            ),
+            Route::new(
+                "GET",
+                "/distribution/syncthing/syncthing:1/json",
+                200,
+                index_body(INDEX),
+            ),
+        ]);
+        let target = Target {
+            stack: "media".into(),
+            project: "media".into(),
+            source: StackSource::Unreadable,
+            error: Some("/mnt/user/appdata/media: cannot be opened".into()),
+        };
+        let out = plugin_toolkit::reactor::block_on(report(&e.client(), vec![target], &all, true));
+        assert_eq!(out.stacks.len(), 1);
+        let media = &out.stacks[0];
+        assert_eq!(media.source, StackSource::Unreadable);
+        assert_eq!(
+            media.error.as_deref(),
+            Some("/mnt/user/appdata/media: cannot be opened")
+        );
+        assert_eq!(by(media, "tv").update_available, Some(true));
+        assert_eq!(out.standalone.len(), 1);
+        let sync = &out.standalone[0];
+        assert_eq!(sync.service, "syncthing");
+        assert_eq!(sync.image, "syncthing/syncthing:1");
+        assert_eq!(sync.update_available, Some(false));
+        let nameless: ContainerSummary =
+            plugin_toolkit::serde_json::from_str(r#"{"Names":["/"],"Id":""}"#).unwrap();
+        assert_eq!(container_name(&nameless), "(unnamed)");
+        let none = plugin_toolkit::reactor::block_on(report(&e.client(), Vec::new(), &all, false));
+        assert!(none.standalone.is_empty());
+    }
+
+    #[test]
+    fn image_status_reports_discovered_stacks_and_registers_none() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let dir = root.join("web");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("compose.yaml"), "services: {}\n").unwrap();
+        let labelled = format!(
+            r#"{{"Id":"c-web","Names":["/web-app-1"],"Image":"nginx","ImageID":"sha256:img","State":"running","Labels":{{"{COMPOSE_PROJECT_LABEL}":"web","{COMPOSE_SERVICE_LABEL}":"app","{COMPOSE_ONEOFF_LABEL}":"False","{}":"{}","{}":"{}"}}}}"#,
+            crate::stacks_root_drift::WORKING_DIR_LABEL,
+            dir.display(),
+            crate::stacks::CONFIG_FILES_LABEL,
+            dir.join("compose.yaml").display(),
+        );
+        let standalone = r#"{"Id":"c-sync","Names":["/syncthing"],"Image":"syncthing/syncthing:1","ImageID":"sha256:s","State":"running","Labels":{}}"#;
+        let e = FakeEngine::routed(vec![Route::new(
+            "GET",
+            "/containers/json",
+            200,
+            format!("[{labelled},{standalone}]"),
+        )]);
+        let (out, tables) = crate::test_support::with_db(|| {
+            plugin_toolkit::reactor::block_on(crate::tools::docker_create(
+                plugin_toolkit::serde_json::from_value(plugin_toolkit::serde_json::json!({
+                    "name": "local",
+                    "stacks_root": root.to_string_lossy(),
+                }))
+                .unwrap(),
+                &crate::test_support::admin(),
+            ))
+            .unwrap();
+            let args = DockerImageStatusArgs {
+                stack: None,
+                skip_standalone: true,
+            };
+            plugin_toolkit::reactor::block_on(image_status(&e.client(), &args)).unwrap()
+        });
+        assert_eq!(out.stacks.len(), 1, "{out:?}");
+        assert_eq!(out.stacks[0].stack, "web");
+        assert_eq!(out.stacks[0].source, StackSource::Discovered);
+        assert!(out.standalone.is_empty(), "skipStandalone");
+        assert!(
+            tables
+                .iter()
+                .all(|((_, t), rows)| t != "stacks" || rows.is_empty()),
+            "image_status registered a stack: {tables:?}"
+        );
     }
 }

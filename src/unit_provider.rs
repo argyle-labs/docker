@@ -143,6 +143,15 @@ pub(crate) fn dry_run(id: UnitId, plan: String) -> VerbOutcome {
     VerbOutcome::Item(ItemOutcome::new(id, body.to_string()))
 }
 
+/// How a stack update treats a discovered project: a self-planning dry run
+/// previews it, anything else is refused.
+fn stack_adoption(args: &UpdateArgs) -> stacks::Adoption {
+    stacks::Adoption::for_call(
+        SELF_PLANNING.contains(&args.action.as_str())
+            && split_dry_run(args.payload.clone()).is_ok_and(|(d, _)| d),
+    )
+}
+
 /// Admin, failing closed: a request with no verified caller is refused.
 fn require_admin(
     subject: &str,
@@ -321,8 +330,12 @@ impl DockerUnitProvider {
 
     /// **edit** (rewrite YAML/env, no deploy) or a compose lifecycle action.
     pub(crate) async fn stack_update(&self, args: UpdateArgs) -> Result<VerbOutcome> {
-        let row =
-            stacks::require_registered(&args.id.id, self.adapter.present_client().as_ref()).await?;
+        let row = stacks::require_registered(
+            &args.id.id,
+            self.adapter.present_client().as_ref(),
+            stack_adoption(&args),
+        )
+        .await?;
         match args.action.as_str() {
             "edit" => {
                 let raw = args
@@ -338,10 +351,11 @@ impl DockerUnitProvider {
                 row.write_checked(
                     p.compose_yaml.as_deref(),
                     p.compose_env.as_deref(),
-                    &crate::tools::stacks_roots()?,
+                    &crate::stacks::allowed_roots()?,
                     self.adapter.client().ok().as_ref(),
                 )
                 .await?;
+                stacks::store(&mut row.clone()).await?;
                 // A stale orca override naming a removed service breaks every
                 // compose command, so regenerate the one that exists.
                 let mut message = format!("edited stack '{}'", row.name);
@@ -540,7 +554,7 @@ impl DockerUnitProvider {
             row.write_compose_if_unchanged(
                 &new_yaml,
                 &yaml,
-                &crate::tools::stacks_roots()?,
+                &crate::stacks::allowed_roots()?,
                 self.adapter.client().ok().as_ref(),
             )
             .await?;
@@ -764,7 +778,7 @@ impl DockerUnitProvider {
             p.allow_unverified,
         )?;
         engine_state::validate(&mut file)?;
-        let roots = crate::tools::stacks_roots()?;
+        let roots = crate::stacks::allowed_roots()?;
         let mut staged = StagedRestore::stage(row, &mut file, &roots)?;
         let live = stacks::stack_dir_in_roots(&row.dir, &roots)?;
         let staged_secrets = staged
@@ -890,10 +904,8 @@ impl DockerUnitProvider {
                 p.name
             ));
         }
-        let source = match &current {
-            Some(row) => Some(row.clone()),
-            None => stacks::discovered_here(&p.name).await,
-        };
+        stacks::require_not_discovered(&p.name, self.adapter.present_client().as_ref()).await?;
+        let source = current.clone();
         // Grants are set only through the admin-only `docker.stack_allow`,
         // and stay bound to the services and images they name.
         let row = stacks::payload_row(
@@ -914,8 +926,8 @@ impl DockerUnitProvider {
             self.adapter.client().ok().as_ref(),
         )
         .await?;
-        stacks::put(&row)?;
         let mut row = row;
+        stacks::store(&mut row).await?;
         let normalized = if p.normalize && row.compose_path(&roots).is_ok_and(|p| p.is_file()) {
             crate::normalize::normalize(&mut row, self.adapter.client().ok().as_ref()).await
         } else {
@@ -1171,7 +1183,12 @@ impl DockerUnitProvider {
             args.caller.as_ref(),
         )?;
         if args.id.kind == STACK_KIND {
-            stacks::require_registered(&args.id.id, self.adapter.present_client().as_ref()).await?;
+            stacks::require_registered(
+                &args.id.id,
+                self.adapter.present_client().as_ref(),
+                stacks::Adoption::Preview,
+            )
+            .await?;
             let plan = format!(
                 "tear down stack '{}' (`compose down`) and deregister it; apply with update action={ACTION_REMOVE}",
                 args.id.id
@@ -3792,6 +3809,7 @@ mod tests {
             allow: Vec::new(),
             files: Vec::new(),
             env_files: Vec::new(),
+            project: None,
         };
         let summary = |id: &str, wd: Option<&str>| bollard::models::ContainerSummary {
             id: Some(id.into()),
@@ -3833,6 +3851,7 @@ mod tests {
             allow: Vec::new(),
             files: Vec::new(),
             env_files: Vec::new(),
+            project: None,
         };
         let summary = |id: &str, wd: &std::path::Path| bollard::models::ContainerSummary {
             id: Some(id.into()),
@@ -4580,6 +4599,7 @@ mod tests {
             allow: Vec::new(),
             files: Vec::new(),
             env_files: Vec::new(),
+            project: None,
         };
         stacks::put(&row).unwrap();
         row
@@ -4598,6 +4618,46 @@ mod tests {
             payload: payload.map(|p| p.to_string()),
             caller: Some(crate::test_support::caller("admin")),
         }))
+    }
+
+    #[test]
+    fn stack_updates_never_adopt() {
+        let args = |action: &str, payload: Option<&str>, role: Option<&str>| UpdateArgs {
+            id: UnitId {
+                manager: "docker@test".into(),
+                kind: STACK_KIND.into(),
+                id: "web".into(),
+                name: "web".into(),
+            },
+            action: action.into(),
+            payload: payload.map(String::from),
+            caller: role.map(crate::test_support::caller),
+        };
+        let dry = Some(r#"{"dryRun":true}"#);
+        assert_eq!(
+            stack_adoption(&args(ACTION_UPDATE, dry, Some("admin"))),
+            stacks::Adoption::Preview
+        );
+        for a in [
+            args(ACTION_UPDATE, None, Some("admin")),
+            args(ACTION_NORMALIZE, None, Some("admin")),
+            args("edit", None, Some("admin")),
+            args("restart", None, Some("admin")),
+            args("restart", dry, Some("admin")),
+            args(ACTION_BACKUP, None, Some("admin")),
+            args(ACTION_BACKUP, None, None),
+        ] {
+            assert_eq!(stack_adoption(&a), stacks::Adoption::Refuse, "{}", a.action);
+        }
+    }
+
+    #[test]
+    fn a_dry_run_lifecycle_action_on_an_unregistered_stack_registers_nothing() {
+        crate::test_support::with_db(|| {
+            let out = stack_update("restart", Some(serde_json::json!({"dryRun": true}))).unwrap();
+            assert!(matches!(out, VerbOutcome::Item(_)), "{out:?}");
+            assert!(stacks::get("web").unwrap().is_none());
+        });
     }
 
     /// A stack archive in `<dir>/.orca-backups`, where a backup without
@@ -4734,7 +4794,7 @@ mod tests {
     }
 
     #[test]
-    fn up_lifecycle_edit_and_restore_refuse_a_stack_outside_the_stacks_roots() {
+    fn up_lifecycle_edit_and_restore_refuse_a_stack_outside_the_stacks_and_discovery_roots() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let yaml = "services:\n  app:\n    image: x:1\n";
@@ -5666,6 +5726,7 @@ mod tests {
             allow: Vec::new(),
             files: Vec::new(),
             env_files: Vec::new(),
+            project: None,
         };
         let c = &snap("sha256:old").containers[0];
         let plain = planned_image(&row, c, vec!["sha256:a".into()], Ok("sha256:b".into()));

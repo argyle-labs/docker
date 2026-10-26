@@ -61,6 +61,10 @@ pub struct StackRow {
     pub files: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env_files: Vec<String>,
+    /// The compose project the stack runs as, once known; unset reads as
+    /// `name`. `docker.stack_adopt` fills it in for rows without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
 }
 
 fn default_compose_file() -> String {
@@ -71,6 +75,10 @@ fn default_true() -> bool {
 }
 
 impl StackRow {
+    pub fn project_name(&self) -> String {
+        self.project.clone().unwrap_or_else(|| self.name.clone())
+    }
+
     pub fn open_dir(&self, roots: &[String]) -> Result<StackDir> {
         StackDir::open(&self.dir, roots, false)?
             .ok_or_else(|| anyhow::anyhow!("stack dir {} does not exist", self.dir))
@@ -502,7 +510,7 @@ pub fn redact(text: &str, values: &[String]) -> String {
     values.sort_by_key(|v| std::cmp::Reverse(v.len()));
     values.dedup();
     values.iter().fold(text.to_string(), |out, v| {
-        out.replace(v, plugin_toolkit::scrub::REDACTED_TEXT)
+        out.replace(v, plugin_toolkit::scrub::REDACTED)
     })
 }
 
@@ -1054,6 +1062,9 @@ fn to_dbrow(row: &StackRow) -> DbRow {
             DbValue::Text(plugin_toolkit::serde_json::to_string(list).unwrap_or_default()),
         );
     }
+    if let Some(p) = &row.project {
+        m.insert("project".to_string(), DbValue::Text(p.clone()));
+    }
     m
 }
 
@@ -1076,6 +1087,10 @@ fn from_dbrow(m: &DbRow) -> Result<StackRow> {
             .unwrap_or_default(),
         files: list_from_row(m, "files")?,
         env_files: list_from_row(m, "env_files")?,
+        project: field_from_row::<Option<String>>(m, "project")
+            .ok()
+            .flatten()
+            .filter(|p| !p.is_empty()),
     })
 }
 
@@ -1167,12 +1182,13 @@ impl From<DiscoveredProject> for StackRow {
                 .and_then(|f| f.file_name())
                 .map(|f| f.to_string_lossy().into_owned())
                 .unwrap_or_else(default_compose_file),
-            name: p.name,
+            name: p.name.clone(),
             dir: p.dir.to_string_lossy().into_owned(),
             enabled: true,
             allow: Vec::new(),
             files: text(p.files),
             env_files: text(p.env_files),
+            project: Some(p.name),
         }
     }
 }
@@ -1293,6 +1309,17 @@ pub fn from_labels(
     registered: &[StackRow],
     roots: &[String],
 ) -> Vec<Discovery> {
+    from_labels_claimed(containers, registered, &[], roots)
+}
+
+/// [`from_labels`], also leaving out the compose projects in `claimed`, the
+/// names registered stacks run as.
+pub fn from_labels_claimed(
+    containers: &[bollard::models::ContainerSummary],
+    registered: &[StackRow],
+    claimed: &[String],
+    roots: &[String],
+) -> Vec<Discovery> {
     let mut groups: std::collections::BTreeMap<
         &String,
         (std::collections::BTreeSet<LabelSet<'_>>, bool),
@@ -1314,7 +1341,9 @@ pub fn from_labels(
     }
     groups
         .into_iter()
-        .filter(|(name, _)| !registered.iter().any(|r| &r.name == *name))
+        .filter(|(name, _)| {
+            !registered.iter().any(|r| &r.name == *name) && !claimed.contains(*name)
+        })
         .filter_map(|(name, (sets, running))| {
             if sets.len() > 1 {
                 let mut dirs: Vec<PathBuf> = sets
@@ -1352,11 +1381,10 @@ fn canonical_in_roots(dir: &str, roots: &[String]) -> Option<PathBuf> {
         return None;
     }
     let real = path.canonicalize().ok().filter(|p| p.is_dir())?;
-    roots
+    crate::tools::validated_roots(roots)
         .iter()
-        .filter_map(|r| Path::new(r).canonicalize().ok())
         .any(|r| {
-            real.strip_prefix(&r)
+            real.strip_prefix(r)
                 .is_ok_and(|rel| rel.components().next().is_some())
         })
         .then_some(real)
@@ -1376,7 +1404,92 @@ pub async fn discover(docker: &bollard::Docker) -> Result<Vec<Discovery>> {
         ))
         .await
         .map_err(|e| anyhow::anyhow!("list compose containers: {e}"))?;
-    Ok(from_labels(&containers, &list()?, &allowed_roots()?))
+    let registered = list()?;
+    let roots = allowed_roots()?;
+    let claimed = claimed_projects(&registered);
+    Ok(from_labels_claimed(
+        &containers,
+        &registered,
+        &claimed,
+        &roots,
+    ))
+}
+
+/// The compose project each registered row runs as.
+pub fn claimed_projects(rows: &[StackRow]) -> Vec<String> {
+    rows.iter().map(StackRow::project_name).collect()
+}
+
+/// The compose project `row` runs as, resolved by compose from its files.
+pub async fn resolve_project(row: &StackRow) -> Result<String> {
+    let compose = row
+        .compose(&allowed_roots()?)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    compose
+        .project_name()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// [`put`] `row` with its compose project resolved; a failed resolution
+/// keeps the stored one.
+pub async fn store(row: &mut StackRow) -> Result<()> {
+    if let Ok(p) = resolve_project(row).await {
+        row.project = Some(p);
+    }
+    put(row)
+}
+
+/// [`insert`] `row` with its compose project resolved, as [`store`].
+pub async fn store_new(row: &mut StackRow) -> Result<()> {
+    if let Ok(p) = resolve_project(row).await {
+        row.project = Some(p);
+    }
+    insert(row)
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    plugin_toolkit::schemars::JsonSchema,
+)]
+#[serde(crate = "plugin_toolkit::serde")]
+#[schemars(crate = "plugin_toolkit::schemars")]
+#[serde(rename_all = "camelCase")]
+pub struct Backfill {
+    /// `<stack>: <old> -> <new>` for each stored project name that changes.
+    pub changed: Vec<String>,
+    /// `<stack>: <error>` for each stack whose project could not be resolved.
+    pub errors: Vec<String>,
+}
+
+/// Re-resolve the compose project of every registered row, storing each that
+/// changed unless `dry_run`. One row's failure never stops the rest.
+pub async fn backfill_projects(dry_run: bool) -> Result<Backfill> {
+    let mut out = Backfill::default();
+    for mut row in list()? {
+        match resolve_project(&row).await {
+            Ok(p) if row.project.as_deref() == Some(p.as_str()) => {}
+            Ok(p) => {
+                out.changed.push(format!(
+                    "{}: {} -> {p}",
+                    row.name,
+                    row.project.as_deref().unwrap_or("(unset)")
+                ));
+                row.project = Some(p);
+                if !dry_run && let Err(e) = put(&row) {
+                    out.errors.push(format!("{}: {e:#}", row.name));
+                }
+            }
+            Err(e) => out.errors.push(format!("{}: {e:#}", row.name)),
+        }
+    }
+    Ok(out)
 }
 
 pub async fn all(docker: Option<&bollard::Docker>) -> Result<Vec<StackRow>> {
@@ -1533,6 +1646,7 @@ pub fn payload_row(
         allow,
         files: Vec::new(),
         env_files: Vec::new(),
+        project: None,
     };
     carry_listed(&mut row, source, roots);
     row
@@ -1581,24 +1695,67 @@ pub async fn discovered_here(name: &str) -> Option<StackRow> {
     discovered(&docker, name).await
 }
 
-pub async fn require_registered(name: &str, docker: Option<&bollard::Docker>) -> Result<StackRow> {
+/// What [`require_registered`] does with a discovered, unregistered project.
+/// Only `docker.stack_adopt` registers one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Adoption {
+    Refuse,
+    /// Return the discovered row unregistered, for a dry run.
+    Preview,
+}
+
+impl Adoption {
+    pub fn for_call(dry_run: bool) -> Self {
+        if dry_run {
+            Adoption::Preview
+        } else {
+            Adoption::Refuse
+        }
+    }
+}
+
+/// The registered stack `name`, or the discovered project of that name as
+/// `adoption` says.
+pub async fn require_registered(
+    name: &str,
+    docker: Option<&bollard::Docker>,
+    adoption: Adoption,
+) -> Result<StackRow> {
     if let Some(row) = get(name)? {
         return Ok(row);
     }
     if let Some(docker) = docker
-        && discovered(docker, name).await.is_some()
+        && let Some(row) = discovered(docker, name).await
     {
-        anyhow::bail!(
-            "stack '{name}' is a discovered compose project, not a registered one; adopt it with docker.stack_allow (`dir` + `approve_current`) before changing it"
-        );
+        return match adoption {
+            Adoption::Refuse => Err(anyhow::anyhow!(
+                "stack '{name}' is a discovered compose project, not a registered one; adopt it with docker.stack_adopt first"
+            )),
+            Adoption::Preview => Ok(row),
+        };
     }
     Err(anyhow::anyhow!("no managed stack named '{name}'"))
 }
 
-pub async fn require_registered_here(name: &str) -> Result<StackRow> {
+/// Fails when `name` is not registered but a discovered compose project
+/// carries it: a deploy would take that project over without adoption.
+pub async fn require_not_discovered(name: &str, docker: Option<&bollard::Docker>) -> Result<()> {
+    if get(name)?.is_none()
+        && let Some(docker) = docker
+        && discovered(docker, name).await.is_some()
+    {
+        anyhow::bail!(
+            "stack '{name}' is a discovered compose project, not a registered one; adopt it with docker.stack_adopt before deploying over it"
+        );
+    }
+    Ok(())
+}
+
+pub async fn require_registered_here(name: &str, adoption: Adoption) -> Result<StackRow> {
     require_registered(
         name,
         crate::registration::adapter().present_client().as_ref(),
+        adoption,
     )
     .await
 }
@@ -1721,6 +1878,7 @@ mod tests {
                 allow: Vec::new(),
                 files: Vec::new(),
                 env_files: Vec::new(),
+                project: None,
             };
             insert(&row("/opt/stacks/web")).unwrap();
             assert!(insert(&row("/opt/stacks/elsewhere")).is_err());
@@ -1888,6 +2046,7 @@ mod tests {
             allow: Vec::new(),
             files: Vec::new(),
             env_files: Vec::new(),
+            project: None,
         }];
         assert!(from_labels(&containers, &registered, &r.roots).is_empty());
     }
@@ -1956,6 +2115,7 @@ mod tests {
             allow: Vec::new(),
             files: vec![r.path("web/compose.yaml"), r.path("web/extra.yaml")],
             env_files: vec![r.path("web/.env")],
+            project: None,
         };
         let compose = row.compose(&r.roots).unwrap();
         let args = config_args(Path::new(&row.dir), &compose).unwrap();
@@ -1977,6 +2137,7 @@ mod tests {
             allow: Vec::new(),
             files: files.iter().map(|f| r.path(f)).collect(),
             env_files: Vec::new(),
+            project: None,
         }
     }
 
@@ -2070,6 +2231,7 @@ mod tests {
             allow: Vec::new(),
             files: vec![r.path("new/compose.yaml")],
             env_files: Vec::new(),
+            project: None,
         };
         let mut row = StackRow {
             dir: link.join("new").to_string_lossy().into_owned(),
@@ -2103,6 +2265,7 @@ mod tests {
             allow: Vec::new(),
             files: vec![r.path("web/compose.yaml"), r.path("web/extra.yaml")],
             env_files: Vec::new(),
+            project: None,
         };
         let dir = PathBuf::from(format!("{}/./web", r.roots[0]));
         let row = payload_row(
@@ -2145,6 +2308,7 @@ mod tests {
                     "/opt/stacks/web/x.yaml".into(),
                 ],
                 env_files: vec!["/opt/stacks/web/.env".into()],
+                project: None,
             };
             put(&row).unwrap();
             let back = require("web").unwrap();
@@ -2164,6 +2328,7 @@ mod tests {
             allow: Vec::new(),
             files: Vec::new(),
             env_files: Vec::new(),
+            project: None,
         };
         let args = row.compose(&r.roots).unwrap().args();
         assert!(
@@ -2227,6 +2392,7 @@ mod tests {
             allow: Vec::new(),
             files: Vec::new(),
             env_files: Vec::new(),
+            project: None,
         }];
         let rows = discovered_rows(from_labels(&containers, &registered, &r.roots));
         let got: Vec<(String, String, String)> = rows
@@ -2277,6 +2443,7 @@ mod tests {
                 allow: Vec::new(),
                 files: Vec::new(),
                 env_files: Vec::new(),
+                project: None,
             };
             assert!(row.read_compose(&r.roots).is_err(), "{dir}");
             assert!(row.compose_path(&r.roots).is_err(), "{dir}");
@@ -2322,6 +2489,7 @@ mod tests {
                 allow: Vec::new(),
                 files: Vec::new(),
                 env_files: Vec::new(),
+                project: None,
             }];
             assert!(
                 discovered_rows(from_labels(&containers, &registered, &r.roots)).is_empty(),
@@ -2395,6 +2563,7 @@ mod tests {
             allow: Vec::new(),
             files: Vec::new(),
             env_files: Vec::new(),
+            project: None,
         };
         let web = Some(r.path("web"));
         assert_eq!(at(r.path("web")).emitted_dir(&r.roots), web);
@@ -2426,6 +2595,7 @@ mod tests {
             allow: Vec::new(),
             files: Vec::new(),
             env_files: Vec::new(),
+            project: None,
         };
         assert!(row.compose_path(&r.roots).is_err());
         assert!(row.read_file("../other/compose.yaml", &r.roots).is_err());
@@ -2441,6 +2611,7 @@ mod tests {
             allow: Vec::new(),
             files: Vec::new(),
             env_files: Vec::new(),
+            project: None,
         };
         assert!(under_dockge_root(&at("/opt/stacks/x")));
         assert!(under_dockge_root(&at("/opt/stacks/./x")));
@@ -2514,6 +2685,13 @@ mod tests {
                 rows[0].read_compose(&allowed_roots().unwrap()).unwrap(),
                 "services: {}\n"
             );
+            let row = plugin_toolkit::reactor::block_on(require_registered(
+                "legacy",
+                Some(&docker),
+                Adoption::Preview,
+            ))
+            .unwrap();
+            assert_eq!(row.dir, extra.path("legacy"));
         });
     }
 
@@ -2535,21 +2713,149 @@ mod tests {
     }
 
     #[test]
-    fn changing_a_discovered_unregistered_project_is_refused() {
+    fn backfill_reports_each_failure_and_plans_on_a_dry_run() {
+        crate::test_support::with_db(|| {
+            let r = Roots::new(&["web"]);
+            register_root(&r.roots[0], &[]);
+            let web = StackRow {
+                name: "web".into(),
+                dir: r.path("web"),
+                file: "compose.yaml".into(),
+                enabled: true,
+                allow: Vec::new(),
+                files: vec![r.path("web/compose.yaml")],
+                env_files: Vec::new(),
+                project: None,
+            };
+            let gone = StackRow {
+                name: "gone".into(),
+                dir: r.path("gone"),
+                files: Vec::new(),
+                ..web.clone()
+            };
+            put(&web).unwrap();
+            put(&gone).unwrap();
+            let mut claimed = claimed_projects(&list().unwrap());
+            claimed.sort();
+            assert_eq!(claimed, ["gone", "web"]);
+            let plan = plugin_toolkit::reactor::block_on(backfill_projects(true)).unwrap();
+            assert!(
+                plan.errors.iter().any(|e| e.starts_with("gone: ")),
+                "{plan:?}"
+            );
+            assert!(
+                require("web").unwrap().project.is_none(),
+                "a dry run stores nothing"
+            );
+            if crate::test_support::have_compose() {
+                assert_eq!(plan.changed, ["web: (unset) -> web"]);
+                let done = plugin_toolkit::reactor::block_on(backfill_projects(false)).unwrap();
+                assert_eq!(done.changed, plan.changed);
+                assert_eq!(require("web").unwrap().project.as_deref(), Some("web"));
+                let again = plugin_toolkit::reactor::block_on(backfill_projects(false)).unwrap();
+                assert!(again.changed.is_empty());
+            }
+            let renamed = StackRow {
+                project: Some("webapp".into()),
+                ..web
+            };
+            assert_eq!(claimed_projects(&[renamed]), ["webapp"]);
+        });
+    }
+
+    #[test]
+    fn a_row_stored_before_the_project_column_reads_as_unset() {
+        let mut legacy = to_dbrow(&StackRow {
+            name: "web".into(),
+            dir: "/opt/stacks/web".into(),
+            file: "compose.yaml".into(),
+            enabled: true,
+            allow: Vec::new(),
+            files: Vec::new(),
+            env_files: Vec::new(),
+            project: None,
+        });
+        legacy.remove("project");
+        let row = from_dbrow(&legacy).unwrap();
+        assert_eq!(row.project, None);
+        assert_eq!(row.project_name(), "web");
+        let schema: plugin_toolkit::serde_json::Value =
+            plugin_toolkit::serde_json::from_str(&crate::registration::schema_json()).unwrap();
+        let project = schema["tables"][0]["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "project")
+            .unwrap();
+        assert_eq!(project["sql_type"], "TEXT");
+        assert!(
+            project.get("not_null").is_none(),
+            "core adds a nullable column to existing tables with ADD COLUMN"
+        );
+    }
+
+    #[test]
+    fn deploying_over_a_discovered_project_needs_adoption_first() {
+        crate::test_support::with_db(|| {
+            let r = Roots::new(&["immich", "fresh"]);
+            register_root(&r.roots[0], &[]);
+            let e = discovered_engine("immich", &r.path("immich"));
+            let docker = e.client();
+            let err =
+                plugin_toolkit::reactor::block_on(require_not_discovered("immich", Some(&docker)))
+                    .unwrap_err()
+                    .to_string();
+            assert!(err.contains("docker.stack_adopt"), "{err}");
+            plugin_toolkit::reactor::block_on(require_not_discovered("fresh", Some(&docker)))
+                .unwrap();
+            plugin_toolkit::reactor::block_on(require_not_discovered("immich", None)).unwrap();
+            put(&StackRow {
+                name: "immich".into(),
+                dir: r.path("immich"),
+                file: "compose.yaml".into(),
+                enabled: true,
+                allow: Vec::new(),
+                files: Vec::new(),
+                env_files: Vec::new(),
+                project: None,
+            })
+            .unwrap();
+            plugin_toolkit::reactor::block_on(require_not_discovered("immich", Some(&docker)))
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn changing_a_discovered_project_never_adopts_it() {
         crate::test_support::with_db(|| {
             let r = Roots::new(&["immich"]);
             register_root(&r.roots[0], &[]);
             let e = discovered_engine("immich", &r.path("immich"));
             let docker = e.client();
-            let err =
-                plugin_toolkit::reactor::block_on(require_registered("immich", Some(&docker)))
-                    .unwrap_err()
-                    .to_string();
-            assert!(err.contains("docker.stack_allow"), "{err}");
-            let err =
-                plugin_toolkit::reactor::block_on(require_registered("absent", Some(&docker)))
-                    .unwrap_err()
-                    .to_string();
+            let err = plugin_toolkit::reactor::block_on(require_registered(
+                "immich",
+                Some(&docker),
+                Adoption::for_call(false),
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("docker.stack_adopt"), "{err}");
+            assert!(get("immich").unwrap().is_none());
+            let preview = plugin_toolkit::reactor::block_on(require_registered(
+                "immich",
+                Some(&docker),
+                Adoption::for_call(true),
+            ))
+            .unwrap();
+            assert_eq!(preview.dir, r.path("immich"));
+            assert!(get("immich").unwrap().is_none(), "a dry run adopts nothing");
+            let err = plugin_toolkit::reactor::block_on(require_registered(
+                "absent",
+                Some(&docker),
+                Adoption::Preview,
+            ))
+            .unwrap_err()
+            .to_string();
             assert!(err.contains("no managed stack"), "{err}");
         });
     }
@@ -2562,6 +2868,30 @@ mod tests {
         let roots = vec![s(&root.path().canonicalize().unwrap())];
         let dir = PathBuf::from(&roots[0]).join("web");
         assert!(StackDir::open(&s(&dir), &roots, true).is_err());
+    }
+
+    #[test]
+    fn a_project_a_registered_stack_runs_as_is_not_discovered_again() {
+        let r = Roots::new(&["web", "elsewhere"]);
+        let containers = summaries(&[(
+            "webapp",
+            &r.path("elsewhere"),
+            &r.path("elsewhere/compose.yaml"),
+        )]);
+        let registered = vec![StackRow {
+            name: "web".into(),
+            dir: r.path("web"),
+            file: "compose.yaml".into(),
+            enabled: true,
+            allow: Vec::new(),
+            files: Vec::new(),
+            env_files: Vec::new(),
+            project: None,
+        }];
+        assert_eq!(from_labels(&containers, &registered, &r.roots).len(), 1);
+        assert!(
+            from_labels_claimed(&containers, &registered, &["webapp".into()], &r.roots).is_empty()
+        );
     }
 
     #[test]
@@ -2731,6 +3061,7 @@ mod tests {
             allow: Vec::new(),
             files: Vec::new(),
             env_files: Vec::new(),
+            project: None,
         }
     }
 
