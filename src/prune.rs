@@ -3259,4 +3259,93 @@ mod tests {
             assert!(s.contains(want), "{want} not in {s}");
         }
     }
+
+    #[test]
+    fn a_conflicting_project_withholds_refs() {
+        let r = tempfile::tempdir().unwrap();
+        let dir = r.path().canonicalize().unwrap();
+        std::fs::create_dir(dir.join("web")).unwrap();
+        for f in ["compose.yaml", "other.yaml"] {
+            std::fs::write(dir.join("web").join(f), "services: {}\n").unwrap();
+        }
+        let roots = vec![dir.to_string_lossy().into_owned()];
+        let at = |f: &str| dir.join("web").join(f).to_string_lossy().into_owned();
+        let web = at("");
+        let containers: Vec<ContainerSummary> = parse(&format!(
+            r#"[{{"Id":"a","Labels":{{"{COMPOSE_PROJECT_LABEL}":"web","com.docker.compose.project.working_dir":"{web}","com.docker.compose.project.config_files":"{}"}}}},{{"Id":"b","Labels":{{"{COMPOSE_PROJECT_LABEL}":"web","com.docker.compose.project.working_dir":"{web}","com.docker.compose.project.config_files":"{}"}}}}]"#,
+            at("compose.yaml"),
+            at("other.yaml")
+        ));
+        let outcomes = crate::stacks::from_labels(&containers, &[], &roots);
+        let withheld = assess(&outcomes).1;
+        assert!(
+            withheld.refs.iter().any(|w| w.contains("web")),
+            "{withheld:?}"
+        );
+        assert!(withheld.networks.is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_labelled_project_withholds_unused_images_and_orphan_volumes() {
+        crate::test_support::with_db(|| {
+            let root = tempfile::tempdir().unwrap();
+            let root_s = root
+                .path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            plugin_toolkit::reactor::block_on(crate::tools::docker_create(
+                crate::tools::DockerCreateArgs {
+                    name: "local".into(),
+                    socket_path: None,
+                    host: None,
+                    url: None,
+                    stacks_root: Some(root_s.clone()),
+                    data_roots: Vec::new(),
+                    discovery_roots: Vec::new(),
+                    registries: Vec::new(),
+                    routes: Vec::new(),
+                    dry_run: false,
+                },
+                &crate::test_support::admin(),
+            ))
+            .unwrap();
+            let web = format!("{root_s}/web");
+            std::fs::create_dir(&web).unwrap();
+            let labelled = format!(
+                r#"[{{"Id":"w","State":"running","Labels":{{"{COMPOSE_PROJECT_LABEL}":"web","com.docker.compose.project.working_dir":"{web}","com.docker.compose.project.config_files":"{web}/missing.yaml"}}}}]"#
+            );
+            let e = extras_engine(vec![
+                Route::new("GET", "/containers/json", 200, labelled)
+                    .when_query(r#""label":["com.docker.compose.project"]"#),
+            ]);
+            let docker = e.client();
+            let configs = plugin_toolkit::reactor::block_on(with_swarm(
+                &docker,
+                plugin_toolkit::reactor::block_on(stack_configs(&docker)).unwrap(),
+            ))
+            .unwrap();
+            let w = &configs.protection.withheld;
+            assert!(
+                w.refs
+                    .iter()
+                    .any(|r| r.contains("web") && r.contains("missing.yaml")),
+                "{w:?}"
+            );
+            assert!(w.networks.is_empty(), "{w:?}");
+            let ext = external();
+            let scope = Scope {
+                stack_refs: w.refs.is_empty().then_some(&configs.refs),
+                ..host_wide(&ext, opted_in())
+            };
+            let f = found(&e, scope);
+            assert!(
+                !f.iter()
+                    .any(|c| c.kind == ResourceKind::Image && c.id != "sha256:dangle"),
+                "{f:?}"
+            );
+            assert!(!keys(&f).contains(&act_key().as_str()), "{f:?}");
+        });
+    }
 }

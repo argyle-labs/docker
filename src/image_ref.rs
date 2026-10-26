@@ -207,4 +207,26 @@ mod tests {
             ImageRef::parse("Ghcr.io/org/app:1").matches(&["ghcr.io/org/app:1".to_string()], &[])
         );
     }
+
+    #[test]
+    fn localhost_with_and_without_a_port_is_a_host() {
+        assert_eq!(repository("localhost/app"), "localhost/app");
+        assert_eq!(repository("localhost:5000/app:1"), "localhost:5000/app");
+        assert_eq!(repository("LOCALHOST:5000/app"), "localhost:5000/app");
+        assert_eq!(repository("localhost"), "docker.io/library/localhost");
+        assert_eq!(
+            ImageRef::parse("localhost:5000/app").canonical(),
+            "localhost:5000/app:latest"
+        );
+    }
+
+    #[test]
+    fn an_uppercase_registry_matches_its_lowercase_spelling() {
+        let tags = vec!["registry.example.com/team/app:2".to_string()];
+        assert!(ImageRef::parse("Registry.Example.COM/team/app:2").matches(&tags, &[]));
+        assert_eq!(
+            repository("Docker.IO/library/nginx"),
+            "docker.io/library/nginx"
+        );
+    }
 }

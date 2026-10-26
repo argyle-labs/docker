@@ -1625,6 +1625,100 @@ mod tests {
         }
     }
 
+    fn labelled_only(project: &str, labels: plugin_toolkit::serde_json::Value) -> Vec<Discovery> {
+        let mut labels = labels;
+        labels["com.docker.compose.project"] = project.into();
+        let containers: Vec<bollard::models::ContainerSummary> =
+            plugin_toolkit::serde_json::from_value(
+                plugin_toolkit::serde_json::json!([{"Id": "c1", "Labels": labels}]),
+            )
+            .unwrap();
+        let r = Roots::new(&[]);
+        from_labels(&containers, &[], &r.roots)
+    }
+
+    #[test]
+    fn a_project_without_a_working_dir_is_unreadable() {
+        let outcomes = labelled_only(
+            "web",
+            plugin_toolkit::serde_json::json!({"com.docker.compose.project.config_files": "/x/compose.yaml"}),
+        );
+        assert!(
+            matches!(&outcomes[..], [Discovery::Unreadable { cause, .. }] if cause == "no working_dir label"),
+            "{outcomes:?}"
+        );
+    }
+
+    #[test]
+    fn a_project_without_config_files_is_unreadable() {
+        let r = Roots::new(&["web"]);
+        let containers: Vec<bollard::models::ContainerSummary> =
+            plugin_toolkit::serde_json::from_value(plugin_toolkit::serde_json::json!([{
+                "Id": "c1",
+                "Labels": {
+                    "com.docker.compose.project": "web",
+                    "com.docker.compose.project.working_dir": r.path("web"),
+                }
+            }]))
+            .unwrap();
+        let outcomes = from_labels(&containers, &[], &r.roots);
+        assert!(
+            matches!(&outcomes[..], [Discovery::Unreadable { cause, .. }] if cause == "no config_files label"),
+            "{outcomes:?}"
+        );
+    }
+
+    #[test]
+    fn mismatched_labels_on_one_projects_containers_are_a_conflict() {
+        let r = Roots::new(&["web"]);
+        std::fs::write(PathBuf::from(r.path("web/other.yaml")), "services: {}\n").unwrap();
+        let containers = summaries(&[
+            ("web", &r.path("web"), &r.path("web/compose.yaml")),
+            ("web", &r.path("web"), &r.path("web/other.yaml")),
+        ]);
+        let outcomes = from_labels(&containers, &[], &r.roots);
+        assert!(
+            matches!(&outcomes[..], [Discovery::Conflict { name, .. }] if name == "web"),
+            "{outcomes:?}"
+        );
+    }
+
+    #[test]
+    fn a_discovered_project_in_a_registered_dir_yields_no_outcome() {
+        let r = Roots::new(&["web"]);
+        let containers = summaries(&[("other", &r.path("web"), &r.path("web/compose.yaml"))]);
+        let registered = [StackRow {
+            name: "web".into(),
+            dir: r.path("web"),
+            file: DEFAULT_COMPOSE_FILE.into(),
+            enabled: true,
+            allow: Vec::new(),
+            files: Vec::new(),
+            env_files: Vec::new(),
+        }];
+        assert!(from_labels(&containers, &registered, &r.roots).is_empty());
+    }
+
+    #[test]
+    fn a_registered_stack_is_read_with_the_project_name_deploy_resolves() {
+        let r = Roots::new(&["web"]);
+        let row = StackRow {
+            name: "registered-name".into(),
+            dir: r.path("web"),
+            file: DEFAULT_COMPOSE_FILE.into(),
+            enabled: true,
+            allow: Vec::new(),
+            files: Vec::new(),
+            env_files: Vec::new(),
+        };
+        let args = row.compose(&r.roots).unwrap().args();
+        assert!(
+            !args.iter().any(|a| a == "-p" || a == "--env-file"),
+            "{args:?}"
+        );
+        assert_eq!(args, vec!["-f".to_string(), r.path("web/compose.yaml")]);
+    }
+
     fn compose_container(project: &str, dir: &str, files: &str) -> String {
         format!(
             r#"{{"Id":"{project}","Labels":{{"com.docker.compose.project":"{project}","com.docker.compose.project.working_dir":"{dir}","com.docker.compose.project.config_files":"{files}"}}}}"#
