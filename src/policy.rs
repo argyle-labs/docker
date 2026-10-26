@@ -2272,6 +2272,9 @@ pub struct DockerStackAdoptOutput {
     pub dry_run: bool,
     pub adopted: Vec<DockerStackAllowOutput>,
     pub refused: Vec<AdoptRefusal>,
+    /// Registered stacks whose compose project name was resolved and stored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backfilled: Vec<String>,
 }
 
 /// [MUTATES STATE] Adopt every compose project discovered on this host as a
@@ -2295,8 +2298,17 @@ async fn docker_stack_adopt(
     let docker = &crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
+    let dry_run = args.dry_run || ctx.dry_run();
+    let backfilled = if dry_run {
+        Vec::new()
+    } else {
+        stacks::backfill_projects().await?
+    };
     let found = stacks::discover(docker).await?;
-    Ok(adopt_all(found, docker, args.dry_run || ctx.dry_run(), admin).await)
+    Ok(DockerStackAdoptOutput {
+        backfilled,
+        ..adopt_all(found, docker, dry_run, admin).await
+    })
 }
 
 pub async fn adopt_all(
@@ -2309,6 +2321,7 @@ pub async fn adopt_all(
         dry_run,
         adopted: Vec::new(),
         refused: Vec::new(),
+        backfilled: Vec::new(),
     };
     for d in found {
         let refusal = |name: String, reason: String| AdoptRefusal { name, reason };
@@ -2447,6 +2460,7 @@ fn adoptable(args: &DockerStackAllowArgs) -> Result<StackRow> {
         allow: Vec::new(),
         files: Vec::new(),
         env_files: Vec::new(),
+        project: None,
     })
 }
 
@@ -2475,6 +2489,7 @@ mod tests {
             allow: Vec::new(),
             files: Vec::new(),
             env_files: Vec::new(),
+            project: None,
         };
         let discovered = StackRow {
             files: vec![format!("{STACK}/compose.yaml"), format!("{STACK}/x.yaml")],
@@ -3138,6 +3153,7 @@ mod tests {
             allow: Vec::new(),
             files: Vec::new(),
             env_files: Vec::new(),
+            project: None,
         };
         stacks::put(&row).unwrap();
         row

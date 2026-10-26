@@ -558,6 +558,11 @@ pub struct DockerImageStatusArgs {
     #[arg(long)]
     #[serde(default)]
     pub stack: Option<String>,
+    /// Leave out containers outside any compose project, saving their
+    /// registry lookups.
+    #[arg(long)]
+    #[serde(default, rename = "skipStandalone", alias = "skip_standalone")]
+    pub skip_standalone: bool,
 }
 
 fn require_docker(absent: bool) -> Result<()> {
@@ -595,6 +600,10 @@ async fn docker_image_status(args: DockerImageStatusArgs, _ctx: &ToolCtx) -> Res
     let docker = &crate::registration::adapter()
         .client()
         .map_err(|e| anyhow!("{e}"))?;
+    image_status(docker, &args).await
+}
+
+async fn image_status(docker: &Docker, args: &DockerImageStatusArgs) -> Result<ImageStatus> {
     let containers = all_containers(docker).await?;
     let roots = crate::stacks::allowed_roots()?;
     let rows = crate::stacks::list()?;
@@ -604,10 +613,7 @@ async fn docker_image_status(args: DockerImageStatusArgs, _ctx: &ToolCtx) -> Res
         if args.stack.as_ref().is_some_and(|s| s != &row.name) {
             continue;
         }
-        let project = match row.compose(&roots) {
-            Ok(c) => c.project_name().await.map_err(|e| e.to_string()),
-            Err(e) => Err(e.to_string()),
-        };
+        let project = Ok(row.project_name());
         registered.push((row, project));
     }
     let projects: BTreeSet<String> = containers
@@ -622,7 +628,13 @@ async fn docker_image_status(args: DockerImageStatusArgs, _ctx: &ToolCtx) -> Res
             bail!("no stack named '{s}'");
         }
     }
-    Ok(report(docker, found, &containers, args.stack.is_none()).await)
+    Ok(report(
+        docker,
+        found,
+        &containers,
+        args.stack.is_none() && !args.skip_standalone,
+    )
+    .await)
 }
 
 #[cfg(test)]
@@ -1036,6 +1048,7 @@ mod tests {
             allow: Vec::new(),
             files: Vec::new(),
             env_files: Vec::new(),
+            project: None,
         }
     }
 
@@ -1189,5 +1202,54 @@ mod tests {
         assert_eq!(container_name(&nameless), "(unnamed)");
         let none = plugin_toolkit::reactor::block_on(report(&e.client(), Vec::new(), &all, false));
         assert!(none.standalone.is_empty());
+    }
+
+    #[test]
+    fn image_status_reports_discovered_stacks_and_registers_none() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let dir = root.join("web");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("compose.yaml"), "services: {}\n").unwrap();
+        let labelled = format!(
+            r#"{{"Id":"c-web","Names":["/web-app-1"],"Image":"nginx","ImageID":"sha256:img","State":"running","Labels":{{"{COMPOSE_PROJECT_LABEL}":"web","{COMPOSE_SERVICE_LABEL}":"app","{COMPOSE_ONEOFF_LABEL}":"False","{}":"{}","{}":"{}"}}}}"#,
+            crate::stacks_root_drift::WORKING_DIR_LABEL,
+            dir.display(),
+            crate::stacks::CONFIG_FILES_LABEL,
+            dir.join("compose.yaml").display(),
+        );
+        let standalone = r#"{"Id":"c-sync","Names":["/syncthing"],"Image":"syncthing/syncthing:1","ImageID":"sha256:s","State":"running","Labels":{}}"#;
+        let e = FakeEngine::routed(vec![Route::new(
+            "GET",
+            "/containers/json",
+            200,
+            format!("[{labelled},{standalone}]"),
+        )]);
+        let (out, tables) = crate::test_support::with_db(|| {
+            plugin_toolkit::reactor::block_on(crate::tools::docker_create(
+                plugin_toolkit::serde_json::from_value(plugin_toolkit::serde_json::json!({
+                    "name": "local",
+                    "stacks_root": root.to_string_lossy(),
+                }))
+                .unwrap(),
+                &crate::test_support::admin(),
+            ))
+            .unwrap();
+            let args = DockerImageStatusArgs {
+                stack: None,
+                skip_standalone: true,
+            };
+            plugin_toolkit::reactor::block_on(image_status(&e.client(), &args)).unwrap()
+        });
+        assert_eq!(out.stacks.len(), 1, "{out:?}");
+        assert_eq!(out.stacks[0].stack, "web");
+        assert_eq!(out.stacks[0].source, StackSource::Discovered);
+        assert!(out.standalone.is_empty(), "skipStandalone");
+        assert!(
+            tables
+                .iter()
+                .all(|((_, t), rows)| t != "stacks" || rows.is_empty()),
+            "image_status registered a stack: {tables:?}"
+        );
     }
 }

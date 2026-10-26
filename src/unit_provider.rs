@@ -144,12 +144,12 @@ pub(crate) fn dry_run(id: UnitId, plan: String) -> VerbOutcome {
 }
 
 /// How a stack update treats a discovered project: a self-planning dry run
-/// previews it, a verified admin adopts it.
+/// previews it, anything else is refused.
 fn stack_adoption(args: &UpdateArgs) -> stacks::Adoption {
-    let dry_run = SELF_PLANNING.contains(&args.action.as_str())
-        && split_dry_run(args.payload.clone()).is_ok_and(|(d, _)| d);
-    let admin = crate::execute::verified_admin("docker stack update", args.caller.as_ref()).ok();
-    stacks::Adoption::for_call(dry_run, admin)
+    stacks::Adoption::for_call(
+        SELF_PLANNING.contains(&args.action.as_str())
+            && split_dry_run(args.payload.clone()).is_ok_and(|(d, _)| d),
+    )
 }
 
 /// Admin, failing closed: a request with no verified caller is refused.
@@ -3810,6 +3810,7 @@ mod tests {
             allow: Vec::new(),
             files: Vec::new(),
             env_files: Vec::new(),
+            project: None,
         };
         let summary = |id: &str, wd: Option<&str>| bollard::models::ContainerSummary {
             id: Some(id.into()),
@@ -3851,6 +3852,7 @@ mod tests {
             allow: Vec::new(),
             files: Vec::new(),
             env_files: Vec::new(),
+            project: None,
         };
         let summary = |id: &str, wd: &std::path::Path| bollard::models::ContainerSummary {
             id: Some(id.into()),
@@ -4598,6 +4600,7 @@ mod tests {
             allow: Vec::new(),
             files: Vec::new(),
             env_files: Vec::new(),
+            project: None,
         };
         stacks::put(&row).unwrap();
         row
@@ -4619,7 +4622,7 @@ mod tests {
     }
 
     #[test]
-    fn stack_updates_adopt_only_for_an_executing_admin() {
+    fn stack_updates_never_adopt() {
         let args = |action: &str, payload: Option<&str>, role: Option<&str>| UpdateArgs {
             id: UnitId {
                 manager: "docker@test".into(),
@@ -4631,30 +4634,22 @@ mod tests {
             payload: payload.map(String::from),
             caller: role.map(crate::test_support::caller),
         };
-        let admin =
-            crate::execute::verified_admin("t", Some(&crate::test_support::caller("admin")))
-                .unwrap();
         let dry = Some(r#"{"dryRun":true}"#);
         assert_eq!(
             stack_adoption(&args(ACTION_UPDATE, dry, Some("admin"))),
             stacks::Adoption::Preview
         );
-        assert_eq!(
-            stack_adoption(&args(ACTION_NORMALIZE, None, Some("admin"))),
-            stacks::Adoption::Adopt(admin)
-        );
-        assert_eq!(
-            stack_adoption(&args("restart", None, Some("admin"))),
-            stacks::Adoption::Adopt(admin)
-        );
-        assert_eq!(
-            stack_adoption(&args("restart", None, Some("user"))),
-            stacks::Adoption::Refuse
-        );
-        assert_eq!(
-            stack_adoption(&args(ACTION_BACKUP, None, None)),
-            stacks::Adoption::Refuse
-        );
+        for a in [
+            args(ACTION_UPDATE, None, Some("admin")),
+            args(ACTION_NORMALIZE, None, Some("admin")),
+            args("edit", None, Some("admin")),
+            args("restart", None, Some("admin")),
+            args("restart", dry, Some("admin")),
+            args(ACTION_BACKUP, None, Some("admin")),
+            args(ACTION_BACKUP, None, None),
+        ] {
+            assert_eq!(stack_adoption(&a), stacks::Adoption::Refuse, "{}", a.action);
+        }
     }
 
     #[test]
@@ -5732,6 +5727,7 @@ mod tests {
             allow: Vec::new(),
             files: Vec::new(),
             env_files: Vec::new(),
+            project: None,
         };
         let c = &snap("sha256:old").containers[0];
         let plain = planned_image(&row, c, vec!["sha256:a".into()], Ok("sha256:b".into()));

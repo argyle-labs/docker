@@ -272,8 +272,8 @@ fn validate_root(kind: &str, root: &str) -> Result<()> {
     Ok(())
 }
 
-/// Host dirs a discovery root may be neither nor sit under: adoption grants
-/// what compose projects there run.
+/// Host dirs a discovery root may neither be, sit under nor contain:
+/// adoption grants what compose projects there run.
 pub const SYSTEM_DIRS: &[&str] = &[
     "/bin",
     "/boot",
@@ -289,14 +289,18 @@ pub const SYSTEM_DIRS: &[&str] = &[
     "/usr",
     "/var/lib/docker",
     "/var/lib/containerd",
+    "/var/run",
 ];
 
 pub(crate) fn validate_discovery_roots(roots: &[String]) -> Result<()> {
     for root in roots {
         validate_root("discovery_root", root)?;
         let path = Path::new(root);
-        if let Some(dir) = SYSTEM_DIRS.iter().find(|d| path.starts_with(d)) {
-            bail!("discovery_root '{root}' is inside the system dir {dir}");
+        if let Some(dir) = SYSTEM_DIRS
+            .iter()
+            .find(|d| path.starts_with(d) || Path::new(d).starts_with(path))
+        {
+            bail!("discovery_root '{root}' overlaps the system dir {dir}");
         }
     }
     Ok(())
@@ -891,6 +895,9 @@ mod registry_tests {
             "/var/lib/docker/volumes",
             "/proc",
             "/root/stacks",
+            "/var",
+            "/var/lib",
+            "/var/run/docker",
         ] {
             assert!(
                 validate_discovery_roots(&[bad.to_string()]).is_err(),

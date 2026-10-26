@@ -1803,6 +1803,7 @@ mod tests {
             allow: Vec::new(),
             files: Vec::new(),
             env_files: Vec::new(),
+            project: None,
         };
         let target = DockerDeployTarget::new("host-a", root);
         let adopt = || {

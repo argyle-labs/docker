@@ -532,11 +532,8 @@ async fn bring_back(row: &StackRow) -> String {
     }
 }
 
-async fn relocate(
-    args: &DockerStackRelocateArgs,
-    admin: Option<crate::execute::Admin>,
-) -> Result<RelocateOutput> {
-    let p = plan(args, stacks::Adoption::for_call(args.dry_run, admin)).await?;
+async fn relocate(args: &DockerStackRelocateArgs) -> Result<RelocateOutput> {
+    let p = plan(args, stacks::Adoption::for_call(args.dry_run)).await?;
     if args.dry_run {
         return Ok(p.out);
     }
@@ -600,8 +597,8 @@ async fn docker_stack_relocate(
         dry_run: args.dry_run || ctx.dry_run(),
         ..args
     };
-    let admin = crate::execute::require_admin(TOOL, ctx)?;
-    relocate(&args, Some(admin)).await
+    crate::execute::require_admin(TOOL, ctx)?;
+    relocate(&args).await
 }
 
 #[cfg(test)]
@@ -772,16 +769,7 @@ mod tests {
                 rewrite: false,
                 dry_run: true,
             };
-            let run = |a| {
-                plugin_toolkit::reactor::block_on(relocate(
-                    &a,
-                    crate::execute::verified_admin(
-                        "t",
-                        Some(&crate::test_support::caller("admin")),
-                    )
-                    .ok(),
-                ))
-            };
+            let run = |a| plugin_toolkit::reactor::block_on(relocate(&a));
             assert!(
                 run(args("ghost", "/srv/stacks"))
                     .unwrap_err()
@@ -796,6 +784,7 @@ mod tests {
                 allow: Vec::new(),
                 files: Vec::new(),
                 env_files: Vec::new(),
+                project: None,
             })
             .unwrap();
             for bad in ["relative", "/srv/../etc", "/"] {

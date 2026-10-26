@@ -168,6 +168,7 @@ pub fn overlapping_dirs(root: &std::path::Path) -> Vec<std::path::PathBuf> {
         allow: vec![bind.parse().unwrap()],
         files: Vec::new(),
         env_files: Vec::new(),
+        project: None,
     })
     .unwrap();
     let dirs = [
