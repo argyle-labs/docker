@@ -111,6 +111,7 @@ pub struct Compose {
     extra_files: Vec<PathBuf>,
     env_files: Vec<PathBuf>,
     project: Option<String>,
+    project_dir: Option<PathBuf>,
 }
 
 impl Compose {
@@ -141,6 +142,7 @@ impl Compose {
             extra_files: Vec::new(),
             env_files: Vec::new(),
             project: None,
+            project_dir: None,
         })
     }
 
@@ -159,6 +161,7 @@ impl Compose {
             extra_files: files.collect(),
             env_files,
             project,
+            project_dir: None,
         })
     }
 
@@ -231,7 +234,19 @@ impl Compose {
             extra_files: self.extra_files.iter().map(|p| f(p)).collect(),
             env_files: self.env_files.iter().map(|p| f(p)).collect(),
             project: self.project.clone(),
+            project_dir: self.project_dir.clone(),
         }
+    }
+
+    /// The project run from `dir` (`--project-directory`), where compose
+    /// reads the default `.env` and resolves relative paths.
+    pub fn with_project_dir(mut self, dir: PathBuf) -> Compose {
+        self.project_dir = Some(dir);
+        self
+    }
+
+    pub fn project_dir(&self) -> Option<&Path> {
+        self.project_dir.as_deref()
     }
 
     pub fn env_files(&self) -> &[PathBuf] {
@@ -248,6 +263,12 @@ impl Compose {
     /// listed, then [`file_args`](Self::file_args).
     pub fn args(&self) -> Vec<String> {
         let mut args = Vec::new();
+        if let Some(d) = &self.project_dir {
+            args.extend([
+                "--project-directory".to_string(),
+                d.to_string_lossy().into_owned(),
+            ]);
+        }
         if let Some(p) = &self.project {
             args.extend(["-p".to_string(), p.clone()]);
         }
@@ -708,6 +729,18 @@ mod tests {
         let mut imgs = parse_stack_images(raw);
         imgs.sort();
         assert_eq!(imgs, vec!["media-app", "mytool:dev", "nginx:1"]);
+    }
+
+    #[test]
+    fn a_restore_keeps_checking_from_the_live_project_dir() {
+        let live = Compose::new(vec![PathBuf::from("/s/web/compose.yaml")], Vec::new(), None)
+            .unwrap()
+            .with_project_dir(PathBuf::from("/s/web"));
+        let staged = live.map_paths(|p| Path::new("/s/.web.staged").join(p.file_name().unwrap()));
+        assert_eq!(staged.file(), Path::new("/s/.web.staged/compose.yaml"));
+        assert_eq!(staged.project_dir(), Some(Path::new("/s/web")));
+        let args = staged.args();
+        assert_eq!(&args[..2], ["--project-directory", "/s/web"]);
     }
 
     #[test]

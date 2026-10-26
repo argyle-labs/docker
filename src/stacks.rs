@@ -119,6 +119,7 @@ impl StackRow {
             check(&self.env_files)?,
             Some(self.name.clone()),
         )
+        .map(|c| c.with_project_dir(anchored(Path::new(&self.dir))))
         .ok_or_else(|| crate::ComposeError::NoComposeFile(PathBuf::from(&self.dir)))
     }
 
@@ -228,28 +229,26 @@ impl StackRow {
         env: Option<&Path>,
         roots: &[String],
     ) -> Result<Compose> {
-        let live_file = anchored(&dir.join(name));
-        if self.files.is_empty() {
-            let mut files = vec![file.to_path_buf()];
-            files.extend(crate::compose::override_in(dir));
-            return Compose::new(
-                files,
-                env.map(Path::to_path_buf).into_iter().collect(),
-                None,
-            )
-            .context("no compose file");
-        }
-        let listed = self.compose(roots)?;
-        if anchored(file) != live_file && !listed.files().iter().any(|f| anchored(f) == live_file) {
+        let live_file = entry(&dir.join(name));
+        let listed = match self.compose(roots) {
+            Ok(c) => c,
+            Err(_) if self.files.is_empty() => {
+                let mut files = vec![dir.join(name)];
+                files.extend(crate::compose::override_in(dir));
+                Compose::new(files, Vec::new(), None).context("no compose file")?
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if entry(file) != live_file && !listed.files().iter().any(|f| entry(f) == live_file) {
             anyhow::bail!(
                 "compose file {} is not one of the files the stack runs",
                 live_file.display()
             );
         }
-        let live_env = anchored(&dir.join(ENV_FILE));
+        let live_env = entry(&dir.join(ENV_FILE));
         if env.is_some()
             && !listed.env_files().is_empty()
-            && !listed.env_files().iter().any(|e| anchored(e) == live_env)
+            && !listed.env_files().iter().any(|e| entry(e) == live_env)
         {
             anyhow::bail!(
                 "the stack runs with env files {}, not {}; a .env would not take effect",
@@ -263,7 +262,7 @@ impl StackRow {
             );
         }
         let swapped = listed.map_paths(|p| {
-            let a = anchored(p);
+            let a = entry(p);
             if a == live_file {
                 file.to_path_buf()
             } else if let Some(env) = env.filter(|_| a == live_env) {
@@ -272,9 +271,14 @@ impl StackRow {
                 p.to_path_buf()
             }
         });
-        Ok(match env {
+        let swapped = match env {
             Some(env) if swapped.env_files().is_empty() => swapped.with_env_file(env.to_path_buf()),
             _ => swapped,
+        };
+        Ok(if dir.join(crate::compose::ORCA_FILE).is_file() {
+            swapped.with_orca(roots)?
+        } else {
+            swapped
         })
     }
 
@@ -507,11 +511,13 @@ pub fn redact(text: &str, values: &[String]) -> String {
 /// reads a stack. Env files are left unread, so the policy sees their paths
 /// rather than their contents.
 pub fn config_args(dir: &Path, compose: &Compose) -> Vec<String> {
-    let mut args: Vec<String> = vec![
-        "compose".into(),
-        "--project-directory".into(),
-        dir.to_string_lossy().into_owned(),
-    ];
+    let mut args: Vec<String> = vec!["compose".into()];
+    if compose.project_dir().is_none() {
+        args.extend([
+            "--project-directory".into(),
+            dir.to_string_lossy().into_owned(),
+        ]);
+    }
     args.extend(compose.args());
     args.extend(
         [
@@ -1529,6 +1535,15 @@ pub fn payload_row(
     row
 }
 
+/// `path` with its parent [`anchored`] and its last component kept as is, so a
+/// symlink is compared by where it sits, not where it points.
+fn entry(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => anchored(parent).join(name),
+        _ => anchored(path),
+    }
+}
+
 /// `path` with its nearest existing ancestor canonicalized, so a dir not yet
 /// created compares equal through a symlinked root. `..` is kept lexically.
 fn anchored(path: &Path) -> PathBuf {
@@ -1948,6 +1963,83 @@ mod tests {
         assert!(has(["--env-file", &r.path("web/.env")]), "{args:?}");
         assert!(has(["--profile", "*"]), "{args:?}");
         assert_eq!(&args[..1], ["compose"]);
+    }
+
+    fn listed_web(r: &Roots, files: &[&str]) -> StackRow {
+        StackRow {
+            name: "web".into(),
+            dir: r.path("web"),
+            file: "compose.yaml".into(),
+            enabled: true,
+            allow: Vec::new(),
+            files: files.iter().map(|f| r.path(f)).collect(),
+            env_files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_staged_write_over_a_symlinked_compose_file_of_a_listed_stack_is_refused() {
+        let r = Roots::new(&["web"]);
+        let dir = PathBuf::from(r.path("web"));
+        std::fs::rename(dir.join("compose.yaml"), dir.join("real.yaml")).unwrap();
+        symlink(dir.join("real.yaml"), dir.join("compose.yaml")).unwrap();
+        let row = listed_web(&r, &["web/real.yaml"]);
+        let err = plugin_toolkit::reactor::block_on(row.write_checked(
+            Some("services: {}\n"),
+            None,
+            &r.roots,
+            None,
+        ))
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("not a regular file"), "{err:#}");
+        assert!(
+            std::fs::symlink_metadata(dir.join("compose.yaml"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn the_unlisted_check_runs_what_compose_runs_including_the_orca_file() {
+        let r = Roots::new(&["web"]);
+        let dir = PathBuf::from(r.path("web"));
+        std::fs::write(dir.join(crate::compose::ORCA_FILE), "services: {}\n").unwrap();
+        let row = listed_web(&r, &[]);
+        let staged = dir.join(".compose.yaml.staged");
+        std::fs::write(&staged, "services: {}\n").unwrap();
+        let checked = row
+            .checked_compose(&dir, "compose.yaml", &staged, None, &r.roots)
+            .unwrap();
+        assert_eq!(
+            checked.files(),
+            vec![
+                staged.as_path(),
+                dir.join(crate::compose::ORCA_FILE).as_path()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_listed_stack_runs_and_is_checked_from_its_own_project_dir() {
+        let r = Roots::new(&["web", "shared"]);
+        let row = listed_web(&r, &["shared/compose.yaml", "web/compose.yaml"]);
+        let compose = row.compose(&r.roots).unwrap();
+        let args = compose.args();
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--project-directory", &r.path("web")]),
+            "{args:?}"
+        );
+        let checked = config_args(Path::new(&r.path("web")), &compose);
+        assert_eq!(
+            checked
+                .iter()
+                .filter(|a| *a == "--project-directory")
+                .count(),
+            1,
+            "{checked:?}"
+        );
     }
 
     #[test]
