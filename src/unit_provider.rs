@@ -321,8 +321,12 @@ impl DockerUnitProvider {
 
     /// **edit** (rewrite YAML/env, no deploy) or a compose lifecycle action.
     pub(crate) async fn stack_update(&self, args: UpdateArgs) -> Result<VerbOutcome> {
-        let row =
-            stacks::require_registered(&args.id.id, self.adapter.present_client().as_ref()).await?;
+        let row = stacks::require_registered(
+            &args.id.id,
+            self.adapter.present_client().as_ref(),
+            args.caller.is_some(),
+        )
+        .await?;
         match args.action.as_str() {
             "edit" => {
                 let raw = args
@@ -338,7 +342,7 @@ impl DockerUnitProvider {
                 row.write_checked(
                     p.compose_yaml.as_deref(),
                     p.compose_env.as_deref(),
-                    &crate::tools::stacks_roots()?,
+                    &crate::stacks::allowed_roots()?,
                     self.adapter.client().ok().as_ref(),
                 )
                 .await?;
@@ -408,7 +412,7 @@ impl DockerUnitProvider {
         if !p.normalize {
             return String::new();
         }
-        let Ok(dir) = crate::tools::stacks_roots()
+        let Ok(dir) = crate::stacks::allowed_roots()
             .and_then(|roots| stacks::stack_dir_in_roots(&p.dir, &roots))
         else {
             return String::new();
@@ -540,7 +544,7 @@ impl DockerUnitProvider {
             row.write_compose_if_unchanged(
                 &new_yaml,
                 &yaml,
-                &crate::tools::stacks_roots()?,
+                &crate::stacks::allowed_roots()?,
                 self.adapter.client().ok().as_ref(),
             )
             .await?;
@@ -764,7 +768,7 @@ impl DockerUnitProvider {
             p.allow_unverified,
         )?;
         engine_state::validate(&mut file)?;
-        let roots = crate::tools::stacks_roots()?;
+        let roots = crate::stacks::allowed_roots()?;
         let mut staged = StagedRestore::stage(row, &mut file, &roots)?;
         let live = stacks::stack_dir_in_roots(&row.dir, &roots)?;
         let staged_secrets = staged
@@ -879,7 +883,7 @@ impl DockerUnitProvider {
             .clone()
             .unwrap_or_else(|| stacks::DEFAULT_COMPOSE_FILE.to_string());
         stacks::check_file_name(&file)?;
-        let roots = crate::tools::stacks_roots()?;
+        let roots = crate::stacks::allowed_roots()?;
         let dir = stacks::stack_dir_in_roots(&p.dir, &roots)?;
         stacks::check_dir_free(&p.name, &dir)?;
         let current = stacks::get(&p.name)?;
@@ -1171,7 +1175,8 @@ impl DockerUnitProvider {
             args.caller.as_ref(),
         )?;
         if args.id.kind == STACK_KIND {
-            stacks::require_registered(&args.id.id, self.adapter.present_client().as_ref()).await?;
+            stacks::require_registered(&args.id.id, self.adapter.present_client().as_ref(), false)
+                .await?;
             let plan = format!(
                 "tear down stack '{}' (`compose down`) and deregister it; apply with update action={ACTION_REMOVE}",
                 args.id.id

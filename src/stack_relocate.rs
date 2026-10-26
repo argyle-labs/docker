@@ -406,7 +406,7 @@ async fn plan(args: &DockerStackRelocateArgs) -> Result<Plan> {
         bail!("stack name '{}' is not a plain dir name", row.name);
     }
     crate::tools::validate_stacks_root(&args.new_root)?;
-    let roots = crate::tools::stacks_roots()?;
+    let roots = crate::stacks::allowed_roots()?;
     let old_dir = stacks::stack_dir_in_roots(&row.dir, &roots)?;
     let new_root = crate::lifecycle::resolve(Path::new(&args.new_root))?;
     if !new_root.is_dir() {

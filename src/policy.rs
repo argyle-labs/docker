@@ -1737,7 +1737,7 @@ async fn resolved(
     row: &StackRow,
     compose: &Compose,
 ) -> Result<(StackDir, Vec<String>, Value, Value)> {
-    let roots = crate::tools::stacks_roots()?;
+    let roots = crate::stacks::allowed_roots()?;
     let dir = StackDir::open(&row.dir, &roots, false)?
         .ok_or_else(|| anyhow!("stack dir {} does not exist", row.dir))?;
     let raw = stacks::resolved_config(dir.path(), compose).await?;
@@ -2113,7 +2113,7 @@ async fn stack_allow_from(
                 Some(s) => Some(s.clone()),
                 None => stacks::discovered_here(&args.name).await,
             };
-            stacks::carry_listed(&mut row, found.as_ref(), &crate::tools::stacks_roots()?);
+            stacks::carry_listed(&mut row, found.as_ref(), &crate::stacks::allowed_roots()?);
             (row, true)
         }
     };
@@ -2294,6 +2294,42 @@ async fn docker_stack_adopt(
     Ok(adopt_all(found, docker, args.dry_run || ctx.dry_run()).await)
 }
 
+pub const ADOPT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+pub fn adoption_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last.is_none_or(|l| now.duration_since(l) >= ADOPT_INTERVAL)
+}
+
+/// Adopt every discovered project as the system, at most once per
+/// [`ADOPT_INTERVAL`]; driven by the reconciler's container probe.
+pub async fn reconcile_adoption(docker: &bollard::Docker) {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let now = std::time::Instant::now();
+    {
+        let Ok(mut last) = LAST.lock() else {
+            return;
+        };
+        if !adoption_due(*last, now) {
+            return;
+        }
+        *last = Some(now);
+    }
+    let found = match stacks::discover(docker).await {
+        Ok(found) => found,
+        Err(e) => {
+            plugin_toolkit::tracing::warn!(error = %e, "docker stacks: adoption discovery failed");
+            return;
+        }
+    };
+    let out = adopt_all(found, docker, false).await;
+    for a in &out.adopted {
+        plugin_toolkit::tracing::info!(stack = %a.name, "docker stacks: adopted");
+    }
+    for r in &out.refused {
+        plugin_toolkit::tracing::debug!(stack = %r.name, reason = %r.reason, "docker stacks: not adopted");
+    }
+}
+
 pub async fn adopt_all(
     found: Vec<stacks::Discovery>,
     docker: &bollard::Docker,
@@ -2413,7 +2449,7 @@ fn adoptable(args: &DockerStackAllowArgs) -> Result<StackRow> {
         .clone()
         .unwrap_or_else(|| stacks::DEFAULT_COMPOSE_FILE.to_string());
     stacks::check_file_name(&file)?;
-    let roots = crate::tools::stacks_roots()?;
+    let roots = crate::stacks::allowed_roots()?;
     let dir = stacks::stack_dir_in_roots(dir, &roots)?;
     stacks::check_dir_free(&args.name, &dir)?;
     let path = dir.join(&file);
@@ -3475,6 +3511,14 @@ mod tests {
             let again = adopt(&docker, Some(&dir), Vec::new(), false).unwrap();
             assert!(!again.adopted, "a registered stack is not adopted again");
         });
+    }
+
+    #[test]
+    fn adoption_runs_once_per_interval() {
+        let t = std::time::Instant::now();
+        assert!(adoption_due(None, t));
+        assert!(!adoption_due(Some(t), t + ADOPT_INTERVAL / 2));
+        assert!(adoption_due(Some(t), t + ADOPT_INTERVAL));
     }
 
     #[test]

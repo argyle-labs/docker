@@ -345,7 +345,7 @@ pub fn read_conversions(dir: &crate::stacks::StackDir) -> Result<Vec<Conversion>
 
 /// `row`'s dir, opened under a stacks root without following symlinks.
 fn stack_dir(row: &StackRow) -> Result<crate::stacks::StackDir> {
-    crate::stacks::StackDir::open(&row.dir, &crate::tools::stacks_roots()?, false)?
+    crate::stacks::StackDir::open(&row.dir, &crate::stacks::allowed_roots()?, false)?
         .ok_or_else(|| anyhow::anyhow!("stack dir {} does not exist", row.dir))
 }
 

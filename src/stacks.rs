@@ -1581,13 +1581,24 @@ pub async fn discovered_here(name: &str) -> Option<StackRow> {
     discovered(&docker, name).await
 }
 
-pub async fn require_registered(name: &str, docker: Option<&bollard::Docker>) -> Result<StackRow> {
+/// The registered stack `name`; with `adopt`, a discovered project of that
+/// name is adopted first, so only admin-caller paths may pass it.
+pub async fn require_registered(
+    name: &str,
+    docker: Option<&bollard::Docker>,
+    adopt: bool,
+) -> Result<StackRow> {
     if let Some(row) = get(name)? {
         return Ok(row);
     }
     if let Some(docker) = docker
         && let Some(row) = discovered(docker, name).await
     {
+        if !adopt {
+            anyhow::bail!(
+                "stack '{name}' is a discovered compose project, not a registered one; adopt it with docker.stack_adopt or an admin stack verb"
+            );
+        }
         crate::policy::adopt(&row, docker, false)
             .await
             .map_err(|e| {
@@ -1604,6 +1615,7 @@ pub async fn require_registered_here(name: &str) -> Result<StackRow> {
     require_registered(
         name,
         crate::registration::adapter().present_client().as_ref(),
+        true,
     )
     .await
 }
@@ -2519,6 +2531,13 @@ mod tests {
                 rows[0].read_compose(&allowed_roots().unwrap()).unwrap(),
                 "services: {}\n"
             );
+            let row = plugin_toolkit::reactor::block_on(require_registered(
+                "legacy",
+                Some(&docker),
+                true,
+            ))
+            .unwrap();
+            assert_eq!(row.dir, extra.path("legacy"));
         });
     }
 
@@ -2547,15 +2566,30 @@ mod tests {
             let e = discovered_engine("immich", &r.path("immich"));
             let docker = e.client();
             assert!(get("immich").unwrap().is_none());
-            let row =
-                plugin_toolkit::reactor::block_on(require_registered("immich", Some(&docker)))
-                    .unwrap();
+            let err = plugin_toolkit::reactor::block_on(require_registered(
+                "immich",
+                Some(&docker),
+                false,
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("docker.stack_adopt"), "{err}");
+            assert!(get("immich").unwrap().is_none());
+            let row = plugin_toolkit::reactor::block_on(require_registered(
+                "immich",
+                Some(&docker),
+                true,
+            ))
+            .unwrap();
             assert_eq!(row.dir, r.path("immich"));
             assert_eq!(require("immich").unwrap().dir, row.dir);
-            let err =
-                plugin_toolkit::reactor::block_on(require_registered("absent", Some(&docker)))
-                    .unwrap_err()
-                    .to_string();
+            let err = plugin_toolkit::reactor::block_on(require_registered(
+                "absent",
+                Some(&docker),
+                true,
+            ))
+            .unwrap_err()
+            .to_string();
             assert!(err.contains("no managed stack"), "{err}");
         });
     }
