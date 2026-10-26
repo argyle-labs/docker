@@ -1621,7 +1621,7 @@ pub async fn discovered_here(name: &str) -> Option<StackRow> {
 }
 
 /// What [`require_registered`] does with a discovered, unregistered project.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Adoption {
     Refuse,
     /// Return the discovered row unregistered, for a dry run.
@@ -1660,7 +1660,7 @@ pub async fn require_registered(
             Adoption::Preview => Ok(row),
             Adoption::Adopt(admin) => match crate::policy::adopt(&row, docker, false, admin).await {
                 Ok(_) => require(name),
-                Err(e) => get(name)?.ok_or_else(|| {
+                Err(e) => get(name)?.filter(|r| r.dir == row.dir).ok_or_else(|| {
                     anyhow::anyhow!(
                         "stack '{name}' is a discovered compose project and adopting it failed: {e:#}"
                     )

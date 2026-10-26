@@ -143,6 +143,15 @@ pub(crate) fn dry_run(id: UnitId, plan: String) -> VerbOutcome {
     VerbOutcome::Item(ItemOutcome::new(id, body.to_string()))
 }
 
+/// How a stack update treats a discovered project: a self-planning dry run
+/// previews it, a verified admin adopts it.
+fn stack_adoption(args: &UpdateArgs) -> stacks::Adoption {
+    let dry_run = SELF_PLANNING.contains(&args.action.as_str())
+        && split_dry_run(args.payload.clone()).is_ok_and(|(d, _)| d);
+    let admin = crate::execute::verified_admin("docker stack update", args.caller.as_ref()).ok();
+    stacks::Adoption::for_call(dry_run, admin)
+}
+
 /// Admin, failing closed: a request with no verified caller is refused.
 fn require_admin(
     subject: &str,
@@ -321,14 +330,10 @@ impl DockerUnitProvider {
 
     /// **edit** (rewrite YAML/env, no deploy) or a compose lifecycle action.
     pub(crate) async fn stack_update(&self, args: UpdateArgs) -> Result<VerbOutcome> {
-        let dry_run = SELF_PLANNING.contains(&args.action.as_str())
-            && split_dry_run(args.payload.clone()).is_ok_and(|(d, _)| d);
-        let admin =
-            crate::execute::verified_admin("docker stack update", args.caller.as_ref()).ok();
         let row = stacks::require_registered(
             &args.id.id,
             self.adapter.present_client().as_ref(),
-            stacks::Adoption::for_call(dry_run, admin),
+            stack_adoption(&args),
         )
         .await?;
         match args.action.as_str() {
@@ -4613,6 +4618,54 @@ mod tests {
         }))
     }
 
+    #[test]
+    fn stack_updates_adopt_only_for_an_executing_admin() {
+        let args = |action: &str, payload: Option<&str>, role: Option<&str>| UpdateArgs {
+            id: UnitId {
+                manager: "docker@test".into(),
+                kind: STACK_KIND.into(),
+                id: "web".into(),
+                name: "web".into(),
+            },
+            action: action.into(),
+            payload: payload.map(String::from),
+            caller: role.map(crate::test_support::caller),
+        };
+        let admin =
+            crate::execute::verified_admin("t", Some(&crate::test_support::caller("admin")))
+                .unwrap();
+        let dry = Some(r#"{"dryRun":true}"#);
+        assert_eq!(
+            stack_adoption(&args(ACTION_UPDATE, dry, Some("admin"))),
+            stacks::Adoption::Preview
+        );
+        assert_eq!(
+            stack_adoption(&args(ACTION_NORMALIZE, None, Some("admin"))),
+            stacks::Adoption::Adopt(admin)
+        );
+        assert_eq!(
+            stack_adoption(&args("restart", None, Some("admin"))),
+            stacks::Adoption::Adopt(admin)
+        );
+        assert_eq!(
+            stack_adoption(&args("restart", None, Some("user"))),
+            stacks::Adoption::Refuse
+        );
+        assert_eq!(
+            stack_adoption(&args(ACTION_BACKUP, None, None)),
+            stacks::Adoption::Refuse
+        );
+    }
+
+    #[test]
+    fn a_dry_run_lifecycle_action_on_an_unregistered_stack_registers_nothing() {
+        crate::test_support::with_db(|| {
+            let out = stack_update("restart", Some(serde_json::json!({"dryRun": true}))).unwrap();
+            assert!(matches!(out, VerbOutcome::Item(_)), "{out:?}");
+            assert!(stacks::get("web").unwrap().is_none());
+        });
+    }
+
     /// A stack archive in `<dir>/.orca-backups`, where a backup without
     /// `dest` puts it, holding `files`.
     fn stack_archive(dir: &std::path::Path, files: &[(&str, &str)]) -> serde_json::Value {
@@ -4747,7 +4800,7 @@ mod tests {
     }
 
     #[test]
-    fn up_lifecycle_edit_and_restore_refuse_a_stack_outside_the_stacks_roots() {
+    fn up_lifecycle_edit_and_restore_refuse_a_stack_outside_the_stacks_and_discovery_roots() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let yaml = "services:\n  app:\n    image: x:1\n";

@@ -22,7 +22,7 @@ pub fn require_admin(tool: &str, ctx: &ToolCtx) -> Result<Admin> {
 }
 
 /// Proof that a caller was verified as admin; only [`verified_admin`] makes one.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Admin(());
 
 pub fn verified_admin(subject: &str, caller: Option<&CallerIdentity>) -> Result<Admin> {

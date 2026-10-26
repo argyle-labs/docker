@@ -772,7 +772,16 @@ mod tests {
                 rewrite: false,
                 dry_run: true,
             };
-            let run = |a| plugin_toolkit::reactor::block_on(relocate(&a, None));
+            let run = |a| {
+                plugin_toolkit::reactor::block_on(relocate(
+                    &a,
+                    crate::execute::verified_admin(
+                        "t",
+                        Some(&crate::test_support::caller("admin")),
+                    )
+                    .ok(),
+                ))
+            };
             assert!(
                 run(args("ghost", "/srv/stacks"))
                     .unwrap_err()

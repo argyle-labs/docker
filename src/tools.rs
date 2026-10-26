@@ -251,19 +251,53 @@ pub(crate) fn validate_data_roots(roots: &[String]) -> Result<()> {
 }
 
 pub(crate) fn validate_stacks_root(root: &str) -> Result<()> {
+    validate_root("stacks_root", root)
+}
+
+fn validate_root(kind: &str, root: &str) -> Result<()> {
     let path = Path::new(root);
     if !path.is_absolute() {
-        bail!("stacks_root '{root}' is not an absolute path");
+        bail!("{kind} '{root}' is not an absolute path");
     }
     if path
         .components()
         .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
         || root.split('/').any(|seg| seg == "." || seg == "..")
     {
-        bail!("stacks_root '{root}' contains '.' or '..'");
+        bail!("{kind} '{root}' contains '.' or '..'");
     }
     if path.parent().is_none() {
-        bail!("stacks_root '/' would admit every host path");
+        bail!("{kind} '/' would admit every host path");
+    }
+    Ok(())
+}
+
+/// Host dirs a discovery root may be neither nor sit under: adoption grants
+/// what compose projects there run.
+pub const SYSTEM_DIRS: &[&str] = &[
+    "/bin",
+    "/boot",
+    "/dev",
+    "/etc",
+    "/lib",
+    "/lib64",
+    "/proc",
+    "/root",
+    "/run",
+    "/sbin",
+    "/sys",
+    "/usr",
+    "/var/lib/docker",
+    "/var/lib/containerd",
+];
+
+pub(crate) fn validate_discovery_roots(roots: &[String]) -> Result<()> {
+    for root in roots {
+        validate_root("discovery_root", root)?;
+        let path = Path::new(root);
+        if let Some(dir) = SYSTEM_DIRS.iter().find(|d| path.starts_with(d)) {
+            bail!("discovery_root '{root}' is inside the system dir {dir}");
+        }
     }
     Ok(())
 }
@@ -438,7 +472,7 @@ pub(crate) async fn docker_create(
         validate_stacks_root(root)?;
     }
     validate_data_roots(&args.data_roots)?;
-    validate_data_roots(&args.discovery_roots)?;
+    validate_discovery_roots(&args.discovery_roots)?;
     if endpoint_db::get(&args.name)?.is_some() {
         bail!(
             "docker endpoint '{}' already exists; use docker.update",
@@ -567,7 +601,7 @@ pub(crate) async fn docker_update(
         validate_stacks_root(root)?;
     }
     validate_data_roots(&args.data_roots)?;
-    validate_data_roots(&args.discovery_roots)?;
+    validate_discovery_roots(&args.discovery_roots)?;
     let mut rt = runtime(&args.name)?
         .ok_or_else(|| plugin_toolkit::runtime::missing_row_error("docker", &args.name))?;
     let mut applied = Vec::new();
@@ -845,6 +879,31 @@ mod resolve_tests {
 #[cfg(test)]
 mod registry_tests {
     use super::*;
+
+    #[test]
+    fn discovery_roots_refuse_root_relative_dotted_and_system_dirs() {
+        for bad in [
+            "/",
+            "relative",
+            "/mnt/../etc",
+            "/etc",
+            "/usr/local/stacks",
+            "/var/lib/docker/volumes",
+            "/proc",
+            "/root/stacks",
+        ] {
+            assert!(
+                validate_discovery_roots(&[bad.to_string()]).is_err(),
+                "{bad}"
+            );
+        }
+        validate_discovery_roots(&[
+            "/mnt/user/appdata/dockge/stacks".to_string(),
+            "/srv/legacy".to_string(),
+            "/var/lib/stacks".to_string(),
+        ])
+        .unwrap();
+    }
     use crate::test_support::{admin, assert_admin_refusal, non_admins, with_db};
     use plugin_toolkit::contract::OrcaToolDef;
     use plugin_toolkit::reactor::block_on;

@@ -2077,15 +2077,17 @@ async fn stack_allow(
     args: DockerStackAllowArgs,
     docker: &bollard::Docker,
 ) -> Result<DockerStackAllowOutput> {
-    stack_allow_from(args, docker, None).await
+    stack_allow_from(args, docker, None, true).await
 }
 
 /// [`stack_allow`] adopting with `source`'s listed files, else the
-/// discovered project's.
+/// discovered project's; an adoption rewrites its compose files only with
+/// `normalize`.
 async fn stack_allow_from(
     args: DockerStackAllowArgs,
     docker: &bollard::Docker,
     source: Option<&StackRow>,
+    normalize: bool,
 ) -> Result<DockerStackAllowOutput> {
     if args.allow.is_none() && !args.approve_current {
         bail!(
@@ -2156,7 +2158,7 @@ async fn stack_allow_from(
         .filter(|g| !planned.contains(g))
         .cloned()
         .collect();
-    let normalize = if adopted {
+    let normalize = if adopted && normalize {
         Some(crate::normalize::plan_stack(&row, Some(docker)).await)
     } else {
         None
@@ -2241,6 +2243,7 @@ pub async fn adopt(
         },
         docker,
         Some(row),
+        false,
     )
     .await
 }
@@ -2275,7 +2278,8 @@ pub struct DockerStackAdoptOutput {
 /// registered stack, each through `docker.stack_allow` with
 /// `approve_current`, so the stack verbs can change it. A project that fails
 /// discovery or the policy checks is listed under `refused` with the reason.
-/// Never starts or changes containers. Applies unless `dryRun` is set.
+/// Never starts or changes containers or files; normalizing stays
+/// the stack `normalize` action. Applies unless `dryRun` is set.
 #[orca_tool(
     domain = "docker",
     verb = "stack_adopt",
@@ -3546,6 +3550,11 @@ mod tests {
             let web = stacks::require("web").unwrap();
             assert_eq!(web.dir, dir.to_string_lossy());
             assert_eq!(web.files, [dir.join("compose.yaml").to_string_lossy()]);
+            assert_eq!(
+                std::fs::read_to_string(dir.join("compose.yaml")).unwrap(),
+                "services:\n  app:\n    image: x:1\n",
+                "adoption rewrites no compose file"
+            );
             let refused: Vec<&str> = done.refused.iter().map(|r| r.name.as_str()).collect();
             assert_eq!(refused, ["outside", "locked"]);
             assert!(stacks::get("outside").unwrap().is_none());
