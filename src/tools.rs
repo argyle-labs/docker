@@ -18,7 +18,7 @@
 use std::path::PathBuf;
 
 use plugin_toolkit::abi::{DbOp, DbRow, DbValue};
-use plugin_toolkit::host_paths::ValidatedRoot;
+use plugin_toolkit::anyhow;
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::route::{Route, Routes};
 use plugin_toolkit::runtime::{db_op, field_from_row};
@@ -209,26 +209,71 @@ pub fn runtime(name: &str) -> Result<Option<Runtime>> {
 
 const HOST_PARENTS: &[&str] = &["/mnt", "/media", "/data", "/home", "/Users"];
 
-pub(crate) fn host_parents() -> Result<Vec<PathBuf>> {
+pub(crate) fn host_parents() -> Vec<PathBuf> {
     #[cfg_attr(not(test), allow(unused_mut))]
-    let mut extra: Vec<String> = HOST_PARENTS.iter().map(|p| p.to_string()).collect();
+    let mut extra: Vec<PathBuf> = HOST_PARENTS.iter().map(PathBuf::from).collect();
     #[cfg(test)]
     {
         let tmp = std::env::temp_dir();
-        extra.push(tmp.to_string_lossy().into_owned());
+        extra.push(tmp.clone());
         if let Ok(canonical) = tmp.canonicalize() {
-            extra.push(canonical.to_string_lossy().into_owned());
+            extra.push(canonical);
         }
     }
-    let refs: Vec<&str> = extra.iter().map(String::as_str).collect();
-    Ok(plugin_toolkit::host_paths::allowed_parents(&refs)?)
+    plugin_toolkit::host_paths::allowed_parents(&extra)
 }
 
-pub(crate) fn validated_roots(roots: &[String]) -> Vec<ValidatedRoot> {
-    let Ok(parents) = host_parents() else {
-        return Vec::new();
-    };
-    plugin_toolkit::host_paths::valid_planned_roots("stacks_root", roots, &parents).0
+/// Like [`plugin_toolkit::host_paths::validate_root`], but `root` may not
+/// exist yet: the first existing ancestor is validated against `allowed`,
+/// and the missing tail is appended unchecked (nothing to canonicalize or
+/// symlink-check below it).
+fn validate_planned_root(kind: &str, root: &str, allowed: &[PathBuf]) -> Result<PathBuf> {
+    use std::path::Component;
+    let refs: Vec<&std::path::Path> = allowed.iter().map(PathBuf::as_path).collect();
+    let path = std::path::Path::new(root);
+    if path.is_dir() {
+        return Ok(plugin_toolkit::host_paths::validate_root(
+            kind, root, &refs,
+        )?);
+    }
+    if !path.is_absolute() {
+        anyhow::bail!("{kind} '{root}' is not an absolute path");
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        anyhow::bail!("{kind} '{root}' contains '.' or '..'");
+    }
+    let mut existing = path;
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    loop {
+        let Some(parent) = existing.parent() else {
+            anyhow::bail!("{kind} '{root}' has no existing ancestor directory");
+        };
+        tail.push(
+            existing
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("{kind} '{root}' has no file name"))?,
+        );
+        existing = parent;
+        if existing.is_dir() {
+            break;
+        }
+    }
+    let existing_str = existing
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("{kind} '{root}' is not valid UTF-8"))?;
+    let base = plugin_toolkit::host_paths::validate_root(kind, existing_str, &refs)?;
+    Ok(tail.iter().rev().fold(base, |p, n| p.join(n)))
+}
+
+pub(crate) fn validated_roots(roots: &[String]) -> Vec<PathBuf> {
+    let parents = host_parents();
+    roots
+        .iter()
+        .filter_map(|r| validate_planned_root("stacks_root", r, &parents).ok())
+        .collect()
 }
 
 pub fn configured_stacks_roots() -> Result<Vec<String>> {
@@ -251,28 +296,30 @@ pub fn configured_stacks_roots() -> Result<Vec<String>> {
 /// each canonical and still passing the toolkit's root validation; one that
 /// no longer does is dropped and logged. Stack dirs must resolve inside one
 /// of these.
-pub fn validated_stacks_roots() -> Result<Vec<ValidatedRoot>> {
-    let (ok, bad) = plugin_toolkit::host_paths::valid_planned_roots(
-        "stacks_root",
-        &configured_stacks_roots()?,
-        &host_parents()?,
-    );
-    for e in bad {
-        plugin_toolkit::tracing::warn!(error = %e, "docker: configured stacks root ignored");
+pub fn validated_stacks_roots() -> Result<Vec<PathBuf>> {
+    let parents = host_parents();
+    let mut ok = Vec::new();
+    for root in configured_stacks_roots()? {
+        match validate_planned_root("stacks_root", &root, &parents) {
+            Ok(p) => ok.push(p),
+            Err(e) => {
+                plugin_toolkit::tracing::warn!(error = %e, "docker: configured stacks root ignored");
+            }
+        }
     }
     Ok(ok)
 }
 
 pub fn stacks_roots() -> Result<Vec<String>> {
     Ok(validated_stacks_roots()?
-        .iter()
-        .map(ValidatedRoot::to_string_lossy)
+        .into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
         .collect())
 }
 
 /// Every runtime's discovery roots that still pass the toolkit's root
 /// validation; one that no longer does is dropped and logged.
-pub fn validated_discovery_roots() -> Result<Vec<ValidatedRoot>> {
+pub fn validated_discovery_roots() -> Result<Vec<PathBuf>> {
     let mut roots = Vec::new();
     for rt in runtimes()? {
         for root in rt.discovery_roots {
@@ -281,38 +328,43 @@ pub fn validated_discovery_roots() -> Result<Vec<ValidatedRoot>> {
             }
         }
     }
-    let (ok, bad) =
-        plugin_toolkit::host_paths::valid_roots("discovery_root", &roots, &host_parents()?);
+    let parents = host_parents();
+    let allowed: Vec<&std::path::Path> = parents.iter().map(PathBuf::as_path).collect();
+    let (ok, bad) = plugin_toolkit::host_paths::valid_roots("discovery_root", &roots, &allowed);
     for e in bad {
         plugin_toolkit::tracing::warn!(error = %e, "docker: stored discovery root ignored");
     }
-    Ok(ok)
+    Ok(ok
+        .iter()
+        .filter_map(|r| std::path::Path::new(r).canonicalize().ok())
+        .collect())
 }
 
 pub fn discovery_roots() -> Result<Vec<String>> {
     Ok(validated_discovery_roots()?
-        .iter()
-        .map(ValidatedRoot::to_string_lossy)
+        .into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
         .collect())
 }
 
 pub(crate) fn validate_data_roots(roots: &[String]) -> Result<()> {
-    let parents = host_parents()?;
+    let parents = host_parents();
     for root in roots {
-        plugin_toolkit::host_paths::validate_planned_root("data_root", root, &parents)?;
+        validate_planned_root("data_root", root, &parents)?;
     }
     Ok(())
 }
 
 pub(crate) fn validate_stacks_root(root: &str) -> Result<()> {
-    plugin_toolkit::host_paths::validate_planned_root("stacks_root", root, &host_parents()?)?;
+    validate_planned_root("stacks_root", root, &host_parents())?;
     Ok(())
 }
 
 pub(crate) fn validate_discovery_roots(roots: &[String]) -> Result<()> {
-    let parents = host_parents()?;
+    let parents = host_parents();
+    let allowed: Vec<&std::path::Path> = parents.iter().map(PathBuf::as_path).collect();
     for root in roots {
-        plugin_toolkit::host_paths::validate_root("discovery_root", root, &parents)?;
+        plugin_toolkit::host_paths::validate_root("discovery_root", root, &allowed)?;
     }
     Ok(())
 }

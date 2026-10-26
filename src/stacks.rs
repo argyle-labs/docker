@@ -510,7 +510,7 @@ pub fn redact(text: &str, values: &[String]) -> String {
     values.sort_by_key(|v| std::cmp::Reverse(v.len()));
     values.dedup();
     values.iter().fold(text.to_string(), |out, v| {
-        out.replace(v, plugin_toolkit::scrub::REDACTED_TEXT)
+        out.replace(v, plugin_toolkit::scrub::REDACTED)
     })
 }
 
@@ -1372,7 +1372,22 @@ fn normalized(dir: &str) -> PathBuf {
 }
 
 fn canonical_in_roots(dir: &str, roots: &[String]) -> Option<PathBuf> {
-    plugin_toolkit::host_paths::canonical_in_roots(dir, &crate::tools::validated_roots(roots))
+    let path = Path::new(dir);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+    {
+        return None;
+    }
+    let real = path.canonicalize().ok().filter(|p| p.is_dir())?;
+    crate::tools::validated_roots(roots)
+        .iter()
+        .any(|r| {
+            real.strip_prefix(r)
+                .is_ok_and(|rel| rel.components().next().is_some())
+        })
+        .then_some(real)
 }
 
 pub async fn discover(docker: &bollard::Docker) -> Result<Vec<Discovery>> {
