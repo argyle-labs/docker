@@ -1586,11 +1586,16 @@ pub async fn require_registered(name: &str, docker: Option<&bollard::Docker>) ->
         return Ok(row);
     }
     if let Some(docker) = docker
-        && discovered(docker, name).await.is_some()
+        && let Some(row) = discovered(docker, name).await
     {
-        anyhow::bail!(
-            "stack '{name}' is a discovered compose project, not a registered one; adopt it with docker.stack_allow (`dir` + `approve_current`) before changing it"
-        );
+        crate::policy::adopt(&row, docker, false)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "stack '{name}' is a discovered compose project and adopting it failed: {e:#}"
+                )
+            })?;
+        return require(name);
     }
     Err(anyhow::anyhow!("no managed stack named '{name}'"))
 }
@@ -2535,17 +2540,18 @@ mod tests {
     }
 
     #[test]
-    fn changing_a_discovered_unregistered_project_is_refused() {
+    fn changing_a_discovered_project_adopts_it_first() {
         crate::test_support::with_db(|| {
             let r = Roots::new(&["immich"]);
             register_root(&r.roots[0], &[]);
             let e = discovered_engine("immich", &r.path("immich"));
             let docker = e.client();
-            let err =
+            assert!(get("immich").unwrap().is_none());
+            let row =
                 plugin_toolkit::reactor::block_on(require_registered("immich", Some(&docker)))
-                    .unwrap_err()
-                    .to_string();
-            assert!(err.contains("docker.stack_allow"), "{err}");
+                    .unwrap();
+            assert_eq!(row.dir, r.path("immich"));
+            assert_eq!(require("immich").unwrap().dir, row.dir);
             let err =
                 plugin_toolkit::reactor::block_on(require_registered("absent", Some(&docker)))
                     .unwrap_err()
