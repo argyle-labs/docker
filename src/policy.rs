@@ -2468,7 +2468,9 @@ pub struct DockerStackAdoptContainerArgs {
     #[arg(long)]
     pub container: String,
     /// Compose file content for the new stack, written to `dir` and run in
-    /// the container's place.
+    /// the container's place. Must pin `container_name:` to `container`'s
+    /// name, or post-cutover verification fails even when the new stack
+    /// comes up fine under a different name.
     #[arg(long)]
     pub compose_yaml: String,
     /// The new stack's dir, inside a stacks root (see `docker.stack_allow`'s
@@ -2572,7 +2574,12 @@ async fn write_and_register(
         env_files: Vec::new(),
         project: None,
     };
-    let allow = adopt(&row, docker, false, admin).await?;
+    let allow = adopt(&row, docker, false, admin).await.with_context(|| {
+        format!(
+            "compose file already written to {}; registering '{name}' failed",
+            dir.display()
+        )
+    })?;
     Ok((row, allow))
 }
 
@@ -2665,7 +2672,7 @@ async fn stack_adopt_container(
         .await
         .with_context(|| {
             format!(
-                "stack '{name}' is registered at {}; the old container has not been changed",
+                "stack '{name}' is already registered at {} with its compose file written; the old container has not been changed; fix the problem and run it manually",
                 dir.display()
             )
         })?;
@@ -3910,6 +3917,206 @@ mod tests {
             ))
             .unwrap_err();
             assert!(err.to_string().contains("already exists"), "{err}");
+        });
+    }
+
+    #[test]
+    fn stack_adopt_container_reports_the_registered_stack_when_the_old_container_wont_delete() {
+        if !crate::test_support::have_compose() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        // No DELETE route: removing the old container 404s, so the cutover
+        // fails right after the stack is registered.
+        let fake = crate::test_engine::FakeEngine::routed(vec![crate::test_engine::Route::new(
+            "GET",
+            "/containers/legacy/json",
+            200,
+            json!({
+                "Id": "abc123",
+                "Name": "/legacy",
+                "State": { "Running": true },
+                "Config": { "Image": "x:1" },
+            })
+            .to_string(),
+        )]);
+        let docker = fake.client();
+        crate::test_support::with_db(|| {
+            unregistered(&root, "services: {}\n");
+            let dir = root.join("new-stack");
+            let args = DockerStackAdoptContainerArgs {
+                container: "legacy".into(),
+                compose_yaml: "services:\n  app:\n    image: x:1\n".into(),
+                dir: dir.to_string_lossy().into_owned(),
+                dry_run: false,
+            };
+            let err = plugin_toolkit::reactor::block_on(stack_adopt_container(
+                args,
+                false,
+                &docker,
+                admin(),
+            ))
+            .unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("already registered")
+                    && msg.contains(&dir.display().to_string())
+                    && msg.contains("compose file written"),
+                "{msg}"
+            );
+            assert!(
+                dir.join(stacks::DEFAULT_COMPOSE_FILE).is_file(),
+                "the compose file stays on disk"
+            );
+            assert!(
+                stacks::require("legacy").is_ok(),
+                "the stack stays registered"
+            );
+        });
+    }
+
+    /// A real container started by `docker run`, removed on drop. `None`
+    /// when no daemon answers or `image` could not be started without
+    /// pulling (keeps the real-cutover tests network-free).
+    struct RealContainer {
+        name: String,
+    }
+
+    impl RealContainer {
+        fn start(name: &str, image: &str, cmd: &[&str]) -> Option<Self> {
+            let mut args = vec!["run", "-d", "--name", name, image];
+            args.extend_from_slice(cmd);
+            let ok = std::process::Command::new(crate::resolve_docker_bin())
+                .args(&args)
+                .output()
+                .is_ok_and(|o| o.status.success());
+            if !ok {
+                eprintln!("skipped: could not start a real '{image}' container");
+                return None;
+            }
+            Some(Self { name: name.into() })
+        }
+    }
+
+    impl Drop for RealContainer {
+        fn drop(&mut self) {
+            drop(
+                std::process::Command::new(crate::resolve_docker_bin())
+                    .args(["rm", "-f", &self.name])
+                    .output(),
+            );
+        }
+    }
+
+    /// A client for the real local daemon, or `None` when none answers; the
+    /// real-cutover tests fall back to skipping rather than failing without
+    /// docker actually running.
+    fn real_docker() -> Option<bollard::Docker> {
+        let docker = bollard::Docker::connect_with_local_defaults().ok()?;
+        plugin_toolkit::reactor::block_on(docker.version())
+            .ok()
+            .map(|_| docker)
+    }
+
+    fn unique_name(tag: &str) -> String {
+        format!(
+            "orca-adopt-test-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    #[test]
+    fn stack_adopt_container_executes_the_real_cutover() {
+        if !crate::test_support::have_compose() {
+            return;
+        }
+        let Some(docker) = real_docker() else {
+            eprintln!("skipped: no reachable docker daemon");
+            return;
+        };
+        let name = unique_name("cutover");
+        let Some(_container) = RealContainer::start(&name, "alpine:3", &["sleep", "300"]) else {
+            return;
+        };
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        crate::test_support::with_db(|| {
+            unregistered(&root, "services: {}\n");
+            let dir = root.join("adopted");
+            let compose_yaml = format!(
+                "services:\n  app:\n    image: alpine:3\n    container_name: {name}\n    command: [\"sleep\", \"300\"]\n"
+            );
+            let args = DockerStackAdoptContainerArgs {
+                container: name.clone(),
+                compose_yaml,
+                dir: dir.to_string_lossy().into_owned(),
+                dry_run: false,
+            };
+            let out = plugin_toolkit::reactor::block_on(stack_adopt_container(
+                args,
+                false,
+                &docker,
+                admin(),
+            ))
+            .unwrap();
+            assert!(!out.dry_run);
+            assert!(out.stopped_container && out.started_stack && out.new_container_running);
+            assert_eq!(out.image, "alpine:3");
+            assert!(out.allow.is_some());
+            assert!(dir.join(stacks::DEFAULT_COMPOSE_FILE).is_file());
+            assert_eq!(stacks::require(&name).unwrap().dir, dir.to_string_lossy());
+        });
+    }
+
+    #[test]
+    fn stack_adopt_container_refuses_a_cutover_whose_replacement_does_not_stay_up() {
+        if !crate::test_support::have_compose() {
+            return;
+        }
+        let Some(docker) = real_docker() else {
+            eprintln!("skipped: no reachable docker daemon");
+            return;
+        };
+        let name = unique_name("exits");
+        let Some(_container) = RealContainer::start(&name, "alpine:3", &["sleep", "300"]) else {
+            return;
+        };
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        crate::test_support::with_db(|| {
+            unregistered(&root, "services: {}\n");
+            let dir = root.join("adopted");
+            // Exits immediately, so the replacement never stays up.
+            let compose_yaml = format!(
+                "services:\n  app:\n    image: alpine:3\n    container_name: {name}\n    command: [\"true\"]\n"
+            );
+            let args = DockerStackAdoptContainerArgs {
+                container: name.clone(),
+                compose_yaml,
+                dir: dir.to_string_lossy().into_owned(),
+                dry_run: false,
+            };
+            let err = plugin_toolkit::reactor::block_on(stack_adopt_container(
+                args,
+                false,
+                &docker,
+                admin(),
+            ))
+            .unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("replacement container is not running"),
+                "{msg}"
+            );
+            assert!(
+                stacks::require(&name).is_ok(),
+                "the stack stays registered for a manual fix"
+            );
         });
     }
 
