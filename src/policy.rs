@@ -36,7 +36,7 @@ use plugin_toolkit::serde_json::{self, Value};
 use crate::compose::{self, Compose};
 use crate::image_ref::ImageRef;
 use crate::stacks::{self, StackDir, StackRow};
-use crate::{engine_state, execute, fsat};
+use crate::{container_delete, engine_state, execute, fsat, ownership};
 
 pub const ALLOW_PRIVILEGED: &str = "privileged";
 pub const ALLOW_PID_HOST: &str = "pid:host";
@@ -84,6 +84,7 @@ const FIXED_GRANTS: &[&str] = &[
 const ALLOW_TOOL: &str = "docker.stack_allow";
 /// Prefix of the `after` item an adoption adds: `adopt:<dir>/<file>`.
 const ADOPT_ITEM: &str = "adopt:";
+const ADOPT_CONTAINER_TOOL: &str = "docker.stack_adopt_container";
 
 /// Capabilities a service may add without a grant: Docker's default set,
 /// which every container already holds, so adding one is a no-op, plus
@@ -2460,6 +2461,275 @@ fn adoptable(args: &DockerStackAllowArgs) -> Result<StackRow> {
     })
 }
 
+#[orca_struct(args)]
+pub struct DockerStackAdoptContainerArgs {
+    /// Name of the existing, unmanaged container (started by `docker run`
+    /// or outside compose) to bring under orca management.
+    #[arg(long)]
+    pub container: String,
+    /// Compose file content for the new stack, written to `dir` and run in
+    /// the container's place. Must pin `container_name:` to `container`'s
+    /// name, or post-cutover verification fails even when the new stack
+    /// comes up fine under a different name.
+    #[arg(long)]
+    pub compose_yaml: String,
+    /// The new stack's dir, inside a stacks root (see `docker.stack_allow`'s
+    /// `dir`); refused when it already exists.
+    #[arg(long)]
+    pub dir: String,
+    /// Return the plan and change nothing. Omitted, the container is
+    /// stopped and removed, and the new stack started in its place.
+    #[arg(long)]
+    #[serde(default, rename = "dryRun", alias = "dry_run")]
+    pub dry_run: bool,
+}
+
+#[orca_struct]
+#[serde(rename_all = "camelCase")]
+#[derive(Debug)]
+pub struct DockerStackAdoptContainerOutput {
+    /// true: nothing was changed; everything below is the plan.
+    pub dry_run: bool,
+    pub container: String,
+    /// `container`'s image before cutover; execute verifies the replacement
+    /// container ends up on this same image.
+    pub image: String,
+    pub container_running: bool,
+    pub name: String,
+    pub dir: String,
+    pub file: String,
+    /// Set once the stack is registered, with the grants its compose file
+    /// needed (see `docker.stack_allow`'s output). Unset on a dry run: those
+    /// grants are computed from the compose file on disk, which a dry run
+    /// never writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow: Option<DockerStackAllowOutput>,
+    pub stopped_container: bool,
+    pub started_stack: bool,
+    pub new_container_running: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub how_to_execute: Option<String>,
+}
+
+/// The dir `docker.stack_adopt_container` would write `compose_yaml` to:
+/// resolved inside a stacks root (the same validation `docker.stack_allow`
+/// does for an unregistered adopt's `dir`), and refused when anything is
+/// there already.
+fn free_stack_dir(dir: &str) -> Result<(PathBuf, String, PathBuf)> {
+    let roots = crate::stacks::allowed_roots()?;
+    let resolved = stacks::stack_dir_in_roots(dir, &roots)?;
+    let file = stacks::DEFAULT_COMPOSE_FILE.to_string();
+    let path = resolved.join(&file);
+    if std::fs::symlink_metadata(&resolved).is_ok() {
+        bail!(
+            "{ADOPT_CONTAINER_TOOL}: stack dir {} already exists",
+            resolved.display()
+        );
+    }
+    Ok((resolved, file, path))
+}
+
+/// Writes `compose_yaml` as `file` in a freshly created `dir` (refusing a
+/// dir or file that is there already, even one created after
+/// [`free_stack_dir`] checked), then registers `name` as `docker.stack_allow`
+/// does for an unregistered adopt with `approve_current`: its grants are
+/// whatever the compose file just written needs.
+async fn write_and_register(
+    name: &str,
+    compose_yaml: &str,
+    dir: &Path,
+    file: &str,
+    docker: &bollard::Docker,
+    admin: execute::Admin,
+) -> Result<(StackRow, DockerStackAllowOutput)> {
+    let roots = crate::stacks::allowed_roots()?;
+    let opened = StackDir::open(&dir.to_string_lossy(), &roots, true)
+        .with_context(|| format!("creating stack dir {}", dir.display()))?
+        .ok_or_else(|| anyhow!("stack dir {} could not be created", dir.display()))?;
+    {
+        use std::io::Write;
+        let mut f = fsat::open_at(
+            opened.fd(),
+            file,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            0o644,
+        )
+        .with_context(|| {
+            format!(
+                "compose file {} already exists",
+                opened.path().join(file).display()
+            )
+        })?;
+        f.write_all(compose_yaml.as_bytes())
+            .and_then(|()| f.sync_all())
+            .with_context(|| format!("writing {}", opened.path().join(file).display()))?;
+    }
+    let row = StackRow {
+        name: name.to_string(),
+        dir: dir.to_string_lossy().into_owned(),
+        file: file.to_string(),
+        enabled: true,
+        allow: Vec::new(),
+        files: Vec::new(),
+        env_files: Vec::new(),
+        project: None,
+    };
+    let allow = adopt(&row, docker, false, admin).await.with_context(|| {
+        format!(
+            "compose file already written to {}; registering '{name}' failed",
+            dir.display()
+        )
+    })?;
+    Ok((row, allow))
+}
+
+/// [MUTATES STATE] Bring an unmanaged container (started by `docker run` or
+/// outside compose) under orca management: write `composeYaml` to a new
+/// stack dir, register it as `docker.stack_allow` does for an unregistered
+/// adopt with `approve_current`, then stop and remove `container` and run
+/// `docker compose up -d` in its place. Verifies the replacement container
+/// is running on `container`'s original image. Applies unless `dryRun` is
+/// set, which leaves `container`, the filesystem and the registry untouched
+/// and does not show the grants the stack would need, since those are
+/// computed from the compose file once it exists on disk.
+#[orca_tool(
+    domain = "docker",
+    verb = "stack_adopt_container",
+    role = "admin",
+    execute_gated = false,
+    dry_run_aware = true
+)]
+async fn docker_stack_adopt_container(
+    args: DockerStackAdoptContainerArgs,
+    ctx: &ToolCtx,
+) -> Result<DockerStackAdoptContainerOutput> {
+    let dry_run = args.dry_run || ctx.dry_run();
+    let admin = execute::require_admin(ADOPT_CONTAINER_TOOL, ctx)?;
+    let docker = &crate::registration::adapter()
+        .client()
+        .map_err(|e| anyhow!("{e}"))?;
+    stack_adopt_container(args, dry_run, docker, admin).await
+}
+
+async fn stack_adopt_container(
+    args: DockerStackAdoptContainerArgs,
+    dry_run: bool,
+    docker: &bollard::Docker,
+    admin: execute::Admin,
+) -> Result<DockerStackAdoptContainerOutput> {
+    let name = container_delete::parse_name(&args.container)?;
+    let (dir, file, path) = free_stack_dir(&args.dir)?;
+    stacks::check_dir_free(&name, &dir)?;
+
+    let opts = bollard::query_parameters::InspectContainerOptionsBuilder::new().build();
+    let before = match docker.inspect_container(&name, Some(opts)).await {
+        Ok(c) => c,
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => bail!("{ADOPT_CONTAINER_TOOL}: no container named '{name}'"),
+        Err(e) => bail!("{ADOPT_CONTAINER_TOOL}: inspect container {name}: {e}"),
+    };
+    let image = before
+        .config
+        .as_ref()
+        .and_then(|c| c.image.clone())
+        .unwrap_or_default();
+    let container_running = before
+        .state
+        .as_ref()
+        .and_then(|s| s.running)
+        .unwrap_or(false);
+
+    if dry_run {
+        return Ok(DockerStackAdoptContainerOutput {
+            dry_run: true,
+            container: name.clone(),
+            image,
+            container_running,
+            name: name.clone(),
+            dir: dir.to_string_lossy().into_owned(),
+            file,
+            allow: None,
+            stopped_container: false,
+            started_stack: false,
+            new_container_running: false,
+            how_to_execute: Some(format!(
+                "re-invoke {ADOPT_CONTAINER_TOOL} with the same arguments without `dryRun`; it writes `composeYaml` to {}, registers '{name}' with the grants its compose file needs, then stops and removes '{name}' and runs `docker compose up -d` there",
+                path.display()
+            )),
+        });
+    }
+
+    let (row, allow) =
+        write_and_register(&name, &args.compose_yaml, &dir, &file, docker, admin).await?;
+
+    let delete_args = container_delete::DockerContainerDeleteArgs {
+        name: name.clone(),
+        force: true,
+        dry_run: false,
+    };
+    container_delete::apply(docker, &delete_args)
+        .await
+        .with_context(|| {
+            format!(
+                "stack '{name}' is already registered at {} with its compose file written; the old container has not been changed; fix the problem and run it manually",
+                dir.display()
+            )
+        })?;
+
+    if let Err(e) = ownership::up(&row, &[]).await {
+        bail!(
+            "{ADOPT_CONTAINER_TOOL}: container '{name}' was stopped and removed, but `docker compose up -d` failed: {e:#}; no replacement container is running — the stack is registered at {}, run it manually once fixed",
+            dir.display()
+        );
+    }
+
+    let opts = bollard::query_parameters::InspectContainerOptionsBuilder::new().build();
+    let after = docker
+        .inspect_container(&name, Some(opts))
+        .await
+        .with_context(|| {
+            format!(
+                "container '{name}' was stopped and removed and the new stack was started, but it could not be inspected afterward",
+            )
+        })?;
+    let new_image = after
+        .config
+        .as_ref()
+        .and_then(|c| c.image.clone())
+        .unwrap_or_default();
+    let new_running = after
+        .state
+        .as_ref()
+        .and_then(|s| s.running)
+        .unwrap_or(false);
+    if !new_running {
+        bail!(
+            "{ADOPT_CONTAINER_TOOL}: container '{name}' was stopped and removed and the new stack was started, but the replacement container is not running (image {new_image})"
+        );
+    }
+    if new_image != image {
+        bail!(
+            "{ADOPT_CONTAINER_TOOL}: container '{name}' was stopped and removed and the new stack was started and is running, but on image '{new_image}', not the original '{image}'"
+        );
+    }
+
+    Ok(DockerStackAdoptContainerOutput {
+        dry_run: false,
+        container: name.clone(),
+        image,
+        container_running,
+        name,
+        dir: dir.to_string_lossy().into_owned(),
+        file,
+        allow: Some(allow),
+        stopped_container: true,
+        started_stack: true,
+        new_container_running: true,
+        how_to_execute: None,
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
@@ -3509,6 +3779,361 @@ mod tests {
                 ))
                 .unwrap_err()
                 .to_string();
+                crate::test_support::assert_admin_refusal(&err);
+            }
+            assert!(stacks::list().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn stack_adopt_container_refuses_a_dir_outside_the_stacks_roots() {
+        crate::test_support::with_db(|| {
+            let root = tempfile::tempdir().unwrap();
+            let root = root.path().canonicalize().unwrap();
+            // Registers a runtime whose stacks root is `root`; the `web`
+            // dir it writes is unused here.
+            unregistered(&root, "services: {}\n");
+            let outside = tempfile::tempdir().unwrap();
+            let dir = outside.path().join("new-stack");
+            let err = free_stack_dir(&dir.to_string_lossy()).unwrap_err();
+            assert!(
+                err.to_string().contains("outside the stacks roots"),
+                "{err}"
+            );
+        });
+    }
+
+    #[test]
+    fn stack_adopt_container_refuses_a_dir_already_on_disk() {
+        crate::test_support::with_db(|| {
+            let root = tempfile::tempdir().unwrap();
+            let root = root.path().canonicalize().unwrap();
+            unregistered(&root, "services: {}\n");
+            let err = free_stack_dir(&root.join("web").to_string_lossy()).unwrap_err();
+            assert!(err.to_string().contains("already exists"), "{err}");
+        });
+    }
+
+    fn adopt_container_engine(
+        container: &str,
+        image: &str,
+        running: bool,
+    ) -> crate::test_engine::FakeEngine {
+        crate::test_engine::FakeEngine::routed(vec![crate::test_engine::Route::new(
+            "GET",
+            format!("/containers/{container}/json"),
+            200,
+            json!({
+                "Id": "abc123",
+                "Name": format!("/{container}"),
+                "State": { "Running": running },
+                "Config": { "Image": image },
+            })
+            .to_string(),
+        )])
+    }
+
+    #[test]
+    fn stack_adopt_container_dry_run_plans_without_writing_or_touching_the_container() {
+        crate::test_support::with_db(|| {
+            let root = tempfile::tempdir().unwrap();
+            let root = root.path().canonicalize().unwrap();
+            unregistered(&root, "services: {}\n");
+            let dir = root.join("new-stack");
+            let fake = adopt_container_engine("legacy", "nginx:1", true);
+            let docker = fake.client();
+            let args = DockerStackAdoptContainerArgs {
+                container: "legacy".into(),
+                compose_yaml: "services:\n  app:\n    image: nginx:1\n".into(),
+                dir: dir.to_string_lossy().into_owned(),
+                dry_run: true,
+            };
+            let out = plugin_toolkit::reactor::block_on(stack_adopt_container(
+                args,
+                true,
+                &docker,
+                admin(),
+            ))
+            .unwrap();
+            assert!(out.dry_run);
+            assert!(out.container_running);
+            assert_eq!(out.image, "nginx:1");
+            assert!(out.allow.is_none());
+            assert!(!out.stopped_container && !out.started_stack && !out.new_container_running);
+            assert!(out.how_to_execute.is_some());
+            assert!(!dir.exists(), "a dry run writes nothing");
+            assert!(
+                stacks::get("legacy").unwrap().is_none(),
+                "a dry run registers nothing"
+            );
+            assert!(fake.paths("DELETE").is_empty());
+        });
+    }
+
+    #[test]
+    fn write_and_register_writes_the_compose_file_and_registers_its_grants() {
+        if !crate::test_support::have_compose() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let pulled = engine(&[PULLED]);
+        let docker = pulled.client();
+        crate::test_support::with_db(|| {
+            unregistered(&root, "services: {}\n");
+            let dir = root.join("legacy");
+            let yaml = "services:\n  app:\n    image: x:1\n    network_mode: host\n";
+            let (row, allow) = plugin_toolkit::reactor::block_on(write_and_register(
+                "legacy",
+                yaml,
+                &dir,
+                stacks::DEFAULT_COMPOSE_FILE,
+                &docker,
+                admin(),
+            ))
+            .unwrap();
+            assert!(allow.adopted && !allow.dry_run);
+            assert!(
+                allow
+                    .after
+                    .iter()
+                    .any(|g| g.ends_with("|network_mode:host")),
+                "{:?}",
+                allow.after
+            );
+            assert_eq!(row.dir, dir.to_string_lossy());
+            assert!(dir.join(stacks::DEFAULT_COMPOSE_FILE).is_file());
+            let stored = stacks::require("legacy").unwrap();
+            assert_eq!(stored.dir, row.dir);
+            assert!(!stored.allow.is_empty());
+
+            let err = plugin_toolkit::reactor::block_on(write_and_register(
+                "legacy2",
+                yaml,
+                &dir,
+                stacks::DEFAULT_COMPOSE_FILE,
+                &docker,
+                admin(),
+            ))
+            .unwrap_err();
+            assert!(err.to_string().contains("already exists"), "{err}");
+        });
+    }
+
+    #[test]
+    fn stack_adopt_container_reports_the_registered_stack_when_the_old_container_wont_delete() {
+        if !crate::test_support::have_compose() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        // No DELETE route: removing the old container 404s, so the cutover
+        // fails right after the stack is registered.
+        let fake = crate::test_engine::FakeEngine::routed(vec![crate::test_engine::Route::new(
+            "GET",
+            "/containers/legacy/json",
+            200,
+            json!({
+                "Id": "abc123",
+                "Name": "/legacy",
+                "State": { "Running": true },
+                "Config": { "Image": "x:1" },
+            })
+            .to_string(),
+        )]);
+        let docker = fake.client();
+        crate::test_support::with_db(|| {
+            unregistered(&root, "services: {}\n");
+            let dir = root.join("new-stack");
+            let args = DockerStackAdoptContainerArgs {
+                container: "legacy".into(),
+                compose_yaml: "services:\n  app:\n    image: x:1\n".into(),
+                dir: dir.to_string_lossy().into_owned(),
+                dry_run: false,
+            };
+            let err = plugin_toolkit::reactor::block_on(stack_adopt_container(
+                args,
+                false,
+                &docker,
+                admin(),
+            ))
+            .unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("already registered")
+                    && msg.contains(&dir.display().to_string())
+                    && msg.contains("compose file written"),
+                "{msg}"
+            );
+            assert!(
+                dir.join(stacks::DEFAULT_COMPOSE_FILE).is_file(),
+                "the compose file stays on disk"
+            );
+            assert!(
+                stacks::require("legacy").is_ok(),
+                "the stack stays registered"
+            );
+        });
+    }
+
+    /// A real container started by `docker run`, removed on drop. `None`
+    /// when no daemon answers or `image` could not be started without
+    /// pulling (keeps the real-cutover tests network-free).
+    struct RealContainer {
+        name: String,
+    }
+
+    impl RealContainer {
+        fn start(name: &str, image: &str, cmd: &[&str]) -> Option<Self> {
+            let mut args = vec!["run", "-d", "--name", name, image];
+            args.extend_from_slice(cmd);
+            let ok = std::process::Command::new(crate::resolve_docker_bin())
+                .args(&args)
+                .output()
+                .is_ok_and(|o| o.status.success());
+            if !ok {
+                eprintln!("skipped: could not start a real '{image}' container");
+                return None;
+            }
+            Some(Self { name: name.into() })
+        }
+    }
+
+    impl Drop for RealContainer {
+        fn drop(&mut self) {
+            drop(
+                std::process::Command::new(crate::resolve_docker_bin())
+                    .args(["rm", "-f", &self.name])
+                    .output(),
+            );
+        }
+    }
+
+    /// A client for the real local daemon, or `None` when none answers; the
+    /// real-cutover tests fall back to skipping rather than failing without
+    /// docker actually running.
+    fn real_docker() -> Option<bollard::Docker> {
+        let docker = bollard::Docker::connect_with_local_defaults().ok()?;
+        plugin_toolkit::reactor::block_on(docker.version())
+            .ok()
+            .map(|_| docker)
+    }
+
+    fn unique_name(tag: &str) -> String {
+        format!(
+            "orca-adopt-test-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    #[test]
+    fn stack_adopt_container_executes_the_real_cutover() {
+        if !crate::test_support::have_compose() {
+            return;
+        }
+        let Some(docker) = real_docker() else {
+            eprintln!("skipped: no reachable docker daemon");
+            return;
+        };
+        let name = unique_name("cutover");
+        let Some(_container) = RealContainer::start(&name, "alpine:3", &["sleep", "300"]) else {
+            return;
+        };
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        crate::test_support::with_db(|| {
+            unregistered(&root, "services: {}\n");
+            let dir = root.join("adopted");
+            let compose_yaml = format!(
+                "services:\n  app:\n    image: alpine:3\n    container_name: {name}\n    command: [\"sleep\", \"300\"]\n"
+            );
+            let args = DockerStackAdoptContainerArgs {
+                container: name.clone(),
+                compose_yaml,
+                dir: dir.to_string_lossy().into_owned(),
+                dry_run: false,
+            };
+            let out = plugin_toolkit::reactor::block_on(stack_adopt_container(
+                args,
+                false,
+                &docker,
+                admin(),
+            ))
+            .unwrap();
+            assert!(!out.dry_run);
+            assert!(out.stopped_container && out.started_stack && out.new_container_running);
+            assert_eq!(out.image, "alpine:3");
+            assert!(out.allow.is_some());
+            assert!(dir.join(stacks::DEFAULT_COMPOSE_FILE).is_file());
+            assert_eq!(stacks::require(&name).unwrap().dir, dir.to_string_lossy());
+        });
+    }
+
+    #[test]
+    fn stack_adopt_container_refuses_a_cutover_whose_replacement_does_not_stay_up() {
+        if !crate::test_support::have_compose() {
+            return;
+        }
+        let Some(docker) = real_docker() else {
+            eprintln!("skipped: no reachable docker daemon");
+            return;
+        };
+        let name = unique_name("exits");
+        let Some(_container) = RealContainer::start(&name, "alpine:3", &["sleep", "300"]) else {
+            return;
+        };
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        crate::test_support::with_db(|| {
+            unregistered(&root, "services: {}\n");
+            let dir = root.join("adopted");
+            // Exits immediately, so the replacement never stays up.
+            let compose_yaml = format!(
+                "services:\n  app:\n    image: alpine:3\n    container_name: {name}\n    command: [\"true\"]\n"
+            );
+            let args = DockerStackAdoptContainerArgs {
+                container: name.clone(),
+                compose_yaml,
+                dir: dir.to_string_lossy().into_owned(),
+                dry_run: false,
+            };
+            let err = plugin_toolkit::reactor::block_on(stack_adopt_container(
+                args,
+                false,
+                &docker,
+                admin(),
+            ))
+            .unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("replacement container is not running"),
+                "{msg}"
+            );
+            assert!(
+                stacks::require(&name).is_ok(),
+                "the stack stays registered for a manual fix"
+            );
+        });
+    }
+
+    #[test]
+    fn stack_adopt_container_is_admin_only() {
+        crate::test_support::with_db(|| {
+            for ctx in crate::test_support::non_admins() {
+                let args = DockerStackAdoptContainerArgs {
+                    container: "legacy".into(),
+                    compose_yaml: "services: {}\n".into(),
+                    dir: "/opt/stacks/new-stack".into(),
+                    dry_run: true,
+                };
+                let err =
+                    plugin_toolkit::reactor::block_on(docker_stack_adopt_container(args, &ctx))
+                        .unwrap_err()
+                        .to_string();
                 crate::test_support::assert_admin_refusal(&err);
             }
             assert!(stacks::list().unwrap().is_empty());

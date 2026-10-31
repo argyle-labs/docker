@@ -4565,12 +4565,15 @@ mod tests {
     }
 
     fn register_root(root: &std::path::Path) {
+        // Canonicalize: on macOS a raw tempdir path resolves through
+        // /var -> /private/var, which the real validation refuses.
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         let args = crate::tools::DockerCreateArgs {
             name: "local".into(),
             socket_path: None,
             host: None,
             url: None,
-            stacks_root: Some(path(root)),
+            stacks_root: Some(path(&root)),
             data_roots: Vec::new(),
             discovery_roots: Vec::new(),
             registries: Vec::new(),
@@ -5000,7 +5003,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), root.path().join("escape")).unwrap();
-        let root_s = path(root.path());
+        let root_s = path(&root.path().canonicalize().unwrap());
         let ((), tables) = with_db(|| {
             let args = crate::tools::DockerCreateArgs {
                 name: "local".into(),
