@@ -257,6 +257,12 @@ pub fn plan(
 }
 
 pub const TZ_KEY: &str = "TZ";
+
+/// Whether `kv` (`KEY=value`) sets `TZ`, matched case-insensitively.
+fn sets_tz(kv: &str) -> bool {
+    kv.split_once('=')
+        .is_some_and(|(k, v)| k.eq_ignore_ascii_case(TZ_KEY) && !v.is_empty())
+}
 pub const HEALTHCHECK_KEY: &str = "healthcheck";
 /// `$$` keeps compose from interpolating, so the shell expands the
 /// container's own env; the defaults mirror the postgres image entrypoint.
@@ -521,11 +527,10 @@ pub fn host_tz(proc: &impl crate::mounts::Proc) -> Option<String> {
 fn has_tz(svc: &Value, contract: &Contract) -> std::result::Result<bool, String> {
     let set = |v: &str| !v.is_empty();
     let env = match svc.get("environment") {
-        Some(Value::Object(m)) => m.get(TZ_KEY).and_then(Value::as_str).is_some_and(set),
-        Some(Value::Array(a)) => a
+        Some(Value::Object(m)) => m
             .iter()
-            .filter_map(Value::as_str)
-            .any(|kv| kv.strip_prefix("TZ=").is_some_and(set)),
+            .any(|(k, v)| k.eq_ignore_ascii_case(TZ_KEY) && v.as_str().is_some_and(set)),
+        Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).any(sets_tz),
         _ => false,
     };
     let localtime = svc
@@ -546,7 +551,7 @@ fn has_tz(svc: &Value, contract: &Contract) -> std::result::Result<bool, String>
             Some(Ok(text)) => {
                 if stacks::env_pairs(text)
                     .iter()
-                    .any(|(k, v)| k == TZ_KEY && set(v))
+                    .any(|(k, v)| k.eq_ignore_ascii_case(TZ_KEY) && set(v))
                 {
                     return Ok(true);
                 }
@@ -684,12 +689,7 @@ async fn image_facts(
             }
         };
         let config = info.config.unwrap_or_default();
-        if config
-            .env
-            .iter()
-            .flatten()
-            .any(|kv| kv.strip_prefix("TZ=").is_some_and(|v| !v.is_empty()))
-        {
+        if config.env.iter().flatten().any(|kv| sets_tz(kv)) {
             tz.insert(image.to_string());
         }
         let own = config
@@ -1401,6 +1401,39 @@ mod tests {
                 "built: healthcheck: none known for image '(built)'; set one in the compose file",
             ]
         );
+    }
+
+    #[test]
+    fn lowercase_tz_counts_as_set_everywhere() {
+        let cfg = json!({"services": {
+            "map": {"image": "a:1", "environment": {"tz": "Europe/Paris"}},
+            "list": {"image": "a:1", "environment": ["Tz=Europe/Paris"]},
+            "file": {"image": "a:1", "env_file": "/srv/app/app.env"},
+            "empty": {"image": "a:1", "environment": {"tz": ""}}
+        }});
+        let contract = Contract {
+            env_files: HashMap::from([(
+                "/srv/app/app.env".to_string(),
+                Ok("tz=Europe/Paris\n".to_string()),
+            )]),
+            ..tz("America/Denver")
+        };
+        let (changes, _) = contract_plan(&cfg, &contract);
+        let tz: Vec<&str> = changes
+            .iter()
+            .filter(|c| c.key == TZ_KEY)
+            .map(|c| c.service.as_str())
+            .collect();
+        assert_eq!(tz, ["empty"]);
+    }
+
+    #[test]
+    fn sets_tz_matches_the_key_case_insensitively_and_needs_a_value() {
+        assert!(sets_tz("TZ=UTC"));
+        assert!(sets_tz("tz=UTC"));
+        assert!(!sets_tz("tz="));
+        assert!(!sets_tz("TZDIR=/x"));
+        assert!(!sets_tz("TZ"));
     }
 
     #[test]
