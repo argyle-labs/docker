@@ -258,10 +258,23 @@ pub fn plan(
 
 pub const TZ_KEY: &str = "TZ";
 pub const HEALTHCHECK_KEY: &str = "healthcheck";
+/// `$$` keeps compose from interpolating, so the shell expands the
+/// container's own env; the defaults mirror the postgres image entrypoint.
+const PG_ISREADY: &[&str] = &[
+    "CMD-SHELL",
+    r#"pg_isready -h 127.0.0.1 -p "$${PGPORT:-5432}" -U "$${POSTGRES_USER:-postgres}" -d "$${POSTGRES_DB:-$${POSTGRES_USER:-postgres}}""#,
+];
+/// Timing for injected checks; `start_period` covers a slow first init.
+const HEALTHCHECK_TIMING: &[(&str, &str)] = &[
+    ("interval", "30s"),
+    ("timeout", "5s"),
+    ("retries", "5"),
+    ("start_period", "60s"),
+];
 /// Checks for images that ship no `HEALTHCHECK`, keyed by image name.
 const KNOWN_HEALTHCHECKS: &[(&str, &[&str])] = &[
-    ("postgres", &["CMD", "pg_isready"]),
-    ("pgvecto-rs", &["CMD", "pg_isready"]),
+    ("postgres", PG_ISREADY),
+    ("pgvecto-rs", PG_ISREADY),
     ("redis", &["CMD", "redis-cli", "ping"]),
     ("valkey", &["CMD", "valkey-cli", "ping"]),
     ("ollama", &["CMD", "ollama", "list"]),
@@ -529,6 +542,9 @@ fn set_healthcheck(lines: &mut Vec<String>, c: &Change) -> Result<()> {
     let pad = " ".repeat(child);
     lines.insert(header + 1, format!("{pad}{HEALTHCHECK_KEY}:"));
     lines.insert(header + 2, format!("{pad}  test: {}", c.value));
+    for (i, (k, v)) in HEALTHCHECK_TIMING.iter().enumerate() {
+        lines.insert(header + 3 + i, format!("{pad}  {k}: {v}"));
+    }
     Ok(())
 }
 
@@ -1066,7 +1082,7 @@ mod tests {
                 r#"cache: TZ=America/Denver"#,
                 r#"cache: healthcheck=["CMD","valkey-cli","ping"]"#,
                 r#"db: TZ=America/Denver"#,
-                r#"db: healthcheck=["CMD","pg_isready"]"#,
+                r#"db: healthcheck=["CMD-SHELL","pg_isready -h 127.0.0.1 -p \"$${PGPORT:-5432}\" -U \"$${POSTGRES_USER:-postgres}\" -d \"$${POSTGRES_DB:-$${POSTGRES_USER:-postgres}}\""]"#,
                 r#"llm: healthcheck=["CMD","ollama","list"]"#,
             ]
         );
@@ -1210,7 +1226,27 @@ mod tests {
         );
         assert_eq!(
             out,
-            "services:\n  a:\n    healthcheck:\n      test: [\"CMD\",\"pg_isready\"]\n    image: x:1\n    environment:\n      TZ: \"Etc/UTC\"\n      K: v\n  b:\n    image: y:1\n    environment:\n      - \"TZ=Etc/UTC\"\n      - K=v\n  c:\n    environment:\n      TZ: \"Etc/UTC\"\n    image: z:1\n    healthcheck:\n      test: [\"CMD\", \"true\"]\n"
+            "services:\n  a:\n    healthcheck:\n      test: [\"CMD\",\"pg_isready\"]\n      interval: 30s\n      timeout: 5s\n      retries: 5\n      start_period: 60s\n    image: x:1\n    environment:\n      TZ: \"Etc/UTC\"\n      K: v\n  b:\n    image: y:1\n    environment:\n      - \"TZ=Etc/UTC\"\n      - K=v\n  c:\n    environment:\n      TZ: \"Etc/UTC\"\n    image: z:1\n    healthcheck:\n      test: [\"CMD\", \"true\"]\n"
+        );
+    }
+
+    #[test]
+    fn postgres_healthcheck_reads_container_env_with_escaped_dollars() {
+        let cfg = json!({"services": {"db": {"image": "postgres:16"}}});
+        let (changes, _) = contract_plan(&cfg, &Contract::default());
+        let hc: Vec<_> = changes
+            .into_iter()
+            .filter(|c| c.key == HEALTHCHECK_KEY)
+            .collect();
+        let (out, applied, warnings) = apply("services:\n  db:\n    image: postgres:16\n", &hc);
+        assert_eq!(applied.len(), 1, "{warnings:?}");
+        assert_eq!(
+            out,
+            concat!(
+                "services:\n  db:\n    healthcheck:\n",
+                r#"      test: ["CMD-SHELL","pg_isready -h 127.0.0.1 -p \"$${PGPORT:-5432}\" -U \"$${POSTGRES_USER:-postgres}\" -d \"$${POSTGRES_DB:-$${POSTGRES_USER:-postgres}}\""]"#,
+                "\n      interval: 30s\n      timeout: 5s\n      retries: 5\n      start_period: 60s\n    image: postgres:16\n"
+            )
         );
     }
 
