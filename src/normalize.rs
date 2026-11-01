@@ -275,10 +275,112 @@ const HEALTHCHECK_TIMING: &[(&str, &str)] = &[
 const KNOWN_HEALTHCHECKS: &[(&str, &[&str])] = &[
     ("postgres", PG_ISREADY),
     ("pgvecto-rs", PG_ISREADY),
-    ("redis", &["CMD", "redis-cli", "ping"]),
-    ("valkey", &["CMD", "valkey-cli", "ping"]),
     ("ollama", &["CMD", "ollama", "list"]),
 ];
+
+/// Password envs of the Bitnami images; the official images take only
+/// `--requirepass`.
+const REDIS_PASSWORD_ENVS: &[&str] = &["REDIS_PASSWORD", "VALKEY_PASSWORD"];
+
+/// The env var `token` references, in any of `$V`, `${V}`, `$$V`, `$${V}`.
+fn env_ref(token: &str) -> Option<&str> {
+    let t = token.trim_matches(|c| c == '"' || c == '\'');
+    let t = t.strip_prefix("$$").or_else(|| t.strip_prefix('$'))?;
+    let t = t
+        .strip_prefix('{')
+        .and_then(|t| t.strip_suffix('}'))
+        .unwrap_or(t);
+    let valid = !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    valid.then_some(t)
+}
+
+/// The value `svc` sets for env `key`, from `environment` or an `env_file`;
+/// `Err` names an `env_file` that could not be read.
+fn env_value(
+    svc: &Value,
+    contract: &Contract,
+    key: &str,
+) -> std::result::Result<Option<String>, String> {
+    let env = match svc.get("environment") {
+        Some(Value::Object(m)) => m.get(key).and_then(Value::as_str).map(str::to_string),
+        Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).find_map(|kv| {
+            kv.strip_prefix(key)
+                .and_then(|r| r.strip_prefix('='))
+                .map(str::to_string)
+        }),
+        _ => None,
+    };
+    if env.as_deref().is_some_and(|v| !v.is_empty()) {
+        return Ok(env);
+    }
+    for (path, _) in env_file_paths(svc) {
+        match contract.env_files.get(&path) {
+            Some(Ok(text)) => {
+                if let Some((_, v)) = stacks::env_pairs(text)
+                    .into_iter()
+                    .find(|(k, v)| k == key && !v.is_empty())
+                {
+                    return Ok(Some(v));
+                }
+            }
+            Some(Err(why)) => return Err(format!("env_file '{path}' {why}")),
+            None => return Err(format!("env_file '{path}' was not read")),
+        }
+    }
+    Ok(None)
+}
+
+/// A redis/valkey check that fails unless the reply is `PONG`; with auth on,
+/// `ping` prints NOAUTH yet exits 0. The password is read from the
+/// container's env at runtime, never written into compose.
+fn redis_check(
+    svc: &Value,
+    contract: &Contract,
+    cli: &str,
+) -> std::result::Result<Vec<String>, String> {
+    let command = match svc.get("command") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    };
+    let mut tokens = command.split_whitespace();
+    let pass = tokens
+        .by_ref()
+        .position(|t| t.trim_start_matches('-') == "requirepass")
+        .map(|_| tokens.next().unwrap_or(""));
+    let var = match pass {
+        Some(token) => match env_ref(token) {
+            Some(var) if env_value(svc, contract, var)?.is_some() => Some(var.to_string()),
+            _ => {
+                return Err(
+                    "requirepass is not set from a container env var the check can read"
+                        .to_string(),
+                );
+            }
+        },
+        None => {
+            let mut found = None;
+            for key in REDIS_PASSWORD_ENVS {
+                if env_value(svc, contract, key)?.is_some() {
+                    found = Some(key.to_string());
+                    break;
+                }
+            }
+            found
+        }
+    };
+    let auth = var
+        .map(|v| format!(r#"REDISCLI_AUTH="$${{{v}}}" VALKEYCLI_AUTH="$${{{v}}}" "#))
+        .unwrap_or_default();
+    Ok(vec![
+        "CMD-SHELL".to_string(),
+        format!("{auth}{cli} ping | grep -q PONG"),
+    ])
+}
 
 /// What the manageability contract repair needs from the host.
 #[derive(Debug, Default)]
@@ -442,16 +544,30 @@ pub fn contract_plan(cfg: &Value, contract: &Contract) -> (Vec<Change>, Vec<Stri
         if image.and_then(|i| contract.image_health.get(i)) == Some(&true) {
             continue;
         }
-        let known = image.map(image_app).and_then(|app| {
-            KNOWN_HEALTHCHECKS
-                .iter()
-                .find(|(k, _)| *k == app)
-                .map(|(_, t)| *t)
-        });
+        let app = image.map(image_app);
+        let known = match app.as_deref() {
+            Some(app @ ("redis" | "valkey")) => {
+                match redis_check(svc, contract, &format!("{app}-cli")) {
+                    Ok(test) => Some(test),
+                    Err(why) => {
+                        unrepaired.push(format!(
+                            "{name}: healthcheck: {why}; set one in the compose file"
+                        ));
+                        continue;
+                    }
+                }
+            }
+            app => app.and_then(|app| {
+                KNOWN_HEALTHCHECKS
+                    .iter()
+                    .find(|(k, _)| *k == app)
+                    .map(|(_, t)| t.iter().map(|s| s.to_string()).collect())
+            }),
+        };
         match known {
             Some(test) => out.push(change(
                 HEALTHCHECK_KEY,
-                plugin_toolkit::serde_json::to_string(test).unwrap_or_default(),
+                plugin_toolkit::serde_json::to_string(&test).unwrap_or_default(),
             )),
             None => unrepaired.push(format!(
                 "{name}: healthcheck: none known for image '{}'; set one in the compose file",
@@ -1080,13 +1196,41 @@ mod tests {
             shown,
             [
                 r#"cache: TZ=America/Denver"#,
-                r#"cache: healthcheck=["CMD","valkey-cli","ping"]"#,
+                r#"cache: healthcheck=["CMD-SHELL","valkey-cli ping | grep -q PONG"]"#,
                 r#"db: TZ=America/Denver"#,
                 r#"db: healthcheck=["CMD-SHELL","pg_isready -h 127.0.0.1 -p \"$${PGPORT:-5432}\" -U \"$${POSTGRES_USER:-postgres}\" -d \"$${POSTGRES_DB:-$${POSTGRES_USER:-postgres}}\""]"#,
                 r#"llm: healthcheck=["CMD","ollama","list"]"#,
             ]
         );
         assert!(unrepaired.is_empty(), "{unrepaired:?}");
+    }
+
+    #[test]
+    fn redis_auth_check_reads_the_password_env_at_runtime() {
+        let cfg = json!({"services": {
+            "env": {"image": "redis:7", "environment": {"TZ": "UTC", "REDIS_PASSWORD": "s3cret"}},
+            "pass": {
+                "image": "redis:7",
+                "environment": ["TZ=UTC", "PW=s3cret"],
+                "command": "redis-server --requirepass $${PW}"
+            },
+            "lit": {"image": "valkey/valkey:8", "environment": {"TZ": "UTC"}, "command": ["valkey-server", "--requirepass", "s3cret"]}
+        }});
+        let (changes, unrepaired) = contract_plan(&cfg, &tz("UTC"));
+        let shown: Vec<String> = changes.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            shown,
+            [
+                r#"env: healthcheck=["CMD-SHELL","REDISCLI_AUTH=\"$${REDIS_PASSWORD}\" VALKEYCLI_AUTH=\"$${REDIS_PASSWORD}\" redis-cli ping | grep -q PONG"]"#,
+                r#"pass: healthcheck=["CMD-SHELL","REDISCLI_AUTH=\"$${PW}\" VALKEYCLI_AUTH=\"$${PW}\" redis-cli ping | grep -q PONG"]"#,
+            ]
+        );
+        assert_eq!(unrepaired.len(), 1, "{unrepaired:?}");
+        assert!(
+            unrepaired[0].starts_with("lit: healthcheck: requirepass"),
+            "{unrepaired:?}"
+        );
+        assert!(!unrepaired[0].contains("s3cret"), "{unrepaired:?}");
     }
 
     #[test]
