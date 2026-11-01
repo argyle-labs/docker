@@ -391,6 +391,8 @@ pub struct Contract {
     pub image_health: HashMap<String, bool>,
     /// Image references whose config sets a non-empty `TZ`.
     pub image_tz: std::collections::HashSet<String>,
+    /// Image references whose inspect failed, with a credential-free reason.
+    pub image_errors: HashMap<String, String>,
     /// Per `env_file` path as the config names it: its text, or why it
     /// could not be read.
     pub env_files: HashMap<String, std::result::Result<String, String>>,
@@ -569,11 +571,19 @@ pub fn contract_plan(cfg: &Value, contract: &Contract) -> (Vec<Change>, Vec<Stri
             key: key.to_string(),
             value,
         };
+        let image = str_at(svc, "image");
+        let uninspectable = image.and_then(|i| contract.image_errors.get(i).map(|why| (i, why)));
+        let unknown = |item: &str, (i, why): (&str, &String)| {
+            format!(
+                "{name}: {item}: image {i} not inspectable ({why}); pull it and rerun normalize"
+            )
+        };
         match has_tz(svc, contract) {
             Ok(true) => {}
-            Ok(false) => match &contract.tz {
-                Some(tz) => out.push(change(TZ_KEY, tz.clone())),
-                None => unrepaired.push(format!(
+            Ok(false) => match (uninspectable, &contract.tz) {
+                (Some(u), _) => unrepaired.push(unknown("tz", u)),
+                (None, Some(tz)) => out.push(change(TZ_KEY, tz.clone())),
+                (None, None) => unrepaired.push(format!(
                     "{name}: tz: host timezone unknown; set TZ in the compose file"
                 )),
             },
@@ -584,7 +594,10 @@ pub fn contract_plan(cfg: &Value, contract: &Contract) -> (Vec<Change>, Vec<Stri
         if svc.get(HEALTHCHECK_KEY).is_some() {
             continue;
         }
-        let image = str_at(svc, "image");
+        if let Some(u) = uninspectable {
+            unrepaired.push(unknown("healthcheck", u));
+            continue;
+        }
         if image.and_then(|i| contract.image_health.get(i)) == Some(&true) {
             continue;
         }
@@ -622,12 +635,30 @@ pub fn contract_plan(cfg: &Value, contract: &Contract) -> (Vec<Change>, Vec<Stri
     (out, unrepaired)
 }
 
-/// Per inspected image: whether it declares a healthcheck, and the images
-/// whose config sets `TZ`.
+/// The reason an image inspect failed, built only from the status so no
+/// registry detail or credential reaches the report.
+fn inspect_reason(e: &bollard::errors::Error) -> String {
+    match e {
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        } => "not present locally".to_string(),
+        bollard::errors::Error::DockerResponseServerError { status_code, .. } => {
+            format!("docker returned HTTP {status_code}")
+        }
+        _ => "docker request failed".to_string(),
+    }
+}
+
+/// Per inspected image: whether it declares a healthcheck, the images whose
+/// config sets `TZ`, and the images that could not be inspected.
 async fn image_facts(
     docker: &Docker,
     cfg: &Value,
-) -> (HashMap<String, bool>, std::collections::HashSet<String>) {
+) -> (
+    HashMap<String, bool>,
+    std::collections::HashSet<String>,
+    HashMap<String, String>,
+) {
     let images: std::collections::BTreeSet<&str> = cfg
         .get("services")
         .and_then(Value::as_object)
@@ -637,26 +668,32 @@ async fn image_facts(
         .collect();
     let mut out = HashMap::new();
     let mut tz = std::collections::HashSet::new();
+    let mut errors = HashMap::new();
     for image in images {
-        if let Ok(info) = docker.inspect_image(image).await {
-            let config = info.config.unwrap_or_default();
-            if config
-                .env
-                .iter()
-                .flatten()
-                .any(|kv| kv.strip_prefix("TZ=").is_some_and(|v| !v.is_empty()))
-            {
-                tz.insert(image.to_string());
+        let info = match docker.inspect_image(image).await {
+            Ok(info) => info,
+            Err(e) => {
+                errors.insert(image.to_string(), inspect_reason(&e));
+                continue;
             }
-            let own = config
-                .healthcheck
-                .and_then(|h| h.test)
-                .and_then(|t| t.into_iter().next())
-                .is_some_and(|kind| kind != "NONE");
-            out.insert(image.to_string(), own);
+        };
+        let config = info.config.unwrap_or_default();
+        if config
+            .env
+            .iter()
+            .flatten()
+            .any(|kv| kv.strip_prefix("TZ=").is_some_and(|v| !v.is_empty()))
+        {
+            tz.insert(image.to_string());
         }
+        let own = config
+            .healthcheck
+            .and_then(|h| h.test)
+            .and_then(|t| t.into_iter().next())
+            .is_some_and(|kind| kind != "NONE");
+        out.insert(image.to_string(), own);
     }
-    (out, tz)
+    (out, tz, errors)
 }
 
 fn quoted(v: &str) -> Result<String> {
@@ -839,7 +876,7 @@ async fn plan_text(
     let (mut planned, mut warnings) = plan(name, &cfg, docker.is_some(), is_unraid(), &icon_for);
     let mut unrepaired = Vec::new();
     if repair_contract {
-        let (image_health, image_tz) = match docker {
+        let (image_health, image_tz, image_errors) = match docker {
             Some(d) => image_facts(d, &cfg).await,
             None => Default::default(),
         };
@@ -847,6 +884,7 @@ async fn plan_text(
             tz: host_tz(&crate::mounts::HostProc),
             image_health,
             image_tz,
+            image_errors,
             env_files: read_env_files(dir, &cfg),
         };
         let (repairs, missing) = contract_plan(&cfg, &contract);
@@ -1292,6 +1330,40 @@ mod tests {
         let (changes, unrepaired) = contract_plan(&cfg, &contract);
         assert!(changes.is_empty(), "{changes:?}");
         assert!(unrepaired.is_empty(), "{unrepaired:?}");
+    }
+
+    #[test]
+    fn an_uninspectable_image_is_unrepaired_not_overridden() {
+        let cfg = json!({"services": {
+            "gone": {"image": "postgres:16"},
+            "seen": {"image": "postgres:17"}
+        }});
+        let contract = Contract {
+            image_health: HashMap::from([("postgres:17".to_string(), false)]),
+            image_errors: HashMap::from([(
+                "postgres:16".to_string(),
+                inspect_reason(&bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404,
+                    message: "pull access denied for https://user:secret@reg".into(),
+                }),
+            )]),
+            ..tz("America/Denver")
+        };
+        let (changes, unrepaired) = contract_plan(&cfg, &contract);
+        assert!(changes.iter().all(|c| c.service == "seen"), "{changes:?}");
+        let mut keys: Vec<&str> = changes.iter().map(|c| c.key.as_str()).collect();
+        keys.sort();
+        let mut want = vec![HEALTHCHECK_KEY, TZ_KEY];
+        want.sort();
+        assert_eq!(keys, want);
+        assert_eq!(
+            unrepaired,
+            [
+                "gone: tz: image postgres:16 not inspectable (not present locally); pull it and rerun normalize",
+                "gone: healthcheck: image postgres:16 not inspectable (not present locally); pull it and rerun normalize",
+            ]
+        );
+        assert!(unrepaired.iter().all(|u| !u.contains("secret")));
     }
 
     #[test]
