@@ -401,6 +401,12 @@ fn redact_token(tok: &str, replace: &impl Fn(&str) -> String) -> Option<String> 
     if is_secret_value(tok) {
         return Some(replace("ARG"));
     }
+    if let Some((flag, value)) = split_value_short_flag(tok)
+        && !value.is_empty()
+        && (flag.len() == 2 || value.contains(|c: char| !c.is_ascii_alphabetic()))
+    {
+        return Some(format!("{flag}{}", replace(flag)));
+    }
     // `-p<secret>` is the mysql-client password form; `-p80`/`-p-1` are ports/numbers.
     if tok.len() > 2
         && tok.starts_with("-p")
@@ -414,16 +420,27 @@ fn redact_token(tok: &str, replace: &impl Fn(&str) -> String) -> Option<String> 
 fn takes_secret_value(tok: &str) -> bool {
     tok.starts_with('-')
         && (matches!(tok, "-a" | "-u" | "-H" | "--header" | "--user")
-            || is_short_flag_cluster_ending_in_u(tok)
+            || is_value_short_flag_cluster(tok)
             || is_sensitive_key(tok.trim_start_matches('-')))
 }
 
-// `curl -fsu user:pw`: in a cluster of short flags the last one takes the next word.
-fn is_short_flag_cluster_ending_in_u(tok: &str) -> bool {
-    tok.len() > 2
-        && !tok.starts_with("--")
-        && tok.ends_with('u')
-        && tok[1..].chars().all(|c| c.is_ascii_alphabetic())
+const VALUE_SHORT_FLAGS: [char; 3] = ['a', 'u', 'H'];
+
+// `curl -fsu user:pw` / `curl -sHvalue`: within a short-flag cluster the first value-taking
+// flag consumes the rest of the token, or the next word when nothing follows it.
+fn split_value_short_flag(tok: &str) -> Option<(&str, &str)> {
+    let body = tok.strip_prefix('-').filter(|b| !b.starts_with('-'))?;
+    let i = body.find(|c: char| VALUE_SHORT_FLAGS.contains(&c) || !c.is_ascii_lowercase())?;
+    let flag = body[i..].chars().next()?;
+    if !VALUE_SHORT_FLAGS.contains(&flag) {
+        return None;
+    }
+    let cut = 1 + i + flag.len_utf8();
+    Some((&tok[..cut], &tok[cut..]))
+}
+
+fn is_value_short_flag_cluster(tok: &str) -> bool {
+    tok.len() > 2 && split_value_short_flag(tok).is_some_and(|(_, rest)| rest.is_empty())
 }
 
 fn unless_redacted(value: &str, name: &str) -> String {
@@ -2344,6 +2361,25 @@ mod tests {
             REDACTED.to_owned()
         });
         assert_eq!(masked, args(&["app --password", REDACTED]));
+    }
+
+    #[test]
+    fn value_taking_short_flag_clusters_end_in_a_u_or_h() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let r = |v: &[&str]| redact_args(&args(v), |_| REDACTED.to_owned());
+        assert_eq!(
+            r(&["curl", "-sH", "Authorization: Bearer tok"])[2],
+            REDACTED
+        );
+        assert_eq!(r(&["redis-cli", "-xa", "hunter2"])[2], REDACTED);
+        assert_eq!(r(&["curl", "-fsu", "admin:hunter2"])[2], REDACTED);
+        assert_eq!(r(&["curl", "-uadmin:hunter2"])[1], format!("-u{REDACTED}"));
+        assert_eq!(r(&["curl", "-Hvalue"])[1], format!("-H{REDACTED}"));
+        let masked = r(&["sh", "-c", "curl -sH 'Authorization: Bearer tok' x"]);
+        assert!(!masked[2].contains("tok'"), "{masked:?}");
+        assert!(!masked[2].contains("Bearer"), "{masked:?}");
+        let benign = args(&["curl", "-fsSL", "-o", "out"]);
+        assert_eq!(redact_args(&benign, |_| REDACTED.to_owned()), benign);
     }
 
     #[test]
