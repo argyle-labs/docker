@@ -393,6 +393,8 @@ pub struct Contract {
     pub image_tz: std::collections::HashSet<String>,
     /// Image references whose inspect failed, with a credential-free reason.
     pub image_errors: HashMap<String, String>,
+    /// No Docker connection, so no image could be inspected.
+    pub docker_unavailable: bool,
     /// Per `env_file` path as the config names it: its text, or why it
     /// could not be read.
     pub env_files: HashMap<String, std::result::Result<String, String>>,
@@ -572,15 +574,19 @@ pub fn contract_plan(cfg: &Value, contract: &Contract) -> (Vec<Change>, Vec<Stri
             value,
         };
         let image = str_at(svc, "image");
-        let uninspectable = image.and_then(|i| contract.image_errors.get(i).map(|why| (i, why)));
-        let unknown = |item: &str, (i, why): (&str, &String)| {
-            format!(
-                "{name}: {item}: image {i} not inspectable ({why}); pull it and rerun normalize"
-            )
-        };
+        let uninspectable = image.and_then(|i| {
+            if contract.docker_unavailable {
+                Some(format!("docker unavailable; image {i} not inspectable"))
+            } else {
+                contract.image_errors.get(i).map(|why| {
+                    format!("image {i} not inspectable ({why}); pull it and rerun normalize")
+                })
+            }
+        });
+        let unknown = |item: &str, why: String| format!("{name}: {item}: {why}");
         match has_tz(svc, contract) {
             Ok(true) => {}
-            Ok(false) => match (uninspectable, &contract.tz) {
+            Ok(false) => match (uninspectable.clone(), &contract.tz) {
                 (Some(u), _) => unrepaired.push(unknown("tz", u)),
                 (None, Some(tz)) => out.push(change(TZ_KEY, tz.clone())),
                 (None, None) => unrepaired.push(format!(
@@ -885,6 +891,7 @@ async fn plan_text(
             image_health,
             image_tz,
             image_errors,
+            docker_unavailable: docker.is_none(),
             env_files: read_env_files(dir, &cfg),
         };
         let (repairs, missing) = contract_plan(&cfg, &contract);
@@ -1252,16 +1259,19 @@ mod tests {
         let explicit =
             plugin_toolkit::reactor::block_on(plan_text("web", yaml.into(), cfg, None, true, None));
         assert!(
-            explicit.changes.iter().any(|c| c.key == HEALTHCHECK_KEY),
+            explicit
+                .changes
+                .iter()
+                .all(|c| c.key != TZ_KEY && c.key != HEALTHCHECK_KEY),
             "{:?}",
             explicit.changes
         );
-        assert!(
-            explicit.changes.iter().any(|c| c.key == TZ_KEY)
-                || explicit.unrepaired.iter().any(|u| u.contains("tz:")),
-            "{:?} {:?}",
-            explicit.changes,
-            explicit.unrepaired
+        assert_eq!(
+            explicit.unrepaired,
+            [
+                "db: tz: docker unavailable; image postgres:16 not inspectable",
+                "db: healthcheck: docker unavailable; image postgres:16 not inspectable",
+            ]
         );
     }
 
@@ -1364,6 +1374,33 @@ mod tests {
             ]
         );
         assert!(unrepaired.iter().all(|u| !u.contains("secret")));
+    }
+
+    #[test]
+    fn no_docker_connection_leaves_image_facts_unrepaired() {
+        let cfg = json!({"services": {
+            "bare": {"image": "postgres:16"},
+            "set": {
+                "image": "redis:7",
+                "environment": {"TZ": "UTC"},
+                "healthcheck": {"test": ["CMD", "true"]}
+            },
+            "built": {"build": ".", "environment": ["TZ=UTC"]}
+        }});
+        let contract = Contract {
+            docker_unavailable: true,
+            ..tz("America/Denver")
+        };
+        let (changes, unrepaired) = contract_plan(&cfg, &contract);
+        assert!(changes.is_empty(), "{changes:?}");
+        assert_eq!(
+            unrepaired,
+            [
+                "bare: tz: docker unavailable; image postgres:16 not inspectable",
+                "bare: healthcheck: docker unavailable; image postgres:16 not inspectable",
+                "built: healthcheck: none known for image '(built)'; set one in the compose file",
+            ]
+        );
     }
 
     #[test]
