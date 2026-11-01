@@ -485,6 +485,7 @@ impl DockerUnitProvider {
                 "dryRun": true,
                 "changes": plan.changes,
                 "warnings": plan.warnings,
+                "unrepaired": plan.unrepaired,
                 "diff": lint::diff(&plan.before, &plan.after),
                 "howToExecute": "re-invoke without `dryRun` in the payload",
             });
@@ -499,10 +500,15 @@ impl DockerUnitProvider {
                 plan.warnings.join("; ")
             ));
         }
+        let unrepaired = if plan.unrepaired.is_empty() {
+            String::new()
+        } else {
+            format!("; unrepaired: {}", plan.unrepaired.join("; "))
+        };
         if plan.changes.is_empty() {
             return Ok(VerbOutcome::Action(ActionOutcome {
                 changed: false,
-                message: format!("stack '{}' is already normalized", row.name),
+                message: format!("stack '{}' is already normalized{unrepaired}", row.name),
             }));
         }
         crate::normalize::write(&mut row, &plan, docker.as_ref()).await?;
@@ -511,7 +517,7 @@ impl DockerUnitProvider {
         Ok(VerbOutcome::Action(ActionOutcome {
             changed: true,
             message: format!(
-                "normalized stack '{}': {}; up: {}",
+                "normalized stack '{}': {}; up: {}{unrepaired}",
                 row.name,
                 shown.join(", "),
                 up.trim()
@@ -5831,7 +5837,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let root = root.path().canonicalize().unwrap();
         let dir = root.join("web");
-        let yaml = "services:\n  app:\n    image: x:1\n  db:\n    image: y:1\n";
+        let yaml = "services:\n  app:\n    image: x:1\n    environment:\n      TZ: UTC\n  db:\n    image: y:1\n    environment:\n      TZ: UTC\n";
         let ((), _) = crate::test_support::with_db(|| {
             register_root(&root);
             registered_stack(&dir, yaml, None);
@@ -5917,7 +5923,7 @@ mod tests {
                 let payload = json!({
                     "name": "web",
                     "dir": dir.to_string_lossy(),
-                    "compose_yaml": "services:\n  app:\n    image: x:1\n",
+                    "compose_yaml": "services:\n  app:\n    image: x:1\n    environment:\n      TZ: UTC\n",
                     "dryRun": true
                 });
                 let out = plugin_toolkit::reactor::block_on(provider.do_create(CreateArgs {

@@ -3706,7 +3706,7 @@ mod tests {
         crate::test_support::with_db(|| {
             let dir = unregistered(
                 &root,
-                "services:\n  app:\n    image: x:1\n    network_mode: host\n    volumes: [\"/srv/media:/media\"]\n",
+                "services:\n  app:\n    image: x:1\n    network_mode: host\n    volumes: [\"/srv/media:/media\"]\n    environment:\n      TZ: UTC\n    healthcheck:\n      test: [\"CMD\", \"true\"]\n",
             );
             let plan = adopt(&docker, Some(&dir), Vec::new(), false).unwrap();
             assert!(plan.dry_run && plan.adopted && plan.before.is_empty());

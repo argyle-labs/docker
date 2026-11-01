@@ -48,6 +48,8 @@ pub struct Plan {
     pub after: String,
     pub changes: Vec<Change>,
     pub warnings: Vec<String>,
+    /// Contract items orca cannot fill in; they do not block the rewrite.
+    pub unrepaired: Vec<String>,
     cfg: Value,
 }
 
@@ -57,6 +59,7 @@ impl Plan {
             .iter()
             .map(ToString::to_string)
             .chain(self.warnings.iter().map(|w| format!("warning: {w}")))
+            .chain(self.unrepaired.iter().map(|u| format!("unrepaired: {u}")))
             .collect()
     }
 }
@@ -114,17 +117,19 @@ fn valid_app(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
 }
 
+fn image_app(image: &str) -> String {
+    let i = image.split('@').next().unwrap_or(image);
+    let last = i.rsplit('/').next().unwrap_or(i);
+    let name = last.split(':').next().unwrap_or(last);
+    ARCH_SUFFIXES
+        .iter()
+        .find_map(|s| name.strip_suffix(s))
+        .unwrap_or(name)
+        .to_string()
+}
+
 pub fn candidates(stack: &str, service: &str, image: Option<&str>) -> Vec<String> {
-    let from_image = image.map(|i| {
-        let i = i.split('@').next().unwrap_or(i);
-        let last = i.rsplit('/').next().unwrap_or(i);
-        let name = last.split(':').next().unwrap_or(last);
-        ARCH_SUFFIXES
-            .iter()
-            .find_map(|s| name.strip_suffix(s))
-            .unwrap_or(name)
-            .to_string()
-    });
+    let from_image = image.map(image_app);
     let mut out: Vec<String> = Vec::new();
     for c in from_image
         .into_iter()
@@ -251,6 +256,138 @@ pub fn plan(
     (out, warnings)
 }
 
+pub const TZ_KEY: &str = "TZ";
+pub const HEALTHCHECK_KEY: &str = "healthcheck";
+/// Checks for images that ship no `HEALTHCHECK`, keyed by image name.
+const KNOWN_HEALTHCHECKS: &[(&str, &[&str])] = &[
+    ("postgres", &["CMD", "pg_isready"]),
+    ("pgvecto-rs", &["CMD", "pg_isready"]),
+    ("redis", &["CMD", "redis-cli", "ping"]),
+    ("valkey", &["CMD", "valkey-cli", "ping"]),
+    ("ollama", &["CMD", "ollama", "list"]),
+];
+
+/// What the manageability contract repair needs from the host.
+#[derive(Debug, Default)]
+pub struct Contract {
+    pub tz: Option<String>,
+    /// Per image reference: whether the image declares its own healthcheck.
+    /// An image missing here could not be inspected.
+    pub image_health: HashMap<String, bool>,
+}
+
+/// The host's IANA timezone under `root`: `etc/timezone`, else the
+/// `zoneinfo/` target of the `etc/localtime` symlink.
+#[allow(clippy::disallowed_methods)] // a host file, not a stack file
+pub fn host_tz(root: &std::path::Path) -> Option<String> {
+    if let Ok(s) = std::fs::read_to_string(root.join("etc/timezone"))
+        && !s.trim().is_empty()
+    {
+        return Some(s.trim().to_string());
+    }
+    let link = std::fs::read_link(root.join("etc/localtime")).ok()?;
+    link.to_string_lossy()
+        .split_once("zoneinfo/")
+        .map(|(_, z)| z.to_string())
+        .filter(|z| !z.is_empty())
+}
+
+fn has_tz(svc: &Value) -> bool {
+    let set = |v: &str| !v.is_empty();
+    let env = match svc.get("environment") {
+        Some(Value::Object(m)) => m.get(TZ_KEY).and_then(Value::as_str).is_some_and(set),
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|kv| kv.strip_prefix("TZ=").is_some_and(set)),
+        _ => false,
+    };
+    let localtime = svc
+        .get("volumes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|v| match v {
+            Value::Object(m) => m.get("target").and_then(Value::as_str) == Some("/etc/localtime"),
+            Value::String(s) => s.split(':').nth(1) == Some("/etc/localtime"),
+            _ => false,
+        });
+    env || localtime
+}
+
+/// The `tz` and `healthcheck` items of `docker.manageability_audit`'s
+/// contract each service of `cfg` lacks, and the ones orca cannot fill in.
+/// A service with any `healthcheck` key, `disable` included, is left alone.
+pub fn contract_plan(cfg: &Value, contract: &Contract) -> (Vec<Change>, Vec<String>) {
+    let Some(services) = cfg.get("services").and_then(Value::as_object) else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut out = Vec::new();
+    let mut unrepaired = Vec::new();
+    for (name, svc) in services {
+        let change = |key: &str, value: String| Change {
+            service: name.clone(),
+            key: key.to_string(),
+            value,
+        };
+        if !has_tz(svc) {
+            match &contract.tz {
+                Some(tz) => out.push(change(TZ_KEY, tz.clone())),
+                None => unrepaired.push(format!(
+                    "{name}: tz: the host timezone is unknown; set TZ in the compose file"
+                )),
+            }
+        }
+        if svc.get(HEALTHCHECK_KEY).is_some() {
+            continue;
+        }
+        let image = str_at(svc, "image");
+        if image.and_then(|i| contract.image_health.get(i)) == Some(&true) {
+            continue;
+        }
+        let known = image.map(image_app).and_then(|app| {
+            KNOWN_HEALTHCHECKS
+                .iter()
+                .find(|(k, _)| *k == app)
+                .map(|(_, t)| *t)
+        });
+        match known {
+            Some(test) => out.push(change(
+                HEALTHCHECK_KEY,
+                plugin_toolkit::serde_json::to_string(test).unwrap_or_default(),
+            )),
+            None => unrepaired.push(format!(
+                "{name}: healthcheck: none known for image '{}'; set one in the compose file",
+                image.unwrap_or("(built)")
+            )),
+        }
+    }
+    (out, unrepaired)
+}
+
+async fn image_health(docker: &Docker, cfg: &Value) -> HashMap<String, bool> {
+    let images: std::collections::BTreeSet<&str> = cfg
+        .get("services")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|s| s.values())
+        .filter_map(|svc| str_at(svc, "image"))
+        .collect();
+    let mut out = HashMap::new();
+    for image in images {
+        if let Ok(info) = docker.inspect_image(image).await {
+            let own = info
+                .config
+                .and_then(|c| c.healthcheck)
+                .and_then(|h| h.test)
+                .and_then(|t| t.into_iter().next())
+                .is_some_and(|kind| kind != "NONE");
+            out.insert(image.to_string(), own);
+        }
+    }
+    out
+}
+
 fn quoted(v: &str) -> Result<String> {
     if v.chars().any(char::is_control) {
         bail!("value holds a control character");
@@ -280,26 +417,45 @@ fn set_name(lines: &mut Vec<String>, c: &Change) -> Result<()> {
     Ok(())
 }
 
+fn find_key(lines: &[String], header: usize, end: usize, child: usize, key: &str) -> Option<usize> {
+    let prefix = format!("{key}:");
+    (header + 1..end)
+        .find(|&i| indent_of(&lines[i]) == child && lines[i].trim_start().starts_with(&prefix))
+}
+
+fn set_healthcheck(lines: &mut Vec<String>, c: &Change) -> Result<()> {
+    let (header, end, child) = block_service(lines, &c.service).map_err(|e| anyhow!(e))?;
+    if find_key(lines, header, end, child, HEALTHCHECK_KEY).is_some() {
+        bail!("the compose file already sets a healthcheck");
+    }
+    let pad = " ".repeat(child);
+    lines.insert(header + 1, format!("{pad}{HEALTHCHECK_KEY}:"));
+    lines.insert(header + 2, format!("{pad}  test: {}", c.value));
+    Ok(())
+}
+
 fn set_label(lines: &mut Vec<String>, c: &Change) -> Result<()> {
+    set_entry(lines, "labels", c)
+}
+
+fn set_entry(lines: &mut Vec<String>, block: &str, c: &Change) -> Result<()> {
     let (header, end, child) = block_service(lines, &c.service).map_err(|e| anyhow!(e))?;
     let pad = " ".repeat(child);
-    let at = (header + 1..end)
-        .find(|&i| indent_of(&lines[i]) == child && lines[i].trim_start().starts_with("labels:"));
-    let Some(at) = at else {
+    let Some(at) = find_key(lines, header, end, child, block) else {
         let line = format!("{pad}  {}: {}", c.key, quoted(&c.value)?);
-        lines.insert(header + 1, format!("{pad}labels:"));
+        lines.insert(header + 1, format!("{pad}{block}:"));
         lines.insert(header + 2, line);
         return Ok(());
     };
     let rest = lines[at]
         .trim_start()
-        .trim_start_matches("labels:")
+        .trim_start_matches(&format!("{block}:"))
         .split('#')
         .next()
         .unwrap_or_default()
         .trim();
     if !rest.is_empty() {
-        bail!("labels are written in flow style");
+        bail!("{block} are written in flow style");
     }
     let next = lines[at + 1..end].iter().find(|l| is_content(l));
     let (inner, list) = match next {
@@ -322,10 +478,11 @@ pub fn apply(yaml: &str, changes: &[Change]) -> (String, Vec<Change>, Vec<String
     let mut warnings = Vec::new();
     for c in changes {
         let mut next = lines.clone();
-        let done = if c.key == CONTAINER_NAME {
-            set_name(&mut next, c)
-        } else {
-            set_label(&mut next, c)
+        let done = match c.key.as_str() {
+            CONTAINER_NAME => set_name(&mut next, c),
+            TZ_KEY => set_entry(&mut next, "environment", c),
+            HEALTHCHECK_KEY => set_healthcheck(&mut next, c),
+            _ => set_label(&mut next, c),
         };
         match done {
             Ok(()) => {
@@ -348,14 +505,23 @@ pub fn rebind(allow: &mut [Grant], before: &Value, changes: &[Change]) {
         let Some(svc) = after.pointer_mut(&format!("/services/{}", c.service)) else {
             continue;
         };
-        if c.key == CONTAINER_NAME {
-            svc[CONTAINER_NAME] = Value::String(c.value.clone());
-        } else {
-            if !svc.get("labels").is_some_and(Value::is_object) {
-                svc["labels"] = Value::Object(Map::new());
+        let block = match c.key.as_str() {
+            CONTAINER_NAME => {
+                svc[CONTAINER_NAME] = Value::String(c.value.clone());
+                continue;
             }
-            svc["labels"][&c.key] = Value::String(c.value.clone());
+            HEALTHCHECK_KEY => {
+                let test = plugin_toolkit::serde_json::from_str(&c.value).unwrap_or(Value::Null);
+                svc[HEALTHCHECK_KEY] = plugin_toolkit::serde_json::json!({ "test": test });
+                continue;
+            }
+            TZ_KEY => "environment",
+            _ => "labels",
+        };
+        if !svc.get(block).is_some_and(Value::is_object) {
+            svc[block] = Value::Object(Map::new());
         }
+        svc[block][&c.key] = Value::String(c.value.clone());
     }
     let (old, new) = (policy::digests(before), policy::digests(&after));
     for g in allow.iter_mut() {
@@ -387,7 +553,16 @@ pub async fn collision(docker: &Docker, project: &str, name: &str) -> Option<Str
 }
 
 async fn plan_text(name: &str, before: String, cfg: Value, docker: Option<&Docker>) -> Plan {
-    let (planned, mut warnings) = plan(name, &cfg, docker.is_some(), is_unraid(), &icon_for);
+    let (mut planned, mut warnings) = plan(name, &cfg, docker.is_some(), is_unraid(), &icon_for);
+    let contract = Contract {
+        tz: host_tz(std::path::Path::new("/")),
+        image_health: match docker {
+            Some(d) => image_health(d, &cfg).await,
+            None => HashMap::new(),
+        },
+    };
+    let (repairs, unrepaired) = contract_plan(&cfg, &contract);
+    planned.extend(repairs);
     let project = cfg
         .get("name")
         .and_then(Value::as_str)
@@ -411,6 +586,7 @@ async fn plan_text(name: &str, before: String, cfg: Value, docker: Option<&Docke
         after,
         changes,
         warnings,
+        unrepaired,
         cfg,
     }
 }
@@ -708,5 +884,134 @@ mod tests {
         assert!(run("app").unwrap().contains("already used on this host"));
         assert_eq!(run("mine"), None);
         assert_eq!(run("free"), None);
+    }
+
+    fn tz(tz: &str) -> Contract {
+        Contract {
+            tz: Some(tz.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn contract_repair_adds_tz_and_known_healthchecks() {
+        let cfg = json!({"services": {
+            "db": {"image": "ghcr.io/immich-app/postgres:14"},
+            "cache": {"image": "valkey/valkey:8@sha256:ab", "environment": {"TZ": ""}},
+            "llm": {"image": "ollama/ollama:latest", "environment": {"TZ": "Etc/UTC"}}
+        }});
+        let (changes, unrepaired) = contract_plan(&cfg, &tz("America/Denver"));
+        let shown: Vec<String> = changes.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            shown,
+            [
+                r#"cache: TZ=America/Denver"#,
+                r#"cache: healthcheck=["CMD","valkey-cli","ping"]"#,
+                r#"db: TZ=America/Denver"#,
+                r#"db: healthcheck=["CMD","pg_isready"]"#,
+                r#"llm: healthcheck=["CMD","ollama","list"]"#,
+            ]
+        );
+        assert!(unrepaired.is_empty(), "{unrepaired:?}");
+    }
+
+    #[test]
+    fn contract_repair_leaves_met_items_alone() {
+        let cfg = json!({"services": {
+            "own": {"image": "zot:2", "environment": ["TZ=UTC"]},
+            "set": {"image": "x:1", "healthcheck": {"disable": true},
+                    "volumes": [{"type": "bind", "source": "/etc/localtime", "target": "/etc/localtime"}]}
+        }});
+        let contract = Contract {
+            tz: None,
+            image_health: HashMap::from([("zot:2".to_string(), true)]),
+        };
+        let (changes, unrepaired) = contract_plan(&cfg, &contract);
+        assert!(changes.is_empty(), "{changes:?}");
+        assert!(unrepaired.is_empty(), "{unrepaired:?}");
+    }
+
+    #[test]
+    fn contract_items_orca_cannot_fill_are_named() {
+        let cfg = json!({"services": {
+            "app": {"image": "louislam/dockge:1"},
+            "built": {"build": "."}
+        }});
+        let contract = Contract {
+            tz: None,
+            image_health: HashMap::from([("louislam/dockge:1".to_string(), false)]),
+        };
+        let (changes, unrepaired) = contract_plan(&cfg, &contract);
+        assert!(changes.is_empty());
+        assert_eq!(unrepaired.len(), 4, "{unrepaired:?}");
+        assert!(
+            unrepaired[1].contains("'louislam/dockge:1'"),
+            "{unrepaired:?}"
+        );
+        assert!(unrepaired[3].contains("(built)"), "{unrepaired:?}");
+    }
+
+    #[test]
+    fn apply_writes_tz_in_both_env_styles_and_a_healthcheck_block() {
+        let yaml = "services:\n  a:\n    image: x:1\n    environment:\n      K: v\n  b:\n    image: y:1\n    environment:\n      - K=v\n  c:\n    image: z:1\n    healthcheck:\n      test: [\"CMD\", \"true\"]\n";
+        let (out, applied, warnings) = apply(
+            yaml,
+            &[
+                ch("a", TZ_KEY, "Etc/UTC"),
+                ch("a", HEALTHCHECK_KEY, r#"["CMD","pg_isready"]"#),
+                ch("b", TZ_KEY, "Etc/UTC"),
+                ch("c", TZ_KEY, "Etc/UTC"),
+                ch("c", HEALTHCHECK_KEY, r#"["CMD","x"]"#),
+            ],
+        );
+        assert_eq!(applied.len(), 4);
+        assert!(
+            warnings[0].contains("already sets a healthcheck"),
+            "{warnings:?}"
+        );
+        assert_eq!(
+            out,
+            "services:\n  a:\n    healthcheck:\n      test: [\"CMD\",\"pg_isready\"]\n    image: x:1\n    environment:\n      TZ: \"Etc/UTC\"\n      K: v\n  b:\n    image: y:1\n    environment:\n      - \"TZ=Etc/UTC\"\n      - K=v\n  c:\n    environment:\n      TZ: \"Etc/UTC\"\n    image: z:1\n    healthcheck:\n      test: [\"CMD\", \"true\"]\n"
+        );
+    }
+
+    #[test]
+    fn rebind_follows_contract_repairs() {
+        let cfg = json!({"name": "web", "services": {"app": {"image": "x:1"}}});
+        let old = policy::digests(&cfg)["app"].clone();
+        let mut allow = vec![Grant {
+            service: "app".into(),
+            image: "x:1".into(),
+            definition: old,
+            image_digest: "sha256:a".into(),
+            allow: "privileged".into(),
+        }];
+        rebind(
+            &mut allow,
+            &cfg,
+            &[
+                ch("app", TZ_KEY, "Etc/UTC"),
+                ch("app", HEALTHCHECK_KEY, r#"["CMD","true"]"#),
+            ],
+        );
+        let mut expected = cfg.clone();
+        expected["services"]["app"]["environment"] = json!({"TZ": "Etc/UTC"});
+        expected["services"]["app"]["healthcheck"] = json!({"test": ["CMD", "true"]});
+        assert_eq!(allow[0].definition, policy::digests(&expected)["app"]);
+    }
+
+    #[test]
+    fn host_tz_reads_timezone_then_the_localtime_link() {
+        let root = crate::fsat::PrivateDir::new("orca-tz-").unwrap();
+        assert_eq!(host_tz(root.path()), None);
+        std::fs::create_dir(root.path().join("etc")).unwrap();
+        std::os::unix::fs::symlink(
+            "/usr/share/zoneinfo/Europe/Oslo",
+            root.path().join("etc/localtime"),
+        )
+        .unwrap();
+        assert_eq!(host_tz(root.path()).as_deref(), Some("Europe/Oslo"));
+        std::fs::write(root.path().join("etc/timezone"), "Asia/Tokyo\n").unwrap();
+        assert_eq!(host_tz(root.path()).as_deref(), Some("Asia/Tokyo"));
     }
 }
