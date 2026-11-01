@@ -247,17 +247,19 @@ impl View {
 
 fn redact_args(args: &[String], replace: impl Fn(&str) -> String) -> Vec<String> {
     let mut out = Vec::with_capacity(args.len());
-    let mut pending: Option<&str> = None;
+    let mut pending: Option<String> = None;
     for arg in args {
         if let Some(flag) = pending.take() {
-            out.push(replace(flag));
+            out.push(replace(&flag));
         } else if arg.contains(char::is_whitespace) {
-            out.push(redact_command_string(arg, &replace));
+            let (masked, trailing) = redact_command_string(arg, &replace, 0);
+            pending = trailing;
+            out.push(masked);
         } else if let Some(masked) = redact_token(arg, &replace) {
             out.push(masked);
         } else {
             if takes_secret_value(arg) {
-                pending = Some(arg);
+                pending = Some(arg.clone());
             }
             out.push(arg.clone());
         }
@@ -265,11 +267,19 @@ fn redact_args(args: &[String], replace: impl Fn(&str) -> String) -> Vec<String>
     out
 }
 
-fn redact_command_string(arg: &str, replace: &impl Fn(&str) -> String) -> String {
+const MAX_NESTING: usize = 4;
+
+/// Returns the redacted string and, if it ends with a flag whose value is the next argv
+/// element, that flag.
+fn redact_command_string(
+    arg: &str,
+    replace: &impl Fn(&str) -> String,
+    depth: usize,
+) -> (String, Option<String>) {
     let scrubbed = scrub_line(arg);
     let mut changed = matches!(scrubbed, std::borrow::Cow::Owned(_));
     let Some(words) = shell_words(&scrubbed) else {
-        return redact_unparsed(&scrubbed, replace);
+        return (redact_unparsed(&scrubbed, replace), None);
     };
     let mut pending: Option<String> = None;
     let mut out: Vec<String> = Vec::new();
@@ -280,6 +290,22 @@ fn redact_command_string(arg: &str, replace: &impl Fn(&str) -> String) -> String
         } else if let Some(masked) = redact_token(&word, replace) {
             out.push(masked);
             changed = true;
+        } else if word.contains(char::is_whitespace) {
+            if depth + 1 >= MAX_NESTING {
+                out.push(replace("ARG"));
+                changed = true;
+                continue;
+            }
+            let (inner, trailing) = redact_command_string(&word, replace, depth + 1);
+            if trailing.is_some() {
+                out.push(replace("ARG"));
+                changed = true;
+            } else if inner != word {
+                out.push(format!("'{}'", inner.replace('\'', "'\\''")));
+                changed = true;
+            } else {
+                out.push(raw.to_owned());
+            }
         } else {
             if takes_secret_value(&word) {
                 pending = Some(word);
@@ -287,11 +313,12 @@ fn redact_command_string(arg: &str, replace: &impl Fn(&str) -> String) -> String
             out.push(raw.to_owned());
         }
     }
-    if changed {
+    let joined = if changed {
         out.join(" ")
     } else {
         arg.to_owned()
-    }
+    };
+    (joined, pending)
 }
 
 /// Splits on unquoted whitespace, yielding each word's raw text and its unquoted value.
@@ -386,7 +413,16 @@ fn redact_token(tok: &str, replace: &impl Fn(&str) -> String) -> Option<String> 
 fn takes_secret_value(tok: &str) -> bool {
     tok.starts_with('-')
         && (matches!(tok, "-a" | "-u" | "-H" | "--header" | "--user")
+            || is_short_flag_cluster_ending_in_u(tok)
             || is_sensitive_key(tok.trim_start_matches('-')))
+}
+
+// `curl -fsu user:pw`: in a cluster of short flags the last one takes the next word.
+fn is_short_flag_cluster_ending_in_u(tok: &str) -> bool {
+    tok.len() > 2
+        && !tok.starts_with("--")
+        && tok.ends_with('u')
+        && tok[1..].chars().all(|c| c.is_ascii_alphabetic())
 }
 
 fn unless_redacted(value: &str, name: &str) -> String {
@@ -2064,6 +2100,33 @@ mod tests {
             "{y}"
         );
         assert!(!y.contains(REDACTED), "{y}");
+    }
+
+    #[test]
+    fn secrets_inside_nested_shell_commands_are_redacted() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for cmd in [
+            "su redis -c 'redis-cli -a hunter2 ping'",
+            "su app -c \"curl -fsu admin:hunter2 http://localhost/health\"",
+            "sh -c 'mysqladmin ping -uroot -phunter2'",
+            "echo \"$(curl -u \"admin:hunter2\" x)\"",
+            "sh -c \"su app -c 'sh -c \\\"sh -c \\\\\\\"app -a hunter2\\\\\\\"\\\"'\"",
+        ] {
+            let masked = redact_args(&args(&["sh", "-c", cmd]), |_| REDACTED.to_owned());
+            assert!(!masked[2].contains("hunter2"), "{masked:?}");
+            assert!(masked[2].contains(REDACTED), "{masked:?}");
+        }
+        let benign = args(&["sh", "-c", "su app -c 'redis-cli ping'"]);
+        assert_eq!(redact_args(&benign, |_| REDACTED.to_owned()), benign);
+    }
+
+    #[test]
+    fn a_secret_flag_ending_a_command_string_masks_the_next_element() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let masked = redact_args(&args(&["app --password", "hunter2"]), |_| {
+            REDACTED.to_owned()
+        });
+        assert_eq!(masked, args(&["app --password", REDACTED]));
     }
 
     #[test]
