@@ -589,22 +589,23 @@ pub fn classify_bind(source: &str, endpoint: Endpoint) -> Option<(&'static str, 
         .then(|| std::fs::canonicalize(source).ok())
         .flatten()
         .and_then(|p| p.to_str().map(str::to_owned));
-    let basis = if real.is_some() {
-        "resolved"
-    } else {
-        "lexical"
-    };
     let resolved = real.filter(|real| *real != lexical);
+    let lexical_class = classify_normalized(&lexical);
     let classes = [
-        classify_normalized(&lexical),
+        lexical_class,
         resolved.as_deref().and_then(classify_normalized),
     ];
-    classes
+    let class = classes
         .into_iter()
         .find(|c| *c == Some("runtimeSocket"))
         .or_else(|| classes.into_iter().find(|c| c.is_some()))
-        .flatten()
-        .map(|class| (class, basis))
+        .flatten()?;
+    let basis = if Some(class) == lexical_class {
+        "lexical"
+    } else {
+        "resolved"
+    };
+    Some((class, basis))
 }
 
 fn is_anonymous_volume(name: &str) -> bool {
@@ -1445,11 +1446,12 @@ fn client() -> Result<Docker> {
 /// capabilities, privileged, read-only rootfs, PID/IPC/UTS modes, labels, user,
 /// working dir, healthcheck. Every caller gets env names only (each value is
 /// `***`, `redacted` marks a secret-looking one) and `***` for every host path
-/// (mount and sensitive bind sources, device host paths, working dir), compose project path label, DNS server and `extraHosts` address; log
-/// option values have credentials scrubbed. Bind mounts of runtime sockets and
+/// (mount and sensitive bind sources, device host paths, working dir), compose project path label, DNS server, `extraHosts` and port host
+/// address; log option and label values have credentials scrubbed and IP
+/// literals and URL hosts masked. Bind mounts of runtime sockets and
 /// sensitive host paths are listed by class in `sensitiveBinds`, each with a
-/// `basis`: `resolved` when symlinks were followed (local unix-socket engine
-/// only), else `lexical`. The classification is advisory: symlinks resolve at
+/// `basis`: `resolved` when the symlink-resolved path decided the class (local
+/// unix-socket engine only), else `lexical`. The classification is advisory: symlinks resolve at
 /// inspect time, not container start, so a repointed link is missed. Callable by plugins through `tool.call`; the unfiltered
 /// form is `docker.container_inspect_raw`. Read-only.
 #[orca_tool(
@@ -1931,6 +1933,28 @@ mod tests {
         assert_eq!(
             classify_bind("/etc/ssh", Endpoint::Remote),
             Some(("sensitivePath", "lexical"))
+        );
+    }
+
+    #[test]
+    fn basis_is_lexical_when_the_lexical_class_alone_decides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("docker.sock");
+        std::fs::write(&sock, "").unwrap();
+        let real = std::fs::canonicalize(&sock).unwrap();
+        assert_eq!(
+            classify_bind(real.to_str().unwrap(), Endpoint::Local),
+            Some(("runtimeSocket", "lexical"))
+        );
+        assert_eq!(
+            classify_bind("/", Endpoint::Local),
+            Some(("sensitivePath", "lexical"))
+        );
+        let to_sock = tmp.path().join("etc-link");
+        std::os::unix::fs::symlink(&sock, &to_sock).unwrap();
+        assert_eq!(
+            classify_bind(to_sock.to_str().unwrap(), Endpoint::Local),
+            Some(("runtimeSocket", "resolved"))
         );
     }
 
