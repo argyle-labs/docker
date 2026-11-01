@@ -377,6 +377,14 @@ fn takes_secret_value(tok: &str) -> bool {
             || is_sensitive_key(tok.trim_start_matches('-')))
 }
 
+fn unless_redacted(value: &str, name: &str) -> String {
+    if value == REDACTED {
+        env_ref(name)
+    } else {
+        lit(value)
+    }
+}
+
 fn env_ref(name: &str) -> String {
     if name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -509,6 +517,13 @@ pub fn env_var(raw: &str, view: View) -> EnvVar {
     }
 }
 
+fn admin_only(value: String, view: View) -> String {
+    match view {
+        View::Admin => value,
+        View::Reader | View::Names => REDACTED.to_owned(),
+    }
+}
+
 pub fn describe(c: &ContainerInspectResponse, view: View) -> ContainerInspectOutput {
     let config = c.config.clone().unwrap_or_default();
     let host = c.host_config.clone().unwrap_or_default();
@@ -549,7 +564,7 @@ pub fn describe(c: &ContainerInspectResponse, view: View) -> ContainerInspectOut
         .filter_map(|m| {
             let source = m.source.clone().unwrap_or_default();
             classify_bind(&source).map(|class| SensitiveBind {
-                source,
+                source: admin_only(source, view),
                 class: class.to_owned(),
                 read_only: !m.rw.unwrap_or(true),
             })
@@ -585,6 +600,9 @@ pub fn describe(c: &ContainerInspectResponse, view: View) -> ContainerInspectOut
             if is_secret(&k, &v) {
                 redacted_log_options.push(k.clone());
                 (k, REDACTED.to_owned())
+            } else if let std::borrow::Cow::Owned(scrubbed) = scrub_line(&v) {
+                redacted_log_options.push(k.clone());
+                (k, scrubbed)
             } else {
                 (k, v)
             }
@@ -617,10 +635,7 @@ pub fn describe(c: &ContainerInspectResponse, view: View) -> ContainerInspectOut
             .into_iter()
             .map(|m| MountInfo {
                 kind: m.typ.map(|t| t.to_string()).unwrap_or_default(),
-                source: match view {
-                    View::Admin => m.source.unwrap_or_default(),
-                    View::Reader | View::Names => REDACTED.to_owned(),
-                },
+                source: admin_only(m.source.unwrap_or_default(), view),
                 target: m.destination.unwrap_or_default(),
                 read_only: !m.rw.unwrap_or(true),
                 volume_name: m.name.filter(|s| !s.is_empty()),
@@ -647,7 +662,7 @@ pub fn describe(c: &ContainerInspectResponse, view: View) -> ContainerInspectOut
             .unwrap_or_default()
             .into_iter()
             .map(|d| DeviceInfo {
-                path_on_host: d.path_on_host.unwrap_or_default(),
+                path_on_host: admin_only(d.path_on_host.unwrap_or_default(), view),
                 path_in_container: d.path_in_container.unwrap_or_default(),
                 cgroup_permissions: d.cgroup_permissions.unwrap_or_default(),
             })
@@ -660,7 +675,7 @@ pub fn describe(c: &ContainerInspectResponse, view: View) -> ContainerInspectOut
         redacted_labels,
         init: host.init.unwrap_or(false),
         user: config.user.unwrap_or_default(),
-        working_dir: config.working_dir.unwrap_or_default(),
+        working_dir: admin_only(config.working_dir.unwrap_or_default(), view),
         healthcheck: config.healthcheck.and_then(|h| {
             let test = h.test.unwrap_or_default();
             (!test.is_empty()).then_some(HealthcheckInfo {
@@ -685,7 +700,15 @@ pub fn describe(c: &ContainerInspectResponse, view: View) -> ContainerInspectOut
             })
             .collect(),
         security_opt: host.security_opt.unwrap_or_default(),
-        extra_hosts: host.extra_hosts.unwrap_or_default(),
+        extra_hosts: host
+            .extra_hosts
+            .unwrap_or_default()
+            .into_iter()
+            .map(|h| match (view, h.split_once(':')) {
+                (View::Admin, _) | (_, None) => h,
+                (_, Some((name, _))) => format!("{name}:{REDACTED}"),
+            })
+            .collect(),
         pid_mode: host.pid_mode.unwrap_or_default(),
         ipc_mode: host.ipc_mode.unwrap_or_default(),
         uts_mode: host.uts_mode.unwrap_or_default(),
@@ -698,7 +721,12 @@ pub fn describe(c: &ContainerInspectResponse, view: View) -> ContainerInspectOut
         stop_signal: config.stop_signal.unwrap_or_default(),
         stop_timeout: config.stop_timeout.filter(|n| *n >= 0),
         hostname: config.hostname.unwrap_or_default(),
-        dns: host.dns.unwrap_or_default(),
+        dns: host
+            .dns
+            .unwrap_or_default()
+            .into_iter()
+            .map(|d| admin_only(d, view))
+            .collect(),
     }
 }
 
@@ -761,7 +789,10 @@ pub fn service_value(c: &ContainerInspectOutput) -> Value {
         svc.insert("user".into(), json!(lit(&c.user)));
     }
     if !c.working_dir.is_empty() {
-        svc.insert("working_dir".into(), json!(lit(&c.working_dir)));
+        svc.insert(
+            "working_dir".into(),
+            json!(unless_redacted(&c.working_dir, "working_dir")),
+        );
     }
     if !c.env.is_empty() {
         let env: serde_json::Map<String, Value> = c
@@ -796,10 +827,30 @@ pub fn service_value(c: &ContainerInspectOutput) -> Value {
         svc.insert("hostname".into(), json!(lit(&c.hostname)));
     }
     if !c.dns.is_empty() {
-        svc.insert("dns".into(), json!(c.dns));
+        let dns: Vec<String> = c
+            .dns
+            .iter()
+            .enumerate()
+            .map(|(i, d)| unless_redacted(d, &format!("dns_{i}")))
+            .collect();
+        svc.insert("dns".into(), json!(dns));
     }
     if !c.extra_hosts.is_empty() {
-        svc.insert("extra_hosts".into(), json!(c.extra_hosts));
+        let hosts: Vec<String> = c
+            .extra_hosts
+            .iter()
+            .map(|h| match h.split_once(':') {
+                Some((name, addr)) => {
+                    format!(
+                        "{}:{}",
+                        lit(name),
+                        unless_redacted(addr, &format!("host_{name}"))
+                    )
+                }
+                None => lit(h),
+            })
+            .collect();
+        svc.insert("extra_hosts".into(), json!(hosts));
     }
     if !c.tmpfs.is_empty() {
         let tmpfs: Vec<String> = c
@@ -958,7 +1009,11 @@ pub fn service_value(c: &ContainerInspectOutput) -> Value {
             .devices
             .iter()
             .map(|d| {
-                let mut s = format!("{}:{}", d.path_on_host, d.path_in_container);
+                let mut s = format!(
+                    "{}:{}",
+                    unless_redacted(&d.path_on_host, &format!("device{}", d.path_in_container)),
+                    d.path_in_container
+                );
                 if !d.cgroup_permissions.is_empty() && d.cgroup_permissions != "rwm" {
                     s.push(':');
                     s.push_str(&d.cgroup_permissions);
@@ -1195,9 +1250,10 @@ fn client() -> Result<Docker> {
 /// names, networks, ports, mounts, restart policy, devices, GPU requests,
 /// capabilities, privileged, read-only rootfs, PID/IPC/UTS modes, labels, user,
 /// working dir, healthcheck. Every caller gets env names only (each value is
-/// `***`, `redacted` marks a secret-looking one) and `***` for every mount
-/// source and compose project path label; bind mounts of runtime sockets and sensitive host paths are listed
-/// in `sensitiveBinds`. Callable by plugins through `tool.call`; the unfiltered
+/// `***`, `redacted` marks a secret-looking one) and `***` for every host path
+/// (mount and sensitive bind sources, device host paths, working dir), compose project path label, DNS server and `extraHosts` address; log
+/// option values have credentials scrubbed. Bind mounts of runtime sockets and
+/// sensitive host paths are listed by class in `sensitiveBinds`. Callable by plugins through `tool.call`; the unfiltered
 /// form is `docker.container_inspect_raw`. Read-only.
 #[orca_tool(
     domain = "docker",
@@ -1566,7 +1622,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let out = describe(&c, View::Names);
+        let out = describe(&c, View::Admin);
         assert_eq!(
             out.sensitive_binds,
             vec![
@@ -1584,6 +1640,59 @@ mod tests {
         );
         c.mounts = None;
         assert!(describe(&c, View::Names).sensitive_binds.is_empty());
+    }
+
+    #[test]
+    fn the_scrubbed_view_hides_host_paths_credentials_and_addresses() {
+        let c = serde_json::from_value::<ContainerInspectResponse>(json!({
+            "Id": "x",
+            "Config": { "WorkingDir": "/srv/app", "Hostname": "box" },
+            "HostConfig": {
+                "LogConfig": { "Type": "loki", "Config": {
+                    "loki-url": "push to https://user:pass@loki.lan/api",
+                    "max-size": "10m"
+                } },
+                "ExtraHosts": ["db.lan:10.1.2.3"],
+                "Dns": ["10.1.2.1"],
+                "Tmpfs": { "/host/tmp": "rw" },
+                "Sysctls": { "net.core.somaxconn": "1024" },
+                "Devices": [{ "PathOnHost": "/dev/dri/renderD128", "PathInContainer": "/dev/dri", "CgroupPermissions": "rwm" }]
+            },
+            "Mounts": [
+                { "Type": "bind", "Source": "/etc", "Destination": "/e", "RW": false }
+            ]
+        }))
+        .unwrap();
+        for view in [View::Reader, View::Names] {
+            let out = describe(&c, view);
+            let text = serde_json::to_string(&out).unwrap();
+            for leak in [
+                "/etc",
+                "/srv/app",
+                "user:pass",
+                "10.1.2.",
+                "/dev/dri/renderD128",
+            ] {
+                assert!(!text.contains(leak), "{view:?} leaks {leak}: {text}");
+            }
+            assert_eq!(out.sensitive_binds[0].source, REDACTED);
+            assert_eq!(out.sensitive_binds[0].class, "sensitivePath");
+            assert_eq!(out.extra_hosts, vec![format!("db.lan:{REDACTED}")]);
+            assert_eq!(out.dns, vec![REDACTED.to_owned()]);
+            assert_eq!(out.working_dir, REDACTED);
+            assert_eq!(out.devices[0].path_on_host, REDACTED);
+            assert_eq!(out.hostname, "box");
+            assert_eq!(out.sysctls["net.core.somaxconn"], "1024");
+        }
+        let admin = describe(&c, View::Admin);
+        assert_eq!(admin.sensitive_binds[0].source, "/etc");
+        assert_eq!(admin.extra_hosts, vec!["db.lan:10.1.2.3".to_owned()]);
+        assert_eq!(admin.dns, vec!["10.1.2.1".to_owned()]);
+        assert_eq!(admin.working_dir, "/srv/app");
+        assert_eq!(admin.devices[0].path_on_host, "/dev/dri/renderD128");
+        let text = serde_json::to_string(&admin).unwrap();
+        assert!(!text.contains("user:pass"), "{text}");
+        assert!(admin.redacted_log_options.contains(&"loki-url".to_owned()));
     }
 
     #[test]
@@ -2004,9 +2113,9 @@ mod tests {
     #[test]
     fn extra_hosts_are_reproduced() {
         let (out, y) = tuned();
-        assert_eq!(out.extra_hosts, vec!["db:10.0.0.9"]);
+        assert_eq!(out.extra_hosts, vec![format!("db:{REDACTED}")]);
         assert!(
-            y.contains("    extra_hosts:\n      - \"db:10.0.0.9\"\n"),
+            y.contains("    extra_hosts:\n      - \"db:${host_db}\"\n"),
             "{y}"
         );
     }
@@ -2071,8 +2180,8 @@ mod tests {
     #[test]
     fn dns_is_reproduced() {
         let (out, y) = tuned();
-        assert_eq!(out.dns, vec!["10.0.0.1"]);
-        assert!(y.contains("    dns:\n      - \"10.0.0.1\"\n"), "{y}");
+        assert_eq!(out.dns, vec![REDACTED]);
+        assert!(y.contains("    dns:\n      - \"${dns_0}\"\n"), "{y}");
     }
 
     #[test]
