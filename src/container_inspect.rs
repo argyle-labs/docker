@@ -20,7 +20,7 @@ pub const RUNTIME_SOCKETS: [&str; 8] = [
     "/var/run/crio/crio.sock",
 ];
 const RUNTIME_SOCKET_MARKERS: [&str; 4] = ["docker", "podman", "containerd", "crio"];
-const SENSITIVE_HOST_PATHS: [&str; 15] = [
+const SENSITIVE_HOST_PATHS: [&str; 17] = [
     "/run",
     "/var/run",
     "/",
@@ -36,6 +36,17 @@ const SENSITIVE_HOST_PATHS: [&str; 15] = [
     "/var/lib/kubelet",
     "/var/lib/lxc",
     "/usr",
+    "/private/etc",
+    "/private/var/lib/docker",
+];
+const SENSITIVE_HOME_SUBPATHS: [&str; 7] = [
+    ".ssh",
+    ".docker",
+    ".kube",
+    ".aws",
+    ".gnupg",
+    ".config/gcloud",
+    ".netrc",
 ];
 const COMPOSE_LABEL_PREFIX: &str = "com.docker.compose.";
 const COMPOSE_PATH_LABELS: [&str; 3] = [
@@ -433,9 +444,23 @@ fn is_runtime_socket_file(path: &str) -> bool {
     base.contains(".sock") && RUNTIME_SOCKET_MARKERS.iter().any(|m| lower.contains(m))
 }
 
-fn is_home_ssh(path: &str) -> bool {
-    let mut parts = path.strip_prefix("/home/").unwrap_or("").split('/');
-    matches!((parts.next(), parts.next()), (Some(user), Some(".ssh")) if !user.is_empty())
+fn home_relative(path: &str) -> Option<&str> {
+    if let Some(rest) = path.strip_prefix("/root/") {
+        return Some(rest);
+    }
+    let rest = path
+        .strip_prefix("/home/")
+        .or_else(|| path.strip_prefix("/users/"))?;
+    let (user, tail) = rest.split_once('/')?;
+    (!user.is_empty()).then_some(tail)
+}
+
+fn is_home_credential(path: &str) -> bool {
+    home_relative(path).is_some_and(|rel| {
+        SENSITIVE_HOME_SUBPATHS
+            .iter()
+            .any(|sub| rel == *sub || rel.starts_with(&format!("{sub}/")))
+    })
 }
 
 fn is_rootless_socket(path: &str) -> bool {
@@ -457,6 +482,9 @@ fn is_rootless_socket(path: &str) -> bool {
 }
 
 fn classify_normalized(s: &str) -> Option<&'static str> {
+    // Host filesystems may be case-insensitive (macOS), so `/ETC` must match `/etc`.
+    let s = s.to_ascii_lowercase();
+    let s = s.as_str();
     if RUNTIME_SOCKETS
         .iter()
         .any(|sock| *sock == s || sock.starts_with(&format!("{s}/")))
@@ -467,7 +495,7 @@ fn classify_normalized(s: &str) -> Option<&'static str> {
     } else if SENSITIVE_HOST_PATHS
         .iter()
         .any(|p| s == *p || (*p != "/" && s.starts_with(&format!("{p}/"))))
-        || is_home_ssh(s)
+        || is_home_credential(s)
     {
         Some("sensitivePath")
     } else {
@@ -1699,6 +1727,29 @@ mod tests {
             ("/mnt/media/", None),
             ("/mnt//media/./x", None),
             ("/var//run///docker.sock", Some("runtimeSocket")),
+            ("/Users/x/.ssh", Some("sensitivePath")),
+            ("/Users/x/.SSH", Some("sensitivePath")),
+            ("/HOME/x/.Ssh/id_ed25519", Some("sensitivePath")),
+            ("/ETC", Some("sensitivePath")),
+            ("/Etc/passwd", Some("sensitivePath")),
+            ("/VAR/RUN/Docker.sock", Some("runtimeSocket")),
+            ("/home/x/.docker", Some("sensitivePath")),
+            ("/Users/x/.docker/config.json", Some("sensitivePath")),
+            ("/home/x/.kube/config", Some("sensitivePath")),
+            ("/Users/x/.aws", Some("sensitivePath")),
+            ("/home/x/.gnupg", Some("sensitivePath")),
+            ("/Users/x/.config/gcloud", Some("sensitivePath")),
+            ("/home/x/.netrc", Some("sensitivePath")),
+            ("/root/.aws", Some("sensitivePath")),
+            ("/ROOT/.kube", Some("sensitivePath")),
+            ("/private/etc", Some("sensitivePath")),
+            ("/private/etc/hosts", Some("sensitivePath")),
+            ("/PRIVATE/var/lib/docker", Some("sensitivePath")),
+            ("/private/var/lib/docker/volumes", Some("sensitivePath")),
+            ("/Users/x/.config/other", None),
+            ("/Users/x/.dockerignore", None),
+            ("/home/.ssh", None),
+            ("/Users/x/code", None),
         ] {
             assert_eq!(
                 classify_bind(path, Endpoint::Remote).map(|(c, _)| c),
