@@ -552,17 +552,29 @@ pub async fn collision(docker: &Docker, project: &str, name: &str) -> Option<Str
     }
 }
 
-async fn plan_text(name: &str, before: String, cfg: Value, docker: Option<&Docker>) -> Plan {
+/// `repair_contract` adds the `contract_plan` repairs; only the explicit
+/// stack `normalize` action sets it, so deploy/set/adopt never inject them.
+async fn plan_text(
+    name: &str,
+    before: String,
+    cfg: Value,
+    docker: Option<&Docker>,
+    repair_contract: bool,
+) -> Plan {
     let (mut planned, mut warnings) = plan(name, &cfg, docker.is_some(), is_unraid(), &icon_for);
-    let contract = Contract {
-        tz: host_tz(std::path::Path::new("/")),
-        image_health: match docker {
-            Some(d) => image_health(d, &cfg).await,
-            None => HashMap::new(),
-        },
-    };
-    let (repairs, unrepaired) = contract_plan(&cfg, &contract);
-    planned.extend(repairs);
+    let mut unrepaired = Vec::new();
+    if repair_contract {
+        let contract = Contract {
+            tz: host_tz(std::path::Path::new("/")),
+            image_health: match docker {
+                Some(d) => image_health(d, &cfg).await,
+                None => HashMap::new(),
+            },
+        };
+        let (repairs, missing) = contract_plan(&cfg, &contract);
+        planned.extend(repairs);
+        unrepaired = missing;
+    }
     let project = cfg
         .get("name")
         .and_then(Value::as_str)
@@ -591,10 +603,14 @@ async fn plan_text(name: &str, before: String, cfg: Value, docker: Option<&Docke
     }
 }
 
-pub async fn plan_stack(row: &StackRow, docker: Option<&Docker>) -> Result<Plan> {
+pub async fn plan_stack(
+    row: &StackRow,
+    docker: Option<&Docker>,
+    repair_contract: bool,
+) -> Result<Plan> {
     let cfg = policy::user_cfg(row).await?;
     let before = row.read_compose(&crate::stacks::allowed_roots()?)?;
-    Ok(plan_text(&row.name, before, cfg, docker).await)
+    Ok(plan_text(&row.name, before, cfg, docker, repair_contract).await)
 }
 
 pub async fn plan_inline(
@@ -610,7 +626,7 @@ pub async fn plan_inline(
         .ok_or_else(|| plugin_toolkit::anyhow::anyhow!("no compose file"))?;
     let raw = stacks::resolved_config(project_dir, &compose).await?;
     let cfg: Value = plugin_toolkit::serde_json::from_str(&raw)?;
-    Ok(plan_text(name, yaml.to_string(), cfg, docker).await)
+    Ok(plan_text(name, yaml.to_string(), cfg, docker, false).await)
 }
 
 pub async fn write(row: &mut StackRow, plan: &Plan, docker: Option<&Docker>) -> Result<()> {
@@ -639,7 +655,7 @@ pub async fn write(row: &mut StackRow, plan: &Plan, docker: Option<&Docker>) -> 
 }
 
 pub async fn normalize(row: &mut StackRow, docker: Option<&Docker>) -> Vec<String> {
-    let plan = match plan_stack(row, docker).await {
+    let plan = match plan_stack(row, docker, false).await {
         Ok(p) => p,
         Err(e) => return vec![format!("warning: normalize skipped: {e:#}")],
     };
@@ -891,6 +907,43 @@ mod tests {
             tz: Some(tz.into()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn only_the_explicit_normalize_repairs_the_contract() {
+        let yaml = "services:\n  db:\n    image: postgres:16\n";
+        let cfg = json!({"services": {"db": {"image": "postgres:16"}}});
+        let deploy = plugin_toolkit::reactor::block_on(plan_text(
+            "web",
+            yaml.into(),
+            cfg.clone(),
+            None,
+            false,
+        ));
+        assert!(
+            deploy
+                .changes
+                .iter()
+                .all(|c| c.key != TZ_KEY && c.key != HEALTHCHECK_KEY),
+            "{:?}",
+            deploy.changes
+        );
+        assert!(deploy.unrepaired.is_empty(), "{:?}", deploy.unrepaired);
+        assert_eq!(deploy.after, yaml);
+        let explicit =
+            plugin_toolkit::reactor::block_on(plan_text("web", yaml.into(), cfg, None, true));
+        assert!(
+            explicit.changes.iter().any(|c| c.key == HEALTHCHECK_KEY),
+            "{:?}",
+            explicit.changes
+        );
+        assert!(
+            explicit.changes.iter().any(|c| c.key == TZ_KEY)
+                || explicit.unrepaired.iter().any(|u| u.contains("tz:")),
+            "{:?} {:?}",
+            explicit.changes,
+            explicit.unrepaired
+        );
     }
 
     #[test]

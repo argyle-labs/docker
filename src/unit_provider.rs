@@ -452,7 +452,7 @@ impl DockerUnitProvider {
                 {
                     return String::new();
                 }
-                crate::normalize::plan_stack(&row, docker.as_ref()).await
+                crate::normalize::plan_stack(&row, docker.as_ref(), false).await
             }
         };
         let report = match planned {
@@ -462,7 +462,10 @@ impl DockerUnitProvider {
         if report.is_empty() {
             String::new()
         } else {
-            format!("; normalize: {}", report.join(", "))
+            format!(
+                "; normalize (names and labels only; TZ and healthcheck repairs run only from the `normalize` action): {}",
+                report.join(", ")
+            )
         }
     }
 
@@ -479,13 +482,14 @@ impl DockerUnitProvider {
             }
         };
         let docker = self.adapter.client().ok();
-        let plan = crate::normalize::plan_stack(&row, docker.as_ref()).await?;
+        let plan = crate::normalize::plan_stack(&row, docker.as_ref(), true).await?;
         if p.dry_run {
             let body = json!({
                 "dryRun": true,
                 "changes": plan.changes,
                 "warnings": plan.warnings,
                 "unrepaired": plan.unrepaired,
+                "contractRepairs": "TZ and healthcheck repairs run only from this action; deploy, set and adopt add names and labels only",
                 "diff": lint::diff(&plan.before, &plan.after),
                 "howToExecute": "re-invoke without `dryRun` in the payload",
             });

@@ -2160,7 +2160,7 @@ async fn stack_allow_from(
         .cloned()
         .collect();
     let normalize = if adopted && normalize {
-        Some(crate::normalize::plan_stack(&row, Some(docker)).await)
+        Some(crate::normalize::plan_stack(&row, Some(docker), false).await)
     } else {
         None
     };
