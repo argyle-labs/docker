@@ -629,6 +629,69 @@ pub fn env_var(raw: &str, view: View) -> EnvVar {
     }
 }
 
+fn mask_hosts(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find("://") {
+        let (head, tail) = rest.split_at(i + 3);
+        out.push_str(&mask_ip_tokens(head));
+        let end = tail
+            .find(|c: char| matches!(c, '/' | '?' | '#' | ',' | '"' | '\'') || c.is_whitespace())
+            .unwrap_or(tail.len());
+        if end > 0 {
+            out.push_str(REDACTED);
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(&mask_ip_tokens(rest));
+    out
+}
+
+fn mask_ip_tokens(s: &str) -> String {
+    let is_tok =
+        |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '[' | ']' | '%' | '-');
+    let mut out = String::with_capacity(s.len());
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        if !is_tok(c) {
+            out.push_str(&mask_token(&s[start..i]));
+            out.push(c);
+            start = i + c.len_utf8();
+        }
+    }
+    out.push_str(&mask_token(&s[start..]));
+    out
+}
+
+fn mask_token(t: &str) -> String {
+    let is_ip = |t: &str| {
+        let t = t
+            .strip_prefix('[')
+            .and_then(|t| t.strip_suffix(']'))
+            .unwrap_or(t);
+        let t = t.split_once('%').map_or(t, |(ip, _)| ip);
+        t.parse::<std::net::IpAddr>().is_ok()
+    };
+    if is_ip(t) {
+        return REDACTED.to_owned();
+    }
+    match t.rsplit_once(':') {
+        Some((host, port))
+            if !port.is_empty()
+                && port.chars().all(|c| c.is_ascii_digit())
+                && (is_ip(host)
+                    || (host.contains('.')
+                        && host.chars().any(|c| c.is_ascii_alphabetic())
+                        && host
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-')))) =>
+        {
+            format!("{REDACTED}:{port}")
+        }
+        _ => t.to_owned(),
+    }
+}
+
 fn admin_only(value: String, view: View) -> String {
     match view {
         View::Admin => value,
@@ -659,7 +722,10 @@ pub fn describe(
                 .into_iter()
                 .map(|b| PortMapping {
                     container_port: port.clone(),
-                    host_ip: b.host_ip.filter(|s| !s.is_empty()),
+                    host_ip: b
+                        .host_ip
+                        .filter(|s| !s.is_empty())
+                        .map(|ip| admin_only(ip, view)),
                     host_port: b.host_port.filter(|s| !s.is_empty()),
                 })
                 .collect()
@@ -700,6 +766,9 @@ pub fn describe(
                 (k, REDACTED.to_owned())
             } else if view != View::Admin && COMPOSE_PATH_LABELS.contains(&k.as_str()) {
                 (k, REDACTED.to_owned())
+            } else if view != View::Admin && mask_hosts(&v) != v {
+                redacted_labels.push(k.clone());
+                (k, mask_hosts(&v))
             } else {
                 (k, v)
             }
@@ -723,6 +792,9 @@ pub fn describe(
             } else if let std::borrow::Cow::Owned(scrubbed) = scrub_line(&v) {
                 redacted_log_options.push(k.clone());
                 (k, scrubbed)
+            } else if view != View::Admin && mask_hosts(&v) != v {
+                redacted_log_options.push(k.clone());
+                (k, mask_hosts(&v))
             } else {
                 (k, v)
             }
@@ -1062,7 +1134,9 @@ pub fn service_value(c: &ContainerInspectOutput) -> Value {
             .map(|p| {
                 let target = p.container_port.trim_end_matches("/tcp");
                 let ip = p.host_ip.as_deref().map(|ip| {
-                    if ip.contains(':') && !ip.starts_with('[') {
+                    if ip == REDACTED {
+                        env_ref(&format!("host_ip_{}", p.container_port))
+                    } else if ip.contains(':') && !ip.starts_with('[') {
                         format!("[{ip}]")
                     } else {
                         ip.to_owned()
@@ -1642,6 +1716,100 @@ mod tests {
     }
 
     #[test]
+    fn mask_hosts_hides_ip_literals_and_url_authorities() {
+        assert_eq!(mask_hosts("tcp://10.0.0.5:514"), "tcp://***");
+        assert_eq!(
+            mask_hosts("http://10.0.0.9:3100/loki/api/v1/push"),
+            "http://***/loki/api/v1/push"
+        );
+        assert_eq!(mask_hosts("fluentd.lan:24224"), "***:24224");
+        assert_eq!(mask_hosts("10.0.0.5:24224"), "***:24224");
+        assert_eq!(mask_hosts("[fe80::1]:53"), "***:53");
+        assert_eq!(mask_hosts("Host(`a`) && 192.168.1.2"), "Host(`a`) && ***");
+        assert_eq!(mask_hosts("app"), "app");
+        assert_eq!(mask_hosts("v1.2.3"), "v1.2.3");
+    }
+
+    fn host_bearing() -> ContainerInspectResponse {
+        serde_json::from_value(json!({
+            "Id": "x",
+            "Config": { "Labels": {
+                "traefik.http.services.x.loadbalancer.server.url": "http://10.0.0.5:8080",
+                "app": "media"
+            } },
+            "HostConfig": {
+                "PortBindings": { "80/tcp": [{ "HostIp": "10.0.0.5", "HostPort": "8080" }] },
+                "LogConfig": { "Type": "syslog", "Config": {
+                    "syslog-address": "tcp://10.0.0.5:514",
+                    "fluentd-address": "10.0.0.6:24224",
+                    "gelf-address": "udp://gelf.lan:12201",
+                    "loki-url": "http://10.0.0.9:3100/loki/api/v1/push",
+                    "tag": "app"
+                } }
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn scrubbed_view_hides_port_host_addresses() {
+        let c = host_bearing();
+        for view in [View::Reader, View::Names] {
+            let out = describe(&c, view, Endpoint::Remote);
+            assert_eq!(out.ports[0].host_ip.as_deref(), Some(REDACTED));
+            let y = compose_yaml(&out).yaml;
+            assert!(y.contains("\"${SECRET_HOST_IP_80_TCP}:8080:80\""), "{y}");
+            assert!(!y.contains("10.0.0.5"), "{y}");
+        }
+        let admin = describe(&c, View::Admin, Endpoint::Remote);
+        assert_eq!(admin.ports[0].host_ip.as_deref(), Some("10.0.0.5"));
+        assert!(compose_yaml(&admin).yaml.contains("\"10.0.0.5:8080:80\""));
+    }
+
+    #[test]
+    fn scrubbed_view_hides_log_option_host_addresses() {
+        let c = host_bearing();
+        for view in [View::Reader, View::Names] {
+            let out = describe(&c, view, Endpoint::Remote);
+            assert_eq!(out.log_options["syslog-address"], "tcp://***");
+            assert_eq!(out.log_options["fluentd-address"], "***:24224");
+            assert_eq!(out.log_options["gelf-address"], "udp://***");
+            assert_eq!(out.log_options["loki-url"], "http://***/loki/api/v1/push");
+            assert_eq!(out.log_options["tag"], "app");
+            let y = compose_yaml(&out).yaml;
+            assert!(
+                y.contains("syslog-address: \"${SECRET_SYSLOG_ADDRESS}\""),
+                "{y}"
+            );
+            for leak in ["10.0.0.5", "10.0.0.6", "10.0.0.9", "gelf.lan"] {
+                assert!(!y.contains(leak), "{view:?} {leak}");
+            }
+        }
+        let admin = describe(&c, View::Admin, Endpoint::Remote);
+        assert_eq!(admin.log_options["syslog-address"], "tcp://10.0.0.5:514");
+        assert_eq!(admin.log_options["fluentd-address"], "10.0.0.6:24224");
+        assert_eq!(admin.log_options["gelf-address"], "udp://gelf.lan:12201");
+        assert_eq!(
+            admin.log_options["loki-url"],
+            "http://10.0.0.9:3100/loki/api/v1/push"
+        );
+    }
+
+    #[test]
+    fn scrubbed_view_hides_label_host_addresses() {
+        let c = host_bearing();
+        let key = "traefik.http.services.x.loadbalancer.server.url";
+        for view in [View::Reader, View::Names] {
+            let out = describe(&c, view, Endpoint::Remote);
+            assert_eq!(out.labels[key], "http://***");
+            assert_eq!(out.labels["app"], "media");
+            assert!(!compose_yaml(&out).yaml.contains("10.0.0.5"));
+        }
+        let admin = describe(&c, View::Admin, Endpoint::Remote);
+        assert_eq!(admin.labels[key], "http://10.0.0.5:8080");
+    }
+
+    #[test]
     fn compose_path_labels_are_masked_outside_the_admin_view() {
         let mut c = serde_json::from_value::<ContainerInspectResponse>(json!({
             "Id": "x",
@@ -2198,8 +2366,10 @@ mod tests {
         assert_eq!(out.networks, vec!["media"]);
         assert_eq!(out.ports.len(), 2);
         assert_eq!(out.ports[0].container_port, "1900/udp");
-        assert_eq!(out.ports[0].host_ip.as_deref(), Some("10.0.0.5"));
+        assert_eq!(out.ports[0].host_ip.as_deref(), Some(REDACTED));
         assert_eq!(out.ports[1].host_ip, None);
+        let admin = inspected_as(View::Admin);
+        assert_eq!(admin.ports[0].host_ip.as_deref(), Some("10.0.0.5"));
         assert!(out.mounts[0].read_only);
         assert_eq!(out.mounts[1].volume_name.as_deref(), Some("plex_config"));
         assert_eq!(out.restart_policy.name, "unless-stopped");
