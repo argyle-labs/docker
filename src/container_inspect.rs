@@ -300,6 +300,7 @@ fn redact_command_string(
             if trailing.is_some() {
                 out.push(replace("ARG"));
                 changed = true;
+                pending = trailing;
             } else if inner != word {
                 out.push(format!("'{}'", inner.replace('\'', "'\\''")));
                 changed = true;
@@ -2343,6 +2344,23 @@ mod tests {
             REDACTED.to_owned()
         });
         assert_eq!(masked, args(&["app --password", REDACTED]));
+    }
+
+    #[test]
+    fn a_nested_trailing_secret_flag_masks_the_next_word() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for cmd in [
+            "eval 'curl -su' admin:hunter2",
+            "eval 'redis-cli -a' hunter2",
+            "eval 'mysql --password' hunter2",
+        ] {
+            let masked = redact_args(&args(&["sh", "-c", cmd]), |_| REDACTED.to_owned());
+            assert!(!masked[2].contains("hunter2"), "{masked:?}");
+        }
+        let masked = redact_args(&args(&["sh -c 'eval \"redis-cli -a\"'", "hunter2"]), |_| {
+            REDACTED.to_owned()
+        });
+        assert_eq!(masked[1], REDACTED, "{masked:?}");
     }
 
     #[test]
