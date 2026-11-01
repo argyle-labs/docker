@@ -1541,14 +1541,14 @@ mod tests {
             }
         }))
         .unwrap();
-        let admin = describe(&c, View::Admin, Endpoint::Local);
+        let admin = describe(&c, View::Admin, Endpoint::Remote);
         assert_eq!(admin.command, ["--password", "hunter2"]);
         assert_eq!(admin.entrypoint, ["run", "--token=s3cr3t"]);
         assert_eq!(
             admin.healthcheck.unwrap().test,
             ["CMD", "curl", "-u", "admin:hunter2", "http://x"]
         );
-        let reader = describe(&c, View::Reader, Endpoint::Local);
+        let reader = describe(&c, View::Reader, Endpoint::Remote);
         for leak in ["hunter2", "s3cr3t"] {
             assert!(
                 !reader.command.iter().any(|a| a.contains(leak)),
@@ -1620,19 +1620,19 @@ mod tests {
         }))
         .unwrap();
         for view in [View::Reader, View::Names] {
-            let labels = describe(&c, view, Endpoint::Local).labels;
+            let labels = describe(&c, view, Endpoint::Remote).labels;
             for key in COMPOSE_PATH_LABELS {
                 assert_eq!(labels[key], REDACTED, "{view:?} {key}");
             }
             assert_eq!(labels["com.docker.compose.project"], "media");
             assert_eq!(labels["com.docker.compose.service"], "plex");
             assert_eq!(labels["com.docker.compose.version"], "2.29.0");
-            let json = serde_json::to_string(&describe(&c, view, Endpoint::Local)).unwrap();
+            let json = serde_json::to_string(&describe(&c, view, Endpoint::Remote)).unwrap();
             for leak in ["/opt/stacks", "/mnt/secret"] {
                 assert!(!json.contains(leak), "{view:?} {leak}");
             }
         }
-        let admin = describe(&c, View::Admin, Endpoint::Local).labels;
+        let admin = describe(&c, View::Admin, Endpoint::Remote).labels;
         assert_eq!(
             admin["com.docker.compose.project.working_dir"],
             "/opt/stacks/x"
@@ -1642,7 +1642,11 @@ mod tests {
             "/mnt/secret/x.yml"
         );
         c.config = None;
-        assert!(describe(&c, View::Names, Endpoint::Local).labels.is_empty());
+        assert!(
+            describe(&c, View::Names, Endpoint::Remote)
+                .labels
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1692,11 +1696,8 @@ mod tests {
 
     #[test]
     fn symlinked_bind_sources_classify_by_their_real_target() {
-        let dir = std::env::temp_dir().join(format!("orca-inspect-link-{}", std::process::id()));
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir).unwrap();
-        }
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let sock = dir.join("docker.sock");
         std::fs::write(&sock, "").unwrap();
         let to_sock = dir.join("innocent");
@@ -1727,7 +1728,6 @@ mod tests {
             classify_bind("/etc/ssh", Endpoint::Remote),
             Some(("sensitivePath", "lexical"))
         );
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1834,7 +1834,7 @@ mod tests {
         );
         c.mounts = None;
         assert!(
-            describe(&c, View::Names, Endpoint::Local)
+            describe(&c, View::Names, Endpoint::Remote)
                 .sensitive_binds
                 .is_empty()
         );
@@ -1862,7 +1862,7 @@ mod tests {
         }))
         .unwrap();
         for view in [View::Reader, View::Names] {
-            let out = describe(&c, view, Endpoint::Local);
+            let out = describe(&c, view, Endpoint::Remote);
             let text = serde_json::to_string(&out).unwrap();
             for leak in [
                 "/etc",
@@ -1882,7 +1882,7 @@ mod tests {
             assert_eq!(out.hostname, "box");
             assert_eq!(out.sysctls["net.core.somaxconn"], "1024");
         }
-        let admin = describe(&c, View::Admin, Endpoint::Local);
+        let admin = describe(&c, View::Admin, Endpoint::Remote);
         assert_eq!(admin.sensitive_binds[0].source, "/etc");
         assert_eq!(admin.extra_hosts, vec!["db.lan:10.1.2.3".to_owned()]);
         assert_eq!(admin.dns, vec!["10.1.2.1".to_owned()]);
