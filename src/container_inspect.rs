@@ -668,7 +668,7 @@ fn mask_hosts(s: &str) -> String {
 
 fn mask_ip_tokens(s: &str) -> String {
     let is_tok =
-        |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '[' | ']' | '%' | '-');
+        |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '[' | ']' | '%' | '-' | '_');
     let mut out = String::with_capacity(s.len());
     let mut start = 0;
     for (i, c) in s.char_indices() {
@@ -694,19 +694,21 @@ fn mask_token(t: &str) -> String {
     if is_ip(t) {
         return REDACTED.to_owned();
     }
-    match t.rsplit_once(':') {
-        Some((host, port))
-            if !port.is_empty()
-                && port.chars().all(|c| c.is_ascii_digit())
-                && (is_ip(host)
-                    || (host.contains('.')
-                        && host.chars().any(|c| c.is_ascii_alphabetic())
-                        && host
-                            .chars()
-                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-')))) =>
-        {
-            format!("{REDACTED}:{port}")
-        }
+    let is_port = |p: &str| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit());
+    let is_host = |h: &str| {
+        is_ip(h)
+            || (h.chars().any(|c| c.is_ascii_alphabetic())
+                && h.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')))
+    };
+    let Some((host, port)) = t.rsplit_once(':').filter(|(_, p)| is_port(p)) else {
+        return t.to_owned();
+    };
+    if is_host(host) {
+        return format!("{REDACTED}:{port}");
+    }
+    match host.rsplit_once(':') {
+        Some((h, mid)) if is_port(mid) && is_host(h) => format!("{REDACTED}:{mid}:{port}"),
         _ => t.to_owned(),
     }
 }
@@ -741,10 +743,13 @@ pub fn describe(
                 .into_iter()
                 .map(|b| PortMapping {
                     container_port: port.clone(),
-                    host_ip: b
-                        .host_ip
-                        .filter(|s| !s.is_empty())
-                        .map(|ip| admin_only(ip, view)),
+                    host_ip: b.host_ip.filter(|s| !s.is_empty()).map(|ip| {
+                        if matches!(ip.as_str(), "0.0.0.0" | "::") {
+                            ip
+                        } else {
+                            admin_only(ip, view)
+                        }
+                    }),
                     host_port: b.host_port.filter(|s| !s.is_empty()),
                 })
                 .collect()
@@ -1150,11 +1155,13 @@ pub fn service_value(c: &ContainerInspectOutput) -> Value {
         let ports: Vec<String> = c
             .ports
             .iter()
-            .map(|p| {
+            .enumerate()
+            .map(|(i, p)| {
                 let target = p.container_port.trim_end_matches("/tcp");
                 let ip = p.host_ip.as_deref().map(|ip| {
                     if ip == REDACTED {
-                        env_ref(&format!("host_ip_{}", p.container_port))
+                        let binding = p.host_port.clone().unwrap_or_else(|| i.to_string());
+                        env_ref(&format!("host_ip_{}_{binding}", p.container_port))
                     } else if ip.contains(':') && !ip.starts_with('[') {
                         format!("[{ip}]")
                     } else {
@@ -1750,6 +1757,67 @@ mod tests {
         assert_eq!(mask_hosts("v1.2.3"), "v1.2.3");
     }
 
+    #[test]
+    fn mask_hosts_masks_port_triples_keeping_the_ports() {
+        assert_eq!(mask_hosts("10.0.0.5:8080:80"), "***:8080:80");
+    }
+
+    #[test]
+    fn mask_hosts_treats_underscores_as_hostname_chars() {
+        assert_eq!(mask_hosts("my_host.lan:514"), "***:514");
+    }
+
+    #[test]
+    fn mask_hosts_masks_dotless_host_port() {
+        assert_eq!(mask_hosts("nas:514"), "***:514");
+        assert_eq!(mask_hosts("fluentd:24224"), "***:24224");
+        assert_eq!(mask_hosts("nas:http"), "nas:http");
+    }
+
+    #[test]
+    fn mask_hosts_leaves_routing_rule_names_alone() {
+        let rule = "Host(`app.example.com`) && PathPrefix(`/api`)";
+        assert_eq!(mask_hosts(rule), rule);
+    }
+
+    #[test]
+    fn wildcard_host_ips_pass_through_unmasked() {
+        let c: ContainerInspectResponse = serde_json::from_value(json!({
+            "Id": "x",
+            "HostConfig": { "PortBindings": {
+                "80/tcp": [{ "HostIp": "0.0.0.0", "HostPort": "80" }],
+                "443/tcp": [{ "HostIp": "::", "HostPort": "443" }]
+            } }
+        }))
+        .unwrap();
+        let out = describe(&c, View::Reader, Endpoint::Remote);
+        let ips: Vec<_> = out.ports.iter().map(|p| p.host_ip.as_deref()).collect();
+        assert_eq!(ips, [Some("::"), Some("0.0.0.0")]);
+    }
+
+    #[test]
+    fn port_placeholders_are_unique_per_binding() {
+        let c: ContainerInspectResponse = serde_json::from_value(json!({
+            "Id": "x",
+            "HostConfig": { "PortBindings": { "80/tcp": [
+                { "HostIp": "10.0.0.5", "HostPort": "8080" },
+                { "HostIp": "10.0.0.6", "HostPort": "8081" },
+                { "HostIp": "10.0.0.7" }
+            ] } }
+        }))
+        .unwrap();
+        let y = compose_yaml(&describe(&c, View::Reader, Endpoint::Remote)).yaml;
+        assert!(
+            y.contains("\"${SECRET_HOST_IP_80_TCP_8080}:8080:80\""),
+            "{y}"
+        );
+        assert!(
+            y.contains("\"${SECRET_HOST_IP_80_TCP_8081}:8081:80\""),
+            "{y}"
+        );
+        assert!(y.contains("\"${SECRET_HOST_IP_80_TCP_2}::80\""), "{y}");
+    }
+
     fn host_bearing() -> ContainerInspectResponse {
         serde_json::from_value(json!({
             "Id": "x",
@@ -1778,7 +1846,10 @@ mod tests {
             let out = describe(&c, view, Endpoint::Remote);
             assert_eq!(out.ports[0].host_ip.as_deref(), Some(REDACTED));
             let y = compose_yaml(&out).yaml;
-            assert!(y.contains("\"${SECRET_HOST_IP_80_TCP}:8080:80\""), "{y}");
+            assert!(
+                y.contains("\"${SECRET_HOST_IP_80_TCP_8080}:8080:80\""),
+                "{y}"
+            );
             assert!(!y.contains("10.0.0.5"), "{y}");
         }
         let admin = describe(&c, View::Admin, Endpoint::Remote);
