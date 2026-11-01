@@ -670,7 +670,10 @@ pub fn describe(
         })
         .collect();
     redacted_labels.sort();
-    let masked = |a: Vec<String>| redact_args(&a, |_| REDACTED.to_owned());
+    let masked = |a: Vec<String>| match view {
+        View::Admin => a,
+        View::Reader | View::Names => redact_args(&a, |_| REDACTED.to_owned()),
+    };
     let log = host.log_config.clone().unwrap_or_default();
     let mut redacted_log_options = Vec::new();
     let log_options = log
@@ -1353,9 +1356,12 @@ async fn docker_container_inspect(
     inspect(&client()?, &args.container, View::Names).await
 }
 
-/// **Inspect a container, unfiltered**: `docker.container_inspect` with the
-/// real env values and mount sources. Admin only; not callable through
-/// `tool.call`. Read-only.
+/// **Inspect a container, unfiltered**: `docker.container_inspect` with real
+/// env values, command, entrypoint, healthcheck test, host paths (mount
+/// sources, device host paths, working dir), compose project path labels, DNS
+/// servers and `extraHosts` addresses. Still masked: secret-looking label values
+/// (listed in `redactedLabels`) and credentials in log option values. Admin
+/// only; not callable through `tool.call`. Read-only.
 #[orca_tool(
     domain = "docker",
     verb = "container_inspect_raw",
@@ -1522,6 +1528,47 @@ mod tests {
         let y = compose_yaml(&out).yaml;
         assert!(!y.contains("hunter2"), "{y}");
         assert!(y.contains("DB_PASSWORD: \"${DB_PASSWORD}\""), "{y}");
+    }
+
+    #[test]
+    fn an_admin_sees_command_entrypoint_and_healthcheck_unmasked() {
+        let c = serde_json::from_value::<ContainerInspectResponse>(json!({
+            "Id": "x",
+            "Config": {
+                "Cmd": ["--password", "hunter2"],
+                "Entrypoint": ["run", "--token=s3cr3t"],
+                "Healthcheck": { "Test": ["CMD", "curl", "-u", "admin:hunter2", "http://x"] }
+            }
+        }))
+        .unwrap();
+        let admin = describe(&c, View::Admin, Endpoint::Local);
+        assert_eq!(admin.command, ["--password", "hunter2"]);
+        assert_eq!(admin.entrypoint, ["run", "--token=s3cr3t"]);
+        assert_eq!(
+            admin.healthcheck.unwrap().test,
+            ["CMD", "curl", "-u", "admin:hunter2", "http://x"]
+        );
+        let reader = describe(&c, View::Reader, Endpoint::Local);
+        for leak in ["hunter2", "s3cr3t"] {
+            assert!(
+                !reader.command.iter().any(|a| a.contains(leak)),
+                "{reader:?}"
+            );
+            assert!(
+                !reader.entrypoint.iter().any(|a| a.contains(leak)),
+                "{reader:?}"
+            );
+            assert!(
+                !reader
+                    .healthcheck
+                    .as_ref()
+                    .unwrap()
+                    .test
+                    .iter()
+                    .any(|a| a.contains(leak)),
+                "{reader:?}"
+            );
+        }
     }
 
     #[test]
