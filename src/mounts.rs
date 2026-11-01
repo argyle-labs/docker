@@ -258,6 +258,7 @@ pub struct HostTable {
 pub trait Proc {
     fn read(&self, path: &str) -> std::io::Result<String>;
     fn readlink(&self, path: &str) -> std::io::Result<String>;
+    fn exists(&self, path: &str) -> bool;
 }
 
 pub struct HostProc;
@@ -270,11 +271,15 @@ impl Proc for HostProc {
     fn readlink(&self, path: &str) -> std::io::Result<String> {
         std::fs::read_link(path).map(|t| t.to_string_lossy().into_owned())
     }
+
+    fn exists(&self, path: &str) -> bool {
+        std::path::Path::new(path).exists()
+    }
 }
 
 /// The pid in dockerd's pid file, if that process is dockerd and shares this
 /// daemon's pid namespace; a stale pid file can name any process.
-fn dockerd_pid(proc: &impl Proc) -> Option<u32> {
+pub(crate) fn dockerd_pid(proc: &impl Proc) -> Option<u32> {
     let pid: u32 = proc.read(DOCKERD_PID).ok()?.trim().parse().ok()?;
     let comm = proc.read(&format!("/proc/{pid}/comm")).ok()?;
     let ours = proc.readlink("/proc/self/ns/pid").ok()?;
@@ -1005,6 +1010,10 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| std::io::ErrorKind::NotFound.into())
         }
+
+        fn exists(&self, p: &str) -> bool {
+            self.files.contains_key(p) || self.links.contains_key(p)
+        }
     }
 
     #[test]
@@ -1086,6 +1095,9 @@ mod tests {
             }
             fn readlink(&self, p: &str) -> std::io::Result<String> {
                 panic!("readlink {p}")
+            }
+            fn exists(&self, p: &str) -> bool {
+                panic!("exists {p}")
             }
         }
         let foreign = HostTable {
