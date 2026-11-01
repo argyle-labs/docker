@@ -463,7 +463,7 @@ impl DockerUnitProvider {
             String::new()
         } else {
             format!(
-                "; normalize (names and labels only; TZ and healthcheck repairs run only from the `normalize` action): {}",
+                "; normalize: {} (names and labels only; TZ and healthcheck repairs run only from the `normalize` action)",
                 report.join(", ")
             )
         }
