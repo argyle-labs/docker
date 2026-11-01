@@ -92,6 +92,7 @@ pub struct SensitiveBind {
     pub source: String,
     pub class: String,
     pub read_only: bool,
+    pub basis: String,
 }
 
 #[orca_struct]
@@ -474,16 +475,62 @@ fn classify_normalized(s: &str) -> Option<&'static str> {
     }
 }
 
-pub fn classify_bind(source: &str) -> Option<&'static str> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Endpoint {
+    Local,
+    Remote,
+}
+
+impl Endpoint {
+    /// `host` is the resolved `DOCKER_HOST`; `None` means bollard's default
+    /// local socket.
+    pub fn of(host: Option<&str>) -> Self {
+        if !cfg!(target_os = "linux") {
+            // Every engine off Linux runs inside a VM with its own filesystem.
+            return Endpoint::Remote;
+        }
+        let Some(host) = host else {
+            return Endpoint::Local;
+        };
+        match host.strip_prefix("unix://") {
+            Some(path)
+                if !["/.colima/", "/.lima/", "/.docker/desktop/", "/.docker/run/"]
+                    .iter()
+                    .any(|vm| path.contains(vm)) =>
+            {
+                Endpoint::Local
+            }
+            _ => Endpoint::Remote,
+        }
+    }
+
+    pub fn current() -> Self {
+        Endpoint::of(
+            crate::tools::resolve_docker_host()
+                .ok()
+                .flatten()
+                .as_deref(),
+        )
+    }
+}
+
+/// Returns the class and the basis (`lexical` or `resolved`). Symlinks are
+/// resolved only for a local engine, since a remote engine's paths live on
+/// another filesystem.
+pub fn classify_bind(source: &str, endpoint: Endpoint) -> Option<(&'static str, &'static str)> {
     let Some(lexical) = normalize_path(source) else {
-        return Some("sensitivePath");
+        return Some(("sensitivePath", "lexical"));
     };
-    let resolved = Path::new(source)
-        .is_absolute()
+    let real = (endpoint == Endpoint::Local && Path::new(source).is_absolute())
         .then(|| std::fs::canonicalize(source).ok())
         .flatten()
-        .and_then(|p| p.to_str().map(str::to_owned))
-        .filter(|real| *real != lexical);
+        .and_then(|p| p.to_str().map(str::to_owned));
+    let basis = if real.is_some() {
+        "resolved"
+    } else {
+        "lexical"
+    };
+    let resolved = real.filter(|real| *real != lexical);
     let classes = [
         classify_normalized(&lexical),
         resolved.as_deref().and_then(classify_normalized),
@@ -493,6 +540,7 @@ pub fn classify_bind(source: &str) -> Option<&'static str> {
         .find(|c| *c == Some("runtimeSocket"))
         .or_else(|| classes.into_iter().find(|c| c.is_some()))
         .flatten()
+        .map(|class| (class, basis))
 }
 
 fn is_anonymous_volume(name: &str) -> bool {
@@ -524,7 +572,11 @@ fn admin_only(value: String, view: View) -> String {
     }
 }
 
-pub fn describe(c: &ContainerInspectResponse, view: View) -> ContainerInspectOutput {
+pub fn describe(
+    c: &ContainerInspectResponse,
+    view: View,
+    endpoint: Endpoint,
+) -> ContainerInspectOutput {
     let config = c.config.clone().unwrap_or_default();
     let host = c.host_config.clone().unwrap_or_default();
     let mut ports: Vec<PortMapping> = host
@@ -563,10 +615,11 @@ pub fn describe(c: &ContainerInspectResponse, view: View) -> ContainerInspectOut
         .filter(|m| m.typ.as_deref() == Some("bind"))
         .filter_map(|m| {
             let source = m.source.clone().unwrap_or_default();
-            classify_bind(&source).map(|class| SensitiveBind {
+            classify_bind(&source, endpoint).map(|(class, basis)| SensitiveBind {
                 source: admin_only(source, view),
                 class: class.to_owned(),
                 read_only: !m.rw.unwrap_or(true),
+                basis: basis.to_owned(),
             })
         })
         .collect();
@@ -1217,7 +1270,7 @@ pub async fn inspect(
     let opts = InspectContainerOptionsBuilder::new().build();
     match docker.inspect_container(&target, Some(opts)).await {
         Ok(c) => {
-            let mut out = describe(&c, view);
+            let mut out = describe(&c, view, Endpoint::current());
             if !out.image_id.is_empty() {
                 match docker.inspect_image(&out.image_id).await {
                     Ok(image) => {
@@ -1253,7 +1306,10 @@ fn client() -> Result<Docker> {
 /// `***`, `redacted` marks a secret-looking one) and `***` for every host path
 /// (mount and sensitive bind sources, device host paths, working dir), compose project path label, DNS server and `extraHosts` address; log
 /// option values have credentials scrubbed. Bind mounts of runtime sockets and
-/// sensitive host paths are listed by class in `sensitiveBinds`. Callable by plugins through `tool.call`; the unfiltered
+/// sensitive host paths are listed by class in `sensitiveBinds`, each with a
+/// `basis`: `resolved` when symlinks were followed (local unix-socket engine
+/// only), else `lexical`. The classification is advisory: symlinks resolve at
+/// inspect time, not container start, so a repointed link is missed. Callable by plugins through `tool.call`; the unfiltered
 /// form is `docker.container_inspect_raw`. Read-only.
 #[orca_tool(
     domain = "docker",
@@ -1489,19 +1545,19 @@ mod tests {
         }))
         .unwrap();
         for view in [View::Reader, View::Names] {
-            let labels = describe(&c, view).labels;
+            let labels = describe(&c, view, Endpoint::Local).labels;
             for key in COMPOSE_PATH_LABELS {
                 assert_eq!(labels[key], REDACTED, "{view:?} {key}");
             }
             assert_eq!(labels["com.docker.compose.project"], "media");
             assert_eq!(labels["com.docker.compose.service"], "plex");
             assert_eq!(labels["com.docker.compose.version"], "2.29.0");
-            let json = serde_json::to_string(&describe(&c, view)).unwrap();
+            let json = serde_json::to_string(&describe(&c, view, Endpoint::Local)).unwrap();
             for leak in ["/opt/stacks", "/mnt/secret"] {
                 assert!(!json.contains(leak), "{view:?} {leak}");
             }
         }
-        let admin = describe(&c, View::Admin).labels;
+        let admin = describe(&c, View::Admin, Endpoint::Local).labels;
         assert_eq!(
             admin["com.docker.compose.project.working_dir"],
             "/opt/stacks/x"
@@ -1511,7 +1567,7 @@ mod tests {
             "/mnt/secret/x.yml"
         );
         c.config = None;
-        assert!(describe(&c, View::Names).labels.is_empty());
+        assert!(describe(&c, View::Names, Endpoint::Local).labels.is_empty());
     }
 
     #[test]
@@ -1541,6 +1597,25 @@ mod tests {
     }
 
     #[test]
+    fn only_a_local_linux_unix_socket_is_a_local_endpoint() {
+        let local = if cfg!(target_os = "linux") {
+            Endpoint::Local
+        } else {
+            Endpoint::Remote
+        };
+        assert_eq!(Endpoint::of(None), local);
+        assert_eq!(Endpoint::of(Some("unix:///var/run/docker.sock")), local);
+        for remote in [
+            "tcp://10.0.0.5:2375",
+            "ssh://deploy@build",
+            "unix:///home/a/.colima/default/docker.sock",
+            "unix:///home/a/.docker/desktop/docker.sock",
+        ] {
+            assert_eq!(Endpoint::of(Some(remote)), Endpoint::Remote, "{remote}");
+        }
+    }
+
+    #[test]
     fn symlinked_bind_sources_classify_by_their_real_target() {
         let dir = std::env::temp_dir().join(format!("orca-inspect-link-{}", std::process::id()));
         if dir.exists() {
@@ -1554,14 +1629,29 @@ mod tests {
         std::os::unix::fs::symlink(&sock, &to_sock).unwrap();
         std::os::unix::fs::symlink("/", &to_root).unwrap();
         assert_eq!(
-            classify_bind(to_sock.to_str().unwrap()),
-            Some("runtimeSocket")
+            classify_bind(to_sock.to_str().unwrap(), Endpoint::Local),
+            Some(("runtimeSocket", "resolved"))
         );
         assert_eq!(
-            classify_bind(to_root.to_str().unwrap()),
-            Some("sensitivePath")
+            classify_bind(to_root.to_str().unwrap(), Endpoint::Local),
+            Some(("sensitivePath", "resolved"))
         );
-        assert_eq!(classify_bind("/definitely/not/a/real/dir"), None);
+        assert_eq!(
+            classify_bind("/definitely/not/a/real/dir", Endpoint::Local),
+            None
+        );
+        assert_eq!(
+            classify_bind(to_sock.to_str().unwrap(), Endpoint::Remote),
+            None
+        );
+        assert_eq!(
+            classify_bind(to_root.to_str().unwrap(), Endpoint::Remote),
+            None
+        );
+        assert_eq!(
+            classify_bind("/etc/ssh", Endpoint::Remote),
+            Some(("sensitivePath", "lexical"))
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1610,7 +1700,11 @@ mod tests {
             ("/mnt//media/./x", None),
             ("/var//run///docker.sock", Some("runtimeSocket")),
         ] {
-            assert_eq!(classify_bind(path), class, "{path}");
+            assert_eq!(
+                classify_bind(path, Endpoint::Remote).map(|(c, _)| c),
+                class,
+                "{path}"
+            );
         }
         let mut c = serde_json::from_value::<ContainerInspectResponse>(json!({
             "Id": "x",
@@ -1622,24 +1716,30 @@ mod tests {
             ]
         }))
         .unwrap();
-        let out = describe(&c, View::Admin);
+        let out = describe(&c, View::Admin, Endpoint::Remote);
         assert_eq!(
             out.sensitive_binds,
             vec![
                 SensitiveBind {
                     source: "/etc".into(),
                     class: "sensitivePath".into(),
-                    read_only: true
+                    read_only: true,
+                    basis: "lexical".into(),
                 },
                 SensitiveBind {
                     source: "/var/run/docker.sock".into(),
                     class: "runtimeSocket".into(),
-                    read_only: false
+                    read_only: false,
+                    basis: "lexical".into(),
                 },
             ]
         );
         c.mounts = None;
-        assert!(describe(&c, View::Names).sensitive_binds.is_empty());
+        assert!(
+            describe(&c, View::Names, Endpoint::Local)
+                .sensitive_binds
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1664,7 +1764,7 @@ mod tests {
         }))
         .unwrap();
         for view in [View::Reader, View::Names] {
-            let out = describe(&c, view);
+            let out = describe(&c, view, Endpoint::Local);
             let text = serde_json::to_string(&out).unwrap();
             for leak in [
                 "/etc",
@@ -1684,7 +1784,7 @@ mod tests {
             assert_eq!(out.hostname, "box");
             assert_eq!(out.sysctls["net.core.somaxconn"], "1024");
         }
-        let admin = describe(&c, View::Admin);
+        let admin = describe(&c, View::Admin, Endpoint::Local);
         assert_eq!(admin.sensitive_binds[0].source, "/etc");
         assert_eq!(admin.extra_hosts, vec!["db.lan:10.1.2.3".to_owned()]);
         assert_eq!(admin.dns, vec!["10.1.2.1".to_owned()]);
