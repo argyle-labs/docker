@@ -235,23 +235,17 @@ impl View {
 
 fn redact_args(args: &[String], replace: impl Fn(&str) -> String) -> Vec<String> {
     let mut out = Vec::with_capacity(args.len());
-    let mut pending: Option<String> = None;
+    let mut pending: Option<&str> = None;
     for arg in args {
         if let Some(flag) = pending.take() {
-            out.push(replace(&flag));
-            continue;
-        }
-        if arg.contains(char::is_whitespace) {
+            out.push(replace(flag));
+        } else if arg.contains(char::is_whitespace) {
             out.push(redact_command_string(arg, &replace));
-        } else if let Some((name, value)) = arg.split_once('=')
-            && is_secret(name, value)
-        {
-            out.push(format!("{name}={}", replace(name)));
-        } else if is_secret_value(arg) {
-            out.push(replace("ARG"));
+        } else if let Some(masked) = redact_token(arg, &replace) {
+            out.push(masked);
         } else {
-            if arg.starts_with('-') && is_sensitive_key(arg) {
-                pending = Some(arg.clone());
+            if takes_secret_value(arg) {
+                pending = Some(arg);
             }
             out.push(arg.clone());
         }
@@ -268,29 +262,11 @@ fn redact_command_string(arg: &str, replace: &impl Fn(&str) -> String) -> String
         if let Some(flag) = pending.take() {
             out.push(replace(flag));
             changed = true;
-            continue;
-        }
-        let bare = tok.trim_start_matches('-');
-        if let Some((name, value)) = bare.split_once('=')
-            && is_secret(name, value)
-        {
-            out.push(format!(
-                "{}{name}={}",
-                &tok[..tok.len() - bare.len()],
-                replace(name)
-            ));
-            changed = true;
-        } else if is_secret_value(tok) {
-            out.push(replace("ARG"));
-            changed = true;
-        } else if tok.len() > 2
-            && tok.starts_with("-p")
-            && !tok[2..].starts_with(|c: char| c.is_ascii_digit() || c == '-')
-        {
-            out.push(format!("-p{}", replace("-p")));
+        } else if let Some(masked) = redact_token(tok, replace) {
+            out.push(masked);
             changed = true;
         } else {
-            if tok.starts_with('-') && (tok == "-a" || is_sensitive_key(bare)) {
+            if takes_secret_value(tok) {
                 pending = Some(tok);
             }
             out.push(tok.to_owned());
@@ -301,6 +277,36 @@ fn redact_command_string(arg: &str, replace: &impl Fn(&str) -> String) -> String
     } else {
         arg.to_owned()
     }
+}
+
+fn redact_token(tok: &str, replace: &impl Fn(&str) -> String) -> Option<String> {
+    let bare = tok.trim_start_matches('-');
+    if let Some((name, value)) = bare.split_once('=')
+        && is_secret(name, value)
+    {
+        return Some(format!(
+            "{}{name}={}",
+            &tok[..tok.len() - bare.len()],
+            replace(name)
+        ));
+    }
+    if is_secret_value(tok) {
+        return Some(replace("ARG"));
+    }
+    // `-p<secret>` is the mysql-client password form; `-p80`/`-p-1` are ports/numbers.
+    if tok.len() > 2
+        && tok.starts_with("-p")
+        && !tok[2..].starts_with(|c: char| c.is_ascii_digit() || c == '-')
+    {
+        return Some(format!("-p{}", replace("-p")));
+    }
+    None
+}
+
+fn takes_secret_value(tok: &str) -> bool {
+    tok.starts_with('-')
+        && (matches!(tok, "-a" | "-u" | "-H" | "--header" | "--user")
+            || is_sensitive_key(tok.trim_start_matches('-')))
 }
 
 fn env_ref(name: &str) -> String {
@@ -1608,6 +1614,22 @@ mod tests {
         ] {
             let cmd: Vec<String> = cmd.into_iter().map(String::from).collect();
             let masked = redact_args(&cmd, |_| REDACTED.to_owned());
+            assert!(
+                !masked.iter().any(|a| a.contains(leak)),
+                "{leak} in {masked:?}"
+            );
+        }
+        for (cmd, leak) in [
+            (vec!["redis-cli", "-a", "hunter2"], "hunter2"),
+            (vec!["mysqld", "-phunter2"], "hunter2"),
+            (vec!["CMD", "mysqladmin", "-phunter2", "ping"], "hunter2"),
+            (vec!["curl", "-u", "user:pass"], "pass"),
+            (vec!["--header", "X-Api-Key: k9"], "k9"),
+            (vec!["-H", "X-Api-Key: k9"], "k9"),
+        ] {
+            let cmd: Vec<String> = cmd.into_iter().map(String::from).collect();
+            let masked = redact_args(&cmd, |_| REDACTED.to_owned());
+            assert!(masked.iter().any(|a| a.contains(REDACTED)), "{masked:?}");
             assert!(
                 !masked.iter().any(|a| a.contains(leak)),
                 "{leak} in {masked:?}"
