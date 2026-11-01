@@ -256,20 +256,23 @@ fn redact_args(args: &[String], replace: impl Fn(&str) -> String) -> Vec<String>
 fn redact_command_string(arg: &str, replace: &impl Fn(&str) -> String) -> String {
     let scrubbed = scrub_line(arg);
     let mut changed = matches!(scrubbed, std::borrow::Cow::Owned(_));
-    let mut pending: Option<&str> = None;
+    let Some(words) = shell_words(&scrubbed) else {
+        return redact_unparsed(&scrubbed, replace);
+    };
+    let mut pending: Option<String> = None;
     let mut out: Vec<String> = Vec::new();
-    for tok in scrubbed.split_whitespace() {
+    for (raw, word) in words {
         if let Some(flag) = pending.take() {
-            out.push(replace(flag));
+            out.push(replace(&flag));
             changed = true;
-        } else if let Some(masked) = redact_token(tok, replace) {
+        } else if let Some(masked) = redact_token(&word, replace) {
             out.push(masked);
             changed = true;
         } else {
-            if takes_secret_value(tok) {
-                pending = Some(tok);
+            if takes_secret_value(&word) {
+                pending = Some(word);
             }
-            out.push(tok.to_owned());
+            out.push(raw.to_owned());
         }
     }
     if changed {
@@ -277,6 +280,71 @@ fn redact_command_string(arg: &str, replace: &impl Fn(&str) -> String) -> String
     } else {
         arg.to_owned()
     }
+}
+
+/// Splits on unquoted whitespace, yielding each word's raw text and its unquoted value.
+/// `None` on an unbalanced quote or trailing backslash.
+fn shell_words(s: &str) -> Option<Vec<(&str, String)>> {
+    let mut words = Vec::new();
+    let mut chars = s.char_indices().peekable();
+    while let Some(&(start, c)) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        let mut value = String::new();
+        let mut end = s.len();
+        while let Some((i, c)) = chars.next() {
+            match c {
+                c if c.is_whitespace() => {
+                    end = i;
+                    break;
+                }
+                '\\' => value.push(chars.next()?.1),
+                '\'' => loop {
+                    match chars.next()?.1 {
+                        '\'' => break,
+                        c => value.push(c),
+                    }
+                },
+                '"' => loop {
+                    match chars.next()?.1 {
+                        '"' => break,
+                        '\\' => {
+                            let (_, e) = chars.next()?;
+                            if !matches!(e, '"' | '\\' | '$' | '`') {
+                                value.push('\\');
+                            }
+                            value.push(e);
+                        }
+                        c => value.push(c),
+                    }
+                },
+                c => value.push(c),
+            }
+        }
+        words.push((&s[start..end], value));
+    }
+    Some(words)
+}
+
+// Without word boundaries a secret's extent is unknowable, so everything from the first
+// sensitive token on is masked.
+fn redact_unparsed(s: &str, replace: &impl Fn(&str) -> String) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for tok in s.split_whitespace() {
+        if let Some(masked) = redact_token(tok, replace) {
+            out.push(masked);
+            return out.join(" ");
+        }
+        if takes_secret_value(tok) {
+            out.push(tok.to_owned());
+            out.push(replace(tok));
+            return out.join(" ");
+        }
+        out.push(tok.to_owned());
+    }
+    s.to_owned()
 }
 
 fn redact_token(tok: &str, replace: &impl Fn(&str) -> String) -> Option<String> {
@@ -1639,6 +1707,32 @@ mod tests {
             .into_iter()
             .map(String::from)
             .collect();
+        assert_eq!(redact_args(&benign, |_| REDACTED.to_owned()), benign);
+        for (cmd, leaks) in [
+            (
+                "app --password 'correct horse battery'",
+                &["correct", "horse", "battery"][..],
+            ),
+            ("app --token \"zq1 zq2\"", &["zq1", "zq2"][..]),
+            ("app --password=\"zq1 zq2 zq3\"", &["zq1", "zq2", "zq3"][..]),
+            (
+                "app --password 'unbalanced horse",
+                &["unbalanced", "horse"][..],
+            ),
+            ("app --token=\"zq1 zq2", &["zq1", "zq2"][..]),
+        ] {
+            let cmd = args(&["sh", "-c", cmd]);
+            let masked = redact_args(&cmd, |_| REDACTED.to_owned());
+            let words: Vec<&str> = masked[2].split_whitespace().collect();
+            assert!(masked[2].contains(REDACTED), "{masked:?}");
+            for leak in leaks {
+                assert!(
+                    !words.iter().any(|w| w.contains(leak)),
+                    "{leak} in {masked:?}"
+                );
+            }
+        }
+        let benign = args(&["sh", "-c", "nginx -g 'daemon off;'"]);
         assert_eq!(redact_args(&benign, |_| REDACTED.to_owned()), benign);
         c.command = masked;
         c.labels.insert(
