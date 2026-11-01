@@ -23,6 +23,7 @@ use plugin_toolkit::prelude::*;
 use plugin_toolkit::route::{Route, Routes};
 use plugin_toolkit::runtime::{db_op, field_from_row};
 
+use crate::container_inspect::RUNTIME_SOCKETS;
 use crate::execute;
 
 /// A registered docker runtime. Exactly one of `socket_path` / `host` / `url`
@@ -816,12 +817,6 @@ fn one_engine(read: Result<Vec<Runtime>>) -> Result<Option<String>> {
     }
 }
 
-/// Well-known docker socket locations probed when no runtime is registered.
-/// An unconfigured host — notably Unraid, where the engine listens on the
-/// standard socket — still yields an explicit `DOCKER_HOST` this way, so the
-/// `subprocess_env` seam injects a concrete value instead of nothing.
-const WELL_KNOWN_SOCKETS: &[&str] = &["/var/run/docker.sock", "/run/docker.sock"];
-
 /// First existing socket in `paths`, formatted as a `unix://` `DOCKER_HOST`.
 /// A path whose existence cannot be checked (EACCES on a parent) counts as
 /// present, so connecting reports the real error instead of "not found".
@@ -842,7 +837,12 @@ fn socket_candidates(xdg_runtime_dir: Option<&str>, uid: u32) -> Vec<String> {
         Some(dir) => out.push(format!("{dir}/docker.sock")),
         None => out.push(format!("/run/user/{uid}/docker.sock")),
     }
-    out.extend(WELL_KNOWN_SOCKETS.iter().map(|p| p.to_string()));
+    out.extend(
+        RUNTIME_SOCKETS
+            .iter()
+            .filter(|p| p.ends_with("/docker.sock"))
+            .map(|p| p.to_string()),
+    );
     out
 }
 
