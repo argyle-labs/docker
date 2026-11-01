@@ -274,6 +274,67 @@ pub struct Contract {
     /// Per image reference: whether the image declares its own healthcheck.
     /// An image missing here could not be inspected.
     pub image_health: HashMap<String, bool>,
+    /// Image references whose config sets a non-empty `TZ`.
+    pub image_tz: std::collections::HashSet<String>,
+    /// Per `env_file` path as the config names it: its text, or why it
+    /// could not be read.
+    pub env_files: HashMap<String, std::result::Result<String, String>>,
+}
+
+/// The `env_file` paths of `svc`, in both the string and list forms, and
+/// whether compose requires each.
+fn env_file_paths(svc: &Value) -> Vec<(String, bool)> {
+    let one = |v: &Value| match v {
+        Value::String(s) => Some((s.clone(), true)),
+        Value::Object(m) => m.get("path").and_then(Value::as_str).map(|p| {
+            let required = m.get("required").and_then(Value::as_bool).unwrap_or(true);
+            (p.to_string(), required)
+        }),
+        _ => None,
+    };
+    match svc.get("env_file") {
+        Some(Value::Array(a)) => a.iter().filter_map(one).collect(),
+        Some(v) => one(v).into_iter().collect(),
+        None => Vec::new(),
+    }
+}
+
+/// The text of every `env_file` in `cfg`, read relative to the project `dir`
+/// without leaving it.
+fn read_env_files(
+    dir: Option<&stacks::StackDir>,
+    cfg: &Value,
+) -> HashMap<String, std::result::Result<String, String>> {
+    let mut out = HashMap::new();
+    let services = cfg.get("services").and_then(Value::as_object);
+    for svc in services.into_iter().flat_map(|s| s.values()) {
+        for (path, required) in env_file_paths(svc) {
+            if out.contains_key(&path) {
+                continue;
+            }
+            let read = match dir {
+                None => Err("no project dir to read it from".to_string()),
+                Some(d) => {
+                    let p = std::path::Path::new(&path);
+                    match p
+                        .strip_prefix(d.path())
+                        .ok()
+                        .or(p.is_relative().then_some(p))
+                    {
+                        None => Err("outside the project dir".to_string()),
+                        Some(rel) => match d.read_rel(rel) {
+                            Ok(Some(text)) => Ok(text),
+                            Ok(None) if !required => Ok(String::new()),
+                            Ok(None) => Err("does not exist".to_string()),
+                            Err(e) => Err(format!("{e:#}")),
+                        },
+                    }
+                }
+            };
+            out.insert(path, read);
+        }
+    }
+    out
 }
 
 /// The host's IANA timezone under `root`: `etc/timezone`, else the
@@ -292,7 +353,9 @@ pub fn host_tz(root: &std::path::Path) -> Option<String> {
         .filter(|z| !z.is_empty())
 }
 
-fn has_tz(svc: &Value) -> bool {
+/// Whether `svc` already sets a timezone; `Err` names an `env_file` that
+/// could not be read, so whether it sets `TZ` is unknown.
+fn has_tz(svc: &Value, contract: &Contract) -> std::result::Result<bool, String> {
     let set = |v: &str| !v.is_empty();
     let env = match svc.get("environment") {
         Some(Value::Object(m)) => m.get(TZ_KEY).and_then(Value::as_str).is_some_and(set),
@@ -312,7 +375,24 @@ fn has_tz(svc: &Value) -> bool {
             Value::String(s) => s.split(':').nth(1) == Some("/etc/localtime"),
             _ => false,
         });
-    env || localtime
+    if env || localtime || str_at(svc, "image").is_some_and(|i| contract.image_tz.contains(i)) {
+        return Ok(true);
+    }
+    for (path, _) in env_file_paths(svc) {
+        match contract.env_files.get(&path) {
+            Some(Ok(text)) => {
+                if stacks::env_pairs(text)
+                    .iter()
+                    .any(|(k, v)| k == TZ_KEY && set(v))
+                {
+                    return Ok(true);
+                }
+            }
+            Some(Err(why)) => return Err(format!("env_file '{path}' {why}")),
+            None => return Err(format!("env_file '{path}' was not read")),
+        }
+    }
+    Ok(false)
 }
 
 /// The `tz` and `healthcheck` items of `docker.manageability_audit`'s
@@ -330,13 +410,17 @@ pub fn contract_plan(cfg: &Value, contract: &Contract) -> (Vec<Change>, Vec<Stri
             key: key.to_string(),
             value,
         };
-        if !has_tz(svc) {
-            match &contract.tz {
+        match has_tz(svc, contract) {
+            Ok(true) => {}
+            Ok(false) => match &contract.tz {
                 Some(tz) => out.push(change(TZ_KEY, tz.clone())),
                 None => unrepaired.push(format!(
                     "{name}: tz: the host timezone is unknown; set TZ in the compose file"
                 )),
-            }
+            },
+            Err(why) => unrepaired.push(format!(
+                "{name}: tz: {why}, so whether it sets TZ is unknown; set TZ in the compose file"
+            )),
         }
         if svc.get(HEALTHCHECK_KEY).is_some() {
             continue;
@@ -365,7 +449,12 @@ pub fn contract_plan(cfg: &Value, contract: &Contract) -> (Vec<Change>, Vec<Stri
     (out, unrepaired)
 }
 
-async fn image_health(docker: &Docker, cfg: &Value) -> HashMap<String, bool> {
+/// Per inspected image: whether it declares a healthcheck, and the images
+/// whose config sets `TZ`.
+async fn image_facts(
+    docker: &Docker,
+    cfg: &Value,
+) -> (HashMap<String, bool>, std::collections::HashSet<String>) {
     let images: std::collections::BTreeSet<&str> = cfg
         .get("services")
         .and_then(Value::as_object)
@@ -374,18 +463,27 @@ async fn image_health(docker: &Docker, cfg: &Value) -> HashMap<String, bool> {
         .filter_map(|svc| str_at(svc, "image"))
         .collect();
     let mut out = HashMap::new();
+    let mut tz = std::collections::HashSet::new();
     for image in images {
         if let Ok(info) = docker.inspect_image(image).await {
-            let own = info
-                .config
-                .and_then(|c| c.healthcheck)
+            let config = info.config.unwrap_or_default();
+            if config
+                .env
+                .iter()
+                .flatten()
+                .any(|kv| kv.strip_prefix("TZ=").is_some_and(|v| !v.is_empty()))
+            {
+                tz.insert(image.to_string());
+            }
+            let own = config
+                .healthcheck
                 .and_then(|h| h.test)
                 .and_then(|t| t.into_iter().next())
                 .is_some_and(|kind| kind != "NONE");
             out.insert(image.to_string(), own);
         }
     }
-    out
+    (out, tz)
 }
 
 fn quoted(v: &str) -> Result<String> {
@@ -560,16 +658,20 @@ async fn plan_text(
     cfg: Value,
     docker: Option<&Docker>,
     repair_contract: bool,
+    dir: Option<&stacks::StackDir>,
 ) -> Plan {
     let (mut planned, mut warnings) = plan(name, &cfg, docker.is_some(), is_unraid(), &icon_for);
     let mut unrepaired = Vec::new();
     if repair_contract {
+        let (image_health, image_tz) = match docker {
+            Some(d) => image_facts(d, &cfg).await,
+            None => Default::default(),
+        };
         let contract = Contract {
             tz: host_tz(std::path::Path::new("/")),
-            image_health: match docker {
-                Some(d) => image_health(d, &cfg).await,
-                None => HashMap::new(),
-            },
+            image_health,
+            image_tz,
+            env_files: read_env_files(dir, &cfg),
         };
         let (repairs, missing) = contract_plan(&cfg, &contract);
         planned.extend(repairs);
@@ -609,8 +711,10 @@ pub async fn plan_stack(
     repair_contract: bool,
 ) -> Result<Plan> {
     let cfg = policy::user_cfg(row).await?;
-    let before = row.read_compose(&crate::stacks::allowed_roots()?)?;
-    Ok(plan_text(&row.name, before, cfg, docker, repair_contract).await)
+    let roots = crate::stacks::allowed_roots()?;
+    let before = row.read_compose(&roots)?;
+    let dir = row.open_dir(&roots)?;
+    Ok(plan_text(&row.name, before, cfg, docker, repair_contract, Some(&dir)).await)
 }
 
 pub async fn plan_inline(
@@ -626,7 +730,7 @@ pub async fn plan_inline(
         .ok_or_else(|| plugin_toolkit::anyhow::anyhow!("no compose file"))?;
     let raw = stacks::resolved_config(project_dir, &compose).await?;
     let cfg: Value = plugin_toolkit::serde_json::from_str(&raw)?;
-    Ok(plan_text(name, yaml.to_string(), cfg, docker, false).await)
+    Ok(plan_text(name, yaml.to_string(), cfg, docker, false, None).await)
 }
 
 pub async fn write(row: &mut StackRow, plan: &Plan, docker: Option<&Docker>) -> Result<()> {
@@ -919,6 +1023,7 @@ mod tests {
             cfg.clone(),
             None,
             false,
+            None,
         ));
         assert!(
             deploy
@@ -931,7 +1036,7 @@ mod tests {
         assert!(deploy.unrepaired.is_empty(), "{:?}", deploy.unrepaired);
         assert_eq!(deploy.after, yaml);
         let explicit =
-            plugin_toolkit::reactor::block_on(plan_text("web", yaml.into(), cfg, None, true));
+            plugin_toolkit::reactor::block_on(plan_text("web", yaml.into(), cfg, None, true, None));
         assert!(
             explicit.changes.iter().any(|c| c.key == HEALTHCHECK_KEY),
             "{:?}",
@@ -978,10 +1083,90 @@ mod tests {
         let contract = Contract {
             tz: None,
             image_health: HashMap::from([("zot:2".to_string(), true)]),
+            ..Default::default()
         };
         let (changes, unrepaired) = contract_plan(&cfg, &contract);
         assert!(changes.is_empty(), "{changes:?}");
         assert!(unrepaired.is_empty(), "{unrepaired:?}");
+    }
+
+    #[test]
+    fn tz_set_by_an_env_file_or_the_image_is_not_injected() {
+        let cfg = json!({"services": {
+            "one": {"image": "a:1", "env_file": "/srv/app/app.env"},
+            "list": {"image": "a:1", "env_file": ["/srv/app/x.env", {"path": "/srv/app/app.env", "required": true}]},
+            "img": {"image": "zone:1"},
+            "bare": {"image": "a:1", "env_file": ["/srv/app/x.env"]}
+        }});
+        let contract = Contract {
+            image_tz: ["zone:1".to_string()].into(),
+            env_files: HashMap::from([
+                (
+                    "/srv/app/app.env".to_string(),
+                    Ok("# z\nTZ=Europe/Paris\n".to_string()),
+                ),
+                ("/srv/app/x.env".to_string(), Ok("K=v\n".to_string())),
+            ]),
+            ..tz("America/Denver")
+        };
+        let (changes, unrepaired) = contract_plan(&cfg, &contract);
+        let tz: Vec<&str> = changes
+            .iter()
+            .filter(|c| c.key == TZ_KEY)
+            .map(|c| c.service.as_str())
+            .collect();
+        assert_eq!(tz, ["bare"]);
+        assert!(
+            unrepaired.iter().all(|u| !u.contains("tz:")),
+            "{unrepaired:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_env_file_leaves_tz_unrepaired() {
+        let cfg = json!({"services": {"app": {"image": "a:1", "env_file": "/srv/app/gone.env"}}});
+        let contract = Contract {
+            env_files: HashMap::from([(
+                "/srv/app/gone.env".to_string(),
+                Err("does not exist".to_string()),
+            )]),
+            ..tz("America/Denver")
+        };
+        let (changes, unrepaired) = contract_plan(&cfg, &contract);
+        assert!(changes.iter().all(|c| c.key != TZ_KEY), "{changes:?}");
+        assert!(
+            unrepaired
+                .iter()
+                .any(|u| u.starts_with("app: tz: env_file '/srv/app/gone.env' does not exist")),
+            "{unrepaired:?}"
+        );
+    }
+
+    #[test]
+    fn env_files_are_read_inside_the_project_dir_only() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let dir = base.join("app");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("app.env"), "TZ=Europe/Paris\n").unwrap();
+        let roots = [base.to_string_lossy().into_owned()];
+        let sd = stacks::StackDir::open(&dir.to_string_lossy(), &roots, false)
+            .unwrap()
+            .unwrap();
+        let abs = dir.join("app.env").to_string_lossy().into_owned();
+        let missing = dir.join("no.env").to_string_lossy().into_owned();
+        let cfg = json!({"services": {"a": {"env_file": [
+            abs, "rel.env", "/etc/passwd", {"path": missing, "required": false}
+        ]}}});
+        let read = read_env_files(Some(&sd), &cfg);
+        assert_eq!(read[&abs], Ok("TZ=Europe/Paris\n".to_string()));
+        assert_eq!(read["rel.env"], Err("does not exist".to_string()));
+        assert_eq!(
+            read["/etc/passwd"],
+            Err("outside the project dir".to_string())
+        );
+        assert_eq!(read[&missing], Ok(String::new()));
+        assert!(read_env_files(None, &cfg)[&abs].is_err());
     }
 
     #[test]
@@ -993,6 +1178,7 @@ mod tests {
         let contract = Contract {
             tz: None,
             image_health: HashMap::from([("louislam/dockge:1".to_string(), false)]),
+            ..Default::default()
         };
         let (changes, unrepaired) = contract_plan(&cfg, &contract);
         assert!(changes.is_empty());
