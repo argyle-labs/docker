@@ -1870,6 +1870,22 @@ mod tests {
     }
 
     #[test]
+    fn the_raw_inspect_gate_ranks_roles_instead_of_matching_admin_exactly() {
+        use crate::test_support::{caller, test_ctx};
+        let gate = |role: &str| {
+            crate::execute::require_admin(
+                "docker.container_inspect_raw",
+                &test_ctx().with_auth(caller(role)),
+            )
+        };
+        gate("admin").unwrap();
+        gate("super-admin").unwrap();
+        for role in ["read", "superadmin", "root"] {
+            crate::test_support::assert_admin_refusal(&gate(role).unwrap_err().to_string());
+        }
+    }
+
+    #[test]
     fn only_the_scrubbed_inspect_tool_is_callable_through_tool_call() {
         use plugin_toolkit::contract::OrcaToolDef;
         assert_eq!(DockerContainerInspect::NAME, "docker.container_inspect");
@@ -2134,6 +2150,14 @@ mod tests {
             View::Reader
         );
         assert_eq!(View::of(&admin()), View::Admin);
+        assert_eq!(
+            View::of(&test_ctx().with_auth(caller("super-admin"))),
+            View::Admin
+        );
+        assert_eq!(
+            View::of(&test_ctx().with_auth(caller("superadmin"))),
+            View::Reader
+        );
     }
 
     #[test]

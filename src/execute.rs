@@ -36,7 +36,7 @@ pub fn require_caller_admin(subject: &str, caller: Option<&CallerIdentity>) -> R
 
 fn check_admin(subject: &str, caller: Option<&CallerIdentity>) -> Result<()> {
     match caller {
-        Some(c) if c.role == "admin" => Ok(()),
+        Some(c) if c.satisfies("admin") => Ok(()),
         Some(c) => bail!(
             "{subject} requires role 'admin'; caller '{}' has '{}'",
             c.username,
