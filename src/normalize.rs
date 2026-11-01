@@ -452,20 +452,64 @@ fn read_env_files(
     out
 }
 
-/// The host's IANA timezone under `root`: `etc/timezone`, else the
-/// `zoneinfo/` target of the `etc/localtime` symlink.
-#[allow(clippy::disallowed_methods)] // a host file, not a stack file
-pub fn host_tz(root: &std::path::Path) -> Option<String> {
-    if let Ok(s) = std::fs::read_to_string(root.join("etc/timezone"))
-        && !s.trim().is_empty()
-    {
-        return Some(s.trim().to_string());
+/// The docker host's IANA timezone, in order: dockerd's `TZ` or
+/// `/etc/timezone`, the `zoneinfo/` target of the `/etc/localtime` symlink,
+/// Unraid's `/boot/config/ident.cfg` `timeZone`. Host files are read through
+/// dockerd's `/proc/<pid>/root`; in a container that cannot see dockerd its
+/// own files are not the host's, so the zone is unknown. A localtime of UTC
+/// yields to ident.cfg, since Unraid leaves it UTC whatever its zone.
+pub fn host_tz(proc: &impl crate::mounts::Proc) -> Option<String> {
+    let pid = crate::mounts::dockerd_pid(proc);
+    let root = match pid {
+        Some(pid) => format!("/proc/{pid}/root"),
+        None if proc.exists("/.dockerenv") || proc.exists("/run/.containerenv") => return None,
+        None => String::new(),
+    };
+    let valid = |z: &str| {
+        let z = z.trim().trim_start_matches(':');
+        let named = !z.is_empty()
+            && z.split('/').all(|part| {
+                !part.is_empty()
+                    && part != "."
+                    && part != ".."
+                    && part
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "_+-".contains(c))
+            });
+        (named
+            && (proc.exists(&format!("{root}/usr/share/zoneinfo/{z}"))
+                || proc.exists(&format!("/usr/share/zoneinfo/{z}"))))
+        .then(|| z.to_string())
+    };
+    let env = pid
+        .and_then(|pid| proc.read(&format!("/proc/{pid}/environ")).ok())
+        .and_then(|e| {
+            e.split('\0')
+                .find_map(|kv| kv.strip_prefix("TZ="))
+                .and_then(valid)
+        });
+    if let Some(z) = env.or_else(|| {
+        proc.read(&format!("{root}/etc/timezone"))
+            .ok()
+            .and_then(|s| valid(&s))
+    }) {
+        return Some(z);
     }
-    let link = std::fs::read_link(root.join("etc/localtime")).ok()?;
-    link.to_string_lossy()
-        .split_once("zoneinfo/")
-        .map(|(_, z)| z.to_string())
-        .filter(|z| !z.is_empty())
+    let link = proc
+        .readlink(&format!("{root}/etc/localtime"))
+        .ok()
+        .and_then(|l| l.split_once("zoneinfo/").and_then(|(_, z)| valid(z)));
+    let ident = || {
+        proc.read(&format!("{root}/boot/config/ident.cfg"))
+            .ok()?
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("timeZone="))
+            .and_then(|v| valid(v.trim().trim_matches('"')))
+    };
+    match link {
+        Some(z) if !matches!(z.as_str(), "UTC" | "Etc/UTC") => Some(z),
+        utc => ident().or(utc),
+    }
 }
 
 /// Whether `svc` already sets a timezone; `Err` names an `env_file` that
@@ -530,7 +574,7 @@ pub fn contract_plan(cfg: &Value, contract: &Contract) -> (Vec<Change>, Vec<Stri
             Ok(false) => match &contract.tz {
                 Some(tz) => out.push(change(TZ_KEY, tz.clone())),
                 None => unrepaired.push(format!(
-                    "{name}: tz: the host timezone is unknown; set TZ in the compose file"
+                    "{name}: tz: host timezone unknown; set TZ in the compose file"
                 )),
             },
             Err(why) => unrepaired.push(format!(
@@ -800,7 +844,7 @@ async fn plan_text(
             None => Default::default(),
         };
         let contract = Contract {
-            tz: host_tz(std::path::Path::new("/")),
+            tz: host_tz(&crate::mounts::HostProc),
             image_health,
             image_tz,
             env_files: read_env_files(dir, &cfg),
@@ -1419,18 +1463,121 @@ mod tests {
         assert_eq!(allow[0].definition, policy::digests(&expected)["app"]);
     }
 
+    /// A fake host; unlisted paths are absent.
+    #[derive(Default)]
+    struct Host {
+        files: HashMap<String, String>,
+        links: HashMap<String, String>,
+    }
+
+    impl Host {
+        fn file(mut self, p: &str, body: &str) -> Self {
+            self.files.insert(p.into(), body.into());
+            self
+        }
+
+        fn link(mut self, p: &str, target: &str) -> Self {
+            self.links.insert(p.into(), target.into());
+            self
+        }
+
+        /// dockerd as pid 42, its root carrying every zone used below.
+        fn dockerd() -> Self {
+            let mut h = Host::default()
+                .file("/var/run/docker.pid", "42\n")
+                .file("/proc/42/comm", "dockerd\n")
+                .link("/proc/self/ns/pid", "pid:[1]")
+                .link("/proc/42/ns/pid", "pid:[1]");
+            for z in ["Europe/Oslo", "Asia/Tokyo", "America/Denver", "Etc/UTC"] {
+                h = h.file(&format!("/proc/42/root/usr/share/zoneinfo/{z}"), "TZif");
+            }
+            h
+        }
+    }
+
+    impl crate::mounts::Proc for Host {
+        fn read(&self, p: &str) -> std::io::Result<String> {
+            self.files
+                .get(p)
+                .cloned()
+                .ok_or_else(|| std::io::ErrorKind::NotFound.into())
+        }
+
+        fn readlink(&self, p: &str) -> std::io::Result<String> {
+            self.links
+                .get(p)
+                .cloned()
+                .ok_or_else(|| std::io::ErrorKind::NotFound.into())
+        }
+
+        fn exists(&self, p: &str) -> bool {
+            self.files.contains_key(p) || self.links.contains_key(p)
+        }
+    }
+
     #[test]
-    fn host_tz_reads_timezone_then_the_localtime_link() {
-        let root = crate::fsat::PrivateDir::new("orca-tz-").unwrap();
-        assert_eq!(host_tz(root.path()), None);
-        std::fs::create_dir(root.path().join("etc")).unwrap();
-        std::os::unix::fs::symlink(
-            "/usr/share/zoneinfo/Europe/Oslo",
-            root.path().join("etc/localtime"),
-        )
-        .unwrap();
-        assert_eq!(host_tz(root.path()).as_deref(), Some("Europe/Oslo"));
-        std::fs::write(root.path().join("etc/timezone"), "Asia/Tokyo\n").unwrap();
-        assert_eq!(host_tz(root.path()).as_deref(), Some("Asia/Tokyo"));
+    fn host_tz_reads_dockerds_tz_env_first() {
+        let h = Host::dockerd()
+            .file("/proc/42/environ", "PATH=/bin\0TZ=:America/Denver\0")
+            .file("/proc/42/root/etc/timezone", "Asia/Tokyo\n");
+        assert_eq!(host_tz(&h).as_deref(), Some("America/Denver"));
+    }
+
+    #[test]
+    fn host_tz_reads_the_hosts_etc_timezone() {
+        let h = Host::dockerd()
+            .file("/proc/42/root/etc/timezone", "Asia/Tokyo\n")
+            .link(
+                "/proc/42/root/etc/localtime",
+                "/usr/share/zoneinfo/Europe/Oslo",
+            );
+        assert_eq!(host_tz(&h).as_deref(), Some("Asia/Tokyo"));
+    }
+
+    #[test]
+    fn host_tz_reads_the_localtime_link() {
+        let h = Host::dockerd().link(
+            "/proc/42/root/etc/localtime",
+            "../usr/share/zoneinfo/Europe/Oslo",
+        );
+        assert_eq!(host_tz(&h).as_deref(), Some("Europe/Oslo"));
+    }
+
+    #[test]
+    fn host_tz_reads_unraids_ident_cfg_over_a_utc_or_missing_localtime() {
+        let ident = "NAME=\"tower\"\ntimeZone=\"America/Denver\"\n";
+        let missing = Host::dockerd().file("/proc/42/root/boot/config/ident.cfg", ident);
+        assert_eq!(host_tz(&missing).as_deref(), Some("America/Denver"));
+        let utc = Host::dockerd()
+            .file("/proc/42/root/boot/config/ident.cfg", ident)
+            .link("/proc/42/root/etc/localtime", "/usr/share/zoneinfo/Etc/UTC");
+        assert_eq!(host_tz(&utc).as_deref(), Some("America/Denver"));
+    }
+
+    #[test]
+    fn host_tz_unknown_is_none_and_the_service_unrepaired() {
+        let copied = Host::dockerd().file("/proc/42/root/etc/localtime", "TZif");
+        let bogus = Host::dockerd()
+            .file("/proc/42/root/etc/timezone", "Mars/Olympus\n")
+            .file(
+                "/proc/42/root/boot/config/ident.cfg",
+                "timeZone=\"../../etc/passwd\"\n",
+            );
+        let container = Host::default()
+            .file("/.dockerenv", "")
+            .file("/etc/timezone", "Asia/Tokyo\n")
+            .file("/usr/share/zoneinfo/Asia/Tokyo", "TZif");
+        for h in [copied, bogus, container] {
+            assert_eq!(host_tz(&h), None);
+        }
+        let cfg = json!({"services": {"app": {"image": "x:1"}}});
+        let (changes, unrepaired) = contract_plan(&cfg, &Contract::default());
+        assert!(changes.iter().all(|c| c.key != TZ_KEY), "{changes:?}");
+        assert!(
+            unrepaired
+                .iter()
+                .any(|u| u.starts_with("app: tz: host timezone unknown")),
+            "{unrepaired:?}"
+        );
     }
 }
