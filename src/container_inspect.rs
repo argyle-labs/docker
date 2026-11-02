@@ -430,7 +430,7 @@ const VALUE_SHORT_FLAGS: [char; 3] = ['a', 'u', 'H'];
 // flag consumes the rest of the token, or the next word when nothing follows it.
 fn split_value_short_flag(tok: &str) -> Option<(&str, &str)> {
     let body = tok.strip_prefix('-').filter(|b| !b.starts_with('-'))?;
-    let i = body.find(|c: char| VALUE_SHORT_FLAGS.contains(&c) || !c.is_ascii_lowercase())?;
+    let i = body.find(|c: char| VALUE_SHORT_FLAGS.contains(&c) || !c.is_ascii_alphanumeric())?;
     let flag = body[i..].chars().next()?;
     if !VALUE_SHORT_FLAGS.contains(&flag) {
         return None;
@@ -2455,6 +2455,14 @@ mod tests {
         let masked = r(&["sh", "-c", "curl -sH 'Authorization: Bearer tok' x"]);
         assert!(!masked[2].contains("tok'"), "{masked:?}");
         assert!(!masked[2].contains("Bearer"), "{masked:?}");
+        assert_eq!(r(&["redis-cli", "-Xahunter"])[1], format!("-Xa{REDACTED}"));
+        assert_eq!(r(&["redis-cli", "-2ahunter"])[1], format!("-2a{REDACTED}"));
+        assert_eq!(r(&["curl", "-Kfsuadmin:pw"])[1], format!("-Kfsu{REDACTED}"));
+        assert_eq!(r(&["curl", "-KHvalue"])[1], format!("-KH{REDACTED}"));
+        let masked = r(&["sh", "-c", "curl -Kfsuadmin:pw x; redis-cli -2ahunter"]);
+        assert!(!masked[2].contains("admin:pw"), "{masked:?}");
+        assert!(!masked[2].contains("hunter"), "{masked:?}");
+        assert_eq!(r(&["x", "-\u{e9}ahunter"])[1], "-\u{e9}ahunter");
         let benign = args(&["curl", "-fsSL", "-o", "out"]);
         assert_eq!(redact_args(&benign, |_| REDACTED.to_owned()), benign);
     }
