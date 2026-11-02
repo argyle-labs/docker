@@ -426,47 +426,52 @@ mod tests {
 
     #[test]
     fn a_timeout_kills_the_whole_process_group() {
-        let pidfile = std::env::temp_dir().join(format!("docker-pg-{}.pid", std::process::id()));
-        std::fs::remove_file(&pidfile).ok();
-        let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
+        let alive = Liveness::new("pg");
         plugin_toolkit::reactor::block_on(run_within(
-            sh(&script),
+            sh(&alive.script()),
             std::time::Duration::from_millis(300),
         ))
         .unwrap_err();
-        assert!(grandchild_dead(&pidfile), "grandchild survived the timeout");
+        assert!(alive.died(), "grandchild never started");
     }
 
-    fn read_pid(pidfile: &std::path::Path) -> libc::pid_t {
-        for _ in 0..250 {
-            if let Some(pid) = std::fs::read_to_string(pidfile)
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
-            {
-                std::fs::remove_file(pidfile).ok();
-                return pid;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+    // The grandchild holds a FIFO's write end; EOF after its "up" line proves
+    // it exited, since the kernel closes its fds at death even before reaping.
+    struct Liveness {
+        dir: std::path::PathBuf,
+        reader: std::thread::JoinHandle<String>,
+    }
+
+    impl Liveness {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("docker-{tag}-{}", std::process::id()));
+            std::fs::remove_dir_all(&dir).ok();
+            std::fs::create_dir(&dir).unwrap();
+            let fifo = dir.join("alive");
+            let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            let reader = std::thread::spawn(move || std::fs::read_to_string(fifo).unwrap());
+            Self { dir, reader }
         }
-        panic!("pidfile {} never appeared", pidfile.display());
-    }
 
-    fn grandchild_dead(pidfile: &std::path::Path) -> bool {
-        let pid = read_pid(pidfile);
-        (0..50).any(|_| {
-            if unsafe { libc::kill(pid, 0) } != 0 || is_zombie(pid) {
-                return true;
+        fn script(&self) -> String {
+            format!(
+                "(echo up >&3; exec sleep 3600) 3>{} & wait",
+                self.dir.join("alive").display()
+            )
+        }
+
+        fn died(self) -> bool {
+            // Unblocks the reader's open if the grandchild never opened the FIFO.
+            let path = std::ffi::CString::new(self.dir.join("alive").to_str().unwrap()).unwrap();
+            let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+            if fd >= 0 {
+                unsafe { libc::close(fd) };
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            false
-        })
-    }
-
-    fn is_zombie(pid: libc::pid_t) -> bool {
-        std::fs::read_to_string(format!("/proc/{pid}/stat"))
-            .ok()
-            .and_then(|s| s.rsplit_once(") ").map(|(_, rest)| rest.starts_with('Z')))
-            .unwrap_or(false)
+            let seen = self.reader.join().unwrap();
+            std::fs::remove_dir_all(&self.dir).ok();
+            seen == "up\n"
+        }
     }
 
     #[test]
@@ -493,19 +498,13 @@ mod tests {
 
     #[test]
     fn cancelling_the_future_kills_the_group() {
-        let pidfile =
-            std::env::temp_dir().join(format!("docker-cancel-{}.pid", std::process::id()));
-        std::fs::remove_file(&pidfile).ok();
-        let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
+        let alive = Liveness::new("cancel");
         let done = plugin_toolkit::reactor::block_on(plugin_toolkit::time::timeout(
             std::time::Duration::from_millis(300),
-            run_within(sh(&script), std::time::Duration::from_secs(60)),
+            run_within(sh(&alive.script()), std::time::Duration::from_secs(60)),
         ));
         assert!(done.is_none());
-        assert!(
-            grandchild_dead(&pidfile),
-            "grandchild survived cancellation"
-        );
+        assert!(alive.died(), "grandchild never started");
     }
 
     #[test]
