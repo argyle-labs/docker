@@ -464,7 +464,12 @@ mod tests {
         fn died(self) -> bool {
             // Unblocks the reader's open if the grandchild never opened the FIFO.
             let path = std::ffi::CString::new(self.dir.join("alive").to_str().unwrap()).unwrap();
-            let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+            let fd = unsafe {
+                libc::open(
+                    path.as_ptr(),
+                    libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
             if fd >= 0 {
                 unsafe { libc::close(fd) };
             }
