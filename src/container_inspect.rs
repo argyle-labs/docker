@@ -1791,8 +1791,9 @@ mod tests {
         }))
         .unwrap();
         let out = describe(&c, View::Reader, Endpoint::Remote);
-        let ips: Vec<_> = out.ports.iter().map(|p| p.host_ip.as_deref()).collect();
-        assert_eq!(ips, [Some("::"), Some("0.0.0.0")]);
+        let mut ips: Vec<_> = out.ports.iter().map(|p| p.host_ip.as_deref()).collect();
+        ips.sort();
+        assert_eq!(ips, [Some("0.0.0.0"), Some("::")]);
     }
 
     #[test]
