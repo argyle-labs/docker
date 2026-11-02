@@ -435,18 +435,41 @@ mod tests {
         assert!(alive.died(), "grandchild never started");
     }
 
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("docker-{tag}-{}", std::process::id()));
+            std::fs::remove_dir_all(&dir).ok();
+            std::fs::create_dir(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl std::ops::Deref for TempDir {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
     // The grandchild holds a FIFO's write end; EOF after its "up" line proves
     // it exited, since the kernel closes its fds at death even before reaping.
     struct Liveness {
-        dir: std::path::PathBuf,
+        dir: TempDir,
         reader: std::thread::JoinHandle<String>,
     }
 
     impl Liveness {
         fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("docker-{tag}-{}", std::process::id()));
-            std::fs::remove_dir_all(&dir).ok();
-            std::fs::create_dir(&dir).unwrap();
+            let dir = TempDir::new(tag);
             let fifo = dir.join("alive");
             let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
             assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
@@ -473,9 +496,7 @@ mod tests {
             if fd >= 0 {
                 unsafe { libc::close(fd) };
             }
-            let seen = self.reader.join().unwrap();
-            std::fs::remove_dir_all(&self.dir).ok();
-            seen == "up\n"
+            self.reader.join().unwrap() == "up\n"
         }
     }
 
@@ -524,9 +545,7 @@ mod tests {
 
     #[test]
     fn a_process_outside_the_group_holding_stdout_is_an_error() {
-        let dir = std::env::temp_dir().join(format!("docker-setsid-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir(&dir).unwrap();
+        let dir = TempDir::new("setsid");
         let fifo = dir.join("ready");
         let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
@@ -552,7 +571,7 @@ mod tests {
         unsafe {
             libc::kill(pid, libc::SIGKILL);
         }
-        std::fs::remove_dir_all(&dir).ok();
+        drop(dir);
         let finished = drains.into_iter().all(|h| h.join().is_ok());
         assert!(err.to_string().contains("drain exceeded budget"), "{err}");
         assert!(finished, "drain threads still running after the budget");
