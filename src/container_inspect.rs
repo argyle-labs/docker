@@ -390,7 +390,10 @@ fn redact_unparsed(s: &str, replace: &impl Fn(&str) -> String) -> String {
 fn redact_token(tok: &str, replace: &impl Fn(&str) -> String) -> Option<String> {
     let bare = tok.trim_start_matches('-');
     if let Some((name, value)) = bare.split_once('=')
-        && is_secret(name, value)
+        && (is_secret(name, value)
+            || tok
+                .strip_prefix("-D")
+                .is_some_and(|_| is_secret(&name[1..], value)))
     {
         return Some(format!(
             "{}{name}={}",
@@ -439,9 +442,8 @@ fn split_value_short_flag(tok: &str) -> Option<(&str, &str)> {
     if !VALUE_SHORT_FLAGS.contains(&flag) {
         return None;
     }
-    // `-Dkey=value` / `-XX:Opt=v`: an uppercase lead flag followed later by `=` is a JVM-style
-    // property, not a cluster; a value flag in lead position (`-Hk=v`) still masks.
-    if i > 0 && body.starts_with(|c: char| c.is_ascii_uppercase()) && body[i..].contains('=') {
+    // `-Dkey=value` is a JVM system property, not a cluster; its key is vetted by `redact_token`.
+    if i > 0 && body.starts_with('D') && body[i..].contains('=') {
         return None;
     }
     let cut = 1 + i + flag.len_utf8();
@@ -2491,6 +2493,20 @@ mod tests {
             "-Dfile.encoding=UTF-8",
         ]);
         assert_eq!(redact_args(&benign, |_| REDACTED.to_owned()), benign);
+        assert_eq!(r(&["java", "-Xufoo=bar"])[1], format!("-Xu{REDACTED}"));
+        let masked = r(&["curl", "-Kusecret=x"]);
+        assert!(
+            masked[1].ends_with(REDACTED) && !masked[1].ends_with("=x"),
+            "{masked:?}"
+        );
+        for prop in ["-Ddb.password=hunter2", "-Dapi.token=abc", "-Dpassword=x"] {
+            let masked = r(&["java", prop]);
+            let (key, value) = prop.split_once('=').unwrap();
+            assert!(
+                masked[1].starts_with(key) && !masked[1].ends_with(&format!("={value}")),
+                "{masked:?}"
+            );
+        }
     }
 
     #[test]
