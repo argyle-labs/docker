@@ -426,47 +426,110 @@ mod tests {
 
     #[test]
     fn a_timeout_kills_the_whole_process_group() {
-        let pidfile = std::env::temp_dir().join(format!("docker-pg-{}.pid", std::process::id()));
-        std::fs::remove_file(&pidfile).ok();
-        let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
+        let alive = Liveness::new("pg");
         plugin_toolkit::reactor::block_on(run_within(
-            sh(&script),
+            sh(&alive.script()),
             std::time::Duration::from_millis(300),
         ))
         .unwrap_err();
-        assert!(grandchild_dead(&pidfile), "grandchild survived the timeout");
+        assert!(alive.died(), "grandchild never started");
     }
 
-    fn read_pid(pidfile: &std::path::Path) -> libc::pid_t {
-        for _ in 0..250 {
-            if let Some(pid) = std::fs::read_to_string(pidfile)
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
-            {
-                std::fs::remove_file(pidfile).ok();
-                return pid;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("docker-{tag}-{}", std::process::id()));
+            std::fs::remove_dir_all(&dir).ok();
+            std::fs::create_dir(&dir).unwrap();
+            Self(dir)
         }
-        panic!("pidfile {} never appeared", pidfile.display());
     }
 
-    fn grandchild_dead(pidfile: &std::path::Path) -> bool {
-        let pid = read_pid(pidfile);
-        (0..50).any(|_| {
-            if unsafe { libc::kill(pid, 0) } != 0 || is_zombie(pid) {
-                return true;
+    impl std::ops::Deref for TempDir {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    // The grandchild holds a FIFO's write end; EOF after its "up" line proves
+    // it exited, since the kernel closes its fds at death even before reaping.
+    struct Liveness {
+        dir: TempDir,
+        reader: Option<std::thread::JoinHandle<String>>,
+    }
+
+    impl Liveness {
+        fn new(tag: &str) -> Self {
+            let dir = TempDir::new(tag);
+            let fifo = dir.join("alive");
+            let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            let reader = std::thread::spawn(move || std::fs::read_to_string(fifo).unwrap());
+            Self {
+                dir,
+                reader: Some(reader),
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            false
-        })
+        }
+
+        fn script(&self) -> String {
+            format!(
+                "{} 3>{} & wait",
+                self.grandchild(""),
+                self.dir.join("alive").display()
+            )
+        }
+
+        // `exec` makes the reported `$$` the sleep's pid, which Drop kills.
+        fn grandchild(&self, ready: &str) -> String {
+            format!(
+                "sh -c 'echo $$ >{}; echo up >&3; {ready} exec sleep 3600'",
+                self.dir.join("pid").display()
+            )
+        }
+
+        // Unblocks the reader's open if the grandchild never opened the FIFO.
+        fn unblock(&self) {
+            let path = std::ffi::CString::new(self.dir.join("alive").to_str().unwrap()).unwrap();
+            let fd = unsafe {
+                libc::open(
+                    path.as_ptr(),
+                    libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
+            if fd >= 0 {
+                unsafe { libc::close(fd) };
+            }
+        }
+
+        fn died(mut self) -> bool {
+            self.unblock();
+            self.reader.take().unwrap().join().unwrap() == "up\n"
+        }
     }
 
-    fn is_zombie(pid: libc::pid_t) -> bool {
-        std::fs::read_to_string(format!("/proc/{pid}/stat"))
-            .ok()
-            .and_then(|s| s.rsplit_once(") ").map(|(_, rest)| rest.starts_with('Z')))
-            .unwrap_or(false)
+    // Runs before `dir` is removed: kills a surviving grandchild and unblocks
+    // the reader, so a panicking test strands neither.
+    impl Drop for Liveness {
+        fn drop(&mut self) {
+            if self.reader.is_some() {
+                if let Some(pid) = std::fs::read_to_string(self.dir.join("pid"))
+                    .ok()
+                    .and_then(|p| p.trim().parse::<libc::pid_t>().ok())
+                {
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+                self.unblock();
+            }
+        }
     }
 
     #[test]
@@ -481,41 +544,50 @@ mod tests {
 
     #[test]
     fn a_grandchild_holding_the_pipe_does_not_stall_the_return() {
-        let started = std::time::Instant::now();
+        let alive = Liveness::new("holder");
+        let ready = alive.dir.join("ready");
+        let path = std::ffi::CString::new(ready.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        // The leader exits only once the grandchild holds stdout, so a return
+        // that waited for pipe EOF would hang here instead of passing.
+        let script = format!(
+            "(exec 3>{a}; exec {g}) & read x <{r}; echo ok",
+            a = alive.dir.join("alive").display(),
+            g = alive.grandchild(&format!("echo r >{};", ready.display())),
+            r = ready.display()
+        );
         let out = plugin_toolkit::reactor::block_on(run_within(
-            sh("sleep 30 & echo ok"),
-            std::time::Duration::from_secs(20),
+            sh(&script),
+            std::time::Duration::from_secs(3600),
         ))
         .unwrap();
         assert_eq!(out, "ok\n");
-        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(alive.died(), "grandchild never held the pipe");
     }
 
     #[test]
     fn cancelling_the_future_kills_the_group() {
-        let pidfile =
-            std::env::temp_dir().join(format!("docker-cancel-{}.pid", std::process::id()));
-        std::fs::remove_file(&pidfile).ok();
-        let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
+        let alive = Liveness::new("cancel");
         let done = plugin_toolkit::reactor::block_on(plugin_toolkit::time::timeout(
             std::time::Duration::from_millis(300),
-            run_within(sh(&script), std::time::Duration::from_secs(60)),
+            run_within(sh(&alive.script()), std::time::Duration::from_secs(60)),
         ));
         assert!(done.is_none());
-        assert!(
-            grandchild_dead(&pidfile),
-            "grandchild survived cancellation"
-        );
+        assert!(alive.died(), "grandchild never started");
     }
 
     #[test]
     fn a_process_outside_the_group_holding_stdout_is_an_error() {
-        let pidfile =
-            std::env::temp_dir().join(format!("docker-setsid-{}.pid", std::process::id()));
-        std::fs::remove_file(&pidfile).ok();
+        let dir = TempDir::new("setsid");
+        let fifo = dir.join("ready");
+        let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        // The leader blocks on the FIFO until the grandchild has left the group,
+        // so the group kill on leader exit can never reach it pre-setsid.
         let script = format!(
-            "perl -e 'use POSIX; exit if fork; POSIX::setsid(); open F, \">{}\"; print F $$; close F; sleep 30' & echo ok; wait",
-            pidfile.display()
+            "perl -e 'use POSIX; exit if fork; POSIX::setsid(); open F, \">{f}\"; print F $$; close F; sleep 30' & cat {f} > {d}/pid; echo ok",
+            f = fifo.display(),
+            d = dir.display()
         );
         let mut drains = Vec::new();
         let err = plugin_toolkit::reactor::block_on(run_tracked(
@@ -524,17 +596,16 @@ mod tests {
             &mut drains,
         ))
         .unwrap_err();
-        let finished = (0..100).any(|_| {
-            if drains.iter().all(|h| h.is_finished()) {
-                return true;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            false
-        });
-        let pid = read_pid(&pidfile);
+        let pid: libc::pid_t = std::fs::read_to_string(dir.join("pid"))
+            .unwrap_or_else(|e| panic!("{e}: {err}"))
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("{e}: {err}"));
         unsafe {
             libc::kill(pid, libc::SIGKILL);
         }
+        drop(dir);
+        let finished = drains.into_iter().all(|h| h.join().is_ok());
         assert!(err.to_string().contains("drain exceeded budget"), "{err}");
         assert!(finished, "drain threads still running after the budget");
     }

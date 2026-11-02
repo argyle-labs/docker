@@ -388,9 +388,19 @@ fn redact_unparsed(s: &str, replace: &impl Fn(&str) -> String) -> String {
 }
 
 fn redact_token(tok: &str, replace: &impl Fn(&str) -> String) -> Option<String> {
+    // Fails closed: `-name`/`-all` get masked too, since `-xahunter` is indistinguishable.
+    if !tok.starts_with("-D")
+        && let Some((flag, value)) = split_value_short_flag(tok)
+        && !value.is_empty()
+    {
+        return Some(format!("{flag}{}", replace(flag)));
+    }
     let bare = tok.trim_start_matches('-');
     if let Some((name, value)) = bare.split_once('=')
-        && is_secret(name, value)
+        && (is_secret(name, value)
+            || tok
+                .strip_prefix("-D")
+                .is_some_and(|_| is_secret(&name[1..], value)))
     {
         return Some(format!(
             "{}{name}={}",
@@ -403,15 +413,12 @@ fn redact_token(tok: &str, replace: &impl Fn(&str) -> String) -> Option<String> 
     }
     if let Some((flag, value)) = split_value_short_flag(tok)
         && !value.is_empty()
-        && (flag.len() == 2 || value.contains(|c: char| !c.is_ascii_alphabetic()))
     {
         return Some(format!("{flag}{}", replace(flag)));
     }
-    // `-p<secret>` is the mysql-client password form; `-p80`/`-p-1` are ports/numbers.
-    if tok.len() > 2
-        && tok.starts_with("-p")
-        && !tok[2..].starts_with(|c: char| c.is_ascii_digit() || c == '-')
-    {
+    // `-p<secret>` is the mysql-client password form; any attached value is masked, since a
+    // container's own argv rarely carries `-p<port>` or `-p<negative int>`.
+    if tok.len() > 2 && tok.starts_with("-p") {
         return Some(format!("-p{}", replace("-p")));
     }
     None
@@ -430,9 +437,19 @@ const VALUE_SHORT_FLAGS: [char; 3] = ['a', 'u', 'H'];
 // flag consumes the rest of the token, or the next word when nothing follows it.
 fn split_value_short_flag(tok: &str) -> Option<(&str, &str)> {
     let body = tok.strip_prefix('-').filter(|b| !b.starts_with('-'))?;
-    let i = body.find(|c: char| VALUE_SHORT_FLAGS.contains(&c) || !c.is_ascii_lowercase())?;
-    let flag = body[i..].chars().next()?;
-    if !VALUE_SHORT_FLAGS.contains(&flag) {
+    // `p` takes any attached value as mysql's `-p<password>`, including one starting with `-`.
+    let is_password_p = |i: usize| i + 1 < body.len();
+    let (i, flag) = body.char_indices().find(|&(i, c)| {
+        VALUE_SHORT_FLAGS.contains(&c)
+            || (c == 'p' && is_password_p(i))
+            || matches!(c, '-' | '=' | '/' | '.' | ':' | '+')
+            || c.is_whitespace()
+    })?;
+    if !(VALUE_SHORT_FLAGS.contains(&flag) || flag == 'p') {
+        return None;
+    }
+    // `-Dkey=value` is a JVM system property, not a cluster; its key is vetted by `redact_token`.
+    if i > 0 && body.starts_with('D') && body[i..].contains('=') {
         return None;
     }
     let cut = 1 + i + flag.len_utf8();
@@ -1791,8 +1808,9 @@ mod tests {
         }))
         .unwrap();
         let out = describe(&c, View::Reader, Endpoint::Remote);
-        let ips: Vec<_> = out.ports.iter().map(|p| p.host_ip.as_deref()).collect();
-        assert_eq!(ips, [Some("::"), Some("0.0.0.0")]);
+        let mut ips: Vec<_> = out.ports.iter().map(|p| p.host_ip.as_deref()).collect();
+        ips.sort();
+        assert_eq!(ips, [Some("0.0.0.0"), Some("::")]);
     }
 
     #[test]
@@ -2435,6 +2453,26 @@ mod tests {
     }
 
     #[test]
+    fn mysql_password_flag_is_masked_inside_a_cluster() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let r = |v: &[&str]| redact_args(&args(v), |_| REDACTED.to_owned());
+        assert_eq!(r(&["mysql", "-Bpsecret"])[1], format!("-Bp{REDACTED}"));
+        assert_eq!(r(&["mysql", "-Npsecretu"])[1], format!("-Np{REDACTED}"));
+        assert_eq!(r(&["mysql", "-psecret"])[1], format!("-p{REDACTED}"));
+        assert_eq!(r(&["mysql", "-Bp3306"])[1], format!("-Bp{REDACTED}"));
+        assert_eq!(r(&["mysql", "-Bp1hunter"])[1], format!("-Bp{REDACTED}"));
+        assert_eq!(r(&["mysql", "-p3306secret"])[1], format!("-p{REDACTED}"));
+        assert_eq!(r(&["mysql", "-Bp-1"])[1], format!("-Bp{REDACTED}"));
+        assert_eq!(r(&["mysql", "-p-hunter2"])[1], format!("-p{REDACTED}"));
+        assert_eq!(r(&["mysql", "-Bp-hunter2"])[1], format!("-Bp{REDACTED}"));
+        let masked = r(&["sh", "-c", "mysql -p-hunter2 db"]);
+        assert!(!masked[2].contains("hunter2"), "{masked:?}");
+        assert_eq!(r(&["docker", "-p", "80:80"])[2], "80:80");
+        let masked = r(&["sh", "-c", "mysql -Bpsecret db"]);
+        assert!(!masked[2].contains("secret"), "{masked:?}");
+    }
+
+    #[test]
     fn value_taking_short_flag_clusters_end_in_a_u_or_h() {
         let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let r = |v: &[&str]| redact_args(&args(v), |_| REDACTED.to_owned());
@@ -2446,11 +2484,52 @@ mod tests {
         assert_eq!(r(&["curl", "-fsu", "admin:hunter2"])[2], REDACTED);
         assert_eq!(r(&["curl", "-uadmin:hunter2"])[1], format!("-u{REDACTED}"));
         assert_eq!(r(&["curl", "-Hvalue"])[1], format!("-H{REDACTED}"));
+        assert_eq!(r(&["redis-cli", "-ahunter"])[1], format!("-a{REDACTED}"));
+        assert_eq!(r(&["redis-cli", "-xahunter"])[1], format!("-xa{REDACTED}"));
+        assert_eq!(r(&["curl", "-fsuadmin"])[1], format!("-fsu{REDACTED}"));
+        let masked = r(&["sh", "-c", "redis-cli -xahunter ping"]);
+        assert!(!masked[2].contains("hunter"), "{masked:?}");
         let masked = r(&["sh", "-c", "curl -sH 'Authorization: Bearer tok' x"]);
         assert!(!masked[2].contains("tok'"), "{masked:?}");
         assert!(!masked[2].contains("Bearer"), "{masked:?}");
+        assert_eq!(r(&["redis-cli", "-Xahunter"])[1], format!("-Xa{REDACTED}"));
+        assert_eq!(r(&["redis-cli", "-2ahunter"])[1], format!("-2a{REDACTED}"));
+        assert_eq!(r(&["curl", "-Kfsuadmin:pw"])[1], format!("-Kfsu{REDACTED}"));
+        assert_eq!(r(&["curl", "-KHvalue"])[1], format!("-KH{REDACTED}"));
+        let masked = r(&["sh", "-c", "curl -Kfsuadmin:pw x; redis-cli -2ahunter"]);
+        assert!(!masked[2].contains("admin:pw"), "{masked:?}");
+        assert!(!masked[2].contains("hunter"), "{masked:?}");
+        let masked = r(&["x", "-\u{e9}ahunter", "-a\u{e9}\u{79d8}\u{5bc6}"]);
+        assert!(
+            masked[1].starts_with("-\u{e9}a") && !masked[1].contains("hunter"),
+            "{masked:?}"
+        );
+        assert!(
+            masked[2].starts_with("-a") && !masked[2].contains('\u{79d8}'),
+            "{masked:?}"
+        );
         let benign = args(&["curl", "-fsSL", "-o", "out"]);
         assert_eq!(redact_args(&benign, |_| REDACTED.to_owned()), benign);
+        let benign = args(&[
+            "x",
+            "-o/tmp/out.tar",
+            "-c/etc/app.conf",
+            "-XX:MaxRAMPercentage=75",
+            "-Duser.home=/x",
+            "-Dfile.encoding=UTF-8",
+        ]);
+        assert_eq!(redact_args(&benign, |_| REDACTED.to_owned()), benign);
+        assert_eq!(r(&["java", "-Xufoo=bar"])[1], format!("-Xu{REDACTED}"));
+        assert_eq!(r(&["curl", "-Kusecret=x"])[1], format!("-Ku{REDACTED}"));
+        assert_eq!(r(&["curl", "-ukey=val"])[1], format!("-u{REDACTED}"));
+        for prop in ["-Ddb.password=hunter2", "-Dapi.token=abc", "-Dpassword=x"] {
+            let masked = r(&["java", prop]);
+            let (key, value) = prop.split_once('=').unwrap();
+            assert!(
+                masked[1].starts_with(key) && !masked[1].ends_with(&format!("={value}")),
+                "{masked:?}"
+            );
+        }
     }
 
     #[test]
