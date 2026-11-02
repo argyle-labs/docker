@@ -510,12 +510,18 @@ mod tests {
 
     #[test]
     fn a_process_outside_the_group_holding_stdout_is_an_error() {
-        let pidfile =
-            std::env::temp_dir().join(format!("docker-setsid-{}.pid", std::process::id()));
-        std::fs::remove_file(&pidfile).ok();
+        let dir = std::env::temp_dir().join(format!("docker-setsid-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir(&dir).unwrap();
+        let fifo = dir.join("ready");
+        let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        // The leader blocks on the FIFO until the grandchild has left the group,
+        // so the group kill on leader exit can never reach it pre-setsid.
         let script = format!(
-            "perl -e 'use POSIX; exit if fork; POSIX::setsid(); open F, \">{}\"; print F $$; close F; sleep 30' & echo ok; wait",
-            pidfile.display()
+            "perl -e 'use POSIX; exit if fork; POSIX::setsid(); open F, \">{f}\"; print F $$; close F; sleep 30' & cat {f} > {d}/pid; echo ok",
+            f = fifo.display(),
+            d = dir.display()
         );
         let mut drains = Vec::new();
         let err = plugin_toolkit::reactor::block_on(run_tracked(
@@ -524,17 +530,16 @@ mod tests {
             &mut drains,
         ))
         .unwrap_err();
-        let finished = (0..100).any(|_| {
-            if drains.iter().all(|h| h.is_finished()) {
-                return true;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            false
-        });
-        let pid = read_pid(&pidfile);
+        let pid: libc::pid_t = std::fs::read_to_string(dir.join("pid"))
+            .unwrap_or_else(|e| panic!("{e}: {err}"))
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("{e}: {err}"));
         unsafe {
             libc::kill(pid, libc::SIGKILL);
         }
+        std::fs::remove_dir_all(&dir).ok();
+        let finished = drains.into_iter().all(|h| h.join().is_ok());
         assert!(err.to_string().contains("drain exceeded budget"), "{err}");
         assert!(finished, "drain threads still running after the budget");
     }
