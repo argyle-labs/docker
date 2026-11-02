@@ -486,14 +486,24 @@ mod tests {
 
     #[test]
     fn a_grandchild_holding_the_pipe_does_not_stall_the_return() {
-        let started = std::time::Instant::now();
+        let alive = Liveness::new("holder");
+        let ready = alive.dir.join("ready");
+        let path = std::ffi::CString::new(ready.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        // The leader exits only once the grandchild holds stdout, so a return
+        // that waited for pipe EOF would hang here instead of passing.
+        let script = format!(
+            "(exec 3>{a}; echo up >&3; echo r >{r}; exec sleep 3600) & read x <{r}; echo ok",
+            a = alive.dir.join("alive").display(),
+            r = ready.display()
+        );
         let out = plugin_toolkit::reactor::block_on(run_within(
-            sh("sleep 30 & echo ok"),
-            std::time::Duration::from_secs(20),
+            sh(&script),
+            std::time::Duration::from_secs(3600),
         ))
         .unwrap();
         assert_eq!(out, "ok\n");
-        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(alive.died(), "grandchild never held the pipe");
     }
 
     #[test]
