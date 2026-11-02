@@ -439,13 +439,20 @@ const VALUE_SHORT_FLAGS: [char; 3] = ['a', 'u', 'H'];
 // flag consumes the rest of the token, or the next word when nothing follows it.
 fn split_value_short_flag(tok: &str) -> Option<(&str, &str)> {
     let body = tok.strip_prefix('-').filter(|b| !b.starts_with('-'))?;
-    let i = body.find(|c: char| {
+    // `p` takes a value only when it is mysql's `-p<password>`; `p80`/`p-1` are ports/numbers.
+    let is_password_p = |i: usize| {
+        body[i + 1..]
+            .chars()
+            .next()
+            .is_some_and(|n| !n.is_ascii_digit() && n != '-')
+    };
+    let (i, flag) = body.char_indices().find(|&(i, c)| {
         VALUE_SHORT_FLAGS.contains(&c)
+            || (c == 'p' && is_password_p(i))
             || matches!(c, '-' | '=' | '/' | '.' | ':' | '+')
             || c.is_whitespace()
     })?;
-    let flag = body[i..].chars().next()?;
-    if !VALUE_SHORT_FLAGS.contains(&flag) {
+    if !(VALUE_SHORT_FLAGS.contains(&flag) || flag == 'p') {
         return None;
     }
     // `-Dkey=value` is a JVM system property, not a cluster; its key is vetted by `redact_token`.
@@ -2450,6 +2457,21 @@ mod tests {
             REDACTED.to_owned()
         });
         assert_eq!(masked, args(&["app --password", REDACTED]));
+    }
+
+    #[test]
+    fn mysql_password_flag_is_masked_inside_a_cluster() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let r = |v: &[&str]| redact_args(&args(v), |_| REDACTED.to_owned());
+        assert_eq!(r(&["mysql", "-Bpsecret"])[1], format!("-Bp{REDACTED}"));
+        assert_eq!(r(&["mysql", "-Npsecretu"])[1], format!("-Np{REDACTED}"));
+        assert_eq!(r(&["mysql", "-psecret"])[1], format!("-p{REDACTED}"));
+        assert_eq!(r(&["mysql", "-Bp3306"])[1], "-Bp3306");
+        assert_eq!(r(&["mysql", "-Bp-1"])[1], "-Bp-1");
+        assert_eq!(r(&["docker", "-p8080"])[1], "-p8080");
+        assert_eq!(r(&["docker", "-p", "80:80"])[2], "80:80");
+        let masked = r(&["sh", "-c", "mysql -Bpsecret db"]);
+        assert!(!masked[2].contains("secret"), "{masked:?}");
     }
 
     #[test]
