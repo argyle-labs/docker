@@ -416,9 +416,9 @@ fn redact_token(tok: &str, replace: &impl Fn(&str) -> String) -> Option<String> 
     {
         return Some(format!("{flag}{}", replace(flag)));
     }
-    // `-p<secret>` is the mysql-client password form; digits are masked too since a
-    // container's own argv rarely carries `-p<port>`. `-p-1` stays a number.
-    if tok.len() > 2 && tok.starts_with("-p") && !tok[2..].starts_with('-') {
+    // `-p<secret>` is the mysql-client password form; any attached value is masked, since a
+    // container's own argv rarely carries `-p<port>` or `-p<negative int>`.
+    if tok.len() > 2 && tok.starts_with("-p") {
         return Some(format!("-p{}", replace("-p")));
     }
     None
@@ -437,8 +437,8 @@ const VALUE_SHORT_FLAGS: [char; 3] = ['a', 'u', 'H'];
 // flag consumes the rest of the token, or the next word when nothing follows it.
 fn split_value_short_flag(tok: &str) -> Option<(&str, &str)> {
     let body = tok.strip_prefix('-').filter(|b| !b.starts_with('-'))?;
-    // `p` takes an attached value as mysql's `-p<password>`, digits included; `p-1` is a number.
-    let is_password_p = |i: usize| body[i + 1..].chars().next().is_some_and(|n| n != '-');
+    // `p` takes any attached value as mysql's `-p<password>`, including one starting with `-`.
+    let is_password_p = |i: usize| i + 1 < body.len();
     let (i, flag) = body.char_indices().find(|&(i, c)| {
         VALUE_SHORT_FLAGS.contains(&c)
             || (c == 'p' && is_password_p(i))
@@ -2462,7 +2462,11 @@ mod tests {
         assert_eq!(r(&["mysql", "-Bp3306"])[1], format!("-Bp{REDACTED}"));
         assert_eq!(r(&["mysql", "-Bp1hunter"])[1], format!("-Bp{REDACTED}"));
         assert_eq!(r(&["mysql", "-p3306secret"])[1], format!("-p{REDACTED}"));
-        assert_eq!(r(&["mysql", "-Bp-1"])[1], "-Bp-1");
+        assert_eq!(r(&["mysql", "-Bp-1"])[1], format!("-Bp{REDACTED}"));
+        assert_eq!(r(&["mysql", "-p-hunter2"])[1], format!("-p{REDACTED}"));
+        assert_eq!(r(&["mysql", "-Bp-hunter2"])[1], format!("-Bp{REDACTED}"));
+        let masked = r(&["sh", "-c", "mysql -p-hunter2 db"]);
+        assert!(!masked[2].contains("hunter2"), "{masked:?}");
         assert_eq!(r(&["docker", "-p", "80:80"])[2], "80:80");
         let masked = r(&["sh", "-c", "mysql -Bpsecret db"]);
         assert!(!masked[2].contains("secret"), "{masked:?}");
