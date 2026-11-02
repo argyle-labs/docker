@@ -431,10 +431,17 @@ const VALUE_SHORT_FLAGS: [char; 3] = ['a', 'u', 'H'];
 fn split_value_short_flag(tok: &str) -> Option<(&str, &str)> {
     let body = tok.strip_prefix('-').filter(|b| !b.starts_with('-'))?;
     let i = body.find(|c: char| {
-        VALUE_SHORT_FLAGS.contains(&c) || matches!(c, '-' | '=') || c.is_whitespace()
+        VALUE_SHORT_FLAGS.contains(&c)
+            || matches!(c, '-' | '=' | '/' | '.' | ':' | '+')
+            || c.is_whitespace()
     })?;
     let flag = body[i..].chars().next()?;
     if !VALUE_SHORT_FLAGS.contains(&flag) {
+        return None;
+    }
+    // `-Dkey=value` / `-XX:Opt=v`: an uppercase lead flag followed later by `=` is a JVM-style
+    // property, not a cluster; a value flag in lead position (`-Hk=v`) still masks.
+    if i > 0 && body.starts_with(|c: char| c.is_ascii_uppercase()) && body[i..].contains('=') {
         return None;
     }
     let cut = 1 + i + flag.len_utf8();
@@ -2474,6 +2481,15 @@ mod tests {
             "{masked:?}"
         );
         let benign = args(&["curl", "-fsSL", "-o", "out"]);
+        assert_eq!(redact_args(&benign, |_| REDACTED.to_owned()), benign);
+        let benign = args(&[
+            "x",
+            "-o/tmp/out.tar",
+            "-c/etc/app.conf",
+            "-XX:MaxRAMPercentage=75",
+            "-Duser.home=/x",
+            "-Dfile.encoding=UTF-8",
+        ]);
         assert_eq!(redact_args(&benign, |_| REDACTED.to_owned()), benign);
     }
 
