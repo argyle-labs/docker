@@ -464,7 +464,7 @@ mod tests {
     // it exited, since the kernel closes its fds at death even before reaping.
     struct Liveness {
         dir: TempDir,
-        reader: std::thread::JoinHandle<String>,
+        reader: Option<std::thread::JoinHandle<String>>,
     }
 
     impl Liveness {
@@ -474,7 +474,10 @@ mod tests {
             let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
             assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
             let reader = std::thread::spawn(move || std::fs::read_to_string(fifo).unwrap());
-            Self { dir, reader }
+            Self {
+                dir,
+                reader: Some(reader),
+            }
         }
 
         fn script(&self) -> String {
@@ -484,8 +487,8 @@ mod tests {
             )
         }
 
-        fn died(self) -> bool {
-            // Unblocks the reader's open if the grandchild never opened the FIFO.
+        // Unblocks the reader's open if the grandchild never opened the FIFO.
+        fn unblock(&self) {
             let path = std::ffi::CString::new(self.dir.join("alive").to_str().unwrap()).unwrap();
             let fd = unsafe {
                 libc::open(
@@ -496,7 +499,21 @@ mod tests {
             if fd >= 0 {
                 unsafe { libc::close(fd) };
             }
-            self.reader.join().unwrap() == "up\n"
+        }
+
+        fn died(mut self) -> bool {
+            self.unblock();
+            self.reader.take().unwrap().join().unwrap() == "up\n"
+        }
+    }
+
+    // Runs before `dir` is removed, so a panicking test never strands the
+    // reader in open() on an unlinked FIFO.
+    impl Drop for Liveness {
+        fn drop(&mut self) {
+            if self.reader.is_some() {
+                self.unblock();
+            }
         }
     }
 
