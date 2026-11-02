@@ -388,6 +388,13 @@ fn redact_unparsed(s: &str, replace: &impl Fn(&str) -> String) -> String {
 }
 
 fn redact_token(tok: &str, replace: &impl Fn(&str) -> String) -> Option<String> {
+    // Fails closed: `-name`/`-all` get masked too, since `-xahunter` is indistinguishable.
+    if !tok.starts_with("-D")
+        && let Some((flag, value)) = split_value_short_flag(tok)
+        && !value.is_empty()
+    {
+        return Some(format!("{flag}{}", replace(flag)));
+    }
     let bare = tok.trim_start_matches('-');
     if let Some((name, value)) = bare.split_once('=')
         && (is_secret(name, value)
@@ -404,7 +411,6 @@ fn redact_token(tok: &str, replace: &impl Fn(&str) -> String) -> Option<String> 
     if is_secret_value(tok) {
         return Some(replace("ARG"));
     }
-    // Fails closed: `-name`/`-all` get masked too, since `-xahunter` is indistinguishable.
     if let Some((flag, value)) = split_value_short_flag(tok)
         && !value.is_empty()
     {
@@ -2494,11 +2500,8 @@ mod tests {
         ]);
         assert_eq!(redact_args(&benign, |_| REDACTED.to_owned()), benign);
         assert_eq!(r(&["java", "-Xufoo=bar"])[1], format!("-Xu{REDACTED}"));
-        let masked = r(&["curl", "-Kusecret=x"]);
-        assert!(
-            masked[1].ends_with(REDACTED) && !masked[1].ends_with("=x"),
-            "{masked:?}"
-        );
+        assert_eq!(r(&["curl", "-Kusecret=x"])[1], format!("-Ku{REDACTED}"));
+        assert_eq!(r(&["curl", "-ukey=val"])[1], format!("-u{REDACTED}"));
         for prop in ["-Ddb.password=hunter2", "-Dapi.token=abc", "-Dpassword=x"] {
             let masked = r(&["java", prop]);
             let (key, value) = prop.split_once('=').unwrap();
