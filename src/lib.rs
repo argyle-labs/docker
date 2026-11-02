@@ -482,8 +482,17 @@ mod tests {
 
         fn script(&self) -> String {
             format!(
-                "(echo up >&3; exec sleep 3600) 3>{} & wait",
+                "{} 3>{} & wait",
+                self.grandchild(""),
                 self.dir.join("alive").display()
+            )
+        }
+
+        // `exec` makes the reported `$$` the sleep's pid, which Drop kills.
+        fn grandchild(&self, ready: &str) -> String {
+            format!(
+                "sh -c 'echo $$ >{}; echo up >&3; {ready} exec sleep 3600'",
+                self.dir.join("pid").display()
             )
         }
 
@@ -507,11 +516,17 @@ mod tests {
         }
     }
 
-    // Runs before `dir` is removed, so a panicking test never strands the
-    // reader in open() on an unlinked FIFO.
+    // Runs before `dir` is removed: kills a surviving grandchild and unblocks
+    // the reader, so a panicking test strands neither.
     impl Drop for Liveness {
         fn drop(&mut self) {
             if self.reader.is_some() {
+                if let Some(pid) = std::fs::read_to_string(self.dir.join("pid"))
+                    .ok()
+                    .and_then(|p| p.trim().parse::<libc::pid_t>().ok())
+                {
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
                 self.unblock();
             }
         }
@@ -536,8 +551,9 @@ mod tests {
         // The leader exits only once the grandchild holds stdout, so a return
         // that waited for pipe EOF would hang here instead of passing.
         let script = format!(
-            "(exec 3>{a}; echo up >&3; echo r >{r}; exec sleep 3600) & read x <{r}; echo ok",
+            "(exec 3>{a}; exec {g}) & read x <{r}; echo ok",
             a = alive.dir.join("alive").display(),
+            g = alive.grandchild(&format!("echo r >{};", ready.display())),
             r = ready.display()
         );
         let out = plugin_toolkit::reactor::block_on(run_within(
