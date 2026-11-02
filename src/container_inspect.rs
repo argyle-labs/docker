@@ -401,9 +401,9 @@ fn redact_token(tok: &str, replace: &impl Fn(&str) -> String) -> Option<String> 
     if is_secret_value(tok) {
         return Some(replace("ARG"));
     }
+    // Fails closed: `-name`/`-all` get masked too, since `-xahunter` is indistinguishable.
     if let Some((flag, value)) = split_value_short_flag(tok)
         && !value.is_empty()
-        && (flag.len() == 2 || value.contains(|c: char| !c.is_ascii_alphabetic()))
     {
         return Some(format!("{flag}{}", replace(flag)));
     }
@@ -2446,6 +2446,11 @@ mod tests {
         assert_eq!(r(&["curl", "-fsu", "admin:hunter2"])[2], REDACTED);
         assert_eq!(r(&["curl", "-uadmin:hunter2"])[1], format!("-u{REDACTED}"));
         assert_eq!(r(&["curl", "-Hvalue"])[1], format!("-H{REDACTED}"));
+        assert_eq!(r(&["redis-cli", "-ahunter"])[1], format!("-a{REDACTED}"));
+        assert_eq!(r(&["redis-cli", "-xahunter"])[1], format!("-xa{REDACTED}"));
+        assert_eq!(r(&["curl", "-fsuadmin"])[1], format!("-fsu{REDACTED}"));
+        let masked = r(&["sh", "-c", "redis-cli -xahunter ping"]);
+        assert!(!masked[2].contains("hunter"), "{masked:?}");
         let masked = r(&["sh", "-c", "curl -sH 'Authorization: Bearer tok' x"]);
         assert!(!masked[2].contains("tok'"), "{masked:?}");
         assert!(!masked[2].contains("Bearer"), "{masked:?}");
