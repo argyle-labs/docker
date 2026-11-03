@@ -1531,7 +1531,8 @@ pub async fn units(docker: Option<&bollard::Docker>) -> Result<Vec<StackRow>> {
             Vec::new()
         }
     };
-    let yield_to_dockge = found.iter().any(under_dockge_root) && dockge_is_local();
+    let yield_to_dockge =
+        found.iter().any(under_dockge_root) && yields_to_dockge(dockge_presence());
     let mut rows = registered;
     rows.extend(
         found
@@ -1548,45 +1549,22 @@ fn under_dockge_root(row: &StackRow) -> bool {
         && normalized(&row.dir).parent() == Some(normalized(DOCKGE_STACKS_ROOT).as_path())
 }
 
-fn dockge_is_local() -> bool {
-    if !plugin_toolkit::tool_call::available() {
-        return false;
-    }
-    match plugin_toolkit::tool_call::call_json("dockge.list", plugin_toolkit::serde_json::json!({}))
-    {
-        Ok(v) => lists_local_dockge(&v, plugin_toolkit::containers::local_hostname()),
-        Err(_) => false,
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockgePresence {
+    Present,
+    Absent,
+    Unknown,
 }
 
-pub fn lists_local_dockge(listed: &plugin_toolkit::serde_json::Value, hostname: &str) -> bool {
-    listed
-        .get("endpoints")
-        .and_then(|e| e.as_array())
-        .is_some_and(|eps| {
-            eps.iter().any(|e| {
-                e.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true)
-                    && e.get("base_url")
-                        .or_else(|| e.get("baseUrl"))
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|u| is_local_url(u, hostname))
-            })
-        })
+/// No seam reports a local dockge yet, so presence is always `Unknown`.
+fn dockge_presence() -> DockgePresence {
+    DockgePresence::Unknown
 }
 
-fn is_local_url(url: &str, hostname: &str) -> bool {
-    let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    let host = match authority.strip_prefix('[') {
-        Some(v6) => v6.split(']').next().unwrap_or(""),
-        None => authority.split(':').next().unwrap_or(""),
-    };
-    host.eq_ignore_ascii_case("localhost")
-        || host.eq_ignore_ascii_case(hostname)
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
+/// Only `Present` yields dockge-root stacks; `Unknown` keeps them, since
+/// dropping a stack nothing else lists would hide it.
+fn yields_to_dockge(presence: DockgePresence) -> bool {
+    presence == DockgePresence::Present
 }
 
 pub async fn find(name: &str, docker: Option<&bollard::Docker>) -> Result<StackRow> {
@@ -2958,38 +2936,11 @@ mod tests {
     }
 
     #[test]
-    fn a_local_dockge_endpoint_is_recognised() {
-        use plugin_toolkit::serde_json::json;
-        let listed = |url: &str, enabled: bool| json!({"endpoints": [{"name": "d", "base_url": url, "enabled": enabled}]});
-        assert!(lists_local_dockge(
-            &listed("http://localhost:5001", true),
-            "freyr"
-        ));
-        assert!(lists_local_dockge(
-            &listed("http://127.0.0.1:5001/", true),
-            "freyr"
-        ));
-        assert!(lists_local_dockge(
-            &listed("http://[::1]:5001", true),
-            "freyr"
-        ));
-        assert!(lists_local_dockge(
-            &listed("http://FREYR:5001", true),
-            "freyr"
-        ));
-        assert!(!lists_local_dockge(
-            &listed("http://localhost:5001", false),
-            "freyr"
-        ));
-        assert!(!lists_local_dockge(
-            &listed("http://baldur:5001", true),
-            "freyr"
-        ));
-        assert!(!lists_local_dockge(
-            &listed("http://10.0.0.5:5001", true),
-            "freyr"
-        ));
-        assert!(!lists_local_dockge(&json!({"endpoints": []}), "freyr"));
+    fn dockge_presence_is_unknown_and_unknown_keeps_stacks() {
+        assert_eq!(dockge_presence(), DockgePresence::Unknown);
+        assert!(!yields_to_dockge(DockgePresence::Unknown));
+        assert!(!yields_to_dockge(DockgePresence::Absent));
+        assert!(yields_to_dockge(DockgePresence::Present));
     }
 
     #[test]
