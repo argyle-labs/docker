@@ -34,10 +34,6 @@ pub fn unit_provider() -> DockerUnitProvider {
     DockerUnitProvider::new(adapter())
 }
 
-/// Tools the `unit` facet reaches over `tool.call`: stack listing yields
-/// dockge-root stacks to a local dockge via `dockge.list`.
-pub const TOOL_CALLS: &[&str] = &["dockge.list"];
-
 /// `topology` facet: wraps the free [`crate::topology::collect_claims`].
 pub struct DockerTopology;
 
@@ -87,11 +83,6 @@ pub fn schema_json() -> String {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn unit_facet_declares_the_dockge_list_tool_call() {
-        assert_eq!(super::TOOL_CALLS, ["dockge.list"]);
-    }
-
     #[test]
     fn schema_declares_every_table() {
         let v: plugin_toolkit::serde_json::Value =

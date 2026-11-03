@@ -21,7 +21,6 @@ fn main() -> plugin_toolkit::anyhow::Result<()> {
     let mut plugin = Plugin::named("docker")
         .version(env!("CARGO_PKG_VERSION"))
         .tools(["docker."])
-        .tool_calls(docker::registration::TOOL_CALLS)
         .schema_json(docker::registration::schema_json())
         .container_runtime(docker::runtime_adapter::DockerAdapter::new())
         .unit(docker::registration::unit_provider())
